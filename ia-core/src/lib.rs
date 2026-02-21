@@ -1,3 +1,7 @@
+pub mod error;
+
+pub use error::{IaError, Result};
+
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
