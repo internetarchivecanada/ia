@@ -1,0 +1,26 @@
+[package]
+name = "ia-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest-middleware = "0.4"
+reqwest-retry = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "signal"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+configparser = "3"
+thiserror = "2"
+tracing = "0.1"
+backon = "1"
+md-5 = "0.10"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
