@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
@@ -67,11 +67,19 @@ enum Commands {
     Search(commands::search::SearchArgs),
     /// Show job log summary
     Status(commands::status::StatusArgs),
+    /// Generate shell completions
+    Completions(commands::completions::CompletionsArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle completions early (no client/config needed)
+    if let Commands::Completions(args) = cli.command {
+        let mut cmd = Cli::command();
+        return commands::completions::run(args, &mut cmd);
+    }
 
     // Initialize logging
     let log_level = if cli.debug {
@@ -118,6 +126,7 @@ async fn main() -> Result<()> {
         Commands::Metadata(args) => commands::metadata::run(&client, args).await?,
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
+        Commands::Completions(_) => unreachable!("handled above"),
     }
 
     Ok(())
