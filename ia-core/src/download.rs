@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use futures::StreamExt;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
@@ -348,6 +350,144 @@ async fn compute_md5(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Result of downloading an entire item.
+#[derive(Debug)]
+pub struct ItemDownloadResult {
+    pub identifier: String,
+    pub files_total: usize,
+    pub files_downloaded: usize,
+    pub files_skipped: usize,
+    pub files_failed: usize,
+    pub bytes_total: u64,
+    pub elapsed: Duration,
+    pub results: Vec<FileDownloadResult>,
+}
+
+/// Download all matching files from an item concurrently.
+pub async fn download_item(
+    client: &IaClient,
+    identifier: &str,
+    opts: &DownloadOpts,
+    progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
+) -> Result<ItemDownloadResult> {
+    let start = std::time::Instant::now();
+
+    // Fetch item metadata
+    let item = crate::metadata::get(client, identifier).await?;
+
+    // Filter files
+    let files = crate::files::list(&item, &opts.filter);
+    let files_total = files.len();
+
+    if files.is_empty() {
+        return Ok(ItemDownloadResult {
+            identifier: identifier.to_string(),
+            files_total: 0,
+            files_downloaded: 0,
+            files_skipped: 0,
+            files_failed: 0,
+            bytes_total: 0,
+            elapsed: start.elapsed(),
+            results: vec![],
+        });
+    }
+
+    // Determine destination directory
+    let dest_dir = if opts.no_directories {
+        opts.destdir.clone()
+    } else {
+        opts.destdir.join(identifier)
+    };
+
+    // Clone file metadata for owned access in tasks
+    let files_owned: Vec<crate::types::FileMetadata> = files.into_iter().cloned().collect();
+
+    // Concurrent download with semaphore
+    let semaphore = Arc::new(Semaphore::new(opts.jobs));
+    let mut handles = Vec::new();
+
+    for file in files_owned {
+        let client = client.clone();
+        let identifier = identifier.to_string();
+        let dest_dir = dest_dir.clone();
+        let opts = opts.clone();
+        let sem = semaphore.clone();
+        let progress = progress.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let prog_ref = progress.as_deref();
+            let mut last_err = None;
+
+            for attempt in 0..=opts.retries {
+                if attempt > 0 {
+                    let delay = Duration::from_secs(2u64.pow(attempt as u32).min(60));
+                    warn!(file = %file.name, attempt, "retrying after {:?}", delay);
+                    tokio::time::sleep(delay).await;
+                }
+
+                match download_file(
+                    &client,
+                    &identifier,
+                    &file,
+                    &dest_dir,
+                    &opts,
+                    prog_ref,
+                )
+                .await
+                {
+                    Ok(result) => return result,
+                    Err(e) => {
+                        warn!(file = %file.name, attempt, error = %e, "download failed");
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            FileDownloadResult {
+                file_name: file.name.clone(),
+                bytes: 0,
+                status: DownloadStatus::Failed(
+                    last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string()),
+                ),
+                elapsed: start.elapsed(),
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Collect results
+    let mut results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok(result) => results.push(result),
+            Err(e) => results.push(FileDownloadResult {
+                file_name: "unknown".to_string(),
+                bytes: 0,
+                status: DownloadStatus::Failed(format!("task panic: {e}")),
+                elapsed: start.elapsed(),
+            }),
+        }
+    }
+
+    let files_downloaded = results.iter().filter(|r| r.status == DownloadStatus::Complete).count();
+    let files_skipped = results.iter().filter(|r| matches!(r.status, DownloadStatus::Skipped(_))).count();
+    let files_failed = results.iter().filter(|r| matches!(r.status, DownloadStatus::Failed(_))).count();
+    let bytes_total = results.iter().map(|r| r.bytes).sum();
+
+    Ok(ItemDownloadResult {
+        identifier: identifier.to_string(),
+        files_total,
+        files_downloaded,
+        files_skipped,
+        files_failed,
+        bytes_total,
+        elapsed: start.elapsed(),
+        results,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +627,50 @@ mod tests {
 
         assert_eq!(result.status, DownloadStatus::Complete);
         assert!(dir.path().join("subdir/test.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn download_item_concurrently() {
+        let mock_server = MockServer::start().await;
+
+        // Mock metadata endpoint
+        Mock::given(method("GET"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": "test-item"},
+                "files": [
+                    {"name": "a.txt", "size": "5", "source": "original"},
+                    {"name": "b.txt", "size": "5", "source": "original"},
+                    {"name": "c.txt", "size": "5", "source": "original"}
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock file downloads
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/test-item/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            jobs: 2,
+            ..Default::default()
+        };
+
+        let result = download_item(&client, "test-item", &opts, None).await.unwrap();
+
+        assert_eq!(result.files_total, 3);
+        assert_eq!(result.files_downloaded, 3);
+        assert_eq!(result.files_failed, 0);
+        assert!(dir.path().join("test-item/a.txt").exists());
+        assert!(dir.path().join("test-item/b.txt").exists());
+        assert!(dir.path().join("test-item/c.txt").exists());
     }
 }
