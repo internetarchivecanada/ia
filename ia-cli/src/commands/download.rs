@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
+use console::style;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,11 +13,12 @@ use crate::output::DownloadDisplay;
 
 #[derive(Args)]
 pub struct DownloadArgs {
-    /// Item identifier to download
-    pub identifier: String,
+    /// Item identifier(s) to download
+    pub identifiers: Vec<String>,
 
-    /// Specific files to download (optional)
-    pub files: Vec<String>,
+    /// File containing item identifiers (one per line)
+    #[arg(short = 'i', long)]
+    itemlist: Option<PathBuf>,
 
     /// Filter files by glob pattern (pipe-separated: "*.mp4|*.webm")
     #[arg(short = 'g', long)]
@@ -76,8 +78,47 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
     }
 }
 
+/// Collect all identifiers from args and --itemlist file.
+fn collect_identifiers(args: &DownloadArgs) -> Result<Vec<String>> {
+    let mut ids = args.identifiers.clone();
+
+    if let Some(path) = &args.itemlist {
+        let content = std::fs::read_to_string(path)
+            .context(format!("failed to read itemlist: {}", path.display()))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                ids.push(trimmed.to_string());
+            }
+        }
+    }
+
+    // Also read from stdin if no identifiers and no itemlist
+    if ids.is_empty() && args.itemlist.is_none() {
+        // Check if stdin is a pipe
+        if atty::isnt(atty::Stream::Stdin) {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let line = line.context("failed to read from stdin")?;
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    ids.push(trimmed);
+                }
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
 pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()> {
-    let identifier = args.identifier.clone();
+    let identifiers = collect_identifiers(&args)?;
+
+    if identifiers.is_empty() {
+        bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
+    }
+
     let opts = DownloadOpts {
         jobs: args.jobs,
         destdir: args.destdir.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -92,46 +133,121 @@ pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()>
             formats: args.format,
             source: args.source,
             exclude_source: args.exclude_source,
-            names: args.files,
+            names: vec![],
         },
     };
 
-    let display = if quiet == 0 {
-        Some(Arc::new(DownloadDisplay::new(&identifier)))
+    // Single item — use the original simple path
+    if identifiers.len() == 1 {
+        let identifier = &identifiers[0];
+        let display = if quiet == 0 {
+            Some(Arc::new(DownloadDisplay::new(identifier)))
+        } else {
+            None
+        };
+
+        let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
+            display.clone().map(|d| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+                Arc::new(move |p| d.update(p))
+            });
+
+        let result = ia_core::download::download_item(
+            client,
+            identifier,
+            &opts,
+            progress,
+        )
+        .await
+        .context(format!("failed to download {}", identifier))?;
+
+        if let Some(d) = display {
+            d.finish(&result);
+        }
+
+        if quiet == 1 {
+            eprintln!(
+                "{}  {} files ({}) in {:.1}s",
+                identifier,
+                result.files_downloaded,
+                format_bytes(result.bytes_total),
+                result.elapsed.as_secs_f64(),
+            );
+        }
+
+        if result.files_failed > 0 {
+            std::process::exit(1);
+        }
+
+        return Ok(());
+    }
+
+    // Batch mode
+    if quiet == 0 {
+        eprintln!(
+            "{}  Downloading {} items...\n",
+            style("batch").bold(),
+            identifiers.len(),
+        );
+    }
+
+    let on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)> = if quiet < 2 {
+        Some(&|id: &str, current: usize, total: usize| {
+            eprintln!(
+                "{} [{}/{}] {}",
+                style("→").cyan(),
+                current,
+                total,
+                style(id).bold(),
+            );
+        })
     } else {
         None
     };
 
-    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
-        display.clone().map(|d| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
-            Arc::new(move |p| d.update(p))
-        });
+    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = if quiet == 0 {
+        // In batch mode, just show per-file status lines (no progress bars to avoid clutter)
+        Some(Arc::new(move |p: DownloadProgress| {
+            match &p.status {
+                ia_core::download::DownloadStatus::Complete => {
+                    eprintln!("  {} {}", style("✓").green(), p.file_name);
+                }
+                ia_core::download::DownloadStatus::Skipped(reason) => {
+                    eprintln!("  {} {} ({})", style("–").yellow(), style(&p.file_name).dim(), reason);
+                }
+                ia_core::download::DownloadStatus::Failed(err) => {
+                    eprintln!("  {} {} {}", style("✗").red(), p.file_name, style(err).red());
+                }
+                _ => {}
+            }
+        }))
+    } else {
+        None
+    };
 
-    let result = ia_core::download::download_item(
+    let result = ia_core::download::download_batch(
         client,
-        &identifier,
+        identifiers,
         &opts,
         progress,
+        on_item_start,
     )
-    .await
-    .context(format!("failed to download {}", identifier))?;
+    .await;
 
-    if let Some(d) = display {
-        d.finish(&result);
-    }
-
-    // Summary for -q mode
-    if quiet == 1 {
+    // Print summary
+    if quiet < 2 {
         eprintln!(
-            "{}  {} files ({}) in {:.1}s",
-            identifier,
+            "\n{}  {} items, {} files downloaded ({}), {} skipped, {} failed — {:.1}s",
+            style("done").bold(),
+            result.items_total,
             result.files_downloaded,
             format_bytes(result.bytes_total),
+            result.files_skipped,
+            result.files_failed + result.items_failed,
             result.elapsed.as_secs_f64(),
         );
     }
 
-    if result.files_failed > 0 {
+    if result.files_failed > 0 || result.items_failed > 0 {
         std::process::exit(1);
     }
 

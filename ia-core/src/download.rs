@@ -488,6 +488,67 @@ pub async fn download_item(
     })
 }
 
+/// Result of downloading a batch of items.
+#[derive(Debug)]
+pub struct BatchDownloadResult {
+    pub items_total: usize,
+    pub items_succeeded: usize,
+    pub items_failed: usize,
+    pub files_downloaded: usize,
+    pub files_skipped: usize,
+    pub files_failed: usize,
+    pub bytes_total: u64,
+    pub elapsed: Duration,
+    pub item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
+}
+
+/// Download multiple items, processing them sequentially but downloading
+/// files within each item concurrently.
+pub async fn download_batch(
+    client: &IaClient,
+    identifiers: Vec<String>,
+    opts: &DownloadOpts,
+    progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
+    on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)>,
+) -> BatchDownloadResult {
+    let start = std::time::Instant::now();
+    let items_total = identifiers.len();
+    let mut item_results = Vec::new();
+
+    for (i, identifier) in identifiers.iter().enumerate() {
+        if let Some(cb) = &on_item_start {
+            cb(identifier, i + 1, items_total);
+        }
+
+        match download_item(client, identifier, opts, progress.clone()).await {
+            Ok(result) => item_results.push(Ok(result)),
+            Err(e) => {
+                warn!(identifier = %identifier, error = %e, "item download failed");
+                item_results.push(Err((identifier.clone(), e)));
+            }
+        }
+    }
+
+    let items_succeeded = item_results.iter().filter(|r| r.is_ok()).count();
+    let items_failed = item_results.iter().filter(|r| r.is_err()).count();
+    let files_downloaded: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_downloaded).sum();
+    let files_skipped: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_skipped).sum();
+    let files_failed: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_failed).sum();
+    let bytes_total: u64 = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.bytes_total).sum();
+
+    BatchDownloadResult {
+        items_total,
+        items_succeeded,
+        items_failed,
+        files_downloaded,
+        files_skipped,
+        files_failed,
+        bytes_total,
+        elapsed: start.elapsed(),
+        item_results,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
