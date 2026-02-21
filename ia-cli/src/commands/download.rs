@@ -79,6 +79,10 @@ pub struct DownloadArgs {
     /// Concurrent items in batch mode
     #[arg(long, default_value = "2")]
     items: usize,
+
+    /// Interactive TUI mode (requires --features tui)
+    #[arg(long)]
+    pub tui: bool,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -203,6 +207,17 @@ pub async fn run(
     };
 
     let opts = make_opts(base_destdir.clone());
+
+    // TUI mode
+    #[cfg(feature = "tui")]
+    if args.tui && identifiers.len() == 1 {
+        return crate::tui::run_tui(client, &identifiers[0], &opts).await;
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if args.tui {
+        bail!("TUI mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
+    }
 
     // Single item — use the original simple path
     if identifiers.len() == 1 {

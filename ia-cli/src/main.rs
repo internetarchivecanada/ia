@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 mod commands;
 mod output;
+#[cfg(feature = "tui")]
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "ia", version, about = "Internet Archive command-line tool")]

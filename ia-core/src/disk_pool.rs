@@ -168,7 +168,6 @@ fn disk_space(path: &Path) -> Result<(u64, u64)> {
     // Use std::fs to get disk space via statvfs on unix
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
         let _ = std::fs::metadata(path).map_err(|_| {
             IaError::Config(format!("cannot access disk: {}", path.display()))
         })?;
