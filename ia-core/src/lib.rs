@@ -1,7 +1,9 @@
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod user_agent;
 
+pub use client::IaClient;
 pub use config::IaConfig;
 pub use error::{IaError, Result};
 
