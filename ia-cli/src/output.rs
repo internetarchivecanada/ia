@@ -148,6 +148,8 @@ impl DownloadDisplay {
 
 pub struct BatchDisplay {
     multi: MultiProgress,
+    batch_header: ProgressBar,
+    bottom_sentinel: ProgressBar,
     active_item_bars: Mutex<HashMap<String, ItemBars>>,
     #[allow(dead_code)]
     started_at: std::time::Instant,
@@ -163,31 +165,34 @@ impl BatchDisplay {
     pub fn new(items_total: usize, jobs: usize) -> Self {
         let multi = MultiProgress::new();
 
-        let header = multi.add(ProgressBar::new_spinner());
-        header.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        header.set_message(format!(
+        let batch_header = multi.add(ProgressBar::new_spinner());
+        batch_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
+        batch_header.set_message(format!(
             "Downloading {} items ({} workers)...",
             style(items_total).bold(),
             jobs,
         ));
 
-        let sep = multi.add(ProgressBar::new_spinner());
-        sep.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        sep.set_message(
-            style("────────────────────────────────────────────────────")
-                .dim()
-                .to_string(),
-        );
+        // Bottom sentinel — new item bars are inserted before this
+        let bottom_sentinel = multi.add(ProgressBar::new_spinner());
+        bottom_sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
+        bottom_sentinel.set_message("");
+        bottom_sentinel.finish();
 
         Self {
             multi,
+            batch_header,
+            bottom_sentinel,
             active_item_bars: Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
         }
     }
 
     pub fn on_item_start(&self, identifier: &str, _current: usize, _total: usize) {
-        let item_header = self.multi.add(ProgressBar::new_spinner());
+        let item_header = self.multi.insert_before(
+            &self.bottom_sentinel,
+            ProgressBar::new_spinner(),
+        );
         item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
         item_header.set_message(format!(
             "{} {}",
@@ -195,7 +200,10 @@ impl BatchDisplay {
             style(identifier).bold(),
         ));
 
-        let sentinel = self.multi.add(ProgressBar::new_spinner());
+        let sentinel = self.multi.insert_before(
+            &self.bottom_sentinel,
+            ProgressBar::new_spinner(),
+        );
         sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
         sentinel.set_message("");
         sentinel.finish();
@@ -311,6 +319,10 @@ impl BatchDisplay {
         result: &ia_core::download::BatchDownloadResult,
         disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>,
     ) {
+        // Finish all multi-progress bars so they render their final state
+        self.batch_header.finish_and_clear();
+        self.bottom_sentinel.finish_and_clear();
+
         let elapsed = result.elapsed.as_secs_f64();
         let speed = if elapsed > 0.0 {
             format!(
