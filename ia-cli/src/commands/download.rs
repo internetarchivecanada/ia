@@ -4,6 +4,7 @@ use console::style;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use ia_core::disk_pool::DiskPool;
 use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
@@ -44,10 +45,6 @@ pub struct DownloadArgs {
     #[arg(long, value_parser = parse_source)]
     exclude_source: Option<FileSource>,
 
-    /// Concurrent downloads per item
-    #[arg(short = 'j', long, default_value = "4")]
-    jobs: usize,
-
     /// Destination directory (repeatable for disk pool)
     #[arg(long, default_value = ".")]
     destdir: Vec<PathBuf>,
@@ -75,10 +72,6 @@ pub struct DownloadArgs {
     /// Download items matching search query
     #[arg(short = 's', long)]
     search: Option<String>,
-
-    /// Concurrent items in batch mode
-    #[arg(long, default_value = "2")]
-    items: usize,
 
     /// Interactive TUI mode (requires --features tui)
     #[arg(long)]
@@ -142,6 +135,7 @@ pub async fn run(
     client: &IaClient,
     args: DownloadArgs,
     quiet: u8,
+    jobs: usize,
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
@@ -189,7 +183,6 @@ pub async fn run(
     let base_destdir = destdirs.first().cloned().unwrap_or_else(|| PathBuf::from("."));
 
     let make_opts = |destdir: PathBuf| DownloadOpts {
-        jobs: args.jobs,
         destdir,
         no_directories: args.no_directories,
         checksum: args.checksum,
@@ -207,11 +200,12 @@ pub async fn run(
     };
 
     let opts = make_opts(base_destdir.clone());
+    let semaphore = Arc::new(Semaphore::new(jobs));
 
     // TUI mode
     #[cfg(feature = "tui")]
     if args.tui && identifiers.len() == 1 {
-        return crate::tui::run_tui(client, &identifiers[0], &opts).await;
+        return crate::tui::run_tui(client, &identifiers[0], &opts, Arc::clone(&semaphore)).await;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -246,6 +240,7 @@ pub async fn run(
             client,
             identifier,
             &item_opts,
+            Arc::clone(&semaphore),
             progress,
         )
         .await
@@ -285,8 +280,8 @@ pub async fn run(
         );
     }
 
-    let on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)> = if quiet < 2 {
-        Some(&|id: &str, current: usize, total: usize| {
+    let on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>> = if quiet < 2 {
+        Some(Arc::new(|id: &str, current: usize, total: usize| {
             eprintln!(
                 "{} [{}/{}] {}",
                 style("→").cyan(),
@@ -294,7 +289,7 @@ pub async fn run(
                 total,
                 style(id).bold(),
             );
-        })
+        }))
     } else {
         None
     };
@@ -319,11 +314,11 @@ pub async fn run(
         None
     };
 
-    let result = ia_core::download::download_batch_concurrent(
+    let result = ia_core::download::download_batch(
         client,
         identifiers,
         &opts,
-        args.items,
+        semaphore,
         progress,
         on_item_start,
     )
