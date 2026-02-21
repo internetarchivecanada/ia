@@ -273,47 +273,26 @@ pub async fn run(
     }
 
     // Batch mode
-    if quiet == 0 {
-        eprintln!(
-            "{}  Downloading {} items...\n",
-            style("batch").bold(),
-            identifiers.len(),
-        );
-    }
-
-    let on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>> = if quiet < 2 {
-        Some(Arc::new(|id: &str, current: usize, total: usize| {
-            eprintln!(
-                "{} [{}/{}] {}",
-                style("→").cyan(),
-                current,
-                total,
-                style(id).bold(),
-            );
-        }))
+    let batch_display = if quiet == 0 {
+        Some(Arc::new(crate::output::BatchDisplay::new(identifiers.len(), jobs)))
     } else {
         None
     };
 
-    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = if quiet == 0 {
-        // In batch mode, just show per-file status lines (no progress bars to avoid clutter)
-        Some(Arc::new(move |p: DownloadProgress| {
-            match &p.status {
-                ia_core::download::DownloadStatus::Complete => {
-                    eprintln!("  {} {}", style("✓").green(), p.file_name);
-                }
-                ia_core::download::DownloadStatus::Skipped(reason) => {
-                    eprintln!("  {} {} ({})", style("–").yellow(), style(&p.file_name).dim(), reason);
-                }
-                ia_core::download::DownloadStatus::Failed(err) => {
-                    eprintln!("  {} {} {}", style("✗").red(), p.file_name, style(err).red());
-                }
-                _ => {}
-            }
-        }))
-    } else {
-        None
-    };
+    let on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>> =
+        batch_display.clone().map(|bd| -> Arc<dyn Fn(&str, usize, usize) + Send + Sync> {
+            Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
+        });
+
+    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
+        batch_display.clone().map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+            Arc::new(move |p: DownloadProgress| bd.on_progress(p))
+        });
+
+    let on_item_complete: Option<Arc<dyn Fn(&ia_core::download::ItemDownloadResult) + Send + Sync>> =
+        batch_display.clone().map(|bd| -> Arc<dyn Fn(&ia_core::download::ItemDownloadResult) + Send + Sync> {
+            Arc::new(move |result| bd.on_item_complete(result))
+        });
 
     let result = ia_core::download::download_batch(
         client,
@@ -322,6 +301,7 @@ pub async fn run(
         semaphore,
         progress,
         on_item_start,
+        on_item_complete,
     )
     .await;
 
@@ -341,29 +321,32 @@ pub async fn run(
 
     // Print summary
     if quiet < 2 {
-        eprintln!(
-            "\n{}  {} items, {} files downloaded ({}), {} skipped, {} failed — {:.1}s",
-            style("done").bold(),
-            result.items_total,
-            result.files_downloaded,
-            crate::output::format_bytes(result.bytes_total),
-            result.files_skipped,
-            result.files_failed + result.items_failed,
-            result.elapsed.as_secs_f64(),
-        );
-    }
-
-    // Report disk pool usage if multi-disk
-    if let Some(ref pool) = disk_pool {
-        if quiet < 2 {
-            for ds in pool.status() {
-                eprintln!(
-                    "  {} {} items, {} free",
-                    style(ds.path.display()).dim(),
-                    ds.items_count,
-                    crate::output::format_bytes(ds.free_bytes),
-                );
+        let disk_statuses = disk_pool.as_ref().map(|p| p.status());
+        if let Some(ref bd) = batch_display {
+            if disk_pool.is_some() {
+                bd.finish(&result, disk_statuses.as_deref());
+            } else if let Some(free) = crate::output::disk_space_free(&base_destdir) {
+                let single_status = vec![ia_core::disk_pool::DiskStatus {
+                    path: base_destdir.clone(),
+                    free_bytes: free,
+                    total_bytes: 0,
+                    items_count: result.items_total,
+                }];
+                bd.finish(&result, Some(&single_status));
+            } else {
+                bd.finish(&result, None);
             }
+        } else if quiet == 1 {
+            eprintln!(
+                "{}  {} items, {} files downloaded ({}), {} skipped, {} failed — {:.1}s",
+                style("done").bold(),
+                result.items_total,
+                result.files_downloaded,
+                crate::output::format_bytes(result.bytes_total),
+                result.files_skipped,
+                result.files_failed + result.items_failed,
+                result.elapsed.as_secs_f64(),
+            );
         }
     }
 

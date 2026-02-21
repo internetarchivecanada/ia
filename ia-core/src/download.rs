@@ -49,6 +49,7 @@ impl Default for DownloadOpts {
 /// Progress information for a single file download.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
+    pub identifier: String,
     pub file_name: String,
     pub bytes_downloaded: u64,
     pub total_bytes: Option<u64>,
@@ -98,6 +99,7 @@ pub async fn download_file(
             debug!(file = %file.name, reason = %skip_reason, "skipping file");
             if let Some(p) = progress {
                 p(DownloadProgress {
+                    identifier: identifier.to_string(),
                     file_name: file.name.clone(),
                     bytes_downloaded: 0,
                     total_bytes: file.size,
@@ -119,6 +121,7 @@ pub async fn download_file(
             debug!(file = %file.name, reason = %skip_reason, "skipping file (checksum match)");
             if let Some(p) = progress {
                 p(DownloadProgress {
+                    identifier: identifier.to_string(),
                     file_name: file.name.clone(),
                     bytes_downloaded: 0,
                     total_bytes: file.size,
@@ -165,6 +168,7 @@ pub async fn download_file(
 
     if let Some(p) = progress {
         p(DownloadProgress {
+            identifier: identifier.to_string(),
             file_name: file.name.clone(),
             bytes_downloaded: resume_from.unwrap_or(0),
             total_bytes: file.size,
@@ -210,6 +214,7 @@ pub async fn download_file(
 
         if let Some(p) = progress {
             p(DownloadProgress {
+                identifier: identifier.to_string(),
                 file_name: file.name.clone(),
                 bytes_downloaded,
                 total_bytes: file.size,
@@ -226,6 +231,7 @@ pub async fn download_file(
         if let Some(expected_md5) = &file.md5 {
             if let Some(p) = progress {
                 p(DownloadProgress {
+                    identifier: identifier.to_string(),
                     file_name: file.name.clone(),
                     bytes_downloaded,
                     total_bytes: file.size,
@@ -265,6 +271,7 @@ pub async fn download_file(
 
     if let Some(p) = progress {
         p(DownloadProgress {
+            identifier: identifier.to_string(),
             file_name: file.name.clone(),
             bytes_downloaded,
             total_bytes: file.size,
@@ -507,6 +514,7 @@ pub async fn download_batch(
     semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
     on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>>,
+    on_item_complete: Option<Arc<dyn Fn(&ItemDownloadResult) + Send + Sync>>,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();
@@ -520,6 +528,7 @@ pub async fn download_batch(
         let progress = progress.clone();
         let counter = Arc::clone(&counter);
         let on_item_start = on_item_start.clone();
+        let on_item_complete = on_item_complete.clone();
 
         let handle = tokio::spawn(async move {
             let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -529,7 +538,12 @@ pub async fn download_batch(
             info!(item = %identifier, idx, "starting item download");
 
             match download_item(&client, &identifier, &opts, semaphore, progress).await {
-                Ok(result) => (idx, Ok(result)),
+                Ok(result) => {
+                    if let Some(ref cb) = on_item_complete {
+                        cb(&result);
+                    }
+                    (idx, Ok(result))
+                }
                 Err(e) => {
                     warn!(identifier = %identifier, error = %e, "item download failed");
                     (idx, Err((identifier, e)))
