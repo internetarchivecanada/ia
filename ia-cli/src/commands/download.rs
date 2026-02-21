@@ -73,6 +73,10 @@ pub struct DownloadArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
+    /// Number of items to download concurrently (for batch/search)
+    #[arg(long, default_value = "2")]
+    pub items: usize,
+
     /// Full-screen dashboard mode
     #[arg(long)]
     pub dashboard: bool,
@@ -205,7 +209,14 @@ pub async fn run(
     // Dashboard mode
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore)).await;
+        return crate::tui::run_tui(
+            client,
+            &identifiers,
+            &opts,
+            Arc::clone(&semaphore),
+            args.items,
+        )
+        .await;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -302,6 +313,7 @@ pub async fn run(
         progress,
         on_item_start,
         on_item_complete,
+        args.items,
     )
     .await;
 
