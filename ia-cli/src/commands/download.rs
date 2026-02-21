@@ -73,9 +73,9 @@ pub struct DownloadArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
-    /// Interactive TUI mode (requires --features tui)
+    /// Full-screen dashboard mode
     #[arg(long)]
-    pub tui: bool,
+    pub dashboard: bool,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -202,15 +202,15 @@ pub async fn run(
     let opts = make_opts(base_destdir.clone());
     let semaphore = Arc::new(Semaphore::new(jobs));
 
-    // TUI mode
+    // Dashboard mode
     #[cfg(feature = "tui")]
-    if args.tui && identifiers.len() == 1 {
-        return crate::tui::run_tui(client, &identifiers[0], &opts, Arc::clone(&semaphore)).await;
+    if args.dashboard {
+        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore)).await;
     }
 
     #[cfg(not(feature = "tui"))]
-    if args.tui {
-        bail!("TUI mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
+    if args.dashboard {
+        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
     }
 
     // Single item — use the original simple path
@@ -225,8 +225,9 @@ pub async fn run(
             opts.clone()
         };
 
+        let multi = indicatif::MultiProgress::new();
         let display = if quiet == 0 {
-            Some(Arc::new(DownloadDisplay::new(identifier)))
+            Some(Arc::new(DownloadDisplay::new(identifier, &multi)))
         } else {
             None
         };
@@ -247,7 +248,7 @@ pub async fn run(
         .context(format!("failed to download {}", identifier))?;
 
         if let Some(d) = display {
-            d.finish(&result);
+            d.finish(&result, &item_opts.destdir);
         }
 
         if let Some(ref jl) = joblog {
@@ -259,7 +260,7 @@ pub async fn run(
                 "{}  {} files ({}) in {:.1}s",
                 identifier,
                 result.files_downloaded,
-                format_bytes(result.bytes_total),
+                crate::output::format_bytes(result.bytes_total),
                 result.elapsed.as_secs_f64(),
             );
         }
@@ -272,47 +273,26 @@ pub async fn run(
     }
 
     // Batch mode
-    if quiet == 0 {
-        eprintln!(
-            "{}  Downloading {} items...\n",
-            style("batch").bold(),
-            identifiers.len(),
-        );
-    }
-
-    let on_item_start: Option<ia_core::download::OnItemStartCallback> = if quiet < 2 {
-        Some(Arc::new(|id: &str, current: usize, total: usize| {
-            eprintln!(
-                "{} [{}/{}] {}",
-                style("→").cyan(),
-                current,
-                total,
-                style(id).bold(),
-            );
-        }))
+    let batch_display = if quiet == 0 {
+        Some(Arc::new(crate::output::BatchDisplay::new(identifiers.len(), jobs)))
     } else {
         None
     };
 
-    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = if quiet == 0 {
-        // In batch mode, just show per-file status lines (no progress bars to avoid clutter)
-        Some(Arc::new(move |p: DownloadProgress| {
-            match &p.status {
-                ia_core::download::DownloadStatus::Complete => {
-                    eprintln!("  {} {}", style("✓").green(), p.file_name);
-                }
-                ia_core::download::DownloadStatus::Skipped(reason) => {
-                    eprintln!("  {} {} ({})", style("–").yellow(), style(&p.file_name).dim(), reason);
-                }
-                ia_core::download::DownloadStatus::Failed(err) => {
-                    eprintln!("  {} {} {}", style("✗").red(), p.file_name, style(err).red());
-                }
-                _ => {}
-            }
-        }))
-    } else {
-        None
-    };
+    let on_item_start: Option<ia_core::download::OnItemStartFn> =
+        batch_display.clone().map(|bd| -> ia_core::download::OnItemStartFn {
+            Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
+        });
+
+    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
+        batch_display.clone().map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+            Arc::new(move |p: DownloadProgress| bd.on_progress(p))
+        });
+
+    let on_item_complete: Option<ia_core::download::OnItemCompleteFn> =
+        batch_display.clone().map(|bd| -> ia_core::download::OnItemCompleteFn {
+            Arc::new(move |result| bd.on_item_complete(result))
+        });
 
     let result = ia_core::download::download_batch(
         client,
@@ -321,6 +301,7 @@ pub async fn run(
         semaphore,
         progress,
         on_item_start,
+        on_item_complete,
     )
     .await;
 
@@ -340,29 +321,32 @@ pub async fn run(
 
     // Print summary
     if quiet < 2 {
-        eprintln!(
-            "\n{}  {} items, {} files downloaded ({}), {} skipped, {} failed — {:.1}s",
-            style("done").bold(),
-            result.items_total,
-            result.files_downloaded,
-            format_bytes(result.bytes_total),
-            result.files_skipped,
-            result.files_failed + result.items_failed,
-            result.elapsed.as_secs_f64(),
-        );
-    }
-
-    // Report disk pool usage if multi-disk
-    if let Some(ref pool) = disk_pool {
-        if quiet < 2 {
-            for ds in pool.status() {
-                eprintln!(
-                    "  {} {} items, {} free",
-                    style(ds.path.display()).dim(),
-                    ds.items_count,
-                    format_bytes(ds.free_bytes),
-                );
+        let disk_statuses = disk_pool.as_ref().map(|p| p.status());
+        if let Some(ref bd) = batch_display {
+            if disk_pool.is_some() {
+                bd.finish(&result, disk_statuses.as_deref());
+            } else if let Some(free) = crate::output::disk_space_free(&base_destdir) {
+                let single_status = vec![ia_core::disk_pool::DiskStatus {
+                    path: base_destdir.clone(),
+                    free_bytes: free,
+                    total_bytes: 0,
+                    items_count: result.items_total,
+                }];
+                bd.finish(&result, Some(&single_status));
+            } else {
+                bd.finish(&result, None);
             }
+        } else if quiet == 1 {
+            eprintln!(
+                "{}  {} items, {} files downloaded ({}), {} skipped, {} failed — {:.1}s",
+                style("done").bold(),
+                result.items_total,
+                result.files_downloaded,
+                crate::output::format_bytes(result.bytes_total),
+                result.files_skipped,
+                result.files_failed + result.items_failed,
+                result.elapsed.as_secs_f64(),
+            );
         }
     }
 
@@ -386,14 +370,3 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}

@@ -50,7 +50,7 @@ These rules are non-negotiable and must NEVER be violated:
 - Errors: `thiserror` 2 (library) + `anyhow` 1 (CLI)
 - Logging: `tracing` 0.1 + `tracing-subscriber` 0.3
 - Console: `indicatif` 0.17 + `console` 0.15 + `comfy-table` 7
-- TUI: `ratatui` (feature-gated)
+- TUI: `ratatui` (default feature, `--dashboard` flag)
 - Retry: `backon` 1
 - Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
 

@@ -177,7 +177,7 @@ ia download --itemlist items.txt --items 4
 An interactive terminal UI for monitoring downloads (requires building with `--features tui`):
 
 ```sh
-ia download nasa --tui
+ia download nasa --dashboard
 ```
 
 ## Architecture

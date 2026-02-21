@@ -38,7 +38,6 @@ impl Default for GeneralConfig {
     }
 }
 
-
 impl IaConfig {
     /// Load config from the default config file location.
     /// Returns default config if no config file is found.

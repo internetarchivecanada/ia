@@ -127,3 +127,19 @@ fn short_flags_work() {
         .assert()
         .success();
 }
+
+#[test]
+fn download_help_shows_dashboard_flag() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dashboard"));
+}
+
+#[test]
+fn download_help_does_not_show_tui_flag() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--tui").not());
+}

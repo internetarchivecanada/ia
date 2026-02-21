@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
 - **Job logging** (`--joblog`) with JSONL append-only format and `--retry-failed` support
 - **Batch downloads** via `--search` query and `--items` concurrency control
 - **Disk pool** for multi-disk downloads with `--destdir` (repeatable) and automatic failover
-- **TUI mode** with interactive ratatui terminal UI (`--tui`, feature-gated behind `tui`)
+- **TUI mode** with interactive ratatui terminal UI (`--dashboard`, feature-gated behind `tui`)
 - Global CLI options: `--insecure`, `--host`, `--user-agent-suffix`, `--config-file`
 
 ### Fixed
