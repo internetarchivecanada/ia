@@ -10,8 +10,8 @@ mod tui;
 #[derive(Parser)]
 #[command(name = "ia", version, about = "Internet Archive command-line tool")]
 struct Cli {
-    /// Path to config file
-    #[arg(short = 'c', long, global = true)]
+    /// Path to configuration file
+    #[arg(short = 'c', long = "config-file", global = true)]
     config: Option<PathBuf>,
 
     /// Enable logging
@@ -21,6 +21,18 @@ struct Cli {
     /// Enable debug output
     #[arg(short = 'd', long, global = true)]
     debug: bool,
+
+    /// Allow insecure (HTTP) connections
+    #[arg(short = 'i', long, global = true)]
+    insecure: bool,
+
+    /// Host to connect to
+    #[arg(short = 'H', long, global = true)]
+    host: Option<String>,
+
+    /// Custom string to append to the default User-Agent
+    #[arg(long, global = true)]
+    user_agent_suffix: Option<String>,
 
     /// Path to job log file
     #[arg(long, global = true)]
@@ -75,11 +87,22 @@ async fn main() -> Result<()> {
         .init();
 
     // Load config
-    let config = if let Some(path) = &cli.config {
+    let mut config = if let Some(path) = &cli.config {
         ia_core::IaConfig::load_from_file(path)?
     } else {
         ia_core::IaConfig::load()?
     };
+
+    // CLI flag overrides
+    if cli.insecure {
+        config.general.secure = false;
+    }
+    if let Some(host) = &cli.host {
+        config.general.host = host.clone();
+    }
+    if let Some(suffix) = &cli.user_agent_suffix {
+        config.general.user_agent_suffix = Some(suffix.clone());
+    }
 
     let client = ia_core::IaClient::from_config(config)?;
 
