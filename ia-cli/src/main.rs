@@ -40,6 +40,8 @@ struct Cli {
 enum Commands {
     /// Download files from an item
     Download(commands::download::DownloadArgs),
+    /// Search the Internet Archive
+    Search(commands::search::SearchArgs),
 }
 
 #[tokio::main]
@@ -76,6 +78,7 @@ async fn main() -> Result<()> {
         Commands::Download(args) => {
             commands::download::run(&client, args, cli.quiet, cli.joblog, cli.retry_failed).await?
         }
+        Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
     }
 
     Ok(())
