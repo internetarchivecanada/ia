@@ -13,7 +13,7 @@ pub struct ListArgs {
     pub identifier: String,
 
     /// Columns to show (comma-separated: name,size,format,source,md5,mtime)
-    #[arg(short = 'c', long)]
+    #[arg(long)]
     pub columns: Option<String>,
 
     /// Filter files by glob pattern
@@ -21,7 +21,7 @@ pub struct ListArgs {
     pub glob: Option<String>,
 
     /// Print full download URLs
-    #[arg(short = 'l', long)]
+    #[arg(long)]
     pub location: bool,
 
     /// Show all file metadata as JSON

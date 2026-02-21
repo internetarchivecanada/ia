@@ -21,7 +21,7 @@ pub struct DownloadArgs {
     pub identifiers: Vec<String>,
 
     /// File containing item identifiers (one per line)
-    #[arg(short = 'i', long)]
+    #[arg(long)]
     itemlist: Option<PathBuf>,
 
     /// Filter files by glob pattern (pipe-separated: "*.mp4|*.webm")
