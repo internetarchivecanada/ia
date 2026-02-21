@@ -73,7 +73,9 @@ async fn main() -> Result<()> {
     let client = ia_core::IaClient::from_config(config)?;
 
     match cli.command {
-        Commands::Download(args) => commands::download::run(&client, args, cli.quiet).await?,
+        Commands::Download(args) => {
+            commands::download::run(&client, args, cli.quiet, cli.joblog, cli.retry_failed).await?
+        }
     }
 
     Ok(())

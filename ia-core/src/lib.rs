@@ -3,6 +3,7 @@ pub mod config;
 pub mod download;
 pub mod error;
 pub mod files;
+pub mod joblog;
 pub mod metadata;
 pub mod types;
 pub mod user_agent;

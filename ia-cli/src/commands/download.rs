@@ -4,8 +4,9 @@ use console::style;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ia_core::download::{DownloadOpts, DownloadProgress};
+use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
 use ia_core::files::FileFilter;
+use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::types::FileSource;
 use ia_core::IaClient;
 
@@ -112,12 +113,41 @@ fn collect_identifiers(args: &DownloadArgs) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()> {
-    let identifiers = collect_identifiers(&args)?;
+pub async fn run(
+    client: &IaClient,
+    args: DownloadArgs,
+    quiet: u8,
+    joblog_path: Option<PathBuf>,
+    retry_failed: bool,
+) -> Result<()> {
+    let mut identifiers = collect_identifiers(&args)?;
+
+    // If --retry-failed, read joblog and use failed items as identifiers
+    if retry_failed {
+        if let Some(ref path) = joblog_path {
+            let entries = ia_core::joblog::read(path)
+                .context(format!("failed to read joblog: {}", path.display()))?;
+            let failed = ia_core::joblog::failed_items(&entries);
+            if failed.is_empty() {
+                eprintln!("{} No failed items in joblog", style("✓").green());
+                return Ok(());
+            }
+            identifiers = failed;
+        } else {
+            bail!("--retry-failed requires --joblog");
+        }
+    }
 
     if identifiers.is_empty() {
         bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
     }
+
+    // Open joblog writer if path provided
+    let joblog = joblog_path
+        .as_ref()
+        .map(|p| JoblogWriter::open(p))
+        .transpose()
+        .context("failed to open joblog")?;
 
     let opts = DownloadOpts {
         jobs: args.jobs,
@@ -162,6 +192,10 @@ pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()>
 
         if let Some(d) = display {
             d.finish(&result);
+        }
+
+        if let Some(ref jl) = joblog {
+            write_item_results(jl, identifier, &result.results);
         }
 
         if quiet == 1 {
@@ -233,6 +267,20 @@ pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()>
     )
     .await;
 
+    // Write batch results to joblog
+    if let Some(ref jl) = joblog {
+        for item_result in &result.item_results {
+            match item_result {
+                Ok(ir) => write_item_results(jl, &ir.identifier, &ir.results),
+                Err((id, err)) => {
+                    jl.write(
+                        &JoblogEntry::new("download", id, "").error(&err.to_string(), 0),
+                    );
+                }
+            }
+        }
+    }
+
     // Print summary
     if quiet < 2 {
         eprintln!(
@@ -252,6 +300,19 @@ pub async fn run(client: &IaClient, args: DownloadArgs, quiet: u8) -> Result<()>
     }
 
     Ok(())
+}
+
+fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownloadResult]) {
+    for r in results {
+        let entry = JoblogEntry::new("download", identifier, &r.file_name);
+        let entry = match &r.status {
+            DownloadStatus::Complete => entry.ok(r.bytes, r.elapsed.as_millis() as u64),
+            DownloadStatus::Skipped(_) => entry.skipped(),
+            DownloadStatus::Failed(msg) => entry.error(msg, 0),
+            _ => continue,
+        };
+        jl.write(&entry);
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
