@@ -1,0 +1,87 @@
+import { VerticalBox, Button } from "std-widgets.slint";
+
+export enum Page {
+    search,
+    downloads,
+    lists,
+    metadata,
+    settings,
+}
+
+component SidebarItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+
+    height: 40px;
+    background: active ? #e0e7ff : transparent;
+    border-radius: 6px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        alignment: start;
+
+        Text {
+            text: label;
+            font-size: 14px;
+            font-weight: active ? 700 : 400;
+            vertical-alignment: center;
+            color: active ? #4338ca : #374151;
+        }
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in-out property <Page> current-page: Page.search;
+
+    width: 200px;
+    background: #f9fafb;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 4px;
+
+        Text {
+            text: "Internet Archive";
+            font-size: 16px;
+            font-weight: 700;
+            color: #111827;
+            horizontal-alignment: left;
+        }
+
+        Rectangle { height: 16px; }
+
+        SidebarItem {
+            label: "Search";
+            active: current-page == Page.search;
+            clicked => { current-page = Page.search; }
+        }
+        SidebarItem {
+            label: "Downloads";
+            active: current-page == Page.downloads;
+            clicked => { current-page = Page.downloads; }
+        }
+        SidebarItem {
+            label: "Lists";
+            active: current-page == Page.lists;
+            clicked => { current-page = Page.lists; }
+        }
+        SidebarItem {
+            label: "Metadata";
+            active: current-page == Page.metadata;
+            clicked => { current-page = Page.metadata; }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        SidebarItem {
+            label: "Settings";
+            active: current-page == Page.settings;
+            clicked => { current-page = Page.settings; }
+        }
+    }
+}
