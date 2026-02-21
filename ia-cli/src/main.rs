@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, global = true)]
     retry_failed: bool,
 
+    /// Concurrent operations
+    #[arg(short = 'j', long, global = true, default_value = "5")]
+    jobs: usize,
+
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
     #[arg(short = 'q', long, global = true, action = clap::ArgAction::Count)]
     quiet: u8,
@@ -108,7 +112,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Download(args) => {
-            commands::download::run(&client, args, cli.quiet, cli.joblog, cli.retry_failed).await?
+            commands::download::run(&client, args, cli.quiet, cli.jobs, cli.joblog, cli.retry_failed).await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => commands::metadata::run(&client, args).await?,

@@ -8,6 +8,8 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use tokio::sync::Semaphore;
+
 use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus};
 use ia_core::IaClient;
 
@@ -139,6 +141,7 @@ pub async fn run_tui(
     client: &IaClient,
     identifier: &str,
     opts: &DownloadOpts,
+    semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(Mutex::new(TuiState::new(identifier)));
 
@@ -164,7 +167,7 @@ pub async fn run_tui(
                 }
             }));
 
-        let result = ia_core::download::download_item(&client, &identifier, &opts, progress).await;
+        let result = ia_core::download::download_item(&client, &identifier, &opts, semaphore, progress).await;
 
         if let Ok(mut s) = download_state.lock() {
             s.done = true;

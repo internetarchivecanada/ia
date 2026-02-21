@@ -16,8 +16,6 @@ use crate::types::FileMetadata;
 /// Options for downloading files.
 #[derive(Debug, Clone)]
 pub struct DownloadOpts {
-    /// Concurrent file downloads per item.
-    pub jobs: usize,
     /// Destination directory.
     pub destdir: PathBuf,
     /// Whether to create item subdirectory.
@@ -37,7 +35,6 @@ pub struct DownloadOpts {
 impl Default for DownloadOpts {
     fn default() -> Self {
         Self {
-            jobs: 4,
             destdir: PathBuf::from("."),
             no_directories: false,
             checksum: false,
@@ -363,11 +360,12 @@ pub struct ItemDownloadResult {
     pub results: Vec<FileDownloadResult>,
 }
 
-/// Download all matching files from an item concurrently.
+/// Download all matching files from an item, using a shared semaphore for concurrency.
 pub async fn download_item(
     client: &IaClient,
     identifier: &str,
     opts: &DownloadOpts,
+    semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
 ) -> Result<ItemDownloadResult> {
     let start = std::time::Instant::now();
@@ -402,8 +400,7 @@ pub async fn download_item(
     // Clone file metadata for owned access in tasks
     let files_owned: Vec<crate::types::FileMetadata> = files.into_iter().cloned().collect();
 
-    // Concurrent download with semaphore
-    let semaphore = Arc::new(Semaphore::new(opts.jobs));
+    // Concurrent download with shared semaphore
     let mut handles = Vec::new();
 
     for file in files_owned {
@@ -411,7 +408,7 @@ pub async fn download_item(
         let identifier = identifier.to_string();
         let dest_dir = dest_dir.clone();
         let opts = opts.clone();
-        let sem = semaphore.clone();
+        let sem = Arc::clone(&semaphore);
         let progress = progress.clone();
 
         let handle = tokio::spawn(async move {
@@ -502,68 +499,36 @@ pub struct BatchDownloadResult {
     pub item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
 }
 
-/// Download multiple items with configurable item-level concurrency.
-/// Each item gets its own file-level concurrency via `opts.jobs`.
+/// Download multiple items concurrently, sharing a single semaphore for all file transfers.
 pub async fn download_batch(
     client: &IaClient,
     identifiers: Vec<String>,
     opts: &DownloadOpts,
+    semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
-    on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)>,
-) -> BatchDownloadResult {
-    download_batch_concurrent(client, identifiers, opts, 1, progress, on_item_start).await
-}
-
-/// Download multiple items with concurrent item processing.
-pub async fn download_batch_concurrent(
-    client: &IaClient,
-    identifiers: Vec<String>,
-    opts: &DownloadOpts,
-    items_concurrent: usize,
-    progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
-    on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)>,
+    on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>>,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();
-    let items_concurrent = items_concurrent.max(1);
-
-    if items_concurrent <= 1 {
-        // Sequential mode (original behavior)
-        let mut item_results = Vec::new();
-        for (i, identifier) in identifiers.iter().enumerate() {
-            if let Some(cb) = &on_item_start {
-                cb(identifier, i + 1, items_total);
-            }
-
-            match download_item(client, identifier, opts, progress.clone()).await {
-                Ok(result) => item_results.push(Ok(result)),
-                Err(e) => {
-                    warn!(identifier = %identifier, error = %e, "item download failed");
-                    item_results.push(Err((identifier.clone(), e)));
-                }
-            }
-        }
-        return collect_batch_results(items_total, item_results, start.elapsed());
-    }
-
-    // Concurrent item processing with semaphore
-    let sem = Arc::new(Semaphore::new(items_concurrent));
-    let mut handles = Vec::new();
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
 
     for identifier in identifiers {
         let client = client.clone();
         let opts = opts.clone();
-        let sem = sem.clone();
+        let semaphore = Arc::clone(&semaphore);
         let progress = progress.clone();
-        let counter = counter.clone();
+        let counter = Arc::clone(&counter);
+        let on_item_start = on_item_start.clone();
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
             let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if let Some(ref cb) = on_item_start {
+                cb(&identifier, idx, items_total);
+            }
             info!(item = %identifier, idx, "starting item download");
 
-            match download_item(&client, &identifier, &opts, progress).await {
+            match download_item(&client, &identifier, &opts, semaphore, progress).await {
                 Ok(result) => (idx, Ok(result)),
                 Err(e) => {
                     warn!(identifier = %identifier, error = %e, "item download failed");
@@ -787,11 +752,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = DownloadOpts {
             destdir: dir.path().to_path_buf(),
-            jobs: 2,
             ..Default::default()
         };
+        let semaphore = Arc::new(Semaphore::new(2));
 
-        let result = download_item(&client, "test-item", &opts, None).await.unwrap();
+        let result = download_item(&client, "test-item", &opts, semaphore, None).await.unwrap();
 
         assert_eq!(result.files_total, 3);
         assert_eq!(result.files_downloaded, 3);
