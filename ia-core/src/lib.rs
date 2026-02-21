@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod files;
 pub mod metadata;
 pub mod types;
 pub mod user_agent;
