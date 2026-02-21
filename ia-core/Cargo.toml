@@ -19,6 +19,9 @@ backon = "1"
 md-5 = "0.10"
 globset = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
+urlencoding = "2"
+httpdate = "1"
+filetime = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
