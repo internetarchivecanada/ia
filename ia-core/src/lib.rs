@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod types;
 pub mod user_agent;
 
 pub use client::IaClient;
