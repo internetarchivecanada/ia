@@ -1,10 +1,54 @@
+import { Sidebar, Page } from "components/sidebar.slint";
+
+export { Page }
+
 export component AppWindow inherits Window {
     title: "Internet Archive";
     preferred-width: 1024px;
     preferred-height: 768px;
+    min-width: 800px;
+    min-height: 600px;
 
-    Text {
-        text: "Internet Archive";
-        font-size: 24px;
+    in-out property <Page> current-page <=> sidebar.current-page;
+
+    HorizontalLayout {
+        sidebar := Sidebar {}
+
+        Rectangle {
+            background: white;
+            horizontal-stretch: 1;
+
+            // Placeholder content per page
+            if current-page == Page.search : Text {
+                text: "Search";
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if current-page == Page.downloads : Text {
+                text: "Downloads";
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if current-page == Page.lists : Text {
+                text: "Lists";
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if current-page == Page.metadata : Text {
+                text: "Metadata";
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if current-page == Page.settings : Text {
+                text: "Settings";
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
     }
 }
