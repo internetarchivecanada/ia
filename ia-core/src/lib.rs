@@ -1,5 +1,7 @@
+pub mod config;
 pub mod error;
 
+pub use config::IaConfig;
 pub use error::{IaError, Result};
 
 pub fn version() -> &'static str {
