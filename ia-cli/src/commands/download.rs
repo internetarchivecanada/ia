@@ -204,8 +204,8 @@ pub async fn run(
 
     // Dashboard mode
     #[cfg(feature = "tui")]
-    if args.dashboard && identifiers.len() == 1 {
-        return crate::tui::run_tui(client, &identifiers[0], &opts, Arc::clone(&semaphore)).await;
+    if args.dashboard {
+        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore)).await;
     }
 
     #[cfg(not(feature = "tui"))]
