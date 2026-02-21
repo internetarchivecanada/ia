@@ -280,7 +280,7 @@ pub async fn run(
         );
     }
 
-    let on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>> = if quiet < 2 {
+    let on_item_start: Option<ia_core::download::OnItemStartCallback> = if quiet < 2 {
         Some(Arc::new(|id: &str, current: usize, total: usize| {
             eprintln!(
                 "{} [{}/{}] {}",

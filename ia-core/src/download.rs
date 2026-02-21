@@ -13,6 +13,9 @@ use crate::error::{IaError, Result};
 use crate::files::FileFilter;
 use crate::types::FileMetadata;
 
+/// Callback invoked when starting to download an item: (identifier, index, total).
+pub type OnItemStartCallback = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
+
 /// Options for downloading files.
 #[derive(Debug, Clone)]
 pub struct DownloadOpts {
@@ -506,7 +509,7 @@ pub async fn download_batch(
     opts: &DownloadOpts,
     semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
-    on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>>,
+    on_item_start: Option<OnItemStartCallback>,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();
