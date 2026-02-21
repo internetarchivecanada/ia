@@ -1,5 +1,5 @@
 [workspace]
-members = ["ia-core", "ia-cli"]
+members = ["ia-core", "ia-cli", "ia-gui"]
 resolver = "2"
 
 [workspace.package]
