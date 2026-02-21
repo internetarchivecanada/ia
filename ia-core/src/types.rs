@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Full response from GET /metadata/{identifier}
@@ -85,7 +85,7 @@ impl StringOrVec {
 
 /// Metadata for a single file within an item.
 /// Note: IA returns size and mtime as strings, not numbers.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileMetadata {
     /// File name (relative path within the item).
     pub name: String,

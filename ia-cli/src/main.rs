@@ -40,6 +40,9 @@ struct Cli {
 enum Commands {
     /// Download files from an item
     Download(commands::download::DownloadArgs),
+    /// List files in an item
+    #[command(alias = "ls")]
+    List(commands::list::ListArgs),
     /// Search the Internet Archive
     Search(commands::search::SearchArgs),
 }
@@ -78,6 +81,7 @@ async fn main() -> Result<()> {
         Commands::Download(args) => {
             commands::download::run(&client, args, cli.quiet, cli.joblog, cli.retry_failed).await?
         }
+        Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
     }
 
