@@ -13,12 +13,23 @@ All notable changes to this project will be documented in this file.
 - **Job logging** (`--joblog`) with JSONL append-only format and `--retry-failed` support
 - **Batch downloads** via `--search` query and `--items` concurrency control
 - **Disk pool** for multi-disk downloads with `--destdir` (repeatable) and automatic failover
-- **TUI mode** with interactive ratatui terminal UI (`--dashboard`, feature-gated behind `tui`)
+- **Dashboard mode** (`--dashboard`) with full-screen ratatui UI for batch downloads — items table, disk space, error log, throughput sparkline, ETA
+- **Rich inline output** by default — per-file progress bars with speeds, separator lines, disk space reporting
+- **Batch download display** with per-item progress, speeds, and summary stats
+- **Shell completions** (`ia completions bash/zsh/fish/powershell`)
+- **Compact JSON** output for metadata command (one item per line)
 - Global CLI options: `--insecure`, `--host`, `--user-agent-suffix`, `--config-file`
+
+### Changed
+
+- Renamed `--tui` to `--dashboard` — more user-friendly
+- TUI (`ratatui`) is now a default feature — no more rebuilding from source
+- Dashboard supports batch downloads (was single-item only)
 
 ### Fixed
 
 - Linux binary now statically linked (musl) to avoid GLIBC version errors
+- Clippy warnings resolved across workspace
 
 ## [0.1.0] - 2026-02-21
 
