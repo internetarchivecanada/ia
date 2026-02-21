@@ -43,6 +43,8 @@ enum Commands {
     /// List files in an item
     #[command(alias = "ls")]
     List(commands::list::ListArgs),
+    /// Display item metadata
+    Metadata(commands::metadata::MetadataArgs),
     /// Search the Internet Archive
     Search(commands::search::SearchArgs),
 }
@@ -82,6 +84,7 @@ async fn main() -> Result<()> {
             commands::download::run(&client, args, cli.quiet, cli.joblog, cli.retry_failed).await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
+        Commands::Metadata(args) => commands::metadata::run(&client, args).await?,
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
     }
 

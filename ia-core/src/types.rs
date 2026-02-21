@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Full response from GET /metadata/{identifier}
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ItemMetadata {
     /// The item's metadata fields.
     #[serde(default)]
@@ -37,7 +37,7 @@ pub struct ItemMetadata {
 
 /// Item-level metadata fields.
 /// Uses a mix of typed common fields and a catch-all HashMap.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MetadataFields {
     pub identifier: Option<String>,
     pub title: Option<StringOrVec>,
@@ -58,7 +58,7 @@ pub struct MetadataFields {
 }
 
 /// IA metadata fields can be a single string or a vec of strings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum StringOrVec {
     Single(String),
