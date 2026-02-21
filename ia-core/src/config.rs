@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IaError, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IaConfig {
     pub s3_access: Option<String>,
     pub s3_secret: Option<String>,
@@ -20,7 +20,7 @@ pub struct GeneralConfig {
     pub screenname: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
     pub level: Option<String>,
     pub file: Option<PathBuf>,
@@ -38,27 +38,6 @@ impl Default for GeneralConfig {
     }
 }
 
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: None,
-            file: None,
-            log_to_stdout: false,
-        }
-    }
-}
-
-impl Default for IaConfig {
-    fn default() -> Self {
-        Self {
-            s3_access: None,
-            s3_secret: None,
-            cookies: HashMap::new(),
-            general: GeneralConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
 
 impl IaConfig {
     /// Load config from the default config file location.
@@ -78,11 +57,11 @@ impl IaConfig {
         let mut ini = configparser::ini::Ini::new();
         ini.load(path).map_err(|e| IaError::Config(e.to_string()))?;
 
-        let mut config = Self::default();
-
-        // [s3] section
-        config.s3_access = ini.get("s3", "access");
-        config.s3_secret = ini.get("s3", "secret");
+        let mut config = Self {
+            s3_access: ini.get("s3", "access"),
+            s3_secret: ini.get("s3", "secret"),
+            ..Self::default()
+        };
 
         // [cookies] section
         if let Some(cookies) = ini.get_map_ref().get("cookies") {

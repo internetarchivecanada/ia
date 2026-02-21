@@ -186,7 +186,9 @@ fn disk_space(path: &Path) -> Result<(u64, u64)> {
             )));
         }
 
+        #[allow(clippy::unnecessary_cast)]
         let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+        #[allow(clippy::unnecessary_cast)]
         let total = stat.f_blocks as u64 * stat.f_frsize as u64;
         Ok((free, total))
     }
