@@ -70,7 +70,8 @@ fn metadata_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--exists"))
-        .stdout(predicate::str::contains("--formats"));
+        .stdout(predicate::str::contains("--formats"))
+        .stdout(predicate::str::contains("--pretty"));
 }
 
 #[test]

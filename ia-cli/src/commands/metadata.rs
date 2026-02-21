@@ -15,6 +15,10 @@ pub struct MetadataArgs {
     /// List file formats in the item
     #[arg(short = 'F', long)]
     pub formats: bool,
+
+    /// Pretty-print JSON output
+    #[arg(long)]
+    pub pretty: bool,
 }
 
 pub async fn run(client: &IaClient, args: MetadataArgs) -> Result<()> {
@@ -50,8 +54,12 @@ pub async fn run(client: &IaClient, args: MetadataArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Default: pretty-print full metadata JSON
-    let json = serde_json::to_string_pretty(&item)?;
+    // Default: compact JSON (one line per item), --pretty for indented output
+    let json = if args.pretty {
+        serde_json::to_string_pretty(&item)?
+    } else {
+        serde_json::to_string(&item)?
+    };
     println!("{json}");
 
     Ok(())
