@@ -20,12 +20,14 @@ fn main() -> anyhow::Result<()> {
     let config = ia_core::IaConfig::load().unwrap_or_default();
     let client = ia_core::IaClient::from_config(config)?;
 
-    let _backend = backend::AppBackend::new(client);
-    let _rt = runtime.handle().clone();
+    let app_backend = backend::AppBackend::new(client);
 
     // Create and run Slint app
     let app = AppWindow::new()?;
-    app.run()?;
 
+    // Wire up backends
+    app_backend.setup_search(&app, runtime.handle());
+
+    app.run()?;
     Ok(())
 }

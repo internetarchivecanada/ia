@@ -2746,6 +2746,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs",
+ "futures",
  "ia-core",
  "serde",
  "serde_json",

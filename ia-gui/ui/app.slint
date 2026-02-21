@@ -1,6 +1,7 @@
 import { Sidebar, Page } from "components/sidebar.slint";
+import { SearchPage, SearchResultData } from "pages/search.slint";
 
-export { Page }
+export { Page, SearchResultData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -11,6 +12,15 @@ export component AppWindow inherits Window {
 
     in-out property <Page> current-page <=> sidebar.current-page;
 
+    // Search state
+    in property <[SearchResultData]> search-results: [];
+    in property <string> search-status: "";
+    in property <bool> search-in-progress: false;
+
+    callback search-requested(string, string);
+    callback search-result-clicked(int);
+    callback search-export-requested();
+
     HorizontalLayout {
         sidebar := Sidebar {}
 
@@ -18,12 +28,13 @@ export component AppWindow inherits Window {
             background: white;
             horizontal-stretch: 1;
 
-            // Placeholder content per page
-            if current-page == Page.search : Text {
-                text: "Search";
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            if current-page == Page.search : SearchPage {
+                results: search-results;
+                status-text: search-status;
+                searching: search-in-progress;
+                search-requested(query, backend) => { root.search-requested(query, backend); }
+                result-clicked(index) => { root.search-result-clicked(index); }
+                export-requested => { root.search-export-requested(); }
             }
             if current-page == Page.downloads : Text {
                 text: "Downloads";
