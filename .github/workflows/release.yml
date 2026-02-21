@@ -66,13 +66,14 @@ jobs:
 
       - name: Rename binaries for release
         run: |
+          mkdir -p release
           for dir in artifacts/ia-*/; do
             target=$(basename "$dir" | sed 's/^ia-//')
             if [ -f "$dir/ia.exe" ]; then
-              mv "$dir/ia.exe" "artifacts/ia-${target}.exe"
+              cp "$dir/ia.exe" "release/ia-${target}.exe"
             elif [ -f "$dir/ia" ]; then
-              mv "$dir/ia" "artifacts/ia-${target}"
-              chmod +x "artifacts/ia-${target}"
+              cp "$dir/ia" "release/ia-${target}"
+              chmod +x "release/ia-${target}"
             fi
           done
 
@@ -81,5 +82,4 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            artifacts/ia-*
-            !artifacts/ia-*/
+            release/ia-*
