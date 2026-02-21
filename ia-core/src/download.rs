@@ -502,8 +502,8 @@ pub struct BatchDownloadResult {
     pub item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
 }
 
-/// Download multiple items, processing them sequentially but downloading
-/// files within each item concurrently.
+/// Download multiple items with configurable item-level concurrency.
+/// Each item gets its own file-level concurrency via `opts.jobs`.
 pub async fn download_batch(
     client: &IaClient,
     identifiers: Vec<String>,
@@ -511,24 +511,90 @@ pub async fn download_batch(
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
     on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)>,
 ) -> BatchDownloadResult {
+    download_batch_concurrent(client, identifiers, opts, 1, progress, on_item_start).await
+}
+
+/// Download multiple items with concurrent item processing.
+pub async fn download_batch_concurrent(
+    client: &IaClient,
+    identifiers: Vec<String>,
+    opts: &DownloadOpts,
+    items_concurrent: usize,
+    progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
+    on_item_start: Option<&(dyn Fn(&str, usize, usize) + Send + Sync)>,
+) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();
-    let mut item_results = Vec::new();
+    let items_concurrent = items_concurrent.max(1);
 
-    for (i, identifier) in identifiers.iter().enumerate() {
-        if let Some(cb) = &on_item_start {
-            cb(identifier, i + 1, items_total);
-        }
-
-        match download_item(client, identifier, opts, progress.clone()).await {
-            Ok(result) => item_results.push(Ok(result)),
-            Err(e) => {
-                warn!(identifier = %identifier, error = %e, "item download failed");
-                item_results.push(Err((identifier.clone(), e)));
+    if items_concurrent <= 1 {
+        // Sequential mode (original behavior)
+        let mut item_results = Vec::new();
+        for (i, identifier) in identifiers.iter().enumerate() {
+            if let Some(cb) = &on_item_start {
+                cb(identifier, i + 1, items_total);
             }
+
+            match download_item(client, identifier, opts, progress.clone()).await {
+                Ok(result) => item_results.push(Ok(result)),
+                Err(e) => {
+                    warn!(identifier = %identifier, error = %e, "item download failed");
+                    item_results.push(Err((identifier.clone(), e)));
+                }
+            }
+        }
+        return collect_batch_results(items_total, item_results, start.elapsed());
+    }
+
+    // Concurrent item processing with semaphore
+    let sem = Arc::new(Semaphore::new(items_concurrent));
+    let mut handles = Vec::new();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    for identifier in identifiers {
+        let client = client.clone();
+        let opts = opts.clone();
+        let sem = sem.clone();
+        let progress = progress.clone();
+        let counter = counter.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            info!(item = %identifier, idx, "starting item download");
+
+            match download_item(&client, &identifier, &opts, progress).await {
+                Ok(result) => (idx, Ok(result)),
+                Err(e) => {
+                    warn!(identifier = %identifier, error = %e, "item download failed");
+                    (idx, Err((identifier, e)))
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    let mut indexed_results = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok((idx, result)) => indexed_results.push((idx, result)),
+            Err(e) => indexed_results.push((0, Err(("unknown".to_string(), IaError::Config(format!("task panic: {e}")))))),
         }
     }
 
+    // Sort by completion order (idx)
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    let item_results: Vec<_> = indexed_results.into_iter().map(|(_, r)| r).collect();
+
+    collect_batch_results(items_total, item_results, start.elapsed())
+}
+
+fn collect_batch_results(
+    items_total: usize,
+    item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
+    elapsed: Duration,
+) -> BatchDownloadResult {
     let items_succeeded = item_results.iter().filter(|r| r.is_ok()).count();
     let items_failed = item_results.iter().filter(|r| r.is_err()).count();
     let files_downloaded: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_downloaded).sum();
@@ -544,7 +610,7 @@ pub async fn download_batch(
         files_skipped,
         files_failed,
         bytes_total,
-        elapsed: start.elapsed(),
+        elapsed,
         item_results,
     }
 }

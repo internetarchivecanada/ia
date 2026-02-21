@@ -1,12 +1,14 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use console::style;
+use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
 use ia_core::files::FileFilter;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
+use ia_core::search::SearchOpts;
 use ia_core::types::FileSource;
 use ia_core::IaClient;
 
@@ -68,6 +70,14 @@ pub struct DownloadArgs {
     /// Show what would be downloaded without downloading
     #[arg(long)]
     dry_run: bool,
+
+    /// Download items matching search query
+    #[arg(short = 's', long)]
+    search: Option<String>,
+
+    /// Concurrent items in batch mode
+    #[arg(long, default_value = "2")]
+    items: usize,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -79,8 +89,8 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
     }
 }
 
-/// Collect all identifiers from args and --itemlist file.
-fn collect_identifiers(args: &DownloadArgs) -> Result<Vec<String>> {
+/// Collect all identifiers from args, --itemlist file, --search, and stdin.
+async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<Vec<String>> {
     let mut ids = args.identifiers.clone();
 
     if let Some(path) = &args.itemlist {
@@ -94,8 +104,18 @@ fn collect_identifiers(args: &DownloadArgs) -> Result<Vec<String>> {
         }
     }
 
-    // Also read from stdin if no identifiers and no itemlist
-    if ids.is_empty() && args.itemlist.is_none() {
+    // --search: collect identifiers from search results
+    if let Some(ref query) = args.search {
+        let opts = SearchOpts::default();
+        let mut stream = ia_core::search::scrape(client, query, &opts);
+        while let Some(result) = stream.next().await {
+            let item = result.context("search failed")?;
+            ids.push(item.identifier);
+        }
+    }
+
+    // Also read from stdin if no identifiers and no itemlist and no search
+    if ids.is_empty() && args.itemlist.is_none() && args.search.is_none() {
         // Check if stdin is a pipe
         if atty::isnt(atty::Stream::Stdin) {
             use std::io::BufRead;
@@ -120,7 +140,7 @@ pub async fn run(
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
-    let mut identifiers = collect_identifiers(&args)?;
+    let mut identifiers = collect_identifiers(&args, client).await?;
 
     // If --retry-failed, read joblog and use failed items as identifiers
     if retry_failed {
@@ -258,10 +278,11 @@ pub async fn run(
         None
     };
 
-    let result = ia_core::download::download_batch(
+    let result = ia_core::download::download_batch_concurrent(
         client,
         identifiers,
         &opts,
+        args.items,
         progress,
         on_item_start,
     )
