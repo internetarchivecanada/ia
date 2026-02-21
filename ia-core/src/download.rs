@@ -506,6 +506,12 @@ pub struct BatchDownloadResult {
     pub item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
 }
 
+/// Callback invoked when an item starts downloading: (identifier, index, total).
+pub type OnItemStartFn = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
+
+/// Callback invoked when an item finishes downloading.
+pub type OnItemCompleteFn = Arc<dyn Fn(&ItemDownloadResult) + Send + Sync>;
+
 /// Download multiple items concurrently, sharing a single semaphore for all file transfers.
 pub async fn download_batch(
     client: &IaClient,
@@ -513,8 +519,8 @@ pub async fn download_batch(
     opts: &DownloadOpts,
     semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
-    on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>>,
-    on_item_complete: Option<Arc<dyn Fn(&ItemDownloadResult) + Send + Sync>>,
+    on_item_start: Option<OnItemStartFn>,
+    on_item_complete: Option<OnItemCompleteFn>,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();

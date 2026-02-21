@@ -279,8 +279,8 @@ pub async fn run(
         None
     };
 
-    let on_item_start: Option<Arc<dyn Fn(&str, usize, usize) + Send + Sync>> =
-        batch_display.clone().map(|bd| -> Arc<dyn Fn(&str, usize, usize) + Send + Sync> {
+    let on_item_start: Option<ia_core::download::OnItemStartFn> =
+        batch_display.clone().map(|bd| -> ia_core::download::OnItemStartFn {
             Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
         });
 
@@ -289,8 +289,8 @@ pub async fn run(
             Arc::new(move |p: DownloadProgress| bd.on_progress(p))
         });
 
-    let on_item_complete: Option<Arc<dyn Fn(&ia_core::download::ItemDownloadResult) + Send + Sync>> =
-        batch_display.clone().map(|bd| -> Arc<dyn Fn(&ia_core::download::ItemDownloadResult) + Send + Sync> {
+    let on_item_complete: Option<ia_core::download::OnItemCompleteFn> =
+        batch_display.clone().map(|bd| -> ia_core::download::OnItemCompleteFn {
             Arc::new(move |result| bd.on_item_complete(result))
         });
 
