@@ -47,6 +47,8 @@ enum Commands {
     Metadata(commands::metadata::MetadataArgs),
     /// Search the Internet Archive
     Search(commands::search::SearchArgs),
+    /// Show job log summary
+    Status(commands::status::StatusArgs),
 }
 
 #[tokio::main]
@@ -86,6 +88,7 @@ async fn main() -> Result<()> {
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => commands::metadata::run(&client, args).await?,
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
+        Commands::Status(args) => commands::status::run(args).await?,
     }
 
     Ok(())
