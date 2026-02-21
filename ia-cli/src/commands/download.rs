@@ -225,8 +225,9 @@ pub async fn run(
             opts.clone()
         };
 
+        let multi = indicatif::MultiProgress::new();
         let display = if quiet == 0 {
-            Some(Arc::new(DownloadDisplay::new(identifier)))
+            Some(Arc::new(DownloadDisplay::new(identifier, &multi)))
         } else {
             None
         };
@@ -247,7 +248,7 @@ pub async fn run(
         .context(format!("failed to download {}", identifier))?;
 
         if let Some(d) = display {
-            d.finish(&result);
+            d.finish(&result, &item_opts.destdir);
         }
 
         if let Some(ref jl) = joblog {
@@ -259,7 +260,7 @@ pub async fn run(
                 "{}  {} files ({}) in {:.1}s",
                 identifier,
                 result.files_downloaded,
-                format_bytes(result.bytes_total),
+                crate::output::format_bytes(result.bytes_total),
                 result.elapsed.as_secs_f64(),
             );
         }
@@ -345,7 +346,7 @@ pub async fn run(
             style("done").bold(),
             result.items_total,
             result.files_downloaded,
-            format_bytes(result.bytes_total),
+            crate::output::format_bytes(result.bytes_total),
             result.files_skipped,
             result.files_failed + result.items_failed,
             result.elapsed.as_secs_f64(),
@@ -360,7 +361,7 @@ pub async fn run(
                     "  {} {} items, {} free",
                     style(ds.path.display()).dim(),
                     ds.items_count,
-                    format_bytes(ds.free_bytes),
+                    crate::output::format_bytes(ds.free_bytes),
                 );
             }
         }
@@ -386,14 +387,3 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}

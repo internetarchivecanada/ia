@@ -909,6 +909,7 @@ dependencies = [
  "futures",
  "ia-core",
  "indicatif",
+ "libc",
  "predicates",
  "ratatui",
  "serde_json",

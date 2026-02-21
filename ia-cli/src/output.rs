@@ -1,6 +1,7 @@
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use ia_core::download::{DownloadProgress, DownloadStatus, ItemDownloadResult};
@@ -10,11 +11,11 @@ pub struct DownloadDisplay {
     multi: MultiProgress,
     bars: Mutex<HashMap<String, ProgressBar>>,
     header: ProgressBar,
+    separator: ProgressBar,
 }
 
 impl DownloadDisplay {
-    pub fn new(identifier: &str) -> Self {
-        let multi = MultiProgress::new();
+    pub fn new(identifier: &str, multi: &MultiProgress) -> Self {
         let header = multi.add(ProgressBar::new_spinner());
         header.set_message(format!(
             "{}  Resolving...",
@@ -22,11 +23,20 @@ impl DownloadDisplay {
         ));
         header.enable_steady_tick(std::time::Duration::from_millis(100));
 
+        let separator = multi.add(ProgressBar::new_spinner());
+        separator.set_style(ProgressStyle::with_template("{msg}").unwrap());
+        separator.set_message(
+            style("────────────────────────────────────────────────────")
+                .dim()
+                .to_string(),
+        );
+
         Self {
             identifier: identifier.to_string(),
-            multi,
+            multi: multi.clone(),
             bars: Mutex::new(HashMap::new()),
             header,
+            separator,
         }
     }
 
@@ -36,9 +46,10 @@ impl DownloadDisplay {
         match &progress.status {
             DownloadStatus::Starting | DownloadStatus::Downloading => {
                 let bar = bars.entry(progress.file_name.clone()).or_insert_with(|| {
-                    let pb = self.multi.add(ProgressBar::new(
-                        progress.total_bytes.unwrap_or(0),
-                    ));
+                    let pb = self.multi.insert_before(
+                        &self.separator,
+                        ProgressBar::new(progress.total_bytes.unwrap_or(0)),
+                    );
                     pb.set_style(
                         ProgressStyle::default_bar()
                             .template("  {prefix:.dim} {bar:20.cyan/dim} {bytes}/{total_bytes} {bytes_per_sec:.dim}")
@@ -81,35 +92,80 @@ impl DownloadDisplay {
         }
     }
 
-    pub fn finish(&self, result: &ItemDownloadResult) {
+    pub fn finish(&self, result: &ItemDownloadResult, destdir: &Path) {
         self.header.finish_and_clear();
 
+        let elapsed = result.elapsed.as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            format!(
+                " · {}/s",
+                format_bytes((result.bytes_total as f64 / elapsed) as u64)
+            )
+        } else {
+            String::new()
+        };
+
         let summary = format!(
-            "\n{}  Downloaded {} files ({}) in {:.1}s",
+            "{}  {} files ({}) in {:.1}s{}",
             style(&self.identifier).bold(),
             result.files_downloaded,
             format_bytes(result.bytes_total),
-            result.elapsed.as_secs_f64(),
+            elapsed,
+            style(&speed).dim(),
         );
 
         let stats = format!(
-            "  {} {} succeeded, {} failed, {} skipped",
+            "  {} {} downloaded · {} skipped · {} errors",
             style("✓").green(),
             result.files_downloaded,
+            if result.files_skipped > 0 {
+                style(result.files_skipped.to_string())
+                    .yellow()
+                    .to_string()
+            } else {
+                "0".to_string()
+            },
             if result.files_failed > 0 {
                 style(result.files_failed.to_string()).red().to_string()
             } else {
                 "0".to_string()
             },
-            result.files_skipped,
         );
 
         eprintln!("{summary}");
         eprintln!("{stats}");
+
+        // Disk space
+        if let Some(free) = disk_space_free(destdir) {
+            eprintln!(
+                "  {}: {} free",
+                style(destdir.display()).dim(),
+                format_bytes(free)
+            );
+        }
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+/// Get free disk space for a path (bytes).
+pub fn disk_space_free(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let c_path = std::ffi::CString::new(path.to_str()?).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if ret == 0 {
+            Some(stat.f_bavail as u64 * stat.f_frsize)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
