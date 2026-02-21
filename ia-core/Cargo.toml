@@ -23,6 +23,7 @@ urlencoding = "2"
 httpdate = "1"
 filetime = "0.2"
 async-stream = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"

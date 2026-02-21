@@ -1,5 +1,6 @@
 pub mod client;
 pub mod config;
+pub mod disk_pool;
 pub mod download;
 pub mod error;
 pub mod files;

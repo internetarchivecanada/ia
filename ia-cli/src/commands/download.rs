@@ -5,6 +5,7 @@ use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ia_core::disk_pool::DiskPool;
 use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
 use ia_core::files::FileFilter;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
@@ -169,27 +170,52 @@ pub async fn run(
         .transpose()
         .context("failed to open joblog")?;
 
-    let opts = DownloadOpts {
+    // Set up disk pool if multiple destdirs
+    let destdirs = if args.destdir.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.destdir.clone()
+    };
+    let mut disk_pool = if destdirs.len() > 1 {
+        Some(DiskPool::new(&destdirs).context("failed to initialize disk pool")?)
+    } else {
+        None
+    };
+
+    let base_destdir = destdirs.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+
+    let make_opts = |destdir: PathBuf| DownloadOpts {
         jobs: args.jobs,
-        destdir: args.destdir.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
+        destdir,
         no_directories: args.no_directories,
         checksum: args.checksum,
         retries: args.retries,
         no_timestamps: args.no_timestamps,
         dry_run: args.dry_run,
         filter: FileFilter {
-            glob: args.glob,
-            exclude: args.exclude,
-            formats: args.format,
-            source: args.source,
-            exclude_source: args.exclude_source,
+            glob: args.glob.clone(),
+            exclude: args.exclude.clone(),
+            formats: args.format.clone(),
+            source: args.source.clone(),
+            exclude_source: args.exclude_source.clone(),
             names: vec![],
         },
     };
 
+    let opts = make_opts(base_destdir.clone());
+
     // Single item — use the original simple path
     if identifiers.len() == 1 {
         let identifier = &identifiers[0];
+
+        // Use disk pool to select destination if multi-disk
+        let item_opts = if let Some(ref mut pool) = disk_pool {
+            let dest = pool.assign_item(identifier, 0)?;
+            make_opts(dest.to_path_buf())
+        } else {
+            opts.clone()
+        };
+
         let display = if quiet == 0 {
             Some(Arc::new(DownloadDisplay::new(identifier)))
         } else {
@@ -204,7 +230,7 @@ pub async fn run(
         let result = ia_core::download::download_item(
             client,
             identifier,
-            &opts,
+            &item_opts,
             progress,
         )
         .await
@@ -314,6 +340,20 @@ pub async fn run(
             result.files_failed + result.items_failed,
             result.elapsed.as_secs_f64(),
         );
+    }
+
+    // Report disk pool usage if multi-disk
+    if let Some(ref pool) = disk_pool {
+        if quiet < 2 {
+            for ds in pool.status() {
+                eprintln!(
+                    "  {} {} items, {} free",
+                    style(ds.path.display()).dim(),
+                    ds.items_count,
+                    format_bytes(ds.free_bytes),
+                );
+            }
+        }
     }
 
     if result.files_failed > 0 || result.items_failed > 0 {
