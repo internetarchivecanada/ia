@@ -73,9 +73,9 @@ pub struct DownloadArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
-    /// Interactive TUI mode (requires --features tui)
+    /// Full-screen dashboard mode
     #[arg(long)]
-    pub tui: bool,
+    pub dashboard: bool,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -202,15 +202,15 @@ pub async fn run(
     let opts = make_opts(base_destdir.clone());
     let semaphore = Arc::new(Semaphore::new(jobs));
 
-    // TUI mode
+    // Dashboard mode
     #[cfg(feature = "tui")]
-    if args.tui && identifiers.len() == 1 {
+    if args.dashboard && identifiers.len() == 1 {
         return crate::tui::run_tui(client, &identifiers[0], &opts, Arc::clone(&semaphore)).await;
     }
 
     #[cfg(not(feature = "tui"))]
-    if args.tui {
-        bail!("TUI mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
+    if args.dashboard {
+        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
     }
 
     // Single item — use the original simple path

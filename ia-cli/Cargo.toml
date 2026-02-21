@@ -25,6 +25,7 @@ urlencoding = "2"
 chrono = "0.4"
 
 [features]
+default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies.ratatui]
