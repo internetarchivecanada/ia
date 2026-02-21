@@ -63,11 +63,25 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 
 ## Development Workflow
 
+- **ALWAYS use feature branches**: Never commit directly to `main`. Create a `feat/`, `fix/`, or `refactor/` branch, push it, and open a PR.
+- **ALWAYS add tests**: Every change must include tests that verify the new behavior.
+- **ALWAYS update documentation**: Update CLAUDE.md, MEMORY.md, and any relevant docs after changes.
+- **ALWAYS push as a PR**: Push the feature branch and create a GitHub PR for review.
 - Use GitHub issues on `jjjake/ia` to organize work
 - Ralph Loop for iterating through issues
 - Keep docs/plans/ updated with design decisions
 - Keep MEMORY.md updated with conventions and lessons learned
 - Run `cargo check`, `cargo test`, `cargo clippy` before committing
+
+## Global CLI Short Flags (Reserved)
+
+These short flags are used by global options and MUST NOT be reused in subcommands:
+- `-c` — `--config-file`
+- `-l` — `--log`
+- `-d` — `--debug`
+- `-i` — `--insecure`
+- `-H` — `--host`
+- `-q` — `--quiet`
 
 ## Key IA API Quirks (from research)
 
