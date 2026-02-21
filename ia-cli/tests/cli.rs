@@ -70,7 +70,8 @@ fn metadata_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--exists"))
-        .stdout(predicate::str::contains("--formats"));
+        .stdout(predicate::str::contains("--formats"))
+        .stdout(predicate::str::contains("--pretty"));
 }
 
 #[test]
@@ -94,6 +95,30 @@ fn config_file_flag_accepts_path() {
     ia().args(["--config-file", "/nonexistent/path.ini", "download", "--help"])
         .assert()
         .success();
+}
+
+#[test]
+fn completions_generates_fish() {
+    ia().args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete -c ia"));
+}
+
+#[test]
+fn completions_generates_bash() {
+    ia().args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_ia"));
+}
+
+#[test]
+fn completions_subcommand_help() {
+    ia().args(["completions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("shell"));
 }
 
 #[test]
