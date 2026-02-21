@@ -97,6 +97,30 @@ fn config_file_flag_accepts_path() {
 }
 
 #[test]
+fn completions_generates_fish() {
+    ia().args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete -c ia"));
+}
+
+#[test]
+fn completions_generates_bash() {
+    ia().args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("_ia"));
+}
+
+#[test]
+fn completions_subcommand_help() {
+    ia().args(["completions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("shell"));
+}
+
+#[test]
 fn short_flags_work() {
     ia().args(["-i", "-H", "test.archive.org", "download", "--help"])
         .assert()
