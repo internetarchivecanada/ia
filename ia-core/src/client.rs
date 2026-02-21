@@ -95,6 +95,20 @@ impl IaClient {
     pub async fn item_exists(&self, identifier: &str) -> Result<bool> {
         crate::metadata::exists(self, identifier).await
     }
+
+    pub fn search<'a>(
+        &'a self,
+        query: &str,
+        opts: &crate::search::SearchOpts,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<crate::search::SearchResult>> + Send + 'a>,
+    > {
+        crate::search::scrape(self, query, opts)
+    }
+
+    pub async fn search_count(&self, query: &str) -> Result<u64> {
+        crate::search::num_found(self, query).await
+    }
 }
 
 #[cfg(test)]

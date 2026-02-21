@@ -5,6 +5,7 @@ pub mod error;
 pub mod files;
 pub mod joblog;
 pub mod metadata;
+pub mod search;
 pub mod types;
 pub mod user_agent;
 
