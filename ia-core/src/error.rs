@@ -31,7 +31,7 @@ pub enum IaError {
     Config(String),
 
     #[error(transparent)]
-    Network(#[from] reqwest::Error),
+    Network(#[from] reqwest_middleware::Error),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

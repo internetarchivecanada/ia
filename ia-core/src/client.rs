@@ -87,6 +87,14 @@ impl IaClient {
     pub fn config(&self) -> &IaConfig {
         &self.config
     }
+
+    pub async fn get_item(&self, identifier: &str) -> Result<crate::types::ItemMetadata> {
+        crate::metadata::get(self, identifier).await
+    }
+
+    pub async fn item_exists(&self, identifier: &str) -> Result<bool> {
+        crate::metadata::exists(self, identifier).await
+    }
 }
 
 #[cfg(test)]
