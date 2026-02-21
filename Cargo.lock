@@ -2748,6 +2748,7 @@ dependencies = [
  "dirs",
  "futures",
  "ia-core",
+ "reqwest",
  "serde",
  "serde_json",
  "slint",
