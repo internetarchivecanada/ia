@@ -1,3 +1,4 @@
+pub mod downloads;
 pub mod export;
 pub mod metadata;
 pub mod search;
