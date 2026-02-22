@@ -1,12 +1,53 @@
+use crate::backend::export::{ExportFormat, ExportRecord};
 use crate::backend::AppBackend;
 use crate::{AppWindow, SearchResultData};
 use futures::StreamExt;
 use ia_core::search::{SearchOpts, SearchResult};
 use ia_core::IaClient;
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::sync::Arc;
 
 impl AppBackend {
+    pub fn setup_export(&self, app: &AppWindow) {
+        let weak = app.as_weak();
+
+        app.on_search_export_requested(move |format_str| {
+            let format = ExportFormat::from_str(&format_str);
+
+            if let Some(app) = weak.upgrade() {
+                let results_model = app.get_search_results();
+                let mut records = Vec::new();
+                for i in 0..results_model.row_count() {
+                    if let Some(r) = results_model.row_data(i) {
+                        records.push(ExportRecord {
+                            identifier: r.identifier.to_string(),
+                            title: r.title.to_string(),
+                            mediatype: r.mediatype.to_string(),
+                            description: r.description.to_string(),
+                        });
+                    }
+                }
+
+                let export_dir = dirs::download_dir()
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+                match crate::backend::export::export_to_file(&records, format, &export_dir) {
+                    Ok(path) => {
+                        app.set_search_status(SharedString::from(format!(
+                            "Exported {} results to {}",
+                            records.len(),
+                            path.display()
+                        )));
+                    }
+                    Err(e) => {
+                        app.set_search_status(SharedString::from(format!("Export error: {e}")));
+                    }
+                }
+            }
+        });
+    }
+
     pub fn setup_search(&self, app: &AppWindow, runtime: &tokio::runtime::Handle) {
         let client = Arc::clone(&self.client);
         let rt = runtime.clone();

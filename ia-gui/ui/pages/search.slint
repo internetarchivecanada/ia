@@ -14,7 +14,7 @@ export component SearchPage inherits Rectangle {
 
     callback search-requested(/* query */ string, /* backend */ string);
     callback result-clicked(/* index */ int);
-    callback export-requested();
+    callback export-requested(/* format */ string);
 
     VerticalBox {
         padding: 24px;
@@ -116,10 +116,16 @@ export component SearchPage inherits Rectangle {
             spacing: 8px;
             alignment: end;
 
+            export-format := ComboBox {
+                width: 120px;
+                model: ["JSONL", "CSV", "Identifiers"];
+                current-value: "JSONL";
+            }
+
             Button {
                 text: "Export Results";
                 enabled: results.length > 0;
-                clicked => { root.export-requested(); }
+                clicked => { root.export-requested(export-format.current-value); }
             }
         }
     }

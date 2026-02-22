@@ -19,7 +19,7 @@ export component AppWindow inherits Window {
 
     callback search-requested(string, string);
     callback search-result-clicked(int);
-    callback search-export-requested();
+    callback search-export-requested(/* format */ string);
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -34,7 +34,7 @@ export component AppWindow inherits Window {
                 searching: search-in-progress;
                 search-requested(query, backend) => { root.search-requested(query, backend); }
                 result-clicked(index) => { root.search-result-clicked(index); }
-                export-requested => { root.search-export-requested(); }
+                export-requested(format) => { root.search-export-requested(format); }
             }
             if current-page == Page.downloads : Text {
                 text: "Downloads";
