@@ -1,8 +1,9 @@
 import { Sidebar, Page } from "components/sidebar.slint";
 import { SearchPage, SearchResultData } from "pages/search.slint";
 import { ItemDetailPage, ItemDetailData, FileEntryData } from "pages/item-detail.slint";
+import { DownloadsPage, ActiveDownloadData, DownloadHistoryData } from "pages/downloads.slint";
 
-export { Page, SearchResultData, ItemDetailData, FileEntryData }
+export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -24,12 +25,18 @@ export component AppWindow inherits Window {
     in property <[FileEntryData]> item-detail-files: [];
     in property <bool> item-detail-loading: false;
 
+    // Downloads state
+    in property <[ActiveDownloadData]> active-downloads: [];
+    in property <[DownloadHistoryData]> download-history: [];
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
     callback item-detail-back();
     callback item-detail-download(/* identifier */ string);
     callback item-detail-add-to-list(/* identifier */ string);
+    callback downloads-retry-failed();
+    callback downloads-clear-history();
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -47,11 +54,11 @@ export component AppWindow inherits Window {
                 result-clicked(index) => { root.search-result-clicked(index); }
                 export-requested(format) => { root.search-export-requested(format); }
             }
-            if !showing-item-detail && current-page == Page.downloads : Text {
-                text: "Downloads";
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            if !showing-item-detail && current-page == Page.downloads : DownloadsPage {
+                active-downloads: root.active-downloads;
+                history: root.download-history;
+                retry-failed => { root.downloads-retry-failed(); }
+                clear-history => { root.downloads-clear-history(); }
             }
             if !showing-item-detail && current-page == Page.lists : Text {
                 text: "Lists";
