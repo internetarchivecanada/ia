@@ -1,5 +1,12 @@
 import { VerticalBox, HorizontalBox, Button, TabWidget } from "std-widgets.slint";
 
+export struct FileEntryData {
+    name: string,
+    format: string,
+    size: string,
+    source: string,
+}
+
 export struct ItemDetailData {
     identifier: string,
     title: string,
@@ -15,6 +22,7 @@ export struct ItemDetailData {
 
 export component ItemDetailPage inherits Rectangle {
     in property <ItemDetailData> item;
+    in property <[FileEntryData]> files: [];
     in property <bool> loading: false;
 
     callback back-clicked();
@@ -195,16 +203,97 @@ export component ItemDetailPage inherits Rectangle {
             Tab {
                 title: "Files";
 
-                // Placeholder — wired in issue #45
-                VerticalBox {
-                    padding: 16px;
+                Flickable {
+                    VerticalBox {
+                        padding: 16px;
+                        spacing: 0px;
 
-                    Text {
-                        text: "Files will be listed here.";
-                        font-size: 14px;
-                        color: #6b7280;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                        // Column headers
+                        HorizontalLayout {
+                            padding-bottom: 8px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "Name";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #6b7280;
+                                horizontal-stretch: 3;
+                            }
+                            Text {
+                                text: "Format";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #6b7280;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: "Size";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #6b7280;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: right;
+                            }
+                            Text {
+                                text: "Source";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: #6b7280;
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        // Separator
+                        Rectangle {
+                            height: 1px;
+                            background: #e5e7eb;
+                        }
+
+                        // File rows
+                        for file in files : Rectangle {
+                            height: 32px;
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+
+                                Text {
+                                    text: file.name;
+                                    font-size: 13px;
+                                    horizontal-stretch: 3;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: file.format;
+                                    font-size: 13px;
+                                    color: #6b7280;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: file.size;
+                                    font-size: 13px;
+                                    color: #6b7280;
+                                    horizontal-stretch: 1;
+                                    horizontal-alignment: right;
+                                }
+                                Text {
+                                    text: file.source;
+                                    font-size: 13px;
+                                    color: #6b7280;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                        }
+
+                        if files.length == 0 : Text {
+                            text: "No files.";
+                            font-size: 14px;
+                            color: #6b7280;
+                            horizontal-alignment: center;
+                        }
                     }
                 }
             }

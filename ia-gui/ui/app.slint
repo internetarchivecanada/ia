@@ -1,8 +1,8 @@
 import { Sidebar, Page } from "components/sidebar.slint";
 import { SearchPage, SearchResultData } from "pages/search.slint";
-import { ItemDetailPage, ItemDetailData } from "pages/item-detail.slint";
+import { ItemDetailPage, ItemDetailData, FileEntryData } from "pages/item-detail.slint";
 
-export { Page, SearchResultData, ItemDetailData }
+export { Page, SearchResultData, ItemDetailData, FileEntryData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -21,6 +21,7 @@ export component AppWindow inherits Window {
     // Item detail state
     in-out property <bool> showing-item-detail: false;
     in property <ItemDetailData> item-detail;
+    in property <[FileEntryData]> item-detail-files: [];
     in property <bool> item-detail-loading: false;
 
     callback search-requested(string, string);
@@ -74,6 +75,7 @@ export component AppWindow inherits Window {
             // Item detail overlay
             if showing-item-detail : ItemDetailPage {
                 item: item-detail;
+                files: item-detail-files;
                 loading: item-detail-loading;
                 back-clicked => {
                     root.showing-item-detail = false;

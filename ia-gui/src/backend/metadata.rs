@@ -1,8 +1,13 @@
 use crate::backend::AppBackend;
-use crate::{AppWindow, ItemDetailData};
+use crate::{AppWindow, FileEntryData, ItemDetailData};
 use ia_core::IaClient;
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::sync::Arc;
+
+struct FetchResult {
+    detail: ItemDetailData,
+    files: Vec<FileEntryData>,
+}
 
 impl AppBackend {
     pub fn setup_metadata_fetch(&self, app: &AppWindow, runtime: &tokio::runtime::Handle) {
@@ -34,6 +39,7 @@ impl AppBackend {
                             total_size: SharedString::default(),
                             json_text: SharedString::default(),
                         });
+                        app.set_item_detail_files(ModelRc::new(VecModel::default()));
                         app.set_item_detail_loading(true);
                         app.set_showing_item_detail(true);
                         result.identifier.to_string()
@@ -52,11 +58,13 @@ impl AppBackend {
                     if let Some(app) = weak.upgrade() {
                         app.set_item_detail_loading(false);
                         match result {
-                            Ok(detail) => {
-                                app.set_item_detail(detail);
+                            Ok(fetched) => {
+                                app.set_item_detail(fetched.detail);
+                                app.set_item_detail_files(ModelRc::new(
+                                    VecModel::from(fetched.files),
+                                ));
                             }
                             Err(e) => {
-                                // Show error in the detail page
                                 let mut current = app.get_item_detail();
                                 current.title = SharedString::from(format!(
                                     "Error loading: {}",
@@ -76,7 +84,7 @@ impl AppBackend {
 async fn fetch_metadata(
     client: &IaClient,
     identifier: &str,
-) -> anyhow::Result<ItemDetailData> {
+) -> anyhow::Result<FetchResult> {
     let meta = ia_core::metadata::get(client, identifier).await?;
 
     let title = meta
@@ -113,20 +121,35 @@ async fn fetch_metadata(
     let total_bytes: u64 = meta.files.iter().filter_map(|f| f.size).sum();
     let total_size = format_bytes(total_bytes);
 
+    // Build file entries
+    let files: Vec<FileEntryData> = meta
+        .files
+        .iter()
+        .map(|f| FileEntryData {
+            name: SharedString::from(&f.name),
+            format: SharedString::from(f.format.as_deref().unwrap_or("")),
+            size: SharedString::from(format_bytes(f.size.unwrap_or(0))),
+            source: SharedString::from(f.source.as_deref().unwrap_or("")),
+        })
+        .collect();
+
     // Pretty-print the raw JSON
     let json_text = serde_json::to_string_pretty(&meta).unwrap_or_default();
 
-    Ok(ItemDetailData {
-        identifier: SharedString::from(identifier),
-        title: SharedString::from(title),
-        mediatype: SharedString::from(mediatype),
-        description: SharedString::from(description),
-        creator: SharedString::from(creator),
-        date: SharedString::from(date),
-        collections: SharedString::from(collections),
-        file_count,
-        total_size: SharedString::from(total_size),
-        json_text: SharedString::from(json_text),
+    Ok(FetchResult {
+        detail: ItemDetailData {
+            identifier: SharedString::from(identifier),
+            title: SharedString::from(title),
+            mediatype: SharedString::from(mediatype),
+            description: SharedString::from(description),
+            creator: SharedString::from(creator),
+            date: SharedString::from(date),
+            collections: SharedString::from(collections),
+            file_count,
+            total_size: SharedString::from(total_size),
+            json_text: SharedString::from(json_text),
+        },
+        files,
     })
 }
 
