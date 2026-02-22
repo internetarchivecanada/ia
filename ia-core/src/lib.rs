@@ -22,6 +22,6 @@ pub fn version() -> &'static str {
 mod tests {
     #[test]
     fn version_is_set() {
-        assert_eq!(super::version(), "0.2.1");
+        assert_eq!(super::version(), "0.2.2");
     }
 }

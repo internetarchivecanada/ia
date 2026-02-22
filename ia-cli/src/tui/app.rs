@@ -161,9 +161,7 @@ impl TuiState {
     }
 
     pub fn overall_progress(&self) -> f64 {
-        if self.bytes_total > 0 {
-            self.bytes_downloaded as f64 / self.bytes_total as f64
-        } else if self.files_total > 0 {
+        if self.files_total > 0 {
             (self.files_completed + self.files_skipped + self.files_failed) as f64
                 / self.files_total as f64
         } else {
@@ -252,19 +250,11 @@ impl TuiState {
             DownloadStatus::Skipped(_) => {
                 self.active_files.remove(&progress.file_name);
                 self.files_skipped += 1;
-                // Count skipped file's bytes as "done" so progress moves forward
-                if let Some(total) = progress.total_bytes {
-                    self.bytes_downloaded += total;
-                }
             }
             DownloadStatus::Failed(msg) => {
                 self.active_files.remove(&progress.file_name);
                 self.files_failed += 1;
                 self.failed_files.push((progress.file_name, msg.clone()));
-                // Count failed file's bytes as "done" so progress moves forward
-                if let Some(total) = progress.total_bytes {
-                    self.bytes_downloaded += total;
-                }
             }
             DownloadStatus::Verifying => {}
         }
