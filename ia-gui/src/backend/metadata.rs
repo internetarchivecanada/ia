@@ -4,9 +4,9 @@ use ia_core::IaClient;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::sync::Arc;
 
-struct FetchResult {
-    detail: ItemDetailData,
-    files: Vec<FileEntryData>,
+pub struct FetchResult {
+    pub detail: ItemDetailData,
+    pub files: Vec<FileEntryData>,
 }
 
 impl AppBackend {
@@ -86,7 +86,12 @@ async fn fetch_metadata(
     identifier: &str,
 ) -> anyhow::Result<FetchResult> {
     let meta = ia_core::metadata::get(client, identifier).await?;
+    Ok(fetch_metadata_from_item(&meta))
+}
 
+/// Convert an already-fetched ItemMetadata into UI data types.
+pub fn fetch_metadata_from_item(meta: &ia_core::types::ItemMetadata) -> FetchResult {
+    let identifier = meta.metadata.identifier.as_deref().unwrap_or("");
     let title = meta
         .metadata
         .title
@@ -136,7 +141,7 @@ async fn fetch_metadata(
     // Pretty-print the raw JSON
     let json_text = serde_json::to_string_pretty(&meta).unwrap_or_default();
 
-    Ok(FetchResult {
+    FetchResult {
         detail: ItemDetailData {
             identifier: SharedString::from(identifier),
             title: SharedString::from(title),
@@ -150,7 +155,7 @@ async fn fetch_metadata(
             json_text: SharedString::from(json_text),
         },
         files,
-    })
+    }
 }
 
 pub fn format_bytes(bytes: u64) -> String {

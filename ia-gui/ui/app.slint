@@ -2,8 +2,9 @@ import { Sidebar, Page } from "components/sidebar.slint";
 import { SearchPage, SearchResultData } from "pages/search.slint";
 import { ItemDetailPage, ItemDetailData, FileEntryData } from "pages/item-detail.slint";
 import { DownloadsPage, ActiveDownloadData, DownloadHistoryData } from "pages/downloads.slint";
+import { ListsPage, ListSummaryData, ListItemData } from "pages/lists.slint";
 
-export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData }
+export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData, ListSummaryData, ListItemData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -29,6 +30,11 @@ export component AppWindow inherits Window {
     in property <[ActiveDownloadData]> active-downloads: [];
     in property <[DownloadHistoryData]> download-history: [];
 
+    // Lists state
+    in property <[ListSummaryData]> lists: [];
+    in-out property <string> selected-list-name: "";
+    in property <[ListItemData]> selected-list-items: [];
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
@@ -37,6 +43,14 @@ export component AppWindow inherits Window {
     callback item-detail-add-to-list(/* identifier */ string);
     callback downloads-retry-failed();
     callback downloads-clear-history();
+    callback lists-create(/* name */ string);
+    callback lists-delete(/* name */ string);
+    callback lists-select(/* name */ string);
+    callback lists-import(/* name */ string);
+    callback lists-download(/* name */ string);
+    callback lists-export(/* name */ string);
+    callback lists-item-clicked(/* identifier */ string);
+    callback lists-remove-item(/* list-name */ string, /* identifier */ string);
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -60,11 +74,18 @@ export component AppWindow inherits Window {
                 retry-failed => { root.downloads-retry-failed(); }
                 clear-history => { root.downloads-clear-history(); }
             }
-            if !showing-item-detail && current-page == Page.lists : Text {
-                text: "Lists";
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            if !showing-item-detail && current-page == Page.lists : ListsPage {
+                lists: root.lists;
+                selected-list-name: root.selected-list-name;
+                selected-list-items: root.selected-list-items;
+                create-list(name) => { root.lists-create(name); }
+                delete-list(name) => { root.lists-delete(name); }
+                select-list(name) => { root.lists-select(name); }
+                import-list(name) => { root.lists-import(name); }
+                download-list(name) => { root.lists-download(name); }
+                export-list(name) => { root.lists-export(name); }
+                list-item-clicked(id) => { root.lists-item-clicked(id); }
+                remove-item(list-name, id) => { root.lists-remove-item(list-name, id); }
             }
             if !showing-item-detail && current-page == Page.metadata : Text {
                 text: "Metadata";

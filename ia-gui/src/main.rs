@@ -30,7 +30,12 @@ fn main() -> anyhow::Result<()> {
         std::sync::Arc::clone(&app_backend.client),
         runtime.handle().clone(),
         2, // concurrency
-        download_dir,
+        download_dir.clone(),
+    ));
+
+    // Create list manager
+    let list_manager = std::sync::Arc::new(backend::lists::ListManager::new(
+        backend::lists::ListManager::default_dir(),
     ));
 
     // Create and run Slint app
@@ -47,6 +52,9 @@ fn main() -> anyhow::Result<()> {
         let history = backend::history::load_history(&joblog_path);
         app.set_download_history(slint::ModelRc::new(slint::VecModel::from(history)));
     }
+
+    // Load initial lists
+    refresh_lists(&app, &list_manager);
 
     // Wire retry-failed and clear-history callbacks
     {
@@ -73,6 +81,165 @@ fn main() -> anyhow::Result<()> {
         let dm = std::sync::Arc::clone(&download_manager);
         app.on_item_detail_download(move |identifier| {
             dm.queue_download(&identifier);
+        });
+    }
+
+    // Wire list callbacks
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_lists_create(move |name| {
+            let name = name.to_string();
+            if !name.is_empty() {
+                let _ = lm.create(&name);
+                if let Some(app) = weak.upgrade() {
+                    refresh_lists(&app, &lm);
+                }
+            }
+        });
+    }
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_lists_delete(move |name| {
+            let name = name.to_string();
+            let _ = lm.delete(&name);
+            if let Some(app) = weak.upgrade() {
+                app.set_selected_list_name(slint::SharedString::default());
+                app.set_selected_list_items(slint::ModelRc::new(slint::VecModel::default()));
+                refresh_lists(&app, &lm);
+            }
+        });
+    }
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_lists_select(move |name| {
+            let name = name.to_string();
+            if let Some(app) = weak.upgrade() {
+                app.set_selected_list_name(slint::SharedString::from(&name));
+                if let Some(list) = lm.load(&name) {
+                    let items: Vec<ListItemData> = list
+                        .identifiers
+                        .iter()
+                        .map(|id| ListItemData {
+                            identifier: slint::SharedString::from(id.as_str()),
+                            title: slint::SharedString::default(),
+                        })
+                        .collect();
+                    app.set_selected_list_items(slint::ModelRc::new(slint::VecModel::from(items)));
+                }
+            }
+        });
+    }
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_lists_remove_item(move |list_name, identifier| {
+            let list_name = list_name.to_string();
+            let identifier = identifier.to_string();
+            if let Some(mut list) = lm.load(&list_name) {
+                list.identifiers.retain(|id| id != &identifier);
+                let _ = lm.save(&list);
+                if let Some(app) = weak.upgrade() {
+                    refresh_lists(&app, &lm);
+                    // Re-select the list to refresh items
+                    let items: Vec<ListItemData> = list
+                        .identifiers
+                        .iter()
+                        .map(|id| ListItemData {
+                            identifier: slint::SharedString::from(id.as_str()),
+                            title: slint::SharedString::default(),
+                        })
+                        .collect();
+                    app.set_selected_list_items(slint::ModelRc::new(slint::VecModel::from(items)));
+                }
+            }
+        });
+    }
+    {
+        let dm = std::sync::Arc::clone(&download_manager);
+        let lm = std::sync::Arc::clone(&list_manager);
+        app.on_lists_download(move |name| {
+            let name = name.to_string();
+            if let Some(list) = lm.load(&name) {
+                for id in &list.identifiers {
+                    dm.queue_download(id);
+                }
+            }
+        });
+    }
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        app.on_lists_export(move |name| {
+            let name = name.to_string();
+            if let Some(list) = lm.load(&name) {
+                let records: Vec<backend::export::ExportRecord> = list
+                    .identifiers
+                    .iter()
+                    .map(|id| backend::export::ExportRecord {
+                        identifier: id.clone(),
+                        title: String::new(),
+                        mediatype: String::new(),
+                        description: String::new(),
+                    })
+                    .collect();
+                let content =
+                    backend::export::format_records(&records, backend::export::ExportFormat::Identifiers);
+                let export_path = std::env::temp_dir().join(format!("{name}-export.txt"));
+                let _ = std::fs::write(&export_path, content);
+                tracing::info!("Exported list '{}' to {}", name, export_path.display());
+            }
+        });
+    }
+    // Wire lists-import (placeholder - logs a message since we can't open native file dialog without additional deps)
+    {
+        app.on_lists_import(move |name| {
+            tracing::info!(
+                "Import requested for list '{}' - file dialog not yet implemented",
+                name
+            );
+        });
+    }
+    // Wire lists-item-clicked to open item detail
+    {
+        let weak = app.as_weak();
+        let client = std::sync::Arc::clone(&app_backend.client);
+        let handle = runtime.handle().clone();
+        app.on_lists_item_clicked(move |identifier| {
+            let identifier = identifier.to_string();
+            let weak = weak.clone();
+            let client = std::sync::Arc::clone(&client);
+            if let Some(app) = weak.upgrade() {
+                app.set_item_detail_loading(true);
+                app.set_showing_item_detail(true);
+            }
+            let weak2 = weak.clone();
+            handle.spawn(async move {
+                match ia_core::metadata::get(&client, &identifier).await {
+                    Ok(meta) => {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = weak2.upgrade() {
+                                let result =
+                                    backend::metadata::fetch_metadata_from_item(&meta);
+                                app.set_item_detail(result.detail);
+                                app.set_item_detail_files(slint::ModelRc::new(
+                                    slint::VecModel::from(result.files),
+                                ));
+                                app.set_item_detail_loading(false);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to fetch metadata for {}: {}", identifier, e);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = weak2.upgrade() {
+                                app.set_item_detail_loading(false);
+                            }
+                        });
+                    }
+                }
+            });
         });
     }
 
@@ -130,4 +297,23 @@ fn main() -> anyhow::Result<()> {
 
     app.run()?;
     Ok(())
+}
+
+fn refresh_lists(app: &AppWindow, lm: &backend::lists::ListManager) {
+    let names = lm.list_names();
+    let summaries: Vec<ListSummaryData> = names
+        .iter()
+        .map(|name| {
+            let count = lm
+                .load(name)
+                .map(|l| l.identifiers.len())
+                .unwrap_or(0);
+            ListSummaryData {
+                name: slint::SharedString::from(name.as_str()),
+                item_count: count as i32,
+                is_builtin: name == "Downloaded",
+            }
+        })
+        .collect();
+    app.set_lists(slint::ModelRc::new(slint::VecModel::from(summaries)));
 }
