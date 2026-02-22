@@ -65,12 +65,16 @@ impl ItemState {
 pub struct TuiState {
     pub identifier: String,
     pub items: Vec<ItemState>,
+    /// O(1) lookup from identifier → index in `items`.
+    item_index: HashMap<String, usize>,
     pub files_total: usize,
     pub files_completed: usize,
     pub files_skipped: usize,
     pub files_failed: usize,
     pub bytes_downloaded: u64,
     pub bytes_total: u64,
+    /// Active file downloads, keyed by "{identifier}/{file_name}" to avoid
+    /// collisions when multiple items have files with the same name.
     pub active_files: HashMap<String, FileProgress>,
     pub completed_files: Vec<String>,
     pub failed_files: Vec<(String, String)>,
@@ -115,9 +119,16 @@ impl TuiState {
             })
             .collect();
 
+        let item_index: HashMap<String, usize> = identifiers
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+
         Self {
             identifier,
             items,
+            item_index,
             files_total: 0,
             files_completed: 0,
             files_skipped: 0,
@@ -184,10 +195,18 @@ impl TuiState {
         total_progress / items_total as f64
     }
 
+    /// Composite key for active_files to avoid collisions when multiple items
+    /// have files with the same name (e.g. `_meta.xml`).
+    fn file_key(identifier: &str, file_name: &str) -> String {
+        format!("{identifier}\0{file_name}")
+    }
+
     fn update(&mut self, progress: DownloadProgress) {
-        // Update per-item state
-        let item_id = progress.identifier.clone();
-        if let Some(item) = self.items.iter_mut().find(|i| i.identifier == item_id) {
+        let file_key = Self::file_key(&progress.identifier, &progress.file_name);
+
+        // Update per-item state via O(1) HashMap lookup
+        if let Some(&idx) = self.item_index.get(&progress.identifier) {
+            let item = &mut self.items[idx];
             match &progress.status {
                 DownloadStatus::Enumerated { files_count, .. } => {
                     if item.status == ItemStatus::Pending {
@@ -198,16 +217,19 @@ impl TuiState {
                 }
                 DownloadStatus::Starting => {}
                 DownloadStatus::Downloading => {
-                    // bytes delta handled below at global level
+                    if let Some(fp) = self.active_files.get(&file_key) {
+                        let delta =
+                            progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                        item.bytes_downloaded += delta;
+                    }
                 }
                 DownloadStatus::Complete => {
                     item.files_completed += 1;
-                    let delta = if let Some(fp) = self.active_files.get(&progress.file_name) {
-                        progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded)
-                    } else {
-                        0
-                    };
-                    item.bytes_downloaded += delta;
+                    if let Some(fp) = self.active_files.get(&file_key) {
+                        let delta =
+                            progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                        item.bytes_downloaded += delta;
+                    }
                 }
                 DownloadStatus::Skipped(_) => {
                     item.files_skipped += 1;
@@ -225,13 +247,12 @@ impl TuiState {
                 files_count,
                 bytes_total,
             } => {
-                // Set totals upfront so the progress bar has a stable denominator
                 self.files_total += files_count;
                 self.bytes_total += bytes_total;
             }
             DownloadStatus::Starting => {
                 self.active_files.insert(
-                    progress.file_name.clone(),
+                    file_key,
                     FileProgress {
                         name: progress.file_name.clone(),
                         bytes_downloaded: 0,
@@ -239,23 +260,16 @@ impl TuiState {
                         started_at: Instant::now(),
                     },
                 );
-                // bytes_total and files_total already set by Enumerated
             }
             DownloadStatus::Downloading => {
-                if let Some(fp) = self.active_files.get_mut(&progress.file_name) {
+                if let Some(fp) = self.active_files.get_mut(&file_key) {
                     let delta = progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
                     self.bytes_downloaded += delta;
-                    // Also update item bytes
-                    if let Some(item) =
-                        self.items.iter_mut().find(|i| i.identifier == item_id)
-                    {
-                        item.bytes_downloaded += delta;
-                    }
                     fp.bytes_downloaded = progress.bytes_downloaded;
                 }
             }
             DownloadStatus::Complete => {
-                if let Some(fp) = self.active_files.remove(&progress.file_name) {
+                if let Some(fp) = self.active_files.remove(&file_key) {
                     let delta = progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
                     self.bytes_downloaded += delta;
                 }
@@ -263,11 +277,11 @@ impl TuiState {
                 self.completed_files.push(progress.file_name);
             }
             DownloadStatus::Skipped(_) => {
-                self.active_files.remove(&progress.file_name);
+                self.active_files.remove(&file_key);
                 self.files_skipped += 1;
             }
             DownloadStatus::Failed(msg) => {
-                self.active_files.remove(&progress.file_name);
+                self.active_files.remove(&file_key);
                 self.files_failed += 1;
                 self.failed_files.push((progress.file_name, msg.clone()));
             }

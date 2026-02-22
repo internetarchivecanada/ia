@@ -210,6 +210,7 @@ pub async fn download_file(
     };
 
     let mut bytes_downloaded = resume_from.unwrap_or(0);
+    let mut last_progress_at = bytes_downloaded;
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -217,14 +218,18 @@ pub async fn download_file(
         output.write_all(&chunk).await?;
         bytes_downloaded += chunk.len() as u64;
 
+        // Rate-limit progress updates to every 256KB to reduce lock contention
         if let Some(p) = progress {
-            p(DownloadProgress {
-                identifier: identifier.to_string(),
-                file_name: file.name.clone(),
-                bytes_downloaded,
-                total_bytes: file.size,
-                status: DownloadStatus::Downloading,
-            });
+            if bytes_downloaded - last_progress_at >= 256 * 1024 {
+                p(DownloadProgress {
+                    identifier: identifier.to_string(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded,
+                    total_bytes: file.size,
+                    status: DownloadStatus::Downloading,
+                });
+                last_progress_at = bytes_downloaded;
+            }
         }
     }
 
