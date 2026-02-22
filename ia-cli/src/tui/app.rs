@@ -17,6 +17,16 @@ use ia_core::IaClient;
 
 use super::ui;
 
+/// Guard that restores the terminal on drop (even during panic).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+    }
+}
+
 /// Per-item download state for batch tracking.
 #[derive(Debug, Clone)]
 pub struct ItemState {
@@ -262,15 +272,28 @@ pub async fn run_tui(
     identifiers: &[String],
     opts: &DownloadOpts,
     semaphore: Arc<Semaphore>,
+    items_concurrency: usize,
 ) -> anyhow::Result<()> {
+    // Check if stdout is a TTY — raw mode requires an interactive terminal
+    if !atty::is(atty::Stream::Stdout) {
+        anyhow::bail!(
+            "Dashboard mode requires an interactive terminal.\n\
+             Hint: remove --dashboard when piping output or running without a TTY."
+        );
+    }
+
     let state = Arc::new(Mutex::new(TuiState::new(identifiers)));
 
-    // Set up terminal
+    // Set up terminal — the guard ensures cleanup even on panic
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Semaphore to limit how many items download concurrently
+    let item_sem = Arc::new(Semaphore::new(items_concurrency));
 
     // Spawn download tasks for each item
     let mut handles = Vec::new();
@@ -279,9 +302,13 @@ pub async fn run_tui(
         let id = identifier.clone();
         let opts = opts.clone();
         let sem = Arc::clone(&semaphore);
+        let isem = Arc::clone(&item_sem);
         let download_state = state.clone();
 
         let handle = tokio::spawn(async move {
+            // Wait for an item slot before starting this item's download
+            let _item_permit = isem.acquire().await.unwrap();
+
             let progress_state = download_state.clone();
             let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
                 Some(Arc::new(move |p: DownloadProgress| {
@@ -316,6 +343,7 @@ pub async fn run_tui(
 
     // Main UI loop
     let tick_rate = Duration::from_millis(100);
+    let mut input_disabled = false;
 
     loop {
         // Draw
@@ -328,32 +356,50 @@ pub async fn run_tui(
             }
         }
 
-        // Handle input
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                let mut s = state.lock().unwrap();
-                match key.code {
-                    KeyCode::Char('q') => {
-                        s.quit_requested = true;
+        // Handle input — if event system fails, continue without input
+        if !input_disabled {
+            match event::poll(tick_rate) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) => {
+                        let mut s = state.lock().unwrap();
+                        match key.code {
+                            KeyCode::Char('q') => {
+                                s.quit_requested = true;
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                s.quit_requested = true;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                s.scroll_offset = s.scroll_offset.saturating_add(1);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                s.scroll_offset = s.scroll_offset.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        s.quit_requested = true;
+                    Ok(_) => {}
+                    Err(_) => {
+                        input_disabled = true;
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        s.scroll_offset = s.scroll_offset.saturating_add(1);
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        s.scroll_offset = s.scroll_offset.saturating_sub(1);
-                    }
-                    _ => {}
+                },
+                Ok(false) => {}
+                Err(_) => {
+                    // Input reader failed — continue rendering without input.
+                    // Downloads will run to completion; the TUI exits automatically.
+                    input_disabled = true;
+                    tokio::time::sleep(tick_rate).await;
                 }
             }
+        } else {
+            tokio::time::sleep(tick_rate).await;
         }
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    std::io::stdout().execute(LeaveAlternateScreen)?;
+    // Guard handles terminal cleanup (disable_raw_mode + LeaveAlternateScreen) on drop.
+    drop(_guard);
 
     // Wait for all downloads to finish and collect results
     let mut total_downloaded = 0usize;

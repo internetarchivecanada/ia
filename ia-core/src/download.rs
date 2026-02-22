@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -512,7 +512,11 @@ pub type OnItemStartFn = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
 /// Callback invoked when an item finishes downloading.
 pub type OnItemCompleteFn = Arc<dyn Fn(&ItemDownloadResult) + Send + Sync>;
 
-/// Download multiple items concurrently, sharing a single semaphore for all file transfers.
+/// Download multiple items with controlled concurrency.
+///
+/// `items_concurrency` limits how many items download simultaneously.
+/// The `semaphore` separately limits total concurrent file transfers across all active items.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_batch(
     client: &IaClient,
     identifiers: Vec<String>,
@@ -521,56 +525,50 @@ pub async fn download_batch(
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
     on_item_start: Option<OnItemStartFn>,
     on_item_complete: Option<OnItemCompleteFn>,
+    items_concurrency: usize,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let items_total = identifiers.len();
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut handles = Vec::new();
 
-    for identifier in identifiers {
-        let client = client.clone();
-        let opts = opts.clone();
-        let semaphore = Arc::clone(&semaphore);
-        let progress = progress.clone();
-        let counter = Arc::clone(&counter);
-        let on_item_start = on_item_start.clone();
-        let on_item_complete = on_item_complete.clone();
+    let item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>> =
+        stream::iter(identifiers)
+            .map(|identifier| {
+                let client = client.clone();
+                let opts = opts.clone();
+                let semaphore = Arc::clone(&semaphore);
+                let progress = progress.clone();
+                let counter = Arc::clone(&counter);
+                let on_item_start = on_item_start.clone();
+                let on_item_complete = on_item_complete.clone();
 
-        let handle = tokio::spawn(async move {
-            let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if let Some(ref cb) = on_item_start {
-                cb(&identifier, idx, items_total);
-            }
-            info!(item = %identifier, idx, "starting item download");
-
-            match download_item(&client, &identifier, &opts, semaphore, progress).await {
-                Ok(result) => {
-                    if let Some(ref cb) = on_item_complete {
-                        cb(&result);
+                async move {
+                    let idx =
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if let Some(ref cb) = on_item_start {
+                        cb(&identifier, idx, items_total);
                     }
-                    (idx, Ok(result))
+                    info!(item = %identifier, idx, "starting item download");
+
+                    match download_item(&client, &identifier, &opts, semaphore, progress)
+                        .await
+                    {
+                        Ok(result) => {
+                            if let Some(ref cb) = on_item_complete {
+                                cb(&result);
+                            }
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            warn!(identifier = %identifier, error = %e, "item download failed");
+                            Err((identifier, e))
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(identifier = %identifier, error = %e, "item download failed");
-                    (idx, Err((identifier, e)))
-                }
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    let mut indexed_results = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok((idx, result)) => indexed_results.push((idx, result)),
-            Err(e) => indexed_results.push((0, Err(("unknown".to_string(), IaError::Config(format!("task panic: {e}")))))),
-        }
-    }
-
-    // Sort by completion order (idx)
-    indexed_results.sort_by_key(|(idx, _)| *idx);
-    let item_results: Vec<_> = indexed_results.into_iter().map(|(_, r)| r).collect();
+            })
+            .buffer_unordered(items_concurrency)
+            .collect()
+            .await;
 
     collect_batch_results(items_total, item_results, start.elapsed())
 }

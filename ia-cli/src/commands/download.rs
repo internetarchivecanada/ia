@@ -73,6 +73,10 @@ pub struct DownloadArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
+    /// Number of items to download concurrently (for batch/search)
+    #[arg(long, default_value = "2")]
+    pub items: usize,
+
     /// Full-screen dashboard mode
     #[arg(long)]
     pub dashboard: bool,
@@ -141,6 +145,17 @@ pub async fn run(
 ) -> Result<()> {
     let mut identifiers = collect_identifiers(&args, client).await?;
 
+    // Detect file paths passed as identifiers and suggest --itemlist
+    for id in &identifiers {
+        if std::path::Path::new(id).exists() && (id.contains('/') || id.contains('\\')) {
+            bail!(
+                "\"{}\" looks like a file path. Did you mean:\n  ia download --itemlist {}",
+                id,
+                id
+            );
+        }
+    }
+
     // If --retry-failed, read joblog and use failed items as identifiers
     if retry_failed {
         if let Some(ref path) = joblog_path {
@@ -205,7 +220,14 @@ pub async fn run(
     // Dashboard mode
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore)).await;
+        return crate::tui::run_tui(
+            client,
+            &identifiers,
+            &opts,
+            Arc::clone(&semaphore),
+            args.items,
+        )
+        .await;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -302,6 +324,7 @@ pub async fn run(
         progress,
         on_item_start,
         on_item_complete,
+        args.items,
     )
     .await;
 
