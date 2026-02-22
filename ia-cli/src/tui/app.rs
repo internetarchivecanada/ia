@@ -176,13 +176,14 @@ impl TuiState {
         let item_id = progress.identifier.clone();
         if let Some(item) = self.items.iter_mut().find(|i| i.identifier == item_id) {
             match &progress.status {
-                DownloadStatus::Starting => {
+                DownloadStatus::Enumerated { files_count, .. } => {
                     if item.status == ItemStatus::Pending {
                         item.status = ItemStatus::Downloading;
                         item.started_at = Instant::now();
                     }
-                    item.files_total += 1;
+                    item.files_total = *files_count;
                 }
+                DownloadStatus::Starting => {}
                 DownloadStatus::Downloading => {
                     // bytes delta handled below at global level
                 }
@@ -207,6 +208,14 @@ impl TuiState {
 
         // Update global state
         match &progress.status {
+            DownloadStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                // Set totals upfront so the progress bar has a stable denominator
+                self.files_total += files_count;
+                self.bytes_total += bytes_total;
+            }
             DownloadStatus::Starting => {
                 self.active_files.insert(
                     progress.file_name.clone(),
@@ -217,10 +226,7 @@ impl TuiState {
                         started_at: Instant::now(),
                     },
                 );
-                if let Some(total) = progress.total_bytes {
-                    self.bytes_total += total;
-                }
-                self.files_total += 1;
+                // bytes_total and files_total already set by Enumerated
             }
             DownloadStatus::Downloading => {
                 if let Some(fp) = self.active_files.get_mut(&progress.file_name) {
@@ -246,11 +252,19 @@ impl TuiState {
             DownloadStatus::Skipped(_) => {
                 self.active_files.remove(&progress.file_name);
                 self.files_skipped += 1;
+                // Count skipped file's bytes as "done" so progress moves forward
+                if let Some(total) = progress.total_bytes {
+                    self.bytes_downloaded += total;
+                }
             }
             DownloadStatus::Failed(msg) => {
                 self.active_files.remove(&progress.file_name);
                 self.files_failed += 1;
                 self.failed_files.push((progress.file_name, msg.clone()));
+                // Count failed file's bytes as "done" so progress moves forward
+                if let Some(total) = progress.total_bytes {
+                    self.bytes_downloaded += total;
+                }
             }
             DownloadStatus::Verifying => {}
         }

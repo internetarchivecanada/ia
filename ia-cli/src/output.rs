@@ -88,7 +88,7 @@ impl DownloadDisplay {
                     ));
                 }
             }
-            DownloadStatus::Verifying => {}
+            DownloadStatus::Enumerated { .. } | DownloadStatus::Verifying => {}
         }
     }
 
@@ -267,7 +267,7 @@ impl BatchDisplay {
                     ));
                 }
             }
-            DownloadStatus::Verifying => {}
+            DownloadStatus::Enumerated { .. } | DownloadStatus::Verifying => {}
         }
     }
 
