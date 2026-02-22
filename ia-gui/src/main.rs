@@ -41,6 +41,33 @@ fn main() -> anyhow::Result<()> {
     app_backend.setup_export(&app);
     app_backend.setup_metadata_fetch(&app, runtime.handle());
 
+    // Load download history from job log
+    let joblog_path = backend::history::default_joblog_path();
+    {
+        let history = backend::history::load_history(&joblog_path);
+        app.set_download_history(slint::ModelRc::new(slint::VecModel::from(history)));
+    }
+
+    // Wire retry-failed and clear-history callbacks
+    {
+        let dm = std::sync::Arc::clone(&download_manager);
+        let path = joblog_path.clone();
+        let weak = app.as_weak();
+        app.on_downloads_retry_failed(move || {
+            let failed = backend::history::failed_identifiers(&path);
+            for id in &failed {
+                dm.queue_download(id);
+            }
+        });
+
+        let weak2 = weak.clone();
+        app.on_downloads_clear_history(move || {
+            if let Some(app) = weak2.upgrade() {
+                app.set_download_history(slint::ModelRc::new(slint::VecModel::default()));
+            }
+        });
+    }
+
     // Wire download button
     {
         let dm = std::sync::Arc::clone(&download_manager);

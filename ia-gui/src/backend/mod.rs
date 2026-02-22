@@ -1,5 +1,6 @@
 pub mod downloads;
 pub mod export;
+pub mod history;
 pub mod metadata;
 pub mod search;
 pub mod state;
