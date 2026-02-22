@@ -1,4 +1,5 @@
 pub mod export;
+pub mod metadata;
 pub mod search;
 pub mod state;
 pub mod thumbnails;

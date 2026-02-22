@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     // Wire up backends
     app_backend.setup_search(&app, runtime.handle());
     app_backend.setup_export(&app);
-    app_backend.setup_item_detail(&app);
+    app_backend.setup_metadata_fetch(&app, runtime.handle());
 
     app.run()?;
     Ok(())
