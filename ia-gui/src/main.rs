@@ -84,6 +84,19 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Wire "Add to List" from item detail — adds to "Favorites" list
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_item_detail_add_to_list(move |identifier| {
+            let id = identifier.to_string();
+            let _ = lm.add_identifiers("Favorites", &[id]);
+            if let Some(app) = weak.upgrade() {
+                refresh_lists(&app, &lm);
+            }
+        });
+    }
+
     // Wire list callbacks
     {
         let lm = std::sync::Arc::clone(&list_manager);
@@ -243,9 +256,15 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Track which downloads have already been added to the "Downloaded" list
+    let tracked_downloads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     // Timer to poll download progress and update UI
     {
         let dm = std::sync::Arc::clone(&download_manager);
+        let lm = std::sync::Arc::clone(&list_manager);
+        let tracked = std::sync::Arc::clone(&tracked_downloads);
         let weak = app.as_weak();
         let timer = slint::Timer::default();
         timer.start(
@@ -253,6 +272,23 @@ fn main() -> anyhow::Result<()> {
             std::time::Duration::from_millis(500),
             move || {
                 let downloads = dm.get_downloads();
+
+                // Auto-add completed downloads to "Downloaded" list
+                {
+                    let mut tracked = tracked.lock().unwrap();
+                    for d in &downloads {
+                        if d.status == backend::downloads::DownloadJobStatus::Complete
+                            && !tracked.contains(&d.identifier)
+                        {
+                            let _ = lm.add_identifiers("Downloaded", &[d.identifier.clone()]);
+                            tracked.insert(d.identifier.clone());
+                            if let Some(app) = weak.upgrade() {
+                                refresh_lists(&app, &lm);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(app) = weak.upgrade() {
                     let active: Vec<ActiveDownloadData> = downloads
                         .iter()
