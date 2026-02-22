@@ -46,6 +46,9 @@ export component AppWindow inherits Window {
     // Settings state
     in-out property <SettingsData> settings;
 
+    // Status bar state
+    in property <string> status-bar-text: "Ready";
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
@@ -69,68 +72,93 @@ export component AppWindow inherits Window {
     callback settings-save(SettingsData);
     callback settings-reset();
 
-    HorizontalLayout {
-        sidebar := Sidebar {}
+    VerticalLayout {
+        HorizontalLayout {
+            vertical-stretch: 1;
 
-        Rectangle {
-            background: white;
-            horizontal-stretch: 1;
+            sidebar := Sidebar {}
 
-            // Main page content (hidden when item detail is shown)
-            if !showing-item-detail && current-page == Page.search : SearchPage {
-                results: search-results;
-                status-text: search-status;
-                searching: search-in-progress;
-                search-requested(query, backend) => { root.search-requested(query, backend); }
-                result-clicked(index) => { root.search-result-clicked(index); }
-                export-requested(format) => { root.search-export-requested(format); }
-            }
-            if !showing-item-detail && current-page == Page.downloads : DownloadsPage {
-                active-downloads: root.active-downloads;
-                history: root.download-history;
-                retry-failed => { root.downloads-retry-failed(); }
-                clear-history => { root.downloads-clear-history(); }
-            }
-            if !showing-item-detail && current-page == Page.lists : ListsPage {
-                lists: root.lists;
-                selected-list-name: root.selected-list-name;
-                selected-list-items: root.selected-list-items;
-                create-list(name) => { root.lists-create(name); }
-                delete-list(name) => { root.lists-delete(name); }
-                select-list(name) => { root.lists-select(name); }
-                import-list(name) => { root.lists-import(name); }
-                download-list(name) => { root.lists-download(name); }
-                export-list(name) => { root.lists-export(name); }
-                list-item-clicked(id) => { root.lists-item-clicked(id); }
-                remove-item(list-name, id) => { root.lists-remove-item(list-name, id); }
-            }
-            if !showing-item-detail && current-page == Page.metadata : MetadataPage {
-                item: root.metadata-item;
-                files: root.metadata-files;
-                loading: root.metadata-loading;
-                has-result: root.metadata-has-result;
-                fetch-requested(id) => { root.metadata-fetch-requested(id); }
-                download-clicked(id) => { root.metadata-download(id); }
-                add-to-list-clicked(id) => { root.metadata-add-to-list(id); }
-                save-json-clicked(id, json) => { root.metadata-save-json(id, json); }
-            }
-            if !showing-item-detail && current-page == Page.settings : SettingsPage {
-                settings <=> root.settings;
-                save-settings(s) => { root.settings-save(s); }
-                reset-defaults => { root.settings-reset(); }
-            }
+            Rectangle {
+                background: white;
+                horizontal-stretch: 1;
 
-            // Item detail overlay
-            if showing-item-detail : ItemDetailPage {
-                item: item-detail;
-                files: item-detail-files;
-                loading: item-detail-loading;
-                back-clicked => {
-                    root.showing-item-detail = false;
-                    root.item-detail-back();
+                // Main page content (hidden when item detail is shown)
+                if !showing-item-detail && current-page == Page.search : SearchPage {
+                    results: search-results;
+                    status-text: search-status;
+                    searching: search-in-progress;
+                    search-requested(query, backend) => { root.search-requested(query, backend); }
+                    result-clicked(index) => { root.search-result-clicked(index); }
+                    export-requested(format) => { root.search-export-requested(format); }
                 }
-                download-clicked(id) => { root.item-detail-download(id); }
-                add-to-list-clicked(id) => { root.item-detail-add-to-list(id); }
+                if !showing-item-detail && current-page == Page.downloads : DownloadsPage {
+                    active-downloads: root.active-downloads;
+                    history: root.download-history;
+                    retry-failed => { root.downloads-retry-failed(); }
+                    clear-history => { root.downloads-clear-history(); }
+                }
+                if !showing-item-detail && current-page == Page.lists : ListsPage {
+                    lists: root.lists;
+                    selected-list-name: root.selected-list-name;
+                    selected-list-items: root.selected-list-items;
+                    create-list(name) => { root.lists-create(name); }
+                    delete-list(name) => { root.lists-delete(name); }
+                    select-list(name) => { root.lists-select(name); }
+                    import-list(name) => { root.lists-import(name); }
+                    download-list(name) => { root.lists-download(name); }
+                    export-list(name) => { root.lists-export(name); }
+                    list-item-clicked(id) => { root.lists-item-clicked(id); }
+                    remove-item(list-name, id) => { root.lists-remove-item(list-name, id); }
+                }
+                if !showing-item-detail && current-page == Page.metadata : MetadataPage {
+                    item: root.metadata-item;
+                    files: root.metadata-files;
+                    loading: root.metadata-loading;
+                    has-result: root.metadata-has-result;
+                    fetch-requested(id) => { root.metadata-fetch-requested(id); }
+                    download-clicked(id) => { root.metadata-download(id); }
+                    add-to-list-clicked(id) => { root.metadata-add-to-list(id); }
+                    save-json-clicked(id, json) => { root.metadata-save-json(id, json); }
+                }
+                if !showing-item-detail && current-page == Page.settings : SettingsPage {
+                    settings <=> root.settings;
+                    save-settings(s) => { root.settings-save(s); }
+                    reset-defaults => { root.settings-reset(); }
+                }
+
+                // Item detail overlay
+                if showing-item-detail : ItemDetailPage {
+                    item: item-detail;
+                    files: item-detail-files;
+                    loading: item-detail-loading;
+                    back-clicked => {
+                        root.showing-item-detail = false;
+                        root.item-detail-back();
+                    }
+                    download-clicked(id) => { root.item-detail-download(id); }
+                    add-to-list-clicked(id) => { root.item-detail-add-to-list(id); }
+                }
+            }
+        }
+
+        // Status bar
+        Rectangle {
+            height: 28px;
+            background: #f9fafb;
+            border-color: #e5e7eb;
+            border-width: 1px;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                alignment: start;
+
+                Text {
+                    text: status-bar-text;
+                    font-size: 12px;
+                    color: #6b7280;
+                    vertical-alignment: center;
+                }
             }
         }
     }

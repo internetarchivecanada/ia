@@ -60,6 +60,15 @@ fn main() -> anyhow::Result<()> {
     // Load initial lists
     refresh_lists(&app, &list_manager);
 
+    // Set initial status bar text
+    {
+        let list_count = list_manager.list_names().len();
+        let host = &gui_settings.host;
+        app.set_status_bar_text(slint::SharedString::from(format!(
+            "Ready \u{00b7} {host} \u{00b7} 0 active downloads \u{00b7} {list_count} lists"
+        )));
+    }
+
     // Wire retry-failed and clear-history callbacks
     {
         let dm = std::sync::Arc::clone(&download_manager);
@@ -365,12 +374,13 @@ fn main() -> anyhow::Result<()> {
     let tracked_downloads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-    // Timer to poll download progress and update UI
+    // Timer to poll download progress and update UI + status bar
     {
         let dm = std::sync::Arc::clone(&download_manager);
         let lm = std::sync::Arc::clone(&list_manager);
         let tracked = std::sync::Arc::clone(&tracked_downloads);
         let weak = app.as_weak();
+        let host = gui_settings.host.clone();
         let timer = slint::Timer::default();
         timer.start(
             slint::TimerMode::Repeated,
@@ -429,6 +439,28 @@ fn main() -> anyhow::Result<()> {
                         })
                         .collect();
                     app.set_active_downloads(slint::ModelRc::new(slint::VecModel::from(active)));
+
+                    // Update status bar text
+                    let active_count = downloads
+                        .iter()
+                        .filter(|d| {
+                            matches!(
+                                d.status,
+                                backend::downloads::DownloadJobStatus::Queued
+                                    | backend::downloads::DownloadJobStatus::Downloading
+                            )
+                        })
+                        .count();
+                    let list_count = lm.list_names().len();
+                    let status = format!(
+                        "Ready \u{00b7} {} \u{00b7} {} active download{} \u{00b7} {} list{}",
+                        host,
+                        active_count,
+                        if active_count == 1 { "" } else { "s" },
+                        list_count,
+                        if list_count == 1 { "" } else { "s" },
+                    );
+                    app.set_status_bar_text(slint::SharedString::from(status));
                 }
             },
         );
