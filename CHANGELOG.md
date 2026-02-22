@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-02-22
+
+### Added
+
+- **GUI desktop app** (`ia-gui`) — Slint-based desktop application for browsing the Internet Archive
+  - **Search page** with scrape/advanced/FTS backends, result table, thumbnail support, and export (JSONL/CSV/identifiers)
+  - **Item detail page** with metadata summary, files tab with size/format info, and raw JSON viewer
+  - **Downloads page** with active download progress, file counts, and download history from job log
+  - **Lists page** with create/delete/select lists, add/remove items, download all, export
+  - **Metadata browse page** with identifier lookup, file listing, JSON viewer, and save-to-disk
+  - **Settings page** with connection config (host, UA suffix, insecure) and download preferences (directory, concurrency, job log)
+  - **Status bar** showing connection host, active download count, and list count (updates in real-time)
+  - **Sidebar navigation** with page routing between all sections
+  - Cross-section integration: "Add to List" from search/metadata, auto-track completed downloads
+  - Async backend infrastructure with tokio runtime and IaClient integration
+  - Persistent settings (JSON) and list storage
+
+### Fixed
+
+- Clippy warnings for Rust 1.93 (io_other_error, cloned_ref_to_slice_refs)
+
 ## [0.2.0] - 2026-02-21
 
 ### Added
@@ -44,5 +65,6 @@ All notable changes to this project will be documented in this file.
 - Configuration file support (ia.ini compatible)
 - Retry with exponential backoff via reqwest-middleware
 
+[0.3.0]: https://github.com/jjjake/ia/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jjjake/ia/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jjjake/ia/releases/tag/v0.1.0

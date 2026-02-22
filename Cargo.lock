@@ -2689,7 +2689,7 @@ dependencies = [
 
 [[package]]
 name = "ia-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "ia-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "backon",
@@ -2742,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "ia-gui"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
