@@ -59,6 +59,11 @@ pub struct DownloadProgress {
 /// Status of a file download.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadStatus {
+    /// Item metadata fetched; reports total file count and bytes for the item.
+    Enumerated {
+        files_count: usize,
+        bytes_total: u64,
+    },
     Starting,
     Downloading,
     Verifying,
@@ -406,6 +411,21 @@ pub async fn download_item(
 
     // Clone file metadata for owned access in tasks
     let files_owned: Vec<crate::types::FileMetadata> = files.into_iter().cloned().collect();
+
+    // Report total file count and bytes upfront so progress tracking has a stable denominator
+    if let Some(ref p) = progress {
+        let enumerated_bytes: u64 = files_owned.iter().filter_map(|f| f.size).sum();
+        p(DownloadProgress {
+            identifier: identifier.to_string(),
+            file_name: String::new(),
+            bytes_downloaded: 0,
+            total_bytes: Some(enumerated_bytes),
+            status: DownloadStatus::Enumerated {
+                files_count: files_total,
+                bytes_total: enumerated_bytes,
+            },
+        });
+    }
 
     // Concurrent download with shared semaphore
     let mut handles = Vec::new();
