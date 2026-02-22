@@ -1,0 +1,270 @@
+import { VerticalBox, HorizontalBox, LineEdit, Button } from "std-widgets.slint";
+import { ItemDetailData, FileEntryData } from "item-detail.slint";
+
+export component MetadataPage inherits Rectangle {
+    in property <ItemDetailData> item;
+    in property <[FileEntryData]> files: [];
+    in property <bool> loading: false;
+    in property <bool> has-result: false;
+
+    callback fetch-requested(/* identifier */ string);
+    callback download-clicked(/* identifier */ string);
+    callback add-to-list-clicked(/* identifier */ string);
+    callback save-json-clicked(/* identifier */ string, /* json */ string);
+
+    VerticalBox {
+        padding: 24px;
+        spacing: 16px;
+
+        Text {
+            text: "Metadata";
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        // Identifier input with Fetch button
+        HorizontalBox {
+            spacing: 8px;
+
+            id-input := LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: "Enter item identifier...";
+                accepted => {
+                    if self.text != "" {
+                        root.fetch-requested(self.text);
+                    }
+                }
+            }
+
+            Button {
+                text: loading ? "Fetching..." : "Fetch";
+                enabled: !loading && id-input.text != "";
+                clicked => {
+                    root.fetch-requested(id-input.text);
+                }
+            }
+        }
+
+        // Loading indicator
+        if loading : Text {
+            text: "Loading metadata...";
+            font-size: 14px;
+            color: #6b7280;
+            horizontal-alignment: center;
+        }
+
+        // Result display
+        if has-result && !loading : VerticalBox {
+            spacing: 16px;
+            vertical-stretch: 1;
+
+            // Summary header
+            HorizontalBox {
+                spacing: 16px;
+
+                // Thumbnail placeholder
+                Rectangle {
+                    width: 100px;
+                    height: 100px;
+                    background: #e5e7eb;
+                    border-radius: 8px;
+
+                    Text {
+                        text: "\u{1F4E6}";
+                        font-size: 36px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    horizontal-stretch: 1;
+
+                    Text {
+                        text: item.title != "" ? item.title : item.identifier;
+                        font-size: 20px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: item.identifier;
+                        font-size: 13px;
+                        color: #6b7280;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+
+                        if item.mediatype != "" : Text {
+                            text: item.mediatype;
+                            font-size: 13px;
+                            color: #6b7280;
+                        }
+                        if item.file-count > 0 : Text {
+                            text: item.file-count + " files";
+                            font-size: 13px;
+                            color: #6b7280;
+                        }
+                        if item.total-size != "" : Text {
+                            text: item.total-size;
+                            font-size: 13px;
+                            color: #6b7280;
+                        }
+                    }
+                    if item.creator != "" : Text {
+                        text: "Creator: " + item.creator;
+                        font-size: 13px;
+                        color: #6b7280;
+                    }
+                    if item.date != "" : Text {
+                        text: "Date: " + item.date;
+                        font-size: 13px;
+                        color: #6b7280;
+                    }
+                }
+            }
+
+            // Action buttons
+            HorizontalBox {
+                spacing: 8px;
+                alignment: start;
+
+                Button {
+                    text: "Download";
+                    clicked => { root.download-clicked(item.identifier); }
+                }
+                Button {
+                    text: "Add to List";
+                    clicked => { root.add-to-list-clicked(item.identifier); }
+                }
+                Button {
+                    text: "Save JSON";
+                    clicked => { root.save-json-clicked(item.identifier, item.json-text); }
+                }
+            }
+
+            // Files section
+            if files.length > 0 : VerticalBox {
+                spacing: 4px;
+
+                Text {
+                    text: "Files (" + files.length + ")";
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+
+                // Column headers
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: "Name";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #6b7280;
+                        horizontal-stretch: 3;
+                    }
+                    Text {
+                        text: "Format";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #6b7280;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "Size";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: #6b7280;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: right;
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: #e5e7eb;
+                }
+            }
+
+            // Scrollable files + JSON
+            Flickable {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    spacing: 0px;
+
+                    // File rows
+                    for file in files : Rectangle {
+                        height: 28px;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: file.name;
+                                font-size: 12px;
+                                horizontal-stretch: 3;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: file.format;
+                                font-size: 12px;
+                                color: #6b7280;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: file.size;
+                                font-size: 12px;
+                                color: #6b7280;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+
+                    // Separator before JSON
+                    if item.json-text != "" : Rectangle {
+                        height: 1px;
+                        background: #e5e7eb;
+                    }
+
+                    // Raw JSON
+                    if item.json-text != "" : VerticalLayout {
+                        spacing: 4px;
+                        padding-top: 12px;
+
+                        Text {
+                            text: "Raw JSON";
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+
+                        Rectangle {
+                            background: #f9fafb;
+                            border-radius: 4px;
+
+                            Text {
+                                text: item.json-text;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Empty state
+        if !has-result && !loading : Text {
+            text: "Enter an item identifier above to browse its metadata.";
+            font-size: 14px;
+            color: #6b7280;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            vertical-stretch: 1;
+        }
+    }
+}

@@ -3,6 +3,7 @@ import { SearchPage, SearchResultData } from "pages/search.slint";
 import { ItemDetailPage, ItemDetailData, FileEntryData } from "pages/item-detail.slint";
 import { DownloadsPage, ActiveDownloadData, DownloadHistoryData } from "pages/downloads.slint";
 import { ListsPage, ListSummaryData, ListItemData } from "pages/lists.slint";
+import { MetadataPage } from "pages/metadata.slint";
 
 export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData, ListSummaryData, ListItemData }
 
@@ -35,6 +36,12 @@ export component AppWindow inherits Window {
     in-out property <string> selected-list-name: "";
     in property <[ListItemData]> selected-list-items: [];
 
+    // Metadata browse state
+    in property <ItemDetailData> metadata-item;
+    in property <[FileEntryData]> metadata-files: [];
+    in property <bool> metadata-loading: false;
+    in property <bool> metadata-has-result: false;
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
@@ -51,6 +58,10 @@ export component AppWindow inherits Window {
     callback lists-export(/* name */ string);
     callback lists-item-clicked(/* identifier */ string);
     callback lists-remove-item(/* list-name */ string, /* identifier */ string);
+    callback metadata-fetch-requested(/* identifier */ string);
+    callback metadata-download(/* identifier */ string);
+    callback metadata-add-to-list(/* identifier */ string);
+    callback metadata-save-json(/* identifier */ string, /* json */ string);
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -87,11 +98,15 @@ export component AppWindow inherits Window {
                 list-item-clicked(id) => { root.lists-item-clicked(id); }
                 remove-item(list-name, id) => { root.lists-remove-item(list-name, id); }
             }
-            if !showing-item-detail && current-page == Page.metadata : Text {
-                text: "Metadata";
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            if !showing-item-detail && current-page == Page.metadata : MetadataPage {
+                item: root.metadata-item;
+                files: root.metadata-files;
+                loading: root.metadata-loading;
+                has-result: root.metadata-has-result;
+                fetch-requested(id) => { root.metadata-fetch-requested(id); }
+                download-clicked(id) => { root.metadata-download(id); }
+                add-to-list-clicked(id) => { root.metadata-add-to-list(id); }
+                save-json-clicked(id, json) => { root.metadata-save-json(id, json); }
             }
             if !showing-item-detail && current-page == Page.settings : Text {
                 text: "Settings";

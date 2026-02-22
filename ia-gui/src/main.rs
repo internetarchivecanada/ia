@@ -256,6 +256,80 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Wire metadata page
+    {
+        let weak = app.as_weak();
+        let client = std::sync::Arc::clone(&app_backend.client);
+        let handle = runtime.handle().clone();
+        app.on_metadata_fetch_requested(move |identifier| {
+            let identifier = identifier.to_string();
+            let weak = weak.clone();
+            let client = std::sync::Arc::clone(&client);
+            if let Some(app) = weak.upgrade() {
+                app.set_metadata_loading(true);
+                app.set_metadata_has_result(false);
+            }
+            let weak2 = weak.clone();
+            handle.spawn(async move {
+                match ia_core::metadata::get(&client, &identifier).await {
+                    Ok(meta) => {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = weak2.upgrade() {
+                                let result =
+                                    backend::metadata::fetch_metadata_from_item(&meta);
+                                app.set_metadata_item(result.detail);
+                                app.set_metadata_files(slint::ModelRc::new(
+                                    slint::VecModel::from(result.files),
+                                ));
+                                app.set_metadata_loading(false);
+                                app.set_metadata_has_result(true);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to fetch metadata for {}: {}", identifier, e);
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = weak2.upgrade() {
+                                app.set_metadata_loading(false);
+                            }
+                        });
+                    }
+                }
+            });
+        });
+    }
+    {
+        let dm = std::sync::Arc::clone(&download_manager);
+        app.on_metadata_download(move |identifier| {
+            dm.queue_download(&identifier);
+        });
+    }
+    {
+        let lm = std::sync::Arc::clone(&list_manager);
+        let weak = app.as_weak();
+        app.on_metadata_add_to_list(move |identifier| {
+            let id = identifier.to_string();
+            let _ = lm.add_identifiers("Favorites", &[id]);
+            if let Some(app) = weak.upgrade() {
+                refresh_lists(&app, &lm);
+            }
+        });
+    }
+    {
+        app.on_metadata_save_json(move |identifier, json| {
+            let id = identifier.to_string();
+            let json = json.to_string();
+            let save_dir = dirs::download_dir()
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let path = save_dir.join(format!("{id}-metadata.json"));
+            match std::fs::write(&path, &json) {
+                Ok(()) => tracing::info!("Saved metadata to {}", path.display()),
+                Err(e) => tracing::error!("Failed to save metadata: {}", e),
+            }
+        });
+    }
+
     // Track which downloads have already been added to the "Downloaded" list
     let tracked_downloads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
