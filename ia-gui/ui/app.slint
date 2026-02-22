@@ -4,8 +4,9 @@ import { ItemDetailPage, ItemDetailData, FileEntryData } from "pages/item-detail
 import { DownloadsPage, ActiveDownloadData, DownloadHistoryData } from "pages/downloads.slint";
 import { ListsPage, ListSummaryData, ListItemData } from "pages/lists.slint";
 import { MetadataPage } from "pages/metadata.slint";
+import { SettingsPage, SettingsData } from "pages/settings.slint";
 
-export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData, ListSummaryData, ListItemData }
+export { Page, SearchResultData, ItemDetailData, FileEntryData, ActiveDownloadData, DownloadHistoryData, ListSummaryData, ListItemData, SettingsData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -42,6 +43,9 @@ export component AppWindow inherits Window {
     in property <bool> metadata-loading: false;
     in property <bool> metadata-has-result: false;
 
+    // Settings state
+    in-out property <SettingsData> settings;
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
@@ -62,6 +66,8 @@ export component AppWindow inherits Window {
     callback metadata-download(/* identifier */ string);
     callback metadata-add-to-list(/* identifier */ string);
     callback metadata-save-json(/* identifier */ string, /* json */ string);
+    callback settings-save(SettingsData);
+    callback settings-reset();
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -108,11 +114,10 @@ export component AppWindow inherits Window {
                 add-to-list-clicked(id) => { root.metadata-add-to-list(id); }
                 save-json-clicked(id, json) => { root.metadata-save-json(id, json); }
             }
-            if !showing-item-detail && current-page == Page.settings : Text {
-                text: "Settings";
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            if !showing-item-detail && current-page == Page.settings : SettingsPage {
+                settings <=> root.settings;
+                save-settings(s) => { root.settings-save(s); }
+                reset-defaults => { root.settings-reset(); }
             }
 
             // Item detail overlay

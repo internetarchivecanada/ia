@@ -4,6 +4,7 @@ pub mod history;
 pub mod lists;
 pub mod metadata;
 pub mod search;
+pub mod settings;
 pub mod state;
 pub mod thumbnails;
 

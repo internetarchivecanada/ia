@@ -41,6 +41,10 @@ fn main() -> anyhow::Result<()> {
     // Create and run Slint app
     let app = AppWindow::new()?;
 
+    // Load and apply settings
+    let gui_settings = backend::settings::GuiSettings::load();
+    apply_settings_to_ui(&app, &gui_settings);
+
     // Wire up backends
     app_backend.setup_search(&app, runtime.handle());
     app_backend.setup_export(&app);
@@ -330,6 +334,33 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Wire settings callbacks
+    {
+        app.on_settings_save(move |s| {
+            let settings = backend::settings::GuiSettings {
+                host: s.host.to_string(),
+                user_agent_suffix: s.user_agent_suffix.to_string(),
+                insecure: s.insecure,
+                download_dir: s.download_dir.to_string(),
+                jobs: s.jobs as u32,
+                joblog_enabled: s.joblog_enabled,
+            };
+            match settings.save() {
+                Ok(()) => tracing::info!("Settings saved"),
+                Err(e) => tracing::error!("Failed to save settings: {}", e),
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        app.on_settings_reset(move || {
+            let defaults = backend::settings::GuiSettings::default();
+            if let Some(app) = weak.upgrade() {
+                apply_settings_to_ui(&app, &defaults);
+            }
+        });
+    }
+
     // Track which downloads have already been added to the "Downloaded" list
     let tracked_downloads: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -407,6 +438,17 @@ fn main() -> anyhow::Result<()> {
 
     app.run()?;
     Ok(())
+}
+
+fn apply_settings_to_ui(app: &AppWindow, settings: &backend::settings::GuiSettings) {
+    app.set_settings(SettingsData {
+        host: slint::SharedString::from(&settings.host),
+        user_agent_suffix: slint::SharedString::from(&settings.user_agent_suffix),
+        insecure: settings.insecure,
+        download_dir: slint::SharedString::from(&settings.download_dir),
+        jobs: settings.jobs as i32,
+        joblog_enabled: settings.joblog_enabled,
+    });
 }
 
 fn refresh_lists(app: &AppWindow, lm: &backend::lists::ListManager) {
