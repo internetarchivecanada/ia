@@ -168,6 +168,7 @@ impl DownloadManager {
     }
 
     /// Get the state for a specific download.
+    #[allow(dead_code)]
     pub fn get_download(&self, identifier: &str) -> Option<DownloadState> {
         let dl = self.downloads.lock().unwrap();
         dl.get(identifier).cloned()

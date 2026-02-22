@@ -395,7 +395,7 @@ fn main() -> anyhow::Result<()> {
                         if d.status == backend::downloads::DownloadJobStatus::Complete
                             && !tracked.contains(&d.identifier)
                         {
-                            let _ = lm.add_identifiers("Downloaded", &[d.identifier.clone()]);
+                            let _ = lm.add_identifiers("Downloaded", std::slice::from_ref(&d.identifier));
                             tracked.insert(d.identifier.clone());
                             if let Some(app) = weak.upgrade() {
                                 refresh_lists(&app, &lm);

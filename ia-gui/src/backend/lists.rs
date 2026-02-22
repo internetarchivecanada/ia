@@ -56,7 +56,7 @@ impl ListManager {
     pub fn save(&self, list: &ItemList) -> std::io::Result<()> {
         let path = self.list_path(&list.name);
         let content = serde_json::to_string_pretty(list)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, content)
     }
 
@@ -98,6 +98,7 @@ impl ListManager {
     }
 
     /// Import identifiers from a plain text file (one per line).
+    #[allow(dead_code)]
     pub fn import_text(&self, name: &str, path: &Path) -> std::io::Result<ItemList> {
         let content = std::fs::read_to_string(path)?;
         let ids: Vec<String> = content
@@ -109,6 +110,7 @@ impl ListManager {
     }
 
     /// Import identifiers from a JSONL file (objects with "identifier" field).
+    #[allow(dead_code)]
     pub fn import_jsonl(&self, name: &str, path: &Path) -> std::io::Result<ItemList> {
         let content = std::fs::read_to_string(path)?;
         let ids: Vec<String> = content
