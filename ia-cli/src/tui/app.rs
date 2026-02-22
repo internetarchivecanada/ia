@@ -161,12 +161,27 @@ impl TuiState {
     }
 
     pub fn overall_progress(&self) -> f64 {
-        if self.files_total > 0 {
-            (self.files_completed + self.files_skipped + self.files_failed) as f64
-                / self.files_total as f64
-        } else {
-            0.0
+        let items_total = self.items.len();
+        if items_total == 0 {
+            return 0.0;
         }
+        let total_progress: f64 = self
+            .items
+            .iter()
+            .map(|item| match &item.status {
+                ItemStatus::Complete | ItemStatus::Failed(_) => 1.0,
+                ItemStatus::Downloading => {
+                    if item.files_total > 0 {
+                        (item.files_completed + item.files_skipped + item.files_failed) as f64
+                            / item.files_total as f64
+                    } else {
+                        0.0
+                    }
+                }
+                ItemStatus::Pending => 0.0,
+            })
+            .sum();
+        total_progress / items_total as f64
     }
 
     fn update(&mut self, progress: DownloadProgress) {
@@ -267,6 +282,424 @@ impl TuiState {
             }
             self.last_throughput_sample = Instant::now();
         }
+    }
+
+    /// Number of items that have finished successfully.
+    pub fn items_completed(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i.status, ItemStatus::Complete))
+            .count()
+    }
+
+    /// Number of items that have failed.
+    pub fn items_failed(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i.status, ItemStatus::Failed(_)))
+            .count()
+    }
+
+    /// Number of items currently downloading.
+    #[cfg(test)]
+    pub fn items_in_progress(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i.status, ItemStatus::Downloading))
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ia_core::download::{DownloadProgress, DownloadStatus};
+
+    fn progress(id: &str, file: &str, status: DownloadStatus) -> DownloadProgress {
+        DownloadProgress {
+            identifier: id.to_string(),
+            file_name: file.to_string(),
+            bytes_downloaded: 0,
+            total_bytes: None,
+            status,
+        }
+    }
+
+    fn progress_bytes(
+        id: &str,
+        file: &str,
+        bytes: u64,
+        total: Option<u64>,
+        status: DownloadStatus,
+    ) -> DownloadProgress {
+        DownloadProgress {
+            identifier: id.to_string(),
+            file_name: file.to_string(),
+            bytes_downloaded: bytes,
+            total_bytes: total,
+            status,
+        }
+    }
+
+    // --- Single-item tests ---
+
+    #[test]
+    fn single_item_progress_starts_at_zero() {
+        let state = TuiState::new(&["item-a".to_string()]);
+        assert_eq!(state.overall_progress(), 0.0);
+    }
+
+    #[test]
+    fn single_item_progress_zero_after_enumeration() {
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 10,
+                bytes_total: 1000,
+            },
+        ));
+        // Item is Downloading but 0 files done
+        assert_eq!(state.overall_progress(), 0.0);
+    }
+
+    #[test]
+    fn single_item_progress_increases_with_completions() {
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 4,
+                bytes_total: 400,
+            },
+        ));
+
+        // Complete 1 file
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            100,
+            Some(100),
+            DownloadStatus::Starting,
+        ));
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            100,
+            Some(100),
+            DownloadStatus::Complete,
+        ));
+        assert!(
+            (state.overall_progress() - 0.25).abs() < 0.001,
+            "expected ~0.25, got {}",
+            state.overall_progress()
+        );
+
+        // Skip 1 file
+        state.update(progress(
+            "item-a",
+            "f2.txt",
+            DownloadStatus::Skipped("match".to_string()),
+        ));
+        assert!(
+            (state.overall_progress() - 0.5).abs() < 0.001,
+            "expected ~0.5, got {}",
+            state.overall_progress()
+        );
+    }
+
+    #[test]
+    fn single_item_all_skipped_reaches_100() {
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 3,
+                bytes_total: 300,
+            },
+        ));
+        for i in 0..3 {
+            state.update(progress(
+                "item-a",
+                &format!("f{i}.txt"),
+                DownloadStatus::Skipped("match".to_string()),
+            ));
+        }
+        assert!(
+            (state.overall_progress() - 1.0).abs() < 0.001,
+            "expected 1.0, got {}",
+            state.overall_progress()
+        );
+    }
+
+    // --- Batch tests ---
+
+    #[test]
+    fn batch_pending_items_keep_progress_low() {
+        // This is the core bug: with 100 items, if only item-0 is enumerated
+        // and all its files skip, progress should be ~1%, not 100%.
+        let ids: Vec<String> = (0..100).map(|i| format!("item-{i}")).collect();
+        let mut state = TuiState::new(&ids);
+
+        // Enumerate and complete all files for item-0
+        state.update(progress(
+            "item-0",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 5,
+                bytes_total: 500,
+            },
+        ));
+        for i in 0..5 {
+            state.update(progress(
+                "item-0",
+                &format!("f{i}.txt"),
+                DownloadStatus::Skipped("match".to_string()),
+            ));
+        }
+
+        // item-0 is fully done (1.0), 99 items are pending (0.0 each)
+        // Overall = 1.0 / 100 = 0.01
+        let p = state.overall_progress();
+        assert!(
+            (p - 0.01).abs() < 0.001,
+            "expected ~0.01, got {p} — pending items must count in denominator"
+        );
+    }
+
+    #[test]
+    fn batch_progress_monotonically_increases() {
+        let ids: Vec<String> = (0..10).map(|i| format!("item-{i}")).collect();
+        let mut state = TuiState::new(&ids);
+
+        let mut prev = 0.0;
+        for i in 0..10 {
+            let id = format!("item-{i}");
+
+            state.update(progress(
+                &id,
+                "",
+                DownloadStatus::Enumerated {
+                    files_count: 2,
+                    bytes_total: 200,
+                },
+            ));
+
+            let p = state.overall_progress();
+            assert!(
+                p >= prev,
+                "progress decreased from {prev} to {p} at enumeration of item {i}"
+            );
+            prev = p;
+
+            // Complete first file
+            state.update(progress_bytes(
+                &id,
+                &format!("a{i}.txt"),
+                100,
+                Some(100),
+                DownloadStatus::Starting,
+            ));
+            state.update(progress_bytes(
+                &id,
+                &format!("a{i}.txt"),
+                100,
+                Some(100),
+                DownloadStatus::Complete,
+            ));
+
+            let p = state.overall_progress();
+            assert!(
+                p >= prev,
+                "progress decreased from {prev} to {p} after first file of item {i}"
+            );
+            prev = p;
+
+            // Skip second file
+            state.update(progress(
+                &id,
+                &format!("b{i}.txt"),
+                DownloadStatus::Skipped("match".to_string()),
+            ));
+
+            let p = state.overall_progress();
+            assert!(
+                p >= prev,
+                "progress decreased from {prev} to {p} after second file of item {i}"
+            );
+            prev = p;
+        }
+
+        assert!(
+            (prev - 1.0).abs() < 0.001,
+            "expected 1.0 at end, got {prev}"
+        );
+    }
+
+    #[test]
+    fn batch_interleaved_enumeration_and_skips() {
+        // Simulate batch where item 1 enumerates and skips before item 2 enumerates
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut state = TuiState::new(&ids);
+
+        // item "a" enumerates 2 files, both skip
+        state.update(progress(
+            "a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 2,
+                bytes_total: 200,
+            },
+        ));
+        state.update(progress(
+            "a",
+            "a1.txt",
+            DownloadStatus::Skipped("match".to_string()),
+        ));
+        state.update(progress(
+            "a",
+            "a2.txt",
+            DownloadStatus::Skipped("match".to_string()),
+        ));
+
+        // At this point: item "a" is 2/2 = 1.0, "b" and "c" are 0.0
+        // Progress = 1.0 / 3 = 0.333
+        let p = state.overall_progress();
+        assert!(
+            (p - 1.0 / 3.0).abs() < 0.01,
+            "expected ~0.333, got {p}"
+        );
+
+        // Now item "b" enumerates
+        state.update(progress(
+            "b",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 4,
+                bytes_total: 400,
+            },
+        ));
+        state.update(progress_bytes(
+            "b",
+            "b1.txt",
+            50,
+            Some(100),
+            DownloadStatus::Starting,
+        ));
+        state.update(progress_bytes(
+            "b",
+            "b1.txt",
+            100,
+            Some(100),
+            DownloadStatus::Complete,
+        ));
+
+        // item "a" = 1.0, item "b" = 1/4 = 0.25, item "c" = 0.0
+        // Progress = (1.0 + 0.25 + 0.0) / 3 = 0.4167
+        let p = state.overall_progress();
+        assert!(
+            (p - (1.0 + 0.25) / 3.0).abs() < 0.01,
+            "expected ~0.417, got {p}"
+        );
+    }
+
+    // --- Item counter tests ---
+
+    #[test]
+    fn items_completed_counts_correctly() {
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut state = TuiState::new(&ids);
+
+        assert_eq!(state.items_completed(), 0);
+        assert_eq!(state.items_failed(), 0);
+        assert_eq!(state.items_in_progress(), 0);
+
+        // Enumerate item "a" (transitions Pending → Downloading)
+        state.update(progress(
+            "a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 1,
+                bytes_total: 100,
+            },
+        ));
+        assert_eq!(state.items_in_progress(), 1);
+        assert_eq!(state.items_completed(), 0);
+
+        // Manually mark "a" complete (as run_tui does)
+        state
+            .items
+            .iter_mut()
+            .find(|i| i.identifier == "a")
+            .unwrap()
+            .status = ItemStatus::Complete;
+        assert_eq!(state.items_completed(), 1);
+        assert_eq!(state.items_in_progress(), 0);
+
+        // Mark "b" as failed
+        state
+            .items
+            .iter_mut()
+            .find(|i| i.identifier == "b")
+            .unwrap()
+            .status = ItemStatus::Failed("error".to_string());
+        assert_eq!(state.items_completed(), 1);
+        assert_eq!(state.items_failed(), 1);
+    }
+
+    // --- Bytes tracking tests ---
+
+    #[test]
+    fn bytes_downloaded_tracks_actual_http_bytes() {
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 2,
+                bytes_total: 200,
+            },
+        ));
+
+        // Download a file: 100 bytes
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            0,
+            Some(100),
+            DownloadStatus::Starting,
+        ));
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            50,
+            Some(100),
+            DownloadStatus::Downloading,
+        ));
+        assert_eq!(state.bytes_downloaded, 50);
+
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            100,
+            Some(100),
+            DownloadStatus::Complete,
+        ));
+        assert_eq!(state.bytes_downloaded, 100);
+
+        // Skip a file: should NOT add to bytes_downloaded
+        state.update(progress(
+            "item-a",
+            "f2.txt",
+            DownloadStatus::Skipped("match".to_string()),
+        ));
+        assert_eq!(
+            state.bytes_downloaded, 100,
+            "skipped files must not inflate bytes_downloaded"
+        );
     }
 }
 

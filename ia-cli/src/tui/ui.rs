@@ -398,28 +398,72 @@ fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
         format!("{}s", elapsed.as_secs())
     };
 
-    let remaining = state.files_total
-        - state.files_completed
-        - state.files_skipped
-        - state.files_failed;
+    let is_batch = state.items.len() > 1;
 
-    let status = Line::from(vec![
-        Span::styled(" Queue: ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("{remaining} remaining"),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("  "),
-        Span::styled(
+    let status = if is_batch {
+        let items_done = state.items_completed();
+        let items_failed = state.items_failed();
+        let items_total = state.items.len();
+
+        let mut parts = vec![
+            Span::styled(" Items: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{items_done}/{items_total} done"),
+                Style::default().fg(if items_done == items_total {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+        ];
+
+        if items_failed > 0 {
+            parts.push(Span::styled(
+                format!(", {items_failed} failed"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+
+        parts.push(Span::raw("  "));
+        parts.push(Span::styled(
             format!(
-                "Done: {}  Skipped: {}  Failed: {}",
+                "Files: {} done, {} skipped, {} failed",
                 state.files_completed, state.files_skipped, state.files_failed,
             ),
             Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)),
-    ]);
+        ));
+        parts.push(Span::raw("  "));
+        parts.push(Span::styled(
+            elapsed_str,
+            Style::default().fg(Color::DarkGray),
+        ));
+
+        Line::from(parts)
+    } else {
+        let remaining = state
+            .files_total
+            .saturating_sub(state.files_completed)
+            .saturating_sub(state.files_skipped)
+            .saturating_sub(state.files_failed);
+
+        Line::from(vec![
+            Span::styled(" Queue: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{remaining} remaining"),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "Done: {}  Skipped: {}  Failed: {}",
+                    state.files_completed, state.files_skipped, state.files_failed,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)),
+        ])
+    };
 
     let keys = Line::from(vec![
         Span::raw(" "),
