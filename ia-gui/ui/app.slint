@@ -1,7 +1,8 @@
 import { Sidebar, Page } from "components/sidebar.slint";
 import { SearchPage, SearchResultData } from "pages/search.slint";
+import { ItemDetailPage, ItemDetailData } from "pages/item-detail.slint";
 
-export { Page, SearchResultData }
+export { Page, SearchResultData, ItemDetailData }
 
 export component AppWindow inherits Window {
     title: "Internet Archive";
@@ -17,9 +18,17 @@ export component AppWindow inherits Window {
     in property <string> search-status: "";
     in property <bool> search-in-progress: false;
 
+    // Item detail state
+    in-out property <bool> showing-item-detail: false;
+    in property <ItemDetailData> item-detail;
+    in property <bool> item-detail-loading: false;
+
     callback search-requested(string, string);
     callback search-result-clicked(int);
     callback search-export-requested(/* format */ string);
+    callback item-detail-back();
+    callback item-detail-download(/* identifier */ string);
+    callback item-detail-add-to-list(/* identifier */ string);
 
     HorizontalLayout {
         sidebar := Sidebar {}
@@ -28,7 +37,8 @@ export component AppWindow inherits Window {
             background: white;
             horizontal-stretch: 1;
 
-            if current-page == Page.search : SearchPage {
+            // Main page content (hidden when item detail is shown)
+            if !showing-item-detail && current-page == Page.search : SearchPage {
                 results: search-results;
                 status-text: search-status;
                 searching: search-in-progress;
@@ -36,29 +46,41 @@ export component AppWindow inherits Window {
                 result-clicked(index) => { root.search-result-clicked(index); }
                 export-requested(format) => { root.search-export-requested(format); }
             }
-            if current-page == Page.downloads : Text {
+            if !showing-item-detail && current-page == Page.downloads : Text {
                 text: "Downloads";
                 font-size: 20px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if current-page == Page.lists : Text {
+            if !showing-item-detail && current-page == Page.lists : Text {
                 text: "Lists";
                 font-size: 20px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if current-page == Page.metadata : Text {
+            if !showing-item-detail && current-page == Page.metadata : Text {
                 text: "Metadata";
                 font-size: 20px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            if current-page == Page.settings : Text {
+            if !showing-item-detail && current-page == Page.settings : Text {
                 text: "Settings";
                 font-size: 20px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+            }
+
+            // Item detail overlay
+            if showing-item-detail : ItemDetailPage {
+                item: item-detail;
+                loading: item-detail-loading;
+                back-clicked => {
+                    root.showing-item-detail = false;
+                    root.item-detail-back();
+                }
+                download-clicked(id) => { root.item-detail-download(id); }
+                add-to-list-clicked(id) => { root.item-detail-add-to-list(id); }
             }
         }
     }

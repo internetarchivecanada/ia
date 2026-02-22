@@ -1,6 +1,6 @@
 use crate::backend::export::{ExportFormat, ExportRecord};
 use crate::backend::AppBackend;
-use crate::{AppWindow, SearchResultData};
+use crate::{AppWindow, ItemDetailData, SearchResultData};
 use futures::StreamExt;
 use ia_core::search::{SearchOpts, SearchResult};
 use ia_core::IaClient;
@@ -43,6 +43,32 @@ impl AppBackend {
                     Err(e) => {
                         app.set_search_status(SharedString::from(format!("Export error: {e}")));
                     }
+                }
+            }
+        });
+    }
+
+    pub fn setup_item_detail(&self, app: &AppWindow) {
+        let weak = app.as_weak();
+
+        app.on_search_result_clicked(move |index| {
+            if let Some(app) = weak.upgrade() {
+                let results_model = app.get_search_results();
+                if let Some(result) = results_model.row_data(index as usize) {
+                    app.set_item_detail(ItemDetailData {
+                        identifier: result.identifier.clone(),
+                        title: result.title.clone(),
+                        mediatype: result.mediatype.clone(),
+                        description: result.description.clone(),
+                        creator: SharedString::default(),
+                        date: SharedString::default(),
+                        collections: SharedString::default(),
+                        file_count: 0,
+                        total_size: SharedString::default(),
+                        json_text: SharedString::default(),
+                    });
+                    app.set_item_detail_loading(true);
+                    app.set_showing_item_detail(true);
                 }
             }
         });
