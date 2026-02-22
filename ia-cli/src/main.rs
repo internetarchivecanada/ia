@@ -43,7 +43,7 @@ struct Cli {
     retry_failed: bool,
 
     /// Concurrent operations
-    #[arg(short = 'j', long, global = true, default_value = "5")]
+    #[arg(short = 'j', long, global = true, default_value = "2")]
     jobs: usize,
 
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
