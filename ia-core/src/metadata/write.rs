@@ -160,7 +160,7 @@ pub fn prepare_metadata(
                             if key == "collection" {
                                 return Err(IaError::MetadataWrite {
                                     identifier: identifier.to_string(),
-                                    message: format!("cannot remove last collection from {identifier}"),
+                                    message: "cannot remove last collection".into(),
                                 });
                             }
                             obj.remove(key);
@@ -188,7 +188,7 @@ pub fn prepare_metadata(
                             if key == "collection" {
                                 return Err(IaError::MetadataWrite {
                                     identifier: identifier.to_string(),
-                                    message: format!("cannot remove last collection from {identifier}"),
+                                    message: "cannot remove last collection".into(),
                                 });
                             }
                             obj.remove(key);
