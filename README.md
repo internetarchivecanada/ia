@@ -16,7 +16,8 @@
 </p>
 
 <p align="center">
-  A fast, concurrent command-line tool for the <a href="https://archive.org">Internet Archive</a>, written in Rust.<br>Single binary, no dependencies.
+  A fast, concurrent command-line tool for the <a href="https://archive.org">Internet Archive</a>, written in Rust.<br>
+  Single binary, no dependencies. Built for humans, AI agents, and machine consumers.
 </p>
 
 <p align="center">
