@@ -443,7 +443,7 @@ async fn set_remove_tag_deletes_field_on_extra_fields_item() {
         ("notes".to_string(), json!(REMOVE_TAG)),
         ("camera".to_string(), json!(REMOVE_TAG)),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert!(dest.get("notes").is_none());
     assert!(dest.get("camera").is_none());
     // Other fields untouched
@@ -455,7 +455,7 @@ async fn set_remove_tag_deletes_field_on_extra_fields_item() {
 fn set_on_string_arrays_item_replaces_string_with_value() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!(["new-subject-1", "new-subject-2"]))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["subject"], json!(["new-subject-1", "new-subject-2"]));
 }
 
@@ -463,7 +463,7 @@ fn set_on_string_arrays_item_replaces_string_with_value() {
 fn set_unicode_value_on_unicode_item() {
     let source = unicode_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("\u{1F680} Rocket Science \u{2764}\u{FE0F}"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("\u{1F680} Rocket Science \u{2764}\u{FE0F}"));
 }
 
@@ -471,7 +471,7 @@ fn set_unicode_value_on_unicode_item() {
 fn set_empty_string_value() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!(""))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!(""));
 }
 
@@ -484,7 +484,7 @@ fn set_multiple_fields_at_once() {
         ("date".to_string(), json!("2025-06-01")),
         ("language".to_string(), json!("fra")),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("New Title"));
     assert_eq!(dest["description"], json!("New Description"));
     assert_eq!(dest["date"], json!("2025-06-01"));
@@ -497,7 +497,7 @@ fn set_multiple_fields_at_once() {
 fn set_overwrite_list_with_scalar() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("single-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["subject"], json!("single-subject"));
 }
 
@@ -505,7 +505,7 @@ fn set_overwrite_list_with_scalar() {
 fn set_overwrite_scalar_with_list() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!(["Title Part 1", "Title Part 2"]))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!(["Title Part 1", "Title Part 2"]));
 }
 
@@ -517,7 +517,7 @@ fn set_overwrite_scalar_with_list() {
 fn append_to_existing_string_on_html_item() {
     let source = html_description_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("<p>Addendum.</p>"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     let desc = dest["description"].as_str().unwrap();
     assert!(desc.starts_with("<p>This has <b>bold</b>"));
     assert!(desc.ends_with("<p>Addendum.</p>"));
@@ -527,7 +527,7 @@ fn append_to_existing_string_on_html_item() {
 fn append_to_missing_field_on_minimal_item() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("First description"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["description"], json!("First description"));
 }
 
@@ -535,7 +535,7 @@ fn append_to_missing_field_on_minimal_item() {
 fn append_to_empty_string_field() {
     let source = empty_strings_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("added text"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["description"], json!(" added text"));
 }
 
@@ -543,7 +543,7 @@ fn append_to_empty_string_field() {
 fn append_to_array_field_errors() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("new-val"))];
-    let result = prepare_metadata(&source, &changes, &MetadataOp::Append);
+    let result = prepare_metadata(&source, &changes, &MetadataOp::Append, "test");
     assert!(result.is_err());
 }
 
@@ -551,7 +551,7 @@ fn append_to_array_field_errors() {
 fn append_to_numeric_string_field() {
     let source = numeric_strings_item()["metadata"].clone();
     let changes = vec![("ppi".to_string(), json!("(updated)"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["ppi"], json!("300 (updated)"));
 }
 
@@ -563,7 +563,7 @@ fn append_to_numeric_string_field() {
 fn append_list_to_existing_array_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("new-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(
         dest["subject"],
         json!(["testing", "metadata", "quality", "new-subject"])
@@ -574,7 +574,7 @@ fn append_list_to_existing_array_on_clean_item() {
 fn append_list_to_string_converts_on_string_arrays_item() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("second-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(dest["subject"], json!(["single-subject", "second-subject"]));
 }
 
@@ -582,7 +582,7 @@ fn append_list_to_string_converts_on_string_arrays_item() {
 fn append_list_to_missing_field_creates_list() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("brand-new"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(dest["subject"], json!(["brand-new"]));
 }
 
@@ -590,7 +590,7 @@ fn append_list_to_missing_field_creates_list() {
 fn append_list_allows_duplicate_values() {
     let source = duplicate_values_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("history"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     // Should now have 4 "history" entries (3 original + 1 new)
     let subjects = dest["subject"].as_array().unwrap();
     let history_count = subjects.iter().filter(|v| v == &&json!("history")).count();
@@ -601,7 +601,7 @@ fn append_list_allows_duplicate_values() {
 fn append_list_on_mega_collections_item() {
     let source = mega_collections_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("new-collection"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     let collections = dest["collection"].as_array().unwrap();
     assert_eq!(collections.len(), 17); // 16 original + 1
     assert_eq!(collections.last().unwrap(), &json!("new-collection"));
@@ -615,7 +615,7 @@ fn append_list_on_mega_collections_item() {
 fn insert_at_beginning_of_array() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("featured"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["collection"], json!(["featured", "opensource", "community"]));
 }
 
@@ -623,7 +623,7 @@ fn insert_at_beginning_of_array() {
 fn insert_at_end_of_array() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("last"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(999)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(999), "test").unwrap();
     let subjects = dest["subject"].as_array().unwrap();
     assert_eq!(subjects.last().unwrap(), &json!("last"));
 }
@@ -633,7 +633,7 @@ fn insert_deduplicates_existing_value() {
     let source = mega_collections_item()["metadata"].clone();
     // "opensource" already exists at index 0; insert it at position 3
     let changes = vec![("collection".to_string(), json!("opensource"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(3)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(3), "test").unwrap();
     let collections = dest["collection"].as_array().unwrap();
     // Count should be same (deduplicated)
     assert_eq!(collections.len(), 16);
@@ -645,7 +645,7 @@ fn insert_deduplicates_existing_value() {
 fn insert_into_string_converts_to_array() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("featured"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["collection"], json!(["featured", "opensource"]));
 }
 
@@ -653,7 +653,7 @@ fn insert_into_string_converts_to_array() {
 fn insert_into_missing_field_creates_array() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("brand-new"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["subject"], json!(["brand-new"]));
 }
 
@@ -665,7 +665,7 @@ fn insert_into_missing_field_creates_array() {
 fn remove_from_array_leaves_remaining() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("metadata"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!(["testing", "quality"]));
 }
 
@@ -673,7 +673,7 @@ fn remove_from_array_leaves_remaining() {
 fn remove_last_from_array_deletes_field() {
     let source = json!({"identifier": "test", "subject": ["only-one"]});
     let changes = vec![("subject".to_string(), json!("only-one"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert!(dest.get("subject").is_none());
 }
 
@@ -681,7 +681,7 @@ fn remove_last_from_array_deletes_field() {
 fn remove_scalar_match_deletes_field() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!("Solo Author"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert!(dest.get("creator").is_none());
 }
 
@@ -689,7 +689,7 @@ fn remove_scalar_match_deletes_field() {
 fn remove_scalar_no_match_is_noop() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!("Wrong Author"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["creator"], json!("Test Author"));
 }
 
@@ -697,7 +697,7 @@ fn remove_scalar_no_match_is_noop() {
 fn remove_from_semicolon_subjects() {
     let source = semicolon_subjects_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("apollo"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!("space;nasa;moon;astronomy"));
 }
 
@@ -706,11 +706,11 @@ fn remove_all_semicolon_subjects_one_by_one() {
     let source = json!({"identifier": "test", "subject": "a;b"});
     // Remove "a"
     let changes = vec![("subject".to_string(), json!("a"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!("b"));
     // Remove "b" from the result
     let changes2 = vec![("subject".to_string(), json!("b"))];
-    let dest2 = prepare_metadata(&dest, &changes2, &MetadataOp::Remove).unwrap();
+    let dest2 = prepare_metadata(&dest, &changes2, &MetadataOp::Remove, "test").unwrap();
     assert!(dest2.get("subject").is_none());
 }
 
@@ -718,7 +718,7 @@ fn remove_all_semicolon_subjects_one_by_one() {
 fn remove_from_duplicate_values_array() {
     let source = duplicate_values_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("history"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     // All "history" values removed, only "archive" remains
     assert_eq!(dest["subject"], json!(["archive"]));
 }
@@ -727,7 +727,7 @@ fn remove_from_duplicate_values_array() {
 fn remove_nonexistent_field_is_noop() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("nonexistent".to_string(), json!("value"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest, source);
 }
 
@@ -1002,7 +1002,7 @@ fn huge_metadata_100_plus_fields() {
         ("field_099".to_string(), json!("updated_99")),
         ("field_new".to_string(), json!("brand_new")),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["field_050"], json!("updated_50"));
     assert_eq!(dest["field_099"], json!("updated_99"));
     assert_eq!(dest["field_new"], json!("brand_new"));
@@ -1019,7 +1019,7 @@ fn huge_metadata_100_plus_fields() {
 fn compute_patch_set_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("Updated"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "replace");
     assert_eq!(patch[0]["path"], "/title");
@@ -1030,7 +1030,7 @@ fn compute_patch_set_on_clean_item() {
 fn compute_patch_add_on_minimal_item() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("New Title"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "add");
     assert_eq!(patch[0]["path"], "/title");
@@ -1040,7 +1040,7 @@ fn compute_patch_add_on_minimal_item() {
 fn compute_patch_remove_tag_on_extra_fields_item() {
     let source = extra_fields_item()["metadata"].clone();
     let changes = vec![("notes".to_string(), json!(REMOVE_TAG))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "remove");
     assert_eq!(patch[0]["path"], "/notes");
@@ -1054,7 +1054,7 @@ fn compute_patch_no_changes_on_duplicate_values_item() {
         "subject".to_string(),
         json!(["history", "history", "archive", "history"]),
     )];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert!(patch.is_empty());
 }
 
@@ -1063,7 +1063,7 @@ fn compute_patch_with_expect_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("New Title"))];
     let expect = HashMap::from([("title".to_string(), json!("A Well-Formed Item"))]);
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect)).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect), "test").unwrap();
     // First op should be the test op
     assert!(patch.len() >= 2);
     assert_eq!(patch[0]["op"], "test");
@@ -1078,7 +1078,7 @@ fn compute_patch_with_expect_on_clean_item() {
 fn compute_patch_append_list_on_scan_metadata_item() {
     let source = scan_metadata_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("digitization"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, None, "test").unwrap();
     // Should produce a replace or add for the subject array
     assert!(!patch.is_empty());
 }
@@ -1087,7 +1087,7 @@ fn compute_patch_append_list_on_scan_metadata_item() {
 fn compute_patch_remove_from_semicolon_subjects() {
     let source = semicolon_subjects_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("nasa"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Remove, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Remove, None, "test").unwrap();
     assert!(!patch.is_empty());
     assert_eq!(patch[0]["op"], "replace");
     assert_eq!(patch[0]["path"], "/subject");
@@ -1102,7 +1102,7 @@ fn compute_patch_remove_from_semicolon_subjects() {
 fn null_fields_set_replaces_null() {
     let source = null_fields_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Real description"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Real description"));
 }
 
@@ -1110,7 +1110,7 @@ fn null_fields_set_replaces_null() {
 fn null_fields_remove_tag_on_null() {
     let source = null_fields_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!(REMOVE_TAG))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert!(dest.get("creator").is_none());
 }
 
@@ -1118,7 +1118,7 @@ fn null_fields_remove_tag_on_null() {
 fn empty_strings_set_replaces_empty() {
     let source = empty_strings_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Not empty anymore"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Not empty anymore"));
 }
 
@@ -1126,7 +1126,7 @@ fn empty_strings_set_replaces_empty() {
 fn description_array_set_replaces_array() {
     let source = description_array_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Single string now"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Single string now"));
 }
 
@@ -1134,7 +1134,7 @@ fn description_array_set_replaces_array() {
 fn description_array_append_errors() {
     let source = description_array_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("More text"))];
-    let result = prepare_metadata(&source, &changes, &MetadataOp::Append);
+    let result = prepare_metadata(&source, &changes, &MetadataOp::Append, "test");
     // Description is an array, so Append should error
     assert!(result.is_err());
 }
@@ -1143,7 +1143,7 @@ fn description_array_append_errors() {
 fn dark_item_can_still_modify_metadata() {
     let source = dark_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("Updated Dark Item"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("Updated Dark Item"));
     // Other fields unchanged
     assert_eq!(dest["is_dark"], json!(true));
@@ -1153,7 +1153,7 @@ fn dark_item_can_still_modify_metadata() {
 fn date_chaos_set_updates_date() {
     let source = date_chaos_item()["metadata"].clone();
     let changes = vec![("date".to_string(), json!("1920"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["date"], json!("1920"));
 }
 

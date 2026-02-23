@@ -73,6 +73,7 @@ pub fn prepare_metadata(
     source: &serde_json::Value,
     changes: &[(String, serde_json::Value)],
     op: &MetadataOp,
+    identifier: &str,
 ) -> Result<serde_json::Value> {
     let mut dest = source.clone();
     let obj = dest
@@ -156,6 +157,12 @@ pub fn prepare_metadata(
                         let filtered: Vec<serde_json::Value> =
                             arr.into_iter().filter(|v| v != value).collect();
                         if filtered.is_empty() {
+                            if key == "collection" {
+                                return Err(IaError::MetadataWrite {
+                                    identifier: identifier.to_string(),
+                                    message: format!("cannot remove last collection from {identifier}"),
+                                });
+                            }
                             obj.remove(key);
                         } else {
                             obj.insert(key.clone(), serde_json::Value::Array(filtered));
@@ -178,6 +185,12 @@ pub fn prepare_metadata(
                                 );
                             }
                         } else if s == value_str {
+                            if key == "collection" {
+                                return Err(IaError::MetadataWrite {
+                                    identifier: identifier.to_string(),
+                                    message: format!("cannot remove last collection from {identifier}"),
+                                });
+                            }
                             obj.remove(key);
                         }
                         // If no match, leave unchanged (no-op)
@@ -205,8 +218,9 @@ pub fn compute_patch(
     changes: &[(String, serde_json::Value)],
     op: &MetadataOp,
     expect: Option<&HashMap<String, serde_json::Value>>,
+    identifier: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    let destination = prepare_metadata(source, changes, op)?;
+    let destination = prepare_metadata(source, changes, op, identifier)?;
     let patch = json_patch::diff(source, &destination);
 
     // Convert patch to Vec<Value> for serialization
@@ -304,7 +318,7 @@ pub async fn modify(
     let source = extract_target_metadata(&item, &req.target, identifier)?;
 
     // 4. Compute patch
-    let patch_ops = compute_patch(&source, &req.changes, &req.op, req.expect.as_ref())?;
+    let patch_ops = compute_patch(&source, &req.changes, &req.op, req.expect.as_ref(), identifier)?;
     if patch_ops.is_empty() {
         return Err(IaError::MetadataWrite {
             identifier: identifier.to_string(),
@@ -532,7 +546,7 @@ mod tests {
     fn prepare_set_replaces_existing_field() {
         let source = serde_json::json!({"title": "Old Title", "date": "2020"});
         let changes = vec![("title".to_string(), serde_json::json!("New Title"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert_eq!(dest["title"], serde_json::json!("New Title"));
         assert_eq!(dest["date"], serde_json::json!("2020")); // unchanged
     }
@@ -541,7 +555,7 @@ mod tests {
     fn prepare_set_adds_new_field() {
         let source = serde_json::json!({"title": "Existing"});
         let changes = vec![("date".to_string(), serde_json::json!("2024-01-01"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert_eq!(dest["date"], serde_json::json!("2024-01-01"));
         assert_eq!(dest["title"], serde_json::json!("Existing"));
     }
@@ -550,7 +564,7 @@ mod tests {
     fn prepare_set_remove_tag_deletes_field() {
         let source = serde_json::json!({"title": "Keep", "bad_field": "remove me"});
         let changes = vec![("bad_field".to_string(), serde_json::json!("REMOVE_TAG"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert!(dest.get("bad_field").is_none());
         assert_eq!(dest["title"], serde_json::json!("Keep"));
     }
@@ -562,7 +576,7 @@ mod tests {
             ("title".to_string(), serde_json::json!("New")),
             ("date".to_string(), serde_json::json!("2024")),
         ];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert_eq!(dest["title"], serde_json::json!("New"));
         assert_eq!(dest["date"], serde_json::json!("2024"));
     }
@@ -573,7 +587,7 @@ mod tests {
     fn prepare_append_to_existing_string() {
         let source = serde_json::json!({"description": "Original text"});
         let changes = vec![("description".to_string(), serde_json::json!("and more"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
         assert_eq!(dest["description"], serde_json::json!("Original text and more"));
     }
 
@@ -581,7 +595,7 @@ mod tests {
     fn prepare_append_to_missing_field_sets_it() {
         let source = serde_json::json!({"title": "Test"});
         let changes = vec![("description".to_string(), serde_json::json!("New desc"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
         assert_eq!(dest["description"], serde_json::json!("New desc"));
     }
 
@@ -589,7 +603,7 @@ mod tests {
     fn prepare_append_to_number_replaces_it() {
         let source = serde_json::json!({"ppi": 300});
         let changes = vec![("ppi".to_string(), serde_json::json!("600"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
         // Non-string, non-array values are replaced (not concatenated)
         assert_eq!(dest["ppi"], serde_json::json!("600"));
     }
@@ -598,7 +612,7 @@ mod tests {
     fn prepare_append_to_array_field_errors() {
         let source = serde_json::json!({"subject": ["math", "science"]});
         let changes = vec![("subject".to_string(), serde_json::json!("physics"))];
-        let result = prepare_metadata(&source, &changes, &MetadataOp::Append);
+        let result = prepare_metadata(&source, &changes, &MetadataOp::Append, "test");
         assert!(result.is_err());
     }
 
@@ -608,7 +622,7 @@ mod tests {
     fn prepare_append_list_to_existing_array() {
         let source = serde_json::json!({"subject": ["math", "science"]});
         let changes = vec![("subject".to_string(), serde_json::json!("physics"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!(["math", "science", "physics"]));
     }
 
@@ -616,7 +630,7 @@ mod tests {
     fn prepare_append_list_to_string_converts() {
         let source = serde_json::json!({"subject": "math"});
         let changes = vec![("subject".to_string(), serde_json::json!("physics"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!(["math", "physics"]));
     }
 
@@ -624,7 +638,7 @@ mod tests {
     fn prepare_append_list_to_missing_creates_list() {
         let source = serde_json::json!({"title": "Test"});
         let changes = vec![("subject".to_string(), serde_json::json!("physics"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!(["physics"]));
     }
 
@@ -632,7 +646,7 @@ mod tests {
     fn prepare_append_list_allows_duplicates() {
         let source = serde_json::json!({"subject": ["math"]});
         let changes = vec![("subject".to_string(), serde_json::json!("math"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!(["math", "math"]));
     }
 
@@ -642,7 +656,7 @@ mod tests {
     fn prepare_insert_at_beginning() {
         let source = serde_json::json!({"collection": ["existing"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
         assert_eq!(dest["collection"], serde_json::json!(["featured", "existing"]));
     }
 
@@ -650,7 +664,7 @@ mod tests {
     fn prepare_insert_deduplicates() {
         let source = serde_json::json!({"collection": ["a", "featured", "b"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
         assert_eq!(dest["collection"], serde_json::json!(["featured", "a", "b"]));
     }
 
@@ -658,7 +672,7 @@ mod tests {
     fn prepare_insert_into_string_converts() {
         let source = serde_json::json!({"collection": "existing"});
         let changes = vec![("collection".to_string(), serde_json::json!("new"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
         assert_eq!(dest["collection"], serde_json::json!(["new", "existing"]));
     }
 
@@ -668,7 +682,7 @@ mod tests {
     fn prepare_remove_from_array() {
         let source = serde_json::json!({"subject": ["math", "science", "physics"]});
         let changes = vec![("subject".to_string(), serde_json::json!("science"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!(["math", "physics"]));
     }
 
@@ -676,7 +690,7 @@ mod tests {
     fn prepare_remove_last_from_array_deletes_field() {
         let source = serde_json::json!({"subject": ["only_one"]});
         let changes = vec![("subject".to_string(), serde_json::json!("only_one"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
         assert!(dest.get("subject").is_none());
     }
 
@@ -684,7 +698,7 @@ mod tests {
     fn prepare_remove_scalar_match_deletes_field() {
         let source = serde_json::json!({"notes": "remove me"});
         let changes = vec![("notes".to_string(), serde_json::json!("remove me"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
         assert!(dest.get("notes").is_none());
     }
 
@@ -692,7 +706,7 @@ mod tests {
     fn prepare_remove_scalar_no_match_is_noop() {
         let source = serde_json::json!({"notes": "keep me"});
         let changes = vec![("notes".to_string(), serde_json::json!("something else"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
         assert_eq!(dest["notes"], serde_json::json!("keep me"));
     }
 
@@ -700,8 +714,46 @@ mod tests {
     fn prepare_remove_from_semicolon_subject() {
         let source = serde_json::json!({"subject": "math;science;physics"});
         let changes = vec![("subject".to_string(), serde_json::json!("science"))];
-        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
         assert_eq!(dest["subject"], serde_json::json!("math;physics"));
+    }
+
+    // --- prepare_metadata: collection last-removal enforcement ---
+
+    #[test]
+    fn prepare_remove_last_collection_string_errors() {
+        let source = serde_json::json!({"collection": "only-collection", "title": "Test"});
+        let changes = vec![("collection".to_string(), serde_json::json!("only-collection"))];
+        let result = prepare_metadata(&source, &changes, &MetadataOp::Remove, "my-item");
+        match result.unwrap_err() {
+            IaError::MetadataWrite { identifier, message } => {
+                assert_eq!(identifier, "my-item");
+                assert!(message.contains("cannot remove last collection"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn prepare_remove_last_collection_array_errors() {
+        let source = serde_json::json!({"collection": ["only-collection"], "title": "Test"});
+        let changes = vec![("collection".to_string(), serde_json::json!("only-collection"))];
+        let result = prepare_metadata(&source, &changes, &MetadataOp::Remove, "my-item");
+        match result.unwrap_err() {
+            IaError::MetadataWrite { identifier, message } => {
+                assert_eq!(identifier, "my-item");
+                assert!(message.contains("cannot remove last collection"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn prepare_remove_non_last_collection_succeeds() {
+        let source = serde_json::json!({"collection": ["keep", "remove-me"], "title": "Test"});
+        let changes = vec![("collection".to_string(), serde_json::json!("remove-me"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "my-item").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["keep"]));
     }
 
     // --- compute_patch tests ---
@@ -710,7 +762,7 @@ mod tests {
     fn compute_patch_for_set_field() {
         let source = serde_json::json!({"title": "Old"});
         let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
         assert_eq!(patch.len(), 1);
         let op = &patch[0];
         assert_eq!(op["op"], "replace");
@@ -722,7 +774,7 @@ mod tests {
     fn compute_patch_for_add_field() {
         let source = serde_json::json!({"title": "Existing"});
         let changes = vec![("date".to_string(), serde_json::json!("2024"))];
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
         assert_eq!(patch.len(), 1);
         assert_eq!(patch[0]["op"], "add");
         assert_eq!(patch[0]["path"], "/date");
@@ -732,7 +784,7 @@ mod tests {
     fn compute_patch_for_remove_tag() {
         let source = serde_json::json!({"title": "Keep", "bad": "remove"});
         let changes = vec![("bad".to_string(), serde_json::json!("REMOVE_TAG"))];
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
         assert_eq!(patch.len(), 1);
         assert_eq!(patch[0]["op"], "remove");
         assert_eq!(patch[0]["path"], "/bad");
@@ -742,7 +794,7 @@ mod tests {
     fn compute_patch_no_changes_returns_empty() {
         let source = serde_json::json!({"title": "Same"});
         let changes = vec![("title".to_string(), serde_json::json!("Same"))];
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
         assert!(patch.is_empty());
     }
 
@@ -752,7 +804,7 @@ mod tests {
         let source = serde_json::json!({"title": "Old"});
         let changes = vec![("title".to_string(), serde_json::json!("New"))];
         let expect = HashMap::from([("title".to_string(), serde_json::json!("Old"))]);
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect)).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect), "test").unwrap();
         assert!(patch.len() >= 2);
         assert_eq!(patch[0]["op"], "test");
         assert_eq!(patch[0]["path"], "/title");
@@ -765,7 +817,7 @@ mod tests {
         let source = serde_json::json!({"collection": ["opensource", "community"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
         let expect = HashMap::from([("collection[0]".to_string(), serde_json::json!("opensource"))]);
-        let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, Some(&expect)).unwrap();
+        let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, Some(&expect), "test").unwrap();
         // First op should be the test with indexed path
         assert_eq!(patch[0]["op"], "test");
         assert_eq!(patch[0]["path"], "/collection/0");

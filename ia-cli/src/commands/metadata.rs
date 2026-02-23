@@ -390,7 +390,7 @@ async fn run_dry_run(
     let source = extract_target_metadata(&item, target, identifier)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let patch = ia_core::metadata::compute_patch(&source, changes, op, expect)?;
+    let patch = ia_core::metadata::compute_patch(&source, changes, op, expect, identifier)?;
 
     let change_count = patch
         .iter()
