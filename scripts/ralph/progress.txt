@@ -377,3 +377,21 @@ Branch: feat/metadata-write
   - For tests, `"test"` is a safe dummy identifier value
   - Collection last-removal check must be in two places: array case (filtered.is_empty()) and string case (scalar match)
 ---
+
+## 2026-02-22 - Review Feedback (US-004, polish round 2)
+- Fixed redundant identifier in collection last-removal error messages
+- Changed `format!("cannot remove last collection from {identifier}")` to `"cannot remove last collection".into()`
+- `IaError::MetadataWrite` Display impl already includes identifier, so message shouldn't repeat it
+- All 264 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/metadata/write.rs`
+---
+
+## 2026-02-22 - US-005 (polish)
+- Accumulated `run_dry_run()` return values in `run_spreadsheet()` dry-run loop
+- Changed summary from `"{} item(s) processed"` to `"{} item(s), {} change(s)"` to match `run_write()` format
+- All 264 workspace tests pass, clippy clean
+- Files changed: `ia-cli/src/commands/metadata.rs`
+- **Learnings for future iterations:**
+  - When `run_write()` and `run_spreadsheet()` have parallel code paths (dry-run, output, joblog), changes to one should be checked against the other for consistency
+  - `run_dry_run()` returns `usize` (change count) — callers must accumulate it for accurate summaries
+---

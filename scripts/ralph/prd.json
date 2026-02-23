@@ -97,7 +97,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "notes": "Small CLI fix in run_spreadsheet() dry-run path."
     },
     {
