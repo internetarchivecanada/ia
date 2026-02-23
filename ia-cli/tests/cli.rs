@@ -245,6 +245,22 @@ fn metadata_spreadsheet_no_write_op_accepted() {
 }
 
 #[test]
+fn help_output_contains_examples_section() {
+    ia().arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"));
+}
+
+#[test]
+fn short_help_omits_examples() {
+    ia().arg("-h")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:").not());
+}
+
+#[test]
 fn metadata_spreadsheet_with_append_list() {
     // --spreadsheet combined with --append-list should be accepted.
     // The flag value is ignored; only the op mode (AppendList) is used.

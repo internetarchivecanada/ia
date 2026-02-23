@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
+use color_print::cstr;
 use std::path::PathBuf;
 
 mod commands;
@@ -7,8 +8,39 @@ mod output;
 #[cfg(feature = "tui")]
 mod tui;
 
+const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
+    .header(
+        clap::builder::styling::AnsiColor::Green
+            .on_default()
+            .bold(),
+    )
+    .usage(
+        clap::builder::styling::AnsiColor::Green
+            .on_default()
+            .bold(),
+    )
+    .literal(
+        clap::builder::styling::AnsiColor::Cyan
+            .on_default()
+            .bold(),
+    )
+    .placeholder(clap::builder::styling::AnsiColor::Cyan.on_default());
+
 #[derive(Parser)]
-#[command(name = "ia", version, about = "Internet Archive command-line tool")]
+#[command(
+    name = "ia",
+    version,
+    about = "Internet Archive command-line tool",
+    long_about = "A command-line tool for interacting with the Internet Archive (archive.org).\n\
+        Download files, search for items, view and edit metadata, and list file contents.",
+    styles = STYLES,
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
+         \n\n  <dim># Search for items in a collection</dim>\n  <bold>$ ia search \"collection:nasa\"</bold>\
+         \n\n  <dim># View metadata for an item</dim>\n  <bold>$ ia metadata nasa</bold>\n"
+    ),
+)]
 struct Cli {
     /// Path to configuration file
     #[arg(short = 'c', long = "config-file", global = true)]
@@ -56,18 +88,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Download files from an item
+    /// Download files from one or more items
     Download(commands::download::DownloadArgs),
-    /// List files in an item
+    /// List files in an item with filtering and formatting
     #[command(alias = "ls")]
     List(commands::list::ListArgs),
-    /// Display item metadata
+    /// Read or modify item metadata
     Metadata(commands::metadata::MetadataArgs),
     /// Search the Internet Archive
     Search(commands::search::SearchArgs),
-    /// Show job log summary
+    /// Show job log summary and failed operations
     Status(commands::status::StatusArgs),
-    /// Generate shell completions
+    /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
 }
 
