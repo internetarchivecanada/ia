@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -25,6 +26,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        let _ = std::io::stdout().execute(Show);
     }
 }
 
