@@ -23,9 +23,13 @@ pub struct SearchArgs {
     #[arg(short = 's', long)]
     pub sort: Vec<String>,
 
-    /// Fields to return (repeatable)
-    #[arg(short = 'f', long)]
+    /// Fields to return (repeatable, default: all)
+    #[arg(short = 'f', long, visible_alias = "fields")]
     pub field: Vec<String>,
+
+    /// Output results as JSON (one object per line)
+    #[arg(long)]
+    pub json: bool,
 
     /// Use full-text search backend
     #[arg(long)]
@@ -61,8 +65,19 @@ pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
         })
         .collect();
 
+    // In non-JSON mode with no explicit fields, request only identifiers
+    // to keep output lightweight. In JSON mode, let the core default (*)
+    // flow through so full docs are returned.
+    let fields = if !args.field.is_empty() {
+        args.field.clone()
+    } else if !args.json {
+        vec!["identifier".to_string()]
+    } else {
+        vec![]
+    };
+
     let opts = SearchOpts {
-        fields: args.field.clone(),
+        fields,
         sorts: args.sort.clone(),
         count: args.count.unwrap_or(0),
         timeout: args.timeout,
@@ -83,7 +98,15 @@ pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
         let item = result?;
         count += 1;
 
-        if args.itemlist {
+        if args.json {
+            // JSON output: full doc as a single line
+            let mut obj = item.fields.clone();
+            obj.insert(
+                "identifier".to_string(),
+                serde_json::Value::String(item.identifier),
+            );
+            println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+        } else if args.itemlist {
             // Identifier-only output (for piping)
             println!("{}", item.identifier);
         } else if quiet == 0 && !item.fields.is_empty() {
@@ -102,7 +125,7 @@ pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
         }
     }
 
-    if quiet < 2 && !args.itemlist {
+    if quiet < 2 && !args.itemlist && !args.json {
         eprintln!(
             "\n{}  {} results",
             style("search").bold(),

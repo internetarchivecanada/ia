@@ -21,7 +21,7 @@ pub struct SearchResult {
 /// Search options shared across backends.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOpts {
-    /// Fields to return (default: identifier only).
+    /// Fields to return (default: all via `*`).
     pub fields: Vec<String>,
     /// Sort clauses (e.g., "downloads desc").
     pub sorts: Vec<String>,
@@ -73,7 +73,7 @@ pub fn scrape<'a>(
 ) -> Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + 'a>> {
     let url = client.url("/services/search/v1/scrape");
     let fields = if opts.fields.is_empty() {
-        "identifier".to_string()
+        "*".to_string()
     } else {
         opts.fields.join(",")
     };
@@ -162,7 +162,7 @@ pub fn advanced<'a>(
 ) -> Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + 'a>> {
     let url = client.url("/advancedsearch.php");
     let fields = if opts.fields.is_empty() {
-        "identifier".to_string()
+        "*".to_string()
     } else {
         opts.fields.join(",")
     };
