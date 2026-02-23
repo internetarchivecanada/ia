@@ -76,6 +76,7 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 - Keep docs/plans/ updated with design decisions
 - Keep MEMORY.md updated with conventions and lessons learned
 - Run `cargo check`, `cargo test`, `cargo clippy` before committing
+- **ALWAYS update help text**: When adding or modifying CLI flags, subcommands, or behaviors, update the corresponding `about`, `long_about`, `after_long_help`, and option-level help strings. Help text is user-facing documentation — it must stay accurate.
 
 ## Global CLI Short Flags (Reserved)
 
