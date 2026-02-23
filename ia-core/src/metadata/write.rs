@@ -242,6 +242,25 @@ pub fn compute_patch(
     Ok(ops)
 }
 
+/// Request parameters for metadata modification.
+#[derive(Debug, Clone)]
+pub struct ModifyRequest {
+    /// Item identifier on archive.org
+    pub identifier: String,
+    /// List of (field_name, value) pairs to apply
+    pub changes: Vec<(String, serde_json::Value)>,
+    /// How to apply the changes (Set, Append, AppendList, Insert, Remove)
+    pub op: MetadataOp,
+    /// Target: "metadata" (default) or "files/filename"
+    pub target: String,
+    /// Optimistic concurrency checks: field -> expected value
+    pub expect: Option<HashMap<String, serde_json::Value>>,
+    /// Task priority (default 0 for single, -5 for batch)
+    pub priority: Option<i32>,
+    /// Whether to send X-Accept-Reduced-Priority header
+    pub reduced_priority: bool,
+}
+
 /// Modify metadata on an Internet Archive item.
 ///
 /// 1. Validates auth credentials
@@ -251,17 +270,12 @@ pub fn compute_patch(
 /// 5. POSTs the patch to /metadata/{identifier}
 ///
 /// Returns `ModifyResponse` with task_id on success.
-#[allow(clippy::too_many_arguments)]
 pub async fn modify(
     client: &IaClient,
-    identifier: &str,
-    changes: &[(String, serde_json::Value)],
-    op: &MetadataOp,
-    target: &str,
-    expect: Option<&HashMap<String, serde_json::Value>>,
-    priority: Option<i32>,
-    reduced_priority: bool,
+    req: &ModifyRequest,
 ) -> Result<ModifyResponse> {
+    let identifier = &req.identifier;
+
     // 1. Validate auth
     let (access, secret) = client.require_auth()?;
     let access = access.to_string();
@@ -287,10 +301,10 @@ pub async fn modify(
         .map_err(reqwest_middleware::Error::from)?;
 
     // 3. Extract source metadata based on target
-    let source = extract_target_metadata(&item, target)?;
+    let source = extract_target_metadata(&item, &req.target)?;
 
     // 4. Compute patch
-    let patch_ops = compute_patch(&source, changes, op, expect)?;
+    let patch_ops = compute_patch(&source, &req.changes, &req.op, req.expect.as_ref())?;
     if patch_ops.is_empty() {
         return Err(IaError::MetadataWrite {
             identifier: identifier.to_string(),
@@ -302,10 +316,10 @@ pub async fn modify(
     let patch_json = serde_json::to_string(&patch_ops)
         .map_err(|e| IaError::Config(format!("failed to serialize patch: {e}")))?;
 
-    let priority_val = priority.unwrap_or(0);
+    let priority_val = req.priority.unwrap_or(0);
     let body = format!(
         "-target={}&-patch={}&priority={}&access={}&secret={}",
-        urlencoding::encode(target),
+        urlencoding::encode(&req.target),
         urlencoding::encode(&patch_json),
         priority_val,
         urlencoding::encode(&access),
@@ -319,7 +333,7 @@ pub async fn modify(
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body);
 
-    if reduced_priority {
+    if req.reduced_priority {
         request = request.header("X-Accept-Reduced-Priority", "1");
     }
 
@@ -830,7 +844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modify_set_sends_correct_patch() {
+    async fn modify_request_struct_works() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -853,19 +867,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("title".to_string(), serde_json::json!("New Title"))];
-        let resp = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New Title"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let resp = modify(&client, &req).await.unwrap();
 
         assert!(resp.success);
         assert_eq!(resp.task_id, Some(12345));
@@ -875,18 +886,16 @@ mod tests {
     async fn modify_errors_without_auth() {
         let config = crate::config::IaConfig::default(); // no credentials
         let client = crate::client::IaClient::from_config(config).unwrap();
-        let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let result = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            None,
-            false,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let result = modify(&client, &req).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), IaError::Auth(_)));
@@ -904,18 +913,16 @@ mod tests {
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         // Set title to its current value — no changes
-        let changes = vec![("title".to_string(), serde_json::json!("Old Title"))];
-        let result = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            None,
-            false,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("Old Title"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let result = modify(&client, &req).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -947,19 +954,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("custom_tag".to_string(), serde_json::json!("hello"))];
-        let resp = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "files/test.pdf",
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("custom_tag".to_string(), serde_json::json!("hello"))],
+            op: MetadataOp::Set,
+            target: "files/test.pdf".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let resp = modify(&client, &req).await.unwrap();
 
         assert!(resp.success);
     }
@@ -975,18 +979,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("tag".to_string(), serde_json::json!("val"))];
-        let result = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "files/missing.pdf",
-            None,
-            None,
-            false,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("tag".to_string(), serde_json::json!("val"))],
+            op: MetadataOp::Set,
+            target: "files/missing.pdf".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let result = modify(&client, &req).await;
 
         assert!(result.is_err());
     }
@@ -1011,18 +1013,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let result = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            None,
-            false,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let result = modify(&client, &req).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1054,19 +1054,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let resp = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            Some(0),
-            true, // reduced_priority
-        )
-        .await
-        .unwrap();
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: Some(0),
+            reduced_priority: true,
+        };
+        let resp = modify(&client, &req).await.unwrap();
 
         assert!(resp.success);
     }
@@ -1091,18 +1088,16 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let result = modify(
-            &client,
-            "test-item",
-            &changes,
-            &MetadataOp::Set,
-            "metadata",
-            None,
-            None,
-            false,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        let result = modify(&client, &req).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {

@@ -8,8 +8,8 @@ use serde_json::json;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
-    extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ADMIN_ONLY_FIELDS,
-    IMMUTABLE_FIELDS,
+    extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ModifyRequest,
+    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS,
 };
 use ia_core::search::SearchOpts;
 use ia_core::IaClient;
@@ -283,17 +283,16 @@ async fn run_write(
         let mut last_task_id = None;
 
         for (changes, batch_op) in &change_groups {
-            let result = ia_core::metadata::modify(
-                client,
-                identifier,
-                changes,
-                batch_op,
-                &args.target,
-                expect.as_ref(),
-                Some(priority),
-                args.reduced_priority,
-            )
-            .await;
+            let req = ModifyRequest {
+                identifier: identifier.clone(),
+                changes: changes.clone(),
+                op: batch_op.clone(),
+                target: args.target.clone(),
+                expect: expect.clone(),
+                priority: Some(priority),
+                reduced_priority: args.reduced_priority,
+            };
+            let result = ia_core::metadata::modify(client, &req).await;
 
             match result {
                 Ok(resp) => {
@@ -507,17 +506,16 @@ async fn run_spreadsheet(
         }
 
         let start = std::time::Instant::now();
-        let result = ia_core::metadata::modify(
-            client,
-            identifier,
-            &changes,
-            &op,
-            &args.target,
-            None, // no expect for spreadsheet
-            Some(priority),
-            args.reduced_priority,
-        )
-        .await;
+        let req = ModifyRequest {
+            identifier: identifier.clone(),
+            changes,
+            op: op.clone(),
+            target: args.target.clone(),
+            expect: None,
+            priority: Some(priority),
+            reduced_priority: args.reduced_priority,
+        };
+        let result = ia_core::metadata::modify(client, &req).await;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let file_target = if args.target == "metadata" {

@@ -4,7 +4,7 @@
 //! All metadata fixtures are FAKE — no real archive.org items.
 
 use ia_core::metadata::write::{
-    compute_patch, modify, prepare_metadata, MetadataOp, REMOVE_TAG,
+    compute_patch, modify, prepare_metadata, MetadataOp, ModifyRequest, REMOVE_TAG,
 };
 use ia_core::{IaClient, IaConfig};
 use serde_json::{json, Value};
@@ -397,7 +397,15 @@ async fn set_replace_existing_field_on_clean_item() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Updated Title"))];
-    let resp = modify(&client, "clean-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -414,7 +422,15 @@ async fn set_add_new_field_on_minimal_item() {
         ("title".to_string(), json!("Brand New Title")),
         ("description".to_string(), json!("A new description")),
     ];
-    let resp = modify(&client, "minimal-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "minimal-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -726,7 +742,15 @@ async fn modify_item_metadata_target() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New Title"))];
-    let resp = modify(&client, "clean-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -751,10 +775,15 @@ async fn modify_file_metadata_target() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("rotation".to_string(), json!("0"))];
-    let resp = modify(
-        &client, "file-level-meta-item", &changes, &MetadataOp::Set,
-        "files/page001.jpg", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "file-level-meta-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "files/page001.jpg".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -772,10 +801,15 @@ async fn modify_file_not_found_returns_error() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("tag".to_string(), json!("val"))];
-    let result = modify(
-        &client, "file-level-meta-item", &changes, &MetadataOp::Set,
-        "files/nonexistent.pdf", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "file-level-meta-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "files/nonexistent.pdf".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::MetadataWrite { message, .. } => {
@@ -802,10 +836,15 @@ async fn zero_change_patch_returns_error() {
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     // Set title to its current value — no changes
     let changes = vec![("title".to_string(), json!("A Well-Formed Item"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -838,10 +877,15 @@ async fn rate_limited_429_returns_retry_after() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::RateLimited { retry_after } => {
@@ -869,10 +913,15 @@ async fn rate_limited_429_no_retry_after_defaults_to_30() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::RateLimited { retry_after } => {
@@ -887,10 +936,15 @@ async fn auth_missing_returns_error_immediately() {
     let config = IaConfig::default(); // no credentials
     let client = IaClient::from_config(config).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "any-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "any-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     assert!(matches!(result.unwrap_err(), ia_core::IaError::Auth(_)));
 }
@@ -916,10 +970,15 @@ async fn server_reports_error_in_response() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::MetadataWrite { message, .. } => {
@@ -1126,10 +1185,15 @@ async fn modify_sends_correct_post_body_format() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Updated"))];
-    let resp = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, Some(-5), false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(-5),
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1154,10 +1218,15 @@ async fn modify_with_priority_sends_correct_priority() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let resp = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, Some(-5), false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(-5),
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1174,10 +1243,15 @@ async fn modify_unicode_item_set_title() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Plain ASCII Title"))];
-    let resp = modify(
-        &client, "unicode-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "unicode-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1190,10 +1264,15 @@ async fn modify_scan_metadata_item_append_list_subject() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("subject".to_string(), json!("digitization"))];
-    let resp = modify(
-        &client, "scan-metadata-item", &changes, &MetadataOp::AppendList,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "scan-metadata-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::AppendList,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1206,10 +1285,15 @@ async fn modify_dark_item_set_metadata() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("noindex".to_string(), json!(REMOVE_TAG))];
-    let resp = modify(
-        &client, "dark-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "dark-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1222,10 +1306,15 @@ async fn modify_numeric_strings_item_set_ppi() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("ppi".to_string(), json!("600"))];
-    let resp = modify(
-        &client, "numeric-strings-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "numeric-strings-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1238,10 +1327,15 @@ async fn modify_empty_strings_item_set_description() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("description".to_string(), json!("Now has a description"))];
-    let resp = modify(
-        &client, "empty-strings-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "empty-strings-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
