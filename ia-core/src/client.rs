@@ -27,9 +27,9 @@ impl IaClient {
         Self::from_config(config)
     }
 
-    /// Create a new client with the provided config.
-    pub fn from_config(config: IaConfig) -> Result<Self> {
-        let user_agent = build_user_agent(&config);
+    /// Build the raw reqwest client with shared settings (headers, pool config).
+    fn build_raw_client(config: &IaConfig) -> Result<(reqwest::Client, String)> {
+        let user_agent = build_user_agent(config);
 
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
@@ -39,6 +39,13 @@ impl IaClient {
             .pool_max_idle_per_host(10)
             .build()
             .map_err(|e| crate::error::IaError::Config(format!("failed to build HTTP client: {e}")))?;
+
+        Ok((raw_client, user_agent))
+    }
+
+    /// Create a new client with the provided config.
+    pub fn from_config(config: IaConfig) -> Result<Self> {
+        let (raw_client, user_agent) = Self::build_raw_client(&config)?;
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(
@@ -92,20 +99,9 @@ impl IaClient {
     ///
     /// Useful when application-level retry handling (e.g., RateLimiter for 429)
     /// needs to see raw HTTP responses without middleware intervention.
+    #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
-        let user_agent = build_user_agent(&config);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
-
-        let raw_client = reqwest::Client::builder()
-            .default_headers(headers)
-            .pool_max_idle_per_host(10)
-            .build()
-            .map_err(|e| {
-                crate::error::IaError::Config(format!("failed to build HTTP client: {e}"))
-            })?;
-
+        let (raw_client, user_agent) = Self::build_raw_client(&config)?;
         let http = ClientBuilder::new(raw_client).build();
 
         Ok(Self {

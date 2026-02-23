@@ -1673,7 +1673,6 @@ async fn batch_modify_mixed_success_and_error() {
 
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            rl.wait_if_paused().await;
 
             let req = ModifyRequest {
                 identifier: id.to_string(),

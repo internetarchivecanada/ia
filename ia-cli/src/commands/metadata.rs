@@ -291,8 +291,9 @@ async fn run_write(
     let rate_limiter = RateLimiter::new();
 
     let mut set = JoinSet::new();
+    let total_count = identifiers.len();
 
-    for identifier in identifiers.clone() {
+    for identifier in identifiers {
         let client = client.clone();
         let sem = Arc::clone(&semaphore);
         let rl = rate_limiter.clone();
@@ -377,10 +378,7 @@ async fn run_write(
     }
 
     if error_count > 0 {
-        bail!(
-            "{error_count} of {} item(s) failed",
-            identifiers.len()
-        );
+        bail!("{error_count} of {total_count} item(s) failed");
     }
 
     Ok(())
