@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn ia() -> Command {
-    Command::cargo_bin("ia").unwrap()
+    assert_cmd::cargo_bin_cmd!("ia")
 }
 
 #[test]

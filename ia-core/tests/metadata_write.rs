@@ -4,11 +4,15 @@
 //! All metadata fixtures are FAKE — no real archive.org items.
 
 use ia_core::metadata::write::{
-    compute_patch, modify, prepare_metadata, MetadataOp, REMOVE_TAG,
+    compute_patch, modify, prepare_metadata, MetadataOp, ModifyRequest, REMOVE_TAG,
 };
-use ia_core::{IaClient, IaConfig};
+use ia_core::rate_limit::RateLimiter;
+use ia_core::{IaClient, IaConfig, IaError};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -397,7 +401,15 @@ async fn set_replace_existing_field_on_clean_item() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Updated Title"))];
-    let resp = modify(&client, "clean-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -414,7 +426,15 @@ async fn set_add_new_field_on_minimal_item() {
         ("title".to_string(), json!("Brand New Title")),
         ("description".to_string(), json!("A new description")),
     ];
-    let resp = modify(&client, "minimal-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "minimal-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -427,7 +447,7 @@ async fn set_remove_tag_deletes_field_on_extra_fields_item() {
         ("notes".to_string(), json!(REMOVE_TAG)),
         ("camera".to_string(), json!(REMOVE_TAG)),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert!(dest.get("notes").is_none());
     assert!(dest.get("camera").is_none());
     // Other fields untouched
@@ -439,7 +459,7 @@ async fn set_remove_tag_deletes_field_on_extra_fields_item() {
 fn set_on_string_arrays_item_replaces_string_with_value() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!(["new-subject-1", "new-subject-2"]))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["subject"], json!(["new-subject-1", "new-subject-2"]));
 }
 
@@ -447,7 +467,7 @@ fn set_on_string_arrays_item_replaces_string_with_value() {
 fn set_unicode_value_on_unicode_item() {
     let source = unicode_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("\u{1F680} Rocket Science \u{2764}\u{FE0F}"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("\u{1F680} Rocket Science \u{2764}\u{FE0F}"));
 }
 
@@ -455,7 +475,7 @@ fn set_unicode_value_on_unicode_item() {
 fn set_empty_string_value() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!(""))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!(""));
 }
 
@@ -468,7 +488,7 @@ fn set_multiple_fields_at_once() {
         ("date".to_string(), json!("2025-06-01")),
         ("language".to_string(), json!("fra")),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("New Title"));
     assert_eq!(dest["description"], json!("New Description"));
     assert_eq!(dest["date"], json!("2025-06-01"));
@@ -481,7 +501,7 @@ fn set_multiple_fields_at_once() {
 fn set_overwrite_list_with_scalar() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("single-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["subject"], json!("single-subject"));
 }
 
@@ -489,7 +509,7 @@ fn set_overwrite_list_with_scalar() {
 fn set_overwrite_scalar_with_list() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!(["Title Part 1", "Title Part 2"]))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!(["Title Part 1", "Title Part 2"]));
 }
 
@@ -501,7 +521,7 @@ fn set_overwrite_scalar_with_list() {
 fn append_to_existing_string_on_html_item() {
     let source = html_description_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("<p>Addendum.</p>"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     let desc = dest["description"].as_str().unwrap();
     assert!(desc.starts_with("<p>This has <b>bold</b>"));
     assert!(desc.ends_with("<p>Addendum.</p>"));
@@ -511,7 +531,7 @@ fn append_to_existing_string_on_html_item() {
 fn append_to_missing_field_on_minimal_item() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("First description"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["description"], json!("First description"));
 }
 
@@ -519,7 +539,7 @@ fn append_to_missing_field_on_minimal_item() {
 fn append_to_empty_string_field() {
     let source = empty_strings_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("added text"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["description"], json!(" added text"));
 }
 
@@ -527,7 +547,7 @@ fn append_to_empty_string_field() {
 fn append_to_array_field_errors() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("new-val"))];
-    let result = prepare_metadata(&source, &changes, &MetadataOp::Append);
+    let result = prepare_metadata(&source, &changes, &MetadataOp::Append, "test");
     assert!(result.is_err());
 }
 
@@ -535,7 +555,7 @@ fn append_to_array_field_errors() {
 fn append_to_numeric_string_field() {
     let source = numeric_strings_item()["metadata"].clone();
     let changes = vec![("ppi".to_string(), json!("(updated)"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
     assert_eq!(dest["ppi"], json!("300 (updated)"));
 }
 
@@ -547,7 +567,7 @@ fn append_to_numeric_string_field() {
 fn append_list_to_existing_array_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("new-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(
         dest["subject"],
         json!(["testing", "metadata", "quality", "new-subject"])
@@ -558,7 +578,7 @@ fn append_list_to_existing_array_on_clean_item() {
 fn append_list_to_string_converts_on_string_arrays_item() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("second-subject"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(dest["subject"], json!(["single-subject", "second-subject"]));
 }
 
@@ -566,7 +586,7 @@ fn append_list_to_string_converts_on_string_arrays_item() {
 fn append_list_to_missing_field_creates_list() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("brand-new"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     assert_eq!(dest["subject"], json!(["brand-new"]));
 }
 
@@ -574,7 +594,7 @@ fn append_list_to_missing_field_creates_list() {
 fn append_list_allows_duplicate_values() {
     let source = duplicate_values_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("history"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     // Should now have 4 "history" entries (3 original + 1 new)
     let subjects = dest["subject"].as_array().unwrap();
     let history_count = subjects.iter().filter(|v| v == &&json!("history")).count();
@@ -585,7 +605,7 @@ fn append_list_allows_duplicate_values() {
 fn append_list_on_mega_collections_item() {
     let source = mega_collections_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("new-collection"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
     let collections = dest["collection"].as_array().unwrap();
     assert_eq!(collections.len(), 17); // 16 original + 1
     assert_eq!(collections.last().unwrap(), &json!("new-collection"));
@@ -599,7 +619,7 @@ fn append_list_on_mega_collections_item() {
 fn insert_at_beginning_of_array() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("featured"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["collection"], json!(["featured", "opensource", "community"]));
 }
 
@@ -607,7 +627,7 @@ fn insert_at_beginning_of_array() {
 fn insert_at_end_of_array() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("last"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(999)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(999), "test").unwrap();
     let subjects = dest["subject"].as_array().unwrap();
     assert_eq!(subjects.last().unwrap(), &json!("last"));
 }
@@ -617,7 +637,7 @@ fn insert_deduplicates_existing_value() {
     let source = mega_collections_item()["metadata"].clone();
     // "opensource" already exists at index 0; insert it at position 3
     let changes = vec![("collection".to_string(), json!("opensource"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(3)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(3), "test").unwrap();
     let collections = dest["collection"].as_array().unwrap();
     // Count should be same (deduplicated)
     assert_eq!(collections.len(), 16);
@@ -629,7 +649,7 @@ fn insert_deduplicates_existing_value() {
 fn insert_into_string_converts_to_array() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("collection".to_string(), json!("featured"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["collection"], json!(["featured", "opensource"]));
 }
 
@@ -637,7 +657,7 @@ fn insert_into_string_converts_to_array() {
 fn insert_into_missing_field_creates_array() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("brand-new"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0)).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
     assert_eq!(dest["subject"], json!(["brand-new"]));
 }
 
@@ -649,7 +669,7 @@ fn insert_into_missing_field_creates_array() {
 fn remove_from_array_leaves_remaining() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("metadata"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!(["testing", "quality"]));
 }
 
@@ -657,7 +677,7 @@ fn remove_from_array_leaves_remaining() {
 fn remove_last_from_array_deletes_field() {
     let source = json!({"identifier": "test", "subject": ["only-one"]});
     let changes = vec![("subject".to_string(), json!("only-one"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert!(dest.get("subject").is_none());
 }
 
@@ -665,7 +685,7 @@ fn remove_last_from_array_deletes_field() {
 fn remove_scalar_match_deletes_field() {
     let source = string_arrays_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!("Solo Author"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert!(dest.get("creator").is_none());
 }
 
@@ -673,7 +693,7 @@ fn remove_scalar_match_deletes_field() {
 fn remove_scalar_no_match_is_noop() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!("Wrong Author"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["creator"], json!("Test Author"));
 }
 
@@ -681,7 +701,7 @@ fn remove_scalar_no_match_is_noop() {
 fn remove_from_semicolon_subjects() {
     let source = semicolon_subjects_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("apollo"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!("space;nasa;moon;astronomy"));
 }
 
@@ -690,11 +710,11 @@ fn remove_all_semicolon_subjects_one_by_one() {
     let source = json!({"identifier": "test", "subject": "a;b"});
     // Remove "a"
     let changes = vec![("subject".to_string(), json!("a"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!("b"));
     // Remove "b" from the result
     let changes2 = vec![("subject".to_string(), json!("b"))];
-    let dest2 = prepare_metadata(&dest, &changes2, &MetadataOp::Remove).unwrap();
+    let dest2 = prepare_metadata(&dest, &changes2, &MetadataOp::Remove, "test").unwrap();
     assert!(dest2.get("subject").is_none());
 }
 
@@ -702,7 +722,7 @@ fn remove_all_semicolon_subjects_one_by_one() {
 fn remove_from_duplicate_values_array() {
     let source = duplicate_values_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("history"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     // All "history" values removed, only "archive" remains
     assert_eq!(dest["subject"], json!(["archive"]));
 }
@@ -711,7 +731,7 @@ fn remove_from_duplicate_values_array() {
 fn remove_nonexistent_field_is_noop() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("nonexistent".to_string(), json!("value"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest, source);
 }
 
@@ -726,7 +746,15 @@ async fn modify_item_metadata_target() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New Title"))];
-    let resp = modify(&client, "clean-item", &changes, &MetadataOp::Set, "metadata", None, None, false)
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
         .await
         .unwrap();
     assert!(resp.success);
@@ -751,10 +779,15 @@ async fn modify_file_metadata_target() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("rotation".to_string(), json!("0"))];
-    let resp = modify(
-        &client, "file-level-meta-item", &changes, &MetadataOp::Set,
-        "files/page001.jpg", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "file-level-meta-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "files/page001.jpg".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -772,10 +805,15 @@ async fn modify_file_not_found_returns_error() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("tag".to_string(), json!("val"))];
-    let result = modify(
-        &client, "file-level-meta-item", &changes, &MetadataOp::Set,
-        "files/nonexistent.pdf", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "file-level-meta-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "files/nonexistent.pdf".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::MetadataWrite { message, .. } => {
@@ -802,10 +840,15 @@ async fn zero_change_patch_returns_error() {
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     // Set title to its current value — no changes
     let changes = vec![("title".to_string(), json!("A Well-Formed Item"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -838,10 +881,15 @@ async fn rate_limited_429_returns_retry_after() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::RateLimited { retry_after } => {
@@ -869,10 +917,15 @@ async fn rate_limited_429_no_retry_after_defaults_to_30() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::RateLimited { retry_after } => {
@@ -887,10 +940,15 @@ async fn auth_missing_returns_error_immediately() {
     let config = IaConfig::default(); // no credentials
     let client = IaClient::from_config(config).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "any-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "any-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     assert!(matches!(result.unwrap_err(), ia_core::IaError::Auth(_)));
 }
@@ -916,10 +974,15 @@ async fn server_reports_error_in_response() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let result = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let result = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await;
     match result.unwrap_err() {
         ia_core::IaError::MetadataWrite { message, .. } => {
@@ -943,7 +1006,7 @@ fn huge_metadata_100_plus_fields() {
         ("field_099".to_string(), json!("updated_99")),
         ("field_new".to_string(), json!("brand_new")),
     ];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["field_050"], json!("updated_50"));
     assert_eq!(dest["field_099"], json!("updated_99"));
     assert_eq!(dest["field_new"], json!("brand_new"));
@@ -960,7 +1023,7 @@ fn huge_metadata_100_plus_fields() {
 fn compute_patch_set_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("Updated"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "replace");
     assert_eq!(patch[0]["path"], "/title");
@@ -971,7 +1034,7 @@ fn compute_patch_set_on_clean_item() {
 fn compute_patch_add_on_minimal_item() {
     let source = minimal_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("New Title"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "add");
     assert_eq!(patch[0]["path"], "/title");
@@ -981,7 +1044,7 @@ fn compute_patch_add_on_minimal_item() {
 fn compute_patch_remove_tag_on_extra_fields_item() {
     let source = extra_fields_item()["metadata"].clone();
     let changes = vec![("notes".to_string(), json!(REMOVE_TAG))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert_eq!(patch.len(), 1);
     assert_eq!(patch[0]["op"], "remove");
     assert_eq!(patch[0]["path"], "/notes");
@@ -995,7 +1058,7 @@ fn compute_patch_no_changes_on_duplicate_values_item() {
         "subject".to_string(),
         json!(["history", "history", "archive", "history"]),
     )];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
     assert!(patch.is_empty());
 }
 
@@ -1004,7 +1067,7 @@ fn compute_patch_with_expect_on_clean_item() {
     let source = clean_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("New Title"))];
     let expect = HashMap::from([("title".to_string(), json!("A Well-Formed Item"))]);
-    let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect)).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect), "test").unwrap();
     // First op should be the test op
     assert!(patch.len() >= 2);
     assert_eq!(patch[0]["op"], "test");
@@ -1019,7 +1082,7 @@ fn compute_patch_with_expect_on_clean_item() {
 fn compute_patch_append_list_on_scan_metadata_item() {
     let source = scan_metadata_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("digitization"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, None, "test").unwrap();
     // Should produce a replace or add for the subject array
     assert!(!patch.is_empty());
 }
@@ -1028,7 +1091,7 @@ fn compute_patch_append_list_on_scan_metadata_item() {
 fn compute_patch_remove_from_semicolon_subjects() {
     let source = semicolon_subjects_item()["metadata"].clone();
     let changes = vec![("subject".to_string(), json!("nasa"))];
-    let patch = compute_patch(&source, &changes, &MetadataOp::Remove, None).unwrap();
+    let patch = compute_patch(&source, &changes, &MetadataOp::Remove, None, "test").unwrap();
     assert!(!patch.is_empty());
     assert_eq!(patch[0]["op"], "replace");
     assert_eq!(patch[0]["path"], "/subject");
@@ -1043,7 +1106,7 @@ fn compute_patch_remove_from_semicolon_subjects() {
 fn null_fields_set_replaces_null() {
     let source = null_fields_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Real description"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Real description"));
 }
 
@@ -1051,7 +1114,7 @@ fn null_fields_set_replaces_null() {
 fn null_fields_remove_tag_on_null() {
     let source = null_fields_item()["metadata"].clone();
     let changes = vec![("creator".to_string(), json!(REMOVE_TAG))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert!(dest.get("creator").is_none());
 }
 
@@ -1059,7 +1122,7 @@ fn null_fields_remove_tag_on_null() {
 fn empty_strings_set_replaces_empty() {
     let source = empty_strings_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Not empty anymore"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Not empty anymore"));
 }
 
@@ -1067,7 +1130,7 @@ fn empty_strings_set_replaces_empty() {
 fn description_array_set_replaces_array() {
     let source = description_array_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("Single string now"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["description"], json!("Single string now"));
 }
 
@@ -1075,7 +1138,7 @@ fn description_array_set_replaces_array() {
 fn description_array_append_errors() {
     let source = description_array_item()["metadata"].clone();
     let changes = vec![("description".to_string(), json!("More text"))];
-    let result = prepare_metadata(&source, &changes, &MetadataOp::Append);
+    let result = prepare_metadata(&source, &changes, &MetadataOp::Append, "test");
     // Description is an array, so Append should error
     assert!(result.is_err());
 }
@@ -1084,7 +1147,7 @@ fn description_array_append_errors() {
 fn dark_item_can_still_modify_metadata() {
     let source = dark_item()["metadata"].clone();
     let changes = vec![("title".to_string(), json!("Updated Dark Item"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["title"], json!("Updated Dark Item"));
     // Other fields unchanged
     assert_eq!(dest["is_dark"], json!(true));
@@ -1094,7 +1157,7 @@ fn dark_item_can_still_modify_metadata() {
 fn date_chaos_set_updates_date() {
     let source = date_chaos_item()["metadata"].clone();
     let changes = vec![("date".to_string(), json!("1920"))];
-    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set).unwrap();
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
     assert_eq!(dest["date"], json!("1920"));
 }
 
@@ -1126,10 +1189,15 @@ async fn modify_sends_correct_post_body_format() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Updated"))];
-    let resp = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, Some(-5), false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(-5),
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1154,10 +1222,15 @@ async fn modify_with_priority_sends_correct_priority() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("New"))];
-    let resp = modify(
-        &client, "clean-item", &changes, &MetadataOp::Set,
-        "metadata", None, Some(-5), false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "clean-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(-5),
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1174,10 +1247,15 @@ async fn modify_unicode_item_set_title() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("title".to_string(), json!("Plain ASCII Title"))];
-    let resp = modify(
-        &client, "unicode-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "unicode-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1190,10 +1268,15 @@ async fn modify_scan_metadata_item_append_list_subject() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("subject".to_string(), json!("digitization"))];
-    let resp = modify(
-        &client, "scan-metadata-item", &changes, &MetadataOp::AppendList,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "scan-metadata-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::AppendList,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1206,10 +1289,15 @@ async fn modify_dark_item_set_metadata() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("noindex".to_string(), json!(REMOVE_TAG))];
-    let resp = modify(
-        &client, "dark-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "dark-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1222,10 +1310,15 @@ async fn modify_numeric_strings_item_set_ppi() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("ppi".to_string(), json!("600"))];
-    let resp = modify(
-        &client, "numeric-strings-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "numeric-strings-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
@@ -1238,11 +1331,381 @@ async fn modify_empty_strings_item_set_description() {
 
     let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
     let changes = vec![("description".to_string(), json!("Now has a description"))];
-    let resp = modify(
-        &client, "empty-strings-item", &changes, &MetadataOp::Set,
-        "metadata", None, None, false,
-    )
+    let resp = modify(&client, &ModifyRequest {
+        identifier: "empty-strings-item".to_string(),
+        changes: changes.clone(),
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    })
     .await
     .unwrap();
     assert!(resp.success);
+}
+
+// =============================================================================
+// Batch concurrency tests: JoinSet + Semaphore + RateLimiter with modify()
+// =============================================================================
+
+fn batch_item(identifier: &str) -> Value {
+    json!({
+        "metadata": {
+            "identifier": identifier,
+            "title": "Old Title",
+            "collection": ["test-collection"]
+        },
+        "files": []
+    })
+}
+
+#[tokio::test]
+async fn no_retry_client_sees_429_as_rate_limited() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test429"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("test429")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test429"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "5"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let req = ModifyRequest {
+        identifier: "test429".to_string(),
+        changes: vec![("title".to_string(), json!("New"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(0),
+        reduced_priority: false,
+    };
+    let result = modify(&client, &req).await;
+    match &result {
+        Err(IaError::RateLimited { retry_after }) => {
+            assert_eq!(*retry_after, 5);
+        }
+        other => panic!("expected RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn single_worker_429_retry_with_rate_limiter() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("retry-item")))
+        .mount(&server)
+        .await;
+
+    // 429 mock: high priority (1), consumed after 1 response
+    Mock::given(method("POST"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    // Success mock: low priority (10), serves after 429 mock is consumed
+    Mock::given(method("POST"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(8001)))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let rl = RateLimiter::new();
+    let mut attempts = 0usize;
+
+    let req = ModifyRequest {
+        identifier: "retry-item".to_string(),
+        changes: vec![("title".to_string(), json!("New"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(0),
+        reduced_priority: false,
+    };
+
+    let result = loop {
+        attempts += 1;
+        rl.wait_if_paused().await;
+        match modify(&client, &req).await {
+            Ok(resp) => break Ok(resp),
+            Err(IaError::RateLimited { retry_after }) => {
+                rl.pause_for(retry_after, |_| {}).await;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    assert!(result.is_ok(), "expected Ok after retry, got: {result:?}");
+    assert_eq!(attempts, 2, "should take 2 attempts (first 429, then success)");
+}
+
+#[tokio::test]
+async fn batch_modify_concurrent_faster_than_sequential() {
+    let server = MockServer::start().await;
+
+    // Mount mocks for 3 items, each POST has 200ms delay
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch_item(id)))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(success_response(5000))
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(3)); // all 3 can run concurrently
+    let rate_limiter = RateLimiter::new();
+
+    let start = std::time::Instant::now();
+    let mut set = JoinSet::new();
+
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            rl.wait_if_paused().await;
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("New Title"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(-5),
+                reduced_priority: false,
+            };
+            modify(&client, &req).await
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result.unwrap());
+    }
+
+    let elapsed = start.elapsed();
+
+    // All 3 should succeed
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        assert!(r.is_ok(), "expected Ok, got: {r:?}");
+    }
+
+    // Concurrent: ~200ms. Sequential would be ~600ms+.
+    // Use 500ms threshold to account for overhead.
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "took {elapsed:?}, expected <500ms for concurrent execution of 3x200ms tasks"
+    );
+}
+
+#[tokio::test]
+async fn batch_modify_429_pauses_all_workers_then_retries() {
+    let server = MockServer::start().await;
+
+    // Mount GET mocks for both items
+    for id in ["rate-a", "rate-b"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch_item(id)))
+            .mount(&server)
+            .await;
+    }
+
+    // rate-a POST: 429 mock (high priority, consumed after 1 response)
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-a"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    // rate-a POST: success mock (low priority, serves after 429 consumed)
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(6001)))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    // rate-b POST: always success
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(6002)))
+        .mount(&server)
+        .await;
+
+    // Use no-retry client so 429 reaches modify() directly as IaError::RateLimited
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(2));
+    let rate_limiter = RateLimiter::new();
+    let pause_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let start = std::time::Instant::now();
+    let mut set = JoinSet::new();
+
+    for id in ["rate-a", "rate-b"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+        let pc = Arc::clone(&pause_count);
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("Updated"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(0),
+                reduced_priority: false,
+            };
+
+            loop {
+                rl.wait_if_paused().await;
+                match modify(&client, &req).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        rl.pause_for(retry_after, |_| {}).await;
+                        // retry
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result.unwrap());
+    }
+
+    let elapsed = start.elapsed();
+
+    // Both should succeed (rate-a after RateLimiter-mediated retry)
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.is_ok(), "expected Ok, got: {r:?}");
+    }
+
+    // RateLimiter should have been triggered at least once
+    assert!(
+        pause_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "rate limiter should have been triggered by 429"
+    );
+
+    // Should take at least 1 second (the Retry-After pause duration)
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "took {elapsed:?}, expected >=900ms due to rate limit pause"
+    );
+}
+
+#[tokio::test]
+async fn batch_modify_mixed_success_and_error() {
+    let server = MockServer::start().await;
+
+    // mix-ok: succeeds
+    mount_modify_mocks(&server, "mix-ok", batch_item("mix-ok"), 7001).await;
+
+    // mix-fail: GET succeeds, POST returns error response
+    Mock::given(method("GET"))
+        .and(path("/metadata/mix-fail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("mix-fail")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/mix-fail"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"success": false, "error": "internal error"})),
+        )
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(2));
+    let rate_limiter = RateLimiter::new();
+
+    let mut set = JoinSet::new();
+
+    for id in ["mix-ok", "mix-fail"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("New"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(0),
+                reduced_priority: false,
+            };
+
+            loop {
+                rl.wait_if_paused().await;
+                match modify(&client, &req).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        rl.pause_for(retry_after, |_| {}).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+    }
+
+    let mut successes = 0;
+    let mut errors = 0;
+    while let Some(result) = set.join_next().await {
+        match result.unwrap() {
+            Ok(_) => successes += 1,
+            Err(_) => errors += 1,
+        }
+    }
+
+    assert_eq!(successes, 1);
+    assert_eq!(errors, 1);
 }
