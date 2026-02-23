@@ -2,6 +2,8 @@
 
 The Python [`internetarchive`](https://github.com/jjjake/internetarchive) library and its `ia` CLI have served the Internet Archive community well for over a decade. This rewrite addresses several long-standing technical limitations that are difficult or impossible to fix within the existing Python codebase.
 
+The Python CLI was designed for humans at a terminal. The Rust CLI is designed for three audiences: humans, AI coding agents, and machine consumers. Everything below follows from that.
+
 ## Concurrent downloads
 
 The Python CLI downloads one file at a time. There is no `--jobs` flag and no way to parallelize downloads within a single invocation. This has been an open request for years, and the architecture makes it hard to add: the library is synchronous Python built on `requests`, with no async support.
