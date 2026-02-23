@@ -425,3 +425,22 @@ Branch: feat/metadata-write
   - `assert_cmd::cargo_bin_cmd!("name")` returns `Command` directly (no `.unwrap()` needed), replacing deprecated `Command::cargo_bin("name")`
   - Both replacements are mechanical — no behavior change, just API modernization
 ---
+
+## 2026-02-22 - US-008 (polish)
+- Wired batch write concurrency using JoinSet + Arc<Semaphore> + RateLimiter in both `run_write()` and `run_spreadsheet()`
+- `--jobs N` (global flag, default 2) controls concurrency via semaphore permits
+- 429 responses trigger `RateLimiter::pause_for()` which pauses ALL workers; each worker calls `wait_if_paused()` before every request
+- Workers retry failed requests after 429 pause ends
+- Results collected from JoinSet on main thread — output naturally non-intermixed since printing happens sequentially after join
+- Added `IaClient::from_config_no_retry()` to bypass reqwest-retry middleware (which transparently handles 429s) for testing
+- Dry-run paths remain sequential (no concurrency needed)
+- TDD: wrote 5 integration tests first (no-retry 429 visibility, single-worker retry, concurrent batch timing, 429 pause-all, mixed success/error), verified RED, fixed wiremock priority issues, implemented concurrent code, verified GREEN
+- All 268 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/client.rs`, `ia-core/tests/metadata_write.rs`, `ia-cli/src/commands/metadata.rs`, `ia-cli/src/main.rs`
+- **Learnings for future iterations:**
+  - wiremock mock priority: lower number = higher priority. Without explicit `with_priority()`, mock registration order is NOT reliable for determining match order in v0.6.2
+  - `up_to_n_times(1)` makes a mock expire after 1 match — useful for "first request gets 429, subsequent get 200" pattern combined with priority
+  - reqwest-retry middleware transparently handles 429 — use `from_config_no_retry()` when testing application-level 429 handling
+  - JoinSet results arrive in completion order, not spawn order — collecting results into Vec and printing on main thread ensures clean output
+  - `file_target` should be computed once in outer scope and cloned into each spawned task, not recomputed per-task
+---

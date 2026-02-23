@@ -156,7 +156,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": "Largest story. Follow download.rs pattern for JoinSet + Semaphore. RateLimiter already in ia-core/src/rate_limit.rs. Depends on US-001 (ModifyRequest) and US-006 (output helper)."
     }
   ]
