@@ -395,3 +395,17 @@ Branch: feat/metadata-write
   - When `run_write()` and `run_spreadsheet()` have parallel code paths (dry-run, output, joblog), changes to one should be checked against the other for consistency
   - `run_dry_run()` returns `usize` (change count) — callers must accumulate it for accurate summaries
 ---
+
+## 2026-02-22 - US-006 (polish)
+- Extracted `record_modify_outcome()` helper from duplicated success/error output + joblog writing code
+- Helper takes `Result<Option<u64>, String>` outcome, prints output, writes joblog, returns bool (is_error)
+- `run_write()` maps `batch_error` / `last_task_id` into `Result<Option<u64>, String>`
+- `run_spreadsheet()` maps `Result<ModifyResponse, IaError>` via `.map(|r| r.task_id).map_err(|e| e.to_string())`
+- Both callers use helper's return value to increment `error_count`
+- All 263 workspace tests pass, clippy clean
+- Files changed: `ia-cli/src/commands/metadata.rs`
+- **Learnings for future iterations:**
+  - `record_modify_outcome()` returns bool (is_error) to let callers manage `error_count` — avoids passing `&mut usize` parameter
+  - Using `Result<Option<u64>, String>` as the outcome type unifies two different call patterns cleanly
+  - Pure refactors are verified by ensuring all existing tests pass — no new test needed when behavior is unchanged
+---

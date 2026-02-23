@@ -113,7 +113,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "notes": "Refactor in ia-cli/src/commands/metadata.rs. After US-001 since it touches the same code."
     },
     {
