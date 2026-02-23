@@ -828,7 +828,7 @@ mod tests {
 
     // --- modify() async tests ---
 
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_config(server_uri: &str) -> crate::config::IaConfig {
@@ -1061,10 +1061,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // We verify the request was made; header checking is done implicitly
-        // by the server receiving and processing the request
         Mock::given(method("POST"))
             .and(path("/metadata/test-item"))
+            .and(header("X-Accept-Reduced-Priority", "1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true, "task_id": 55555
             })))
