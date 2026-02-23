@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use color_print::cstr;
 use console::style;
 use futures::StreamExt;
 use std::io::IsTerminal;
@@ -18,6 +19,17 @@ use ia_core::IaClient;
 use crate::output::DownloadDisplay;
 
 #[derive(Args)]
+#[command(
+    long_about = "Download files from the Internet Archive. Downloads all files from one or more \
+        items, with options to filter by format, glob pattern, or source type. Supports batch \
+        downloads via search queries or item lists.",
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
+         \n\n  <dim># Download only MP4 files</dim>\n  <bold>$ ia download nasa --glob \"*.mp4\"</bold>\
+         \n\n  <dim># Batch download items matching a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\n"
+    ),
+)]
 pub struct DownloadArgs {
     /// Item identifier(s) to download
     pub identifiers: Vec<String>,
@@ -38,11 +50,11 @@ pub struct DownloadArgs {
     #[arg(short = 'f', long)]
     format: Vec<String>,
 
-    /// Filter by source type
+    /// Filter by source type (original, derivative, metadata)
     #[arg(long, value_parser = parse_source)]
     source: Option<FileSource>,
 
-    /// Exclude by source type
+    /// Exclude by source type (original, derivative, metadata)
     #[arg(long, value_parser = parse_source)]
     exclude_source: Option<FileSource>,
 
@@ -70,11 +82,11 @@ pub struct DownloadArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Download items matching search query
+    /// Download items matching a search query (downloads each result)
     #[arg(short = 's', long)]
     search: Option<String>,
 
-    /// Number of items to download concurrently (for batch/search)
+    /// Concurrent items for batch/search (use -j/--jobs for concurrent files)
     #[arg(long, default_value = "2")]
     pub items: usize,
 
