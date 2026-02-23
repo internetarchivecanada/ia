@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use console::style;
 use futures::StreamExt;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -119,7 +120,7 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
     // Also read from stdin if no identifiers and no itemlist and no search
     if ids.is_empty() && args.itemlist.is_none() && args.search.is_none() {
         // Check if stdin is a pipe
-        if atty::isnt(atty::Stream::Stdin) {
+        if !std::io::stdin().is_terminal() {
             use std::io::BufRead;
             let stdin = std::io::stdin();
             for line in stdin.lock().lines() {

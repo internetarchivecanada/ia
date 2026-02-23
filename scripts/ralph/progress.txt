@@ -409,3 +409,19 @@ Branch: feat/metadata-write
   - Using `Result<Option<u64>, String>` as the outcome type unifies two different call patterns cleanly
   - Pure refactors are verified by ensuring all existing tests pass — no new test needed when behavior is unchanged
 ---
+
+## 2026-02-22 - US-007 (polish)
+- Replaced `atty` crate with `std::io::IsTerminal` (stable since Rust 1.70, project uses 1.85)
+- Removed `atty = "0.2"` from `ia-cli/Cargo.toml`
+- Replaced 3 usages across 3 files:
+  - `ia-cli/src/commands/metadata.rs`: `atty::isnt(atty::Stream::Stdin)` → `!std::io::stdin().is_terminal()`
+  - `ia-cli/src/commands/download.rs`: `atty::isnt(atty::Stream::Stdin)` → `!std::io::stdin().is_terminal()`
+  - `ia-cli/src/tui/app.rs`: `atty::is(atty::Stream::Stdout)` → `std::io::stdout().is_terminal()`
+- Fixed assert_cmd deprecation: `Command::cargo_bin("ia").unwrap()` → `assert_cmd::cargo_bin_cmd!("ia")`
+- All 263 workspace tests pass, clippy clean, zero deprecation warnings
+- Files changed: `ia-cli/Cargo.toml`, `ia-cli/src/commands/metadata.rs`, `ia-cli/src/commands/download.rs`, `ia-cli/src/tui/app.rs`, `ia-cli/tests/cli.rs`
+- **Learnings for future iterations:**
+  - `std::io::IsTerminal` requires `use std::io::IsTerminal;` import for the trait to be in scope
+  - `assert_cmd::cargo_bin_cmd!("name")` returns `Command` directly (no `.unwrap()` needed), replacing deprecated `Command::cargo_bin("name")`
+  - Both replacements are mechanical — no behavior change, just API modernization
+---

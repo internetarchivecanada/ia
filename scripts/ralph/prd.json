@@ -130,7 +130,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": "Pre-existing issue. Check where atty is used (likely collect_identifiers in CLI)."
     },
     {

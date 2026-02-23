@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -607,7 +608,7 @@ async fn collect_identifiers(args: &MetadataArgs, client: &IaClient) -> Result<V
     if ids.is_empty()
         && args.itemlist.is_none()
         && args.search.is_none()
-        && atty::isnt(atty::Stream::Stdin)
+        && !std::io::stdin().is_terminal()
     {
         use std::io::BufRead;
         let stdin = std::io::stdin();

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -726,7 +727,7 @@ pub async fn run_tui(
     items_concurrency: usize,
 ) -> anyhow::Result<()> {
     // Check if stdout is a TTY — raw mode requires an interactive terminal
-    if !atty::is(atty::Stream::Stdout) {
+    if !std::io::stdout().is_terminal() {
         anyhow::bail!(
             "Dashboard mode requires an interactive terminal.\n\
              Hint: remove --dashboard when piping output or running without a TTY."
