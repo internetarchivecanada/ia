@@ -192,6 +192,17 @@ pub async fn download_file(
         });
     }
 
+    // If we asked for a Range but got 200 (not 206), the server ignored our
+    // Range header and is sending the full file.  Truncate the .part file so
+    // we don't corrupt it by appending the full content after existing bytes.
+    let resume_from = if resume_from.is_some() && status == reqwest::StatusCode::OK {
+        debug!(file = %file.name, "server returned 200 for Range request, restarting download");
+        // Will create/truncate below
+        None
+    } else {
+        resume_from
+    };
+
     // Parse Last-Modified for mtime
     let last_modified = response
         .headers()
@@ -322,14 +333,15 @@ async fn should_skip(path: &Path, file: &FileMetadata) -> Option<String> {
                 return Some("size+mtime match".to_string());
             }
         }
+        // Size matches but mtime doesn't — still skip.
+        // The mtime on disk may come from the HTTP Last-Modified header which
+        // can differ from the metadata API's mtime.  Re-downloading a
+        // correctly-sized file just because the timestamp disagrees is wasteful.
+        return Some("size match".to_string());
     }
 
-    // If we have matching size but no mtime to compare, skip based on size alone
-    if file.mtime.is_none() {
-        return Some("size match (no remote mtime)".to_string());
-    }
-
-    None
+    // No remote mtime to compare — skip on size alone
+    Some("size match (no remote mtime)".to_string())
 }
 
 /// Check if a file should be skipped based on MD5 checksum.
@@ -807,5 +819,89 @@ mod tests {
         assert!(dir.path().join("test-item/a.txt").exists());
         assert!(dir.path().join("test-item/b.txt").exists());
         assert!(dir.path().join("test-item/c.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn skip_file_with_matching_size_but_different_mtime() {
+        // When the file has the right size but a different mtime (e.g. set
+        // from HTTP Last-Modified instead of metadata mtime), it should
+        // still be skipped rather than re-downloaded.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("data.bin");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        // Set local mtime to something different from the metadata mtime
+        filetime::set_file_mtime(
+            &file_path,
+            filetime::FileTime::from_unix_time(1700000099, 0),
+        )
+        .unwrap();
+
+        let file = FileMetadata {
+            name: "data.bin".to_string(),
+            size: Some(5),           // matches "hello".len()
+            mtime: Some(1700000000), // different from the 1700000099 we set
+            ..test_file_meta("data.bin", 5)
+        };
+
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result.status, DownloadStatus::Skipped(_)),
+            "file with matching size should be skipped even if mtime differs"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_handles_200_response_without_corruption() {
+        // When the server ignores Range and returns 200 (full content),
+        // the .part file should be truncated before writing to prevent
+        // appending full content to existing partial data.
+        let mock_server = MockServer::start().await;
+        let body = b"full content here";
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/resume.txt"))
+            .respond_with(
+                ResponseTemplate::new(200) // 200, NOT 206
+                    .set_body_bytes(body.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a .part file simulating a previous partial download
+        let part_path = dir.path().join("resume.txt.part");
+        std::fs::write(&part_path, "partial da").unwrap(); // 10 bytes
+
+        let file = test_file_meta("resume.txt", body.len() as u64);
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        // The file should contain ONLY the full response, not "partial da" + full response
+        let content = std::fs::read_to_string(dir.path().join("resume.txt")).unwrap();
+        assert_eq!(content, "full content here");
+        assert_eq!(result.bytes, body.len() as u64);
     }
 }

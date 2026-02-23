@@ -230,6 +230,8 @@ impl TuiState {
                         let delta =
                             progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
                         item.bytes_downloaded += delta;
+                    } else {
+                        item.bytes_downloaded += progress.bytes_downloaded;
                     }
                 }
                 DownloadStatus::Skipped(_) => {
@@ -256,7 +258,7 @@ impl TuiState {
                     file_key,
                     FileProgress {
                         name: progress.file_name.clone(),
-                        bytes_downloaded: 0,
+                        bytes_downloaded: progress.bytes_downloaded,
                         total_bytes: progress.total_bytes,
                         started_at: Instant::now(),
                     },
@@ -273,6 +275,10 @@ impl TuiState {
                 if let Some(fp) = self.active_files.remove(&file_key) {
                     let delta = progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
                     self.bytes_downloaded += delta;
+                } else {
+                    // File wasn't in active_files (e.g. Starting event missed) —
+                    // count the full bytes so the total stays accurate.
+                    self.bytes_downloaded += progress.bytes_downloaded;
                 }
                 self.files_completed += 1;
                 self.completed_files.push(progress.file_name);
@@ -716,6 +722,76 @@ mod tests {
             "skipped files must not inflate bytes_downloaded"
         );
     }
+
+    #[test]
+    fn bytes_tracked_even_without_starting_event() {
+        // If a Complete event arrives without a prior Starting event (edge
+        // case), bytes should still be counted via the fallback path.
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 1,
+                bytes_total: 500,
+            },
+        ));
+
+        // Complete without Starting — the else branch should count bytes
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            500,
+            Some(500),
+            DownloadStatus::Complete,
+        ));
+        assert_eq!(
+            state.bytes_downloaded, 500,
+            "bytes must be tracked even without Starting event"
+        );
+        // Per-item bytes should also be tracked
+        assert_eq!(state.items[0].bytes_downloaded, 500);
+    }
+
+    #[test]
+    fn resumed_download_starting_bytes_preserved() {
+        // When resuming, the Starting event carries the already-downloaded
+        // byte count.  The TUI should store that in active_files so the
+        // delta on Complete is correct.
+        let mut state = TuiState::new(&["item-a".to_string()]);
+        state.update(progress(
+            "item-a",
+            "",
+            DownloadStatus::Enumerated {
+                files_count: 1,
+                bytes_total: 1000,
+            },
+        ));
+
+        // Starting with 400 bytes already on disk (resume)
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            400,
+            Some(1000),
+            DownloadStatus::Starting,
+        ));
+
+        // Complete with total 1000 bytes
+        state.update(progress_bytes(
+            "item-a",
+            "f1.txt",
+            1000,
+            Some(1000),
+            DownloadStatus::Complete,
+        ));
+
+        // Only the new bytes (600) should be counted, not the full 1000
+        assert_eq!(
+            state.bytes_downloaded, 600,
+            "resumed downloads should only count new bytes"
+        );
+    }
 }
 
 /// Run the TUI download interface for one or more items.
@@ -773,6 +849,10 @@ pub async fn run_tui(
                 ia_core::download::download_item(&client, &id, &opts, sem, progress).await;
 
             if let Ok(mut s) = download_state.lock() {
+                // Clean up any leaked active_files for this item (e.g. files
+                // that failed all retries without sending a Complete event).
+                s.active_files.retain(|k, _| !k.starts_with(&format!("{id}\0")));
+
                 // Mark item as complete or failed
                 if let Some(item) = s.items.iter_mut().find(|i| i.identifier == id) {
                     match &result {
