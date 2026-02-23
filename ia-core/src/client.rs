@@ -109,6 +109,19 @@ impl IaClient {
     pub async fn search_count(&self, query: &str) -> Result<u64> {
         crate::search::num_found(self, query).await
     }
+
+    /// Get S3 credentials, or error if not configured.
+    /// Called on first write attempt — read operations stay unauthenticated.
+    pub fn require_auth(&self) -> Result<(&str, &str)> {
+        match (&self.config.s3_access, &self.config.s3_secret) {
+            (Some(a), Some(s)) => Ok((a.as_str(), s.as_str())),
+            _ => Err(crate::error::IaError::Auth(
+                "S3 credentials required. Run `ia configure` or set \
+                 IA_ACCESS_KEY_ID/IA_SECRET_ACCESS_KEY environment variables."
+                    .into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +170,36 @@ mod tests {
     fn client_is_clone() {
         let client = IaClient::from_config(IaConfig::default()).unwrap();
         let _clone = client.clone(); // Should compile — reqwest::Client is Arc-based
+    }
+
+    #[test]
+    fn require_auth_returns_credentials_when_present() {
+        let mut config = IaConfig::default();
+        config.s3_access = Some("test_access".to_string());
+        config.s3_secret = Some("test_secret".to_string());
+        let client = IaClient::from_config(config).unwrap();
+        let (access, secret) = client.require_auth().unwrap();
+        assert_eq!(access, "test_access");
+        assert_eq!(secret, "test_secret");
+    }
+
+    #[test]
+    fn require_auth_errors_when_no_credentials() {
+        let client = IaClient::from_config(IaConfig::default()).unwrap();
+        let result = client.require_auth();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn require_auth_errors_when_partial_credentials() {
+        let mut config = IaConfig::default();
+        config.s3_access = Some("access_only".to_string());
+        // s3_secret is None
+        let client = IaClient::from_config(config).unwrap();
+        assert!(client.require_auth().is_err());
     }
 }

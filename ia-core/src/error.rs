@@ -30,6 +30,12 @@ pub enum IaError {
     #[error("config error: {0}")]
     Config(String),
 
+    #[error("authentication required: {0}")]
+    Auth(String),
+
+    #[error("metadata write failed for {identifier}: {message}")]
+    MetadataWrite { identifier: String, message: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -77,5 +83,24 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
         let ia_err: IaError = io_err.into();
         assert!(matches!(ia_err, IaError::Io(_)));
+    }
+
+    #[test]
+    fn auth_error_displays_message() {
+        let err = IaError::Auth("S3 credentials required".to_string());
+        assert_eq!(
+            err.to_string(),
+            "authentication required: S3 credentials required"
+        );
+    }
+
+    #[test]
+    fn metadata_write_error_displays_details() {
+        let err = IaError::MetadataWrite {
+            identifier: "nasa".to_string(),
+            message: "no changes to xml".to_string(),
+        };
+        assert!(err.to_string().contains("nasa"));
+        assert!(err.to_string().contains("no changes to xml"));
     }
 }

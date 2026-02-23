@@ -24,6 +24,9 @@ httpdate = "1"
 filetime = "0.2"
 async-stream = "0.3"
 libc = "0.2"
+json-patch = "3"
+calamine = "0.26"
+csv = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

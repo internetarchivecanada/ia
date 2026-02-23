@@ -1,0 +1,335 @@
+{
+  "project": "ia",
+  "branchName": "feat/metadata-write",
+  "description": "Metadata Write Support - Add metadata::modify() to ia-core and ia metadata --modify CLI",
+  "parentIssue": 85,
+  "designDoc": "docs/plans/2026-02-22-metadata-write-design.md",
+  "implementationPlan": "docs/plans/2026-02-22-metadata-write-implementation-plan.md",
+  "qualityChecks": [
+    "cargo test --workspace",
+    "cargo clippy --workspace -- -D warnings"
+  ],
+  "safetyRules": [
+    "NEVER send real HTTP requests to archive.org — all tests use wiremock mocks",
+    "NEVER commit secrets, credentials, or .env files",
+    "ALWAYS run gh auth switch --user jjjake before any gh or git push command",
+    "NEVER push to any repo other than jjjake/ia"
+  ],
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add json-patch, calamine, csv dependencies",
+      "description": "Add new crate dependencies needed for metadata write: json-patch 3 (RFC 6902), calamine 0.26 (XLSX/ODS), csv 1 (CSV/TSV).",
+      "githubIssue": 109,
+      "acceptanceCriteria": [
+        "json-patch, calamine, csv added to ia-core/Cargo.toml [dependencies]",
+        "cargo check --workspace compiles cleanly",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Dependencies already added in prior work"
+    },
+    {
+      "id": "US-002",
+      "title": "Add Auth and MetadataWrite error variants",
+      "description": "Add IaError::Auth(String) and IaError::MetadataWrite { identifier, message } to the error enum in ia-core/src/error.rs. Write tests first (TDD).",
+      "githubIssue": 110,
+      "acceptanceCriteria": [
+        "IaError::Auth variant exists with display: 'authentication required: {msg}'",
+        "IaError::MetadataWrite variant exists with display: 'metadata write failed for {id}: {msg}'",
+        "Unit tests for both error display strings pass",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Add require_auth() to IaClient",
+      "description": "Add require_auth() method to IaClient that returns (&str, &str) credentials or IaError::Auth. Checked lazily on first write attempt.",
+      "githubIssue": 111,
+      "acceptanceCriteria": [
+        "require_auth() returns Ok((access, secret)) when both present in config",
+        "require_auth() returns Err(IaError::Auth) when credentials missing",
+        "require_auth() returns Err when only partial credentials (access but no secret)",
+        "Unit tests for all three cases pass",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Depends on US-002 (Auth error variant)"
+    },
+    {
+      "id": "US-004",
+      "title": "Add MetadataOp enum and ModifyResponse types",
+      "description": "Split metadata.rs into metadata/ module directory. Add MetadataOp enum (Set, Append, AppendList, Insert(usize), Remove), ModifyResponse struct, REMOVE_TAG constant, IMMUTABLE_FIELDS and ADMIN_ONLY_FIELDS constants.",
+      "githubIssue": 112,
+      "acceptanceCriteria": [
+        "ia-core/src/metadata.rs replaced by ia-core/src/metadata/{mod.rs, read.rs, write.rs}",
+        "Existing metadata::get() and metadata::exists() re-exported and still work",
+        "MetadataOp enum with 5 variants defined",
+        "ModifyResponse deserializes from success and error JSON",
+        "REMOVE_TAG = 'REMOVE_TAG', IMMUTABLE_FIELDS includes identifier/addeddate/publicdate/uploader",
+        "All existing metadata tests still pass",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "This is a refactor — existing public API must not break"
+    },
+    {
+      "id": "US-005",
+      "title": "Key:value and indexed key parsing",
+      "description": "Implement parse_key_value() and parse_indexed_key() in metadata/write.rs for parsing CLI-style 'field:value' and 'field[index]:value' strings.",
+      "githubIssue": 113,
+      "acceptanceCriteria": [
+        "parse_key_value('title:New Title') returns ('title', 'New Title')",
+        "parse_key_value('desc:Time: 10:30') handles colons in value",
+        "parse_key_value('no_colon') returns error",
+        "parse_indexed_key('collection[0]') returns Some(('collection', 0))",
+        "parse_indexed_key('title') returns None",
+        "Unit tests for all cases pass",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Depends on US-004 (write.rs file exists)"
+    },
+    {
+      "id": "US-006",
+      "title": "Metadata preparation (apply changes to copy)",
+      "description": "Implement prepare_metadata() — applies desired changes to a copy of source metadata based on MetadataOp. Handles Set (with REMOVE_TAG), Append, AppendList, Insert (with deduplication), Remove (with semicolon subject handling).",
+      "githubIssue": 114,
+      "acceptanceCriteria": [
+        "Set: replaces existing, adds new, REMOVE_TAG deletes, multiple fields",
+        "Append: concatenates strings with space, errors on arrays, sets missing fields",
+        "AppendList: appends to array, converts string to array, creates list from missing, allows dupes",
+        "Insert: at index 0 (prepend), deduplication, converts string to list",
+        "Remove: from array, last-from-array deletes field, scalar match deletes, semicolon subjects",
+        "All unit tests pass (see implementation plan Task 6 for full test list)",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Depends on US-005. This is the core logic — test thoroughly"
+    },
+    {
+      "id": "US-007",
+      "title": "JSON Patch computation with expect test ops",
+      "description": "Implement compute_patch() — uses json_patch::diff() to compute RFC 6902 patch from source vs destination, prepends test ops from --expect for optimistic concurrency.",
+      "githubIssue": 115,
+      "acceptanceCriteria": [
+        "Set field produces 'replace' op",
+        "Add field produces 'add' op",
+        "REMOVE_TAG produces 'remove' op",
+        "No changes returns empty patch",
+        "With expect: test ops prepended before patch ops",
+        "Indexed expect keys produce correct path (e.g., /field/0)",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Depends on US-006. Uses json_patch crate"
+    },
+    {
+      "id": "US-008",
+      "title": "Implement modify() function (HTTP POST)",
+      "description": "Implement metadata::modify() — the main public function. Validates auth, fetches current metadata, extracts target, computes patch, POSTs to /metadata/{id} with S3 auth in form body. All tests use wiremock.",
+      "githubIssue": 116,
+      "acceptanceCriteria": [
+        "Successful set sends correct patch via POST, returns ModifyResponse with task_id",
+        "Missing auth returns IaError::Auth immediately (no HTTP calls)",
+        "No-changes case returns IaError::MetadataWrite",
+        "File target (files/foo.txt) extracts correct file metadata",
+        "File not found in item returns error",
+        "429 response returns IaError::RateLimited with retry_after",
+        "POST body format: -target={}&-patch={}&priority={}&access={}&secret={}",
+        "X-Accept-Reduced-Priority header sent when reduced_priority=true",
+        "Re-export modify, compute_patch, parse_key_value, etc. from metadata/mod.rs",
+        "All tests use wiremock mocks — ZERO live requests",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Depends on US-003, US-007. This is the big one — the core write function"
+    },
+    {
+      "id": "US-009",
+      "title": "Comprehensive edge case tests with mock fixtures",
+      "description": "Build extensive integration test suite in ia-core/tests/metadata_write.rs with 16+ fake metadata fixtures covering IA's real-world metadata chaos. All wiremock, zero live requests.",
+      "githubIssue": 117,
+      "acceptanceCriteria": [
+        "16+ fixture functions (clean_item, minimal_item, string_arrays_item, mega_collections_item, unicode_item, html_description_item, date_chaos_item, duplicate_values_item, numeric_strings_item, empty_strings_item, null_fields_item, extra_fields_item, file_level_meta_item, dark_item, semicolon_subjects_item, scan_metadata_item)",
+        "Tests per operation: Set (8+), Append (3+), AppendList (4+), Insert (4+), Remove (6+)",
+        "Target tests: item metadata, file metadata, file not found",
+        "Edge cases: zero-change patch, 429, 401/403, huge metadata",
+        "ALL tests use wiremock — ZERO live requests to archive.org",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "62 integration tests with 17 fixtures covering all operations and edge cases"
+    },
+    {
+      "id": "US-010",
+      "title": "Extend MetadataArgs with write CLI flags",
+      "description": "Add write flags to MetadataArgs in ia-cli: --modify/-m, --append/-a, --append-list/-A, --insert/-I, --remove/-r (mutually exclusive), plus --target, --expect, --priority, --reduced-priority, --dry-run, --spreadsheet, --itemlist, --search.",
+      "githubIssue": 118,
+      "acceptanceCriteria": [
+        "All write flags appear in ia metadata --help",
+        "Short flags -m, -a, -A, -I, -r work",
+        "Write flags are mutually exclusive (--modify + --append errors)",
+        "Short flags don't conflict with reserved globals (-c, -l, -d, -i, -H, -j, -q)",
+        "identifiers field is Vec<String> (multi-item support)",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "identifier changed to identifiers: Vec<String>, all write flags added with mutual exclusivity"
+    },
+    {
+      "id": "US-011",
+      "title": "CLI write flow (single and batch)",
+      "description": "Implement the run() function for write operations: parse changes, warn about immutable fields, collect identifiers from all sources (positional/--itemlist/--search/stdin), call metadata::modify(), print results, log to joblog. Includes dry-run mode.",
+      "githubIssue": 119,
+      "acceptanceCriteria": [
+        "Single item write works: ia metadata nasa --modify='title:New'",
+        "Batch from positional args: ia metadata item1 item2 --modify='title:X'",
+        "Batch from --itemlist FILE works",
+        "Batch from --search QUERY works",
+        "Batch from stdin works (piped identifiers)",
+        "Dry-run shows computed changes without writing",
+        "Immutable field warning printed for identifier/addeddate/publicdate/uploader",
+        "Admin-only field warning printed for mediatype",
+        "Joblog entries written with op='modify'",
+        "Errors logged to joblog with status='error'",
+        "Update main.rs dispatch to pass joblog/quiet/jobs to metadata run()",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Write flow with single/batch support, immutable field warnings, dry-run, joblog, error tracking"
+    },
+    {
+      "id": "US-012",
+      "title": "Multi-format spreadsheet reader",
+      "description": "Create ia-core/src/spreadsheet.rs — reads CSV, TSV, XLSX, ODS, JSONL into uniform (identifier, HashMap<String, String>) records. Format auto-detected by extension.",
+      "githubIssue": 120,
+      "acceptanceCriteria": [
+        "CSV: reads header row + data rows, requires 'identifier' column",
+        "CSV with BOM: handles Excel UTF-8 BOM export",
+        "CSV: skips empty rows and empty identifiers",
+        "CSV: skips empty cell values (not written as empty strings)",
+        "TSV: works with tab delimiter",
+        "JSONL: parses one JSON object per line, skips empty lines",
+        "XLSX/ODS: reads first sheet, same schema as CSV",
+        "Unknown extension returns error",
+        "Module added to ia-core/src/lib.rs",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "CSV/TSV/XLSX/ODS/JSONL reader with BOM handling, empty row/value skipping"
+    },
+    {
+      "id": "US-013",
+      "title": "Wire spreadsheet reader to CLI",
+      "description": "Integrate spreadsheet reader with metadata write CLI: when --spreadsheet is provided, read records and call modify() for each. Default op is Set, default priority -5.",
+      "githubIssue": 121,
+      "acceptanceCriteria": [
+        "ia metadata --spreadsheet=updates.csv processes all rows",
+        "Default operation is Set when no write flags given with spreadsheet",
+        "Can combine with --append-list for all fields",
+        "Default priority -5 for spreadsheet batch",
+        "Dry-run shows per-item changes",
+        "Each result logged to joblog",
+        "Errors printed and logged but don't stop batch",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Spreadsheet mode wired to CLI with default Set op, -5 priority, dry-run, joblog, error tracking"
+    },
+    {
+      "id": "US-014",
+      "title": "Rate limiter with global 429 pause",
+      "description": "Create ia-core/src/rate_limit.rs — shared RateLimiter that pauses ALL concurrent write tasks when any task receives 429. Uses AtomicBool + tokio::sync::Notify.",
+      "githubIssue": 122,
+      "acceptanceCriteria": [
+        "RateLimiter::new() creates non-paused instance",
+        "wait_if_paused() returns immediately when not paused",
+        "pause_for(seconds) pauses all clones, resumes after duration",
+        "Multiple concurrent tasks pause correctly (only one triggers the wait)",
+        "is_paused() reflects current state",
+        "Module added to ia-core/src/lib.rs",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "AtomicBool + Notify pattern, 5 tests covering default state, pause/resume, waiter blocking, single-trigger, state reflection"
+    },
+    {
+      "id": "US-015",
+      "title": "CLI integration tests for metadata write",
+      "description": "Add assert_cmd integration tests to ia-cli/tests/cli.rs for all new metadata write flags.",
+      "githubIssue": 123,
+      "acceptanceCriteria": [
+        "All write flags appear in --help output",
+        "Short flags (-m, -a, -A, -I, -r) appear in --help",
+        "Mutually exclusive flags conflict correctly",
+        "Missing identifier errors appropriately",
+        "cargo test --workspace passes",
+        "cargo clippy --workspace -- -D warnings passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "Tests already added during US-010/US-011: write flags in help, short flags, mutual exclusivity, missing identifier errors"
+    },
+    {
+      "id": "US-016",
+      "title": "Update documentation (CLAUDE.md, MEMORY.md)",
+      "description": "Update MEMORY.md implementation status for Milestone 5. Add new modules to key modules list. Note metadata write capability in CLAUDE.md.",
+      "githubIssue": 124,
+      "acceptanceCriteria": [
+        "MEMORY.md: Milestone 5 status updated with new modules listed",
+        "CLAUDE.md: safety rules section notes write capability",
+        "cargo test --workspace passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "Updated CLAUDE.md safety rules, crate stack, API quirks. Updated MEMORY.md milestone status, modules, test count."
+    },
+    {
+      "id": "US-017",
+      "title": "Final verification and cleanup",
+      "description": "Run full test suite, clippy, check. Verify all commits are clean. Push branch and create PR.",
+      "githubIssue": 125,
+      "acceptanceCriteria": [
+        "cargo test --workspace — all tests pass",
+        "cargo clippy --workspace -- -D warnings — no warnings",
+        "cargo check --workspace — clean build",
+        "git log --oneline shows clean commit history",
+        "Branch pushed and PR created referencing #85"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": "All 259 tests pass, clippy clean, branch pushed, PR #127 created"
+    }
+  ]
+}

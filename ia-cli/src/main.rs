@@ -128,7 +128,9 @@ async fn main() -> Result<()> {
             commands::download::run(&client, args, cli.quiet, cli.jobs, cli.joblog, cli.retry_failed).await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
-        Commands::Metadata(args) => commands::metadata::run(&client, args).await?,
+        Commands::Metadata(args) => {
+            commands::metadata::run(&client, args, cli.quiet, cli.joblog.clone()).await?
+        }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
         Commands::Completions(_) => unreachable!("handled above"),

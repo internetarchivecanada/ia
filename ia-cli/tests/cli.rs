@@ -143,3 +143,124 @@ fn download_help_does_not_show_tui_flag() {
         .success()
         .stdout(predicate::str::contains("--tui").not());
 }
+
+#[test]
+fn metadata_write_flags_in_help() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--modify"))
+        .stdout(predicate::str::contains("--append"))
+        .stdout(predicate::str::contains("--append-list"))
+        .stdout(predicate::str::contains("--insert"))
+        .stdout(predicate::str::contains("--remove"))
+        .stdout(predicate::str::contains("--target"))
+        .stdout(predicate::str::contains("--expect"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--spreadsheet"))
+        .stdout(predicate::str::contains("--priority"))
+        .stdout(predicate::str::contains("--reduced-priority"));
+}
+
+#[test]
+fn metadata_write_short_flags_in_help() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-m"))
+        .stdout(predicate::str::contains("-a"))
+        .stdout(predicate::str::contains("-A"))
+        .stdout(predicate::str::contains("-I"))
+        .stdout(predicate::str::contains("-r"));
+}
+
+#[test]
+fn metadata_write_flags_conflict() {
+    // --modify and --append should conflict (same ArgGroup)
+    ia().args(["metadata", "test", "--modify=title:X", "--append=title:Y"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn metadata_no_identifier_errors() {
+    // Read mode with no identifier should fail
+    ia().args(["metadata"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn metadata_modify_no_identifier_errors() {
+    // Write mode with no identifier should fail
+    ia().args(["metadata", "--modify=title:New"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no identifiers"));
+}
+
+#[test]
+fn metadata_immutable_field_warning() {
+    // Attempting to modify an immutable field should warn (fails with auth error too)
+    ia().args(["metadata", "test-item", "--modify=identifier:new_id"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("immutable"));
+}
+
+#[test]
+fn metadata_admin_field_warning() {
+    // Attempting to modify an admin-only field should warn
+    ia().args(["metadata", "test-item", "--modify=mediatype:audio"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("admin"));
+}
+
+#[test]
+fn metadata_spreadsheet_nonexistent_file_errors() {
+    // --spreadsheet with a nonexistent file should report a read error
+    ia().args(["metadata", "--spreadsheet=/tmp/nonexistent_ia_test_file.csv"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read spreadsheet"));
+}
+
+#[test]
+fn metadata_spreadsheet_no_write_op_accepted() {
+    // --spreadsheet alone (without explicit write op flag) should be accepted
+    // as a write operation, not rejected as "not yet implemented".
+    // It will fail with auth error after reading the CSV, which is fine.
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(&csv_path, "identifier,title\ntest-item,New Title\n").unwrap();
+
+    let result = ia()
+        .args(["metadata", &format!("--spreadsheet={}", csv_path.display())])
+        .assert()
+        .failure();
+
+    // Should NOT contain the old "not yet implemented" message
+    result.stderr(predicate::str::contains("not yet implemented").not());
+}
+
+#[test]
+fn metadata_spreadsheet_with_append_list() {
+    // --spreadsheet combined with --append-list should be accepted.
+    // The flag value is ignored; only the op mode (AppendList) is used.
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(&csv_path, "identifier,subject\ntest-item,science\n").unwrap();
+
+    ia().args([
+        "metadata",
+        &format!("--spreadsheet={}", csv_path.display()),
+        "--append-list=subject:placeholder",
+    ])
+    .assert()
+    .failure()
+    // Should warn that flag values are ignored in spreadsheet mode
+    .stderr(predicate::str::contains("write flag values are ignored"))
+    // Should fail with auth, not "not yet implemented"
+    .stderr(predicate::str::contains("not yet implemented").not());
+}

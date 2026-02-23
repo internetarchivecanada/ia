@@ -9,11 +9,13 @@ Design doc: `docs/plans/2026-02-20-ia-rust-port-design.md`
 
 These rules are non-negotiable and must NEVER be violated:
 
-### 1. NEVER Write to archive.org
-- NEVER send POST, PUT, DELETE, or PATCH requests to any archive.org service
-- NEVER implement upload, delete, metadata modify, or any write operation against live archive.org
-- Read-only operations ONLY: GET requests to archive.org endpoints
-- The only exception is POST to search endpoints (scrape API, FTS) which are read-only queries
+### 1. NEVER Write to archive.org During Development/Testing
+- NEVER send POST, PUT, DELETE, or PATCH requests to any live archive.org service
+- NEVER run metadata modify, upload, or delete against live archive.org
+- ALL write operation tests MUST use wiremock mocks — ZERO live requests
+- Read-only GET requests to archive.org are OK for development
+- POST to search endpoints (scrape API, FTS) is OK (read-only queries)
+- Note: metadata write (`metadata::modify()`) is implemented in ia-core but must only be tested with mocks
 
 ### 2. NEVER Use Authentication with archive.org
 - NEVER read, load, or use IA S3 credentials (access key, secret key)
@@ -52,6 +54,8 @@ These rules are non-negotiable and must NEVER be violated:
 - Console: `indicatif` 0.17 + `console` 0.15 + `comfy-table` 7
 - TUI: `ratatui` (default feature, `--dashboard` flag)
 - Retry: `backon` 1
+- Metadata write: `json-patch` 3 (RFC 6902), `urlencoding` 2
+- Spreadsheet: `calamine` 0.26 (XLSX/ODS/XLS), `csv` 1 (CSV/TSV)
 - Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
 
 ## User-Agent
@@ -92,3 +96,5 @@ These short flags are used by global options and MUST NOT be reused in subcomman
 - File metadata fields (size, mtime) come as strings from JSON API — deserialize carefully
 - Auth headers must be preserved on redirects to *.archive.org domains
 - S3 metadata headers: underscores become double-dashes, non-ASCII wrapped in uri()
+- Metadata write POST body: `-target={}&-patch={}&priority={}&access={}&secret={}` (form-encoded, NOT JSON)
+- Metadata write uses RFC 6902 JSON Patch (test/add/replace/remove ops)
