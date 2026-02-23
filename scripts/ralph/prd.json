@@ -82,7 +82,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "notes": "prepare_metadata() currently doesn't take identifier — need to add it for the error message. Check if US-001 already changed the signature."
     },
     {

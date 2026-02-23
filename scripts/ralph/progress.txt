@@ -362,3 +362,18 @@ Branch: feat/metadata-write
   - wiremock `header(name, value)` matcher from `wiremock::matchers` validates exact header values on requests
   - Adding header matchers to POST mocks makes tests fail if the header is ever removed from production code (wiremock returns 404 for unmatched requests)
 ---
+
+## 2026-02-22 - US-004 (polish)
+- Added `identifier: &str` parameter to `prepare_metadata()` and `compute_patch()`
+- In Remove arm, when key is "collection" and removal would leave 0 collections, returns `IaError::MetadataWrite` error
+- Works for both string collections (scalar match) and array collections (filtered to empty)
+- Removing non-last collection still succeeds normally
+- TDD: wrote 3 failing tests (last-string, last-array, non-last succeeds), RED → GREEN
+- Updated all callers: `modify()` in write.rs, CLI `run_dry_run()`, 39 prepare_metadata call sites + 7 compute_patch call sites in tests
+- All 264 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/metadata/write.rs`, `ia-core/tests/metadata_write.rs`, `ia-cli/src/commands/metadata.rs`
+- **Learnings for future iterations:**
+  - Adding a parameter to a widely-called function cascades to many call sites — use `replace_all` for efficient bulk updates
+  - For tests, `"test"` is a safe dummy identifier value
+  - Collection last-removal check must be in two places: array case (filtered.is_empty()) and string case (scalar match)
+---
