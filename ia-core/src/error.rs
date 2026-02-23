@@ -66,6 +66,35 @@ pub enum IaError {
 pub type Result<T> = std::result::Result<T, IaError>;
 
 impl IaError {
+    /// Whether this error is transient and worth retrying.
+    ///
+    /// Returns `false` for permanent failures (access denied, not found, config
+    /// errors, disk full) where retrying would just waste time.
+    /// Returns `true` for transient failures (server errors, network issues,
+    /// rate limits, checksum mismatches) that may succeed on retry.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // HTTP 4xx client errors are permanent (except 429 rate-limit)
+            IaError::Http { status, .. } => {
+                *status == 429 || *status >= 500
+            }
+            // Transient — may succeed on retry
+            IaError::RateLimited { .. } => true,
+            IaError::Network(_) => true,
+            IaError::Io(_) => true,
+            IaError::ChecksumMismatch { .. } => true,
+            IaError::ResumeFailed { .. } => true,
+            // Permanent — retrying won't help
+            IaError::NotFound(_) => false,
+            IaError::Auth(_) => false,
+            IaError::Config(_) => false,
+            IaError::DiskFull { .. } => false,
+            IaError::NoDiskSpace { .. } => false,
+            IaError::MetadataWrite { .. } => false,
+            IaError::Json(_) => false,
+        }
+    }
+
     /// Convert this error into a structured `JsonError` for `--json` mode.
     pub fn to_json_error(&self) -> JsonError {
         let mut extra = serde_json::Map::new();
@@ -332,5 +361,124 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error"]["code"], "not_found");
         assert_eq!(v["error"]["identifier"], "test-item");
+    }
+
+    // -- is_retryable tests --
+
+    #[test]
+    fn http_403_is_not_retryable() {
+        let err = IaError::Http {
+            status: 403,
+            message: "Forbidden".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn http_401_is_not_retryable() {
+        let err = IaError::Http {
+            status: 401,
+            message: "Unauthorized".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn http_404_is_not_retryable() {
+        let err = IaError::Http {
+            status: 404,
+            message: "Not Found".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn http_410_is_not_retryable() {
+        let err = IaError::Http {
+            status: 410,
+            message: "Gone".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn http_500_is_retryable() {
+        let err = IaError::Http {
+            status: 500,
+            message: "Internal Server Error".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_503_is_retryable() {
+        let err = IaError::Http {
+            status: 503,
+            message: "Service Unavailable".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_429_is_retryable() {
+        let err = IaError::Http {
+            status: 429,
+            message: "Too Many Requests".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn not_found_error_is_not_retryable() {
+        let err = IaError::NotFound("nasa".into());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn auth_error_is_not_retryable() {
+        let err = IaError::Auth("credentials required".into());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn config_error_is_not_retryable() {
+        let err = IaError::Config("bad value".into());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn disk_full_is_not_retryable() {
+        let err = IaError::DiskFull {
+            path: PathBuf::from("/mnt/data"),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn network_error_is_retryable() {
+        // Construct a Network error variant; it's always retryable regardless of inner value
+        let err = IaError::Http {
+            status: 502,
+            message: "Bad Gateway".into(),
+        };
+        // 5xx through Http is retryable (proxy for network issues reaching server)
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn io_error_is_retryable() {
+        let err: IaError =
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into();
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn checksum_mismatch_is_retryable() {
+        let err = IaError::ChecksumMismatch {
+            file: "photo.jpg".into(),
+            expected: "abc".into(),
+            actual: "def".into(),
+        };
+        assert!(err.is_retryable());
     }
 }

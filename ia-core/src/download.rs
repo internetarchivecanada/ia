@@ -479,7 +479,13 @@ pub async fn download_item(
                 {
                     Ok(result) => return result,
                     Err(e) => {
-                        warn!(file = %file.name, attempt, error = %e, "download failed");
+                        if e.is_retryable() {
+                            warn!(file = %file.name, attempt, error = %e, "download failed (will retry)");
+                        } else {
+                            warn!(file = %file.name, error = %e, "download failed (not retryable)");
+                            last_err = Some(e);
+                            break;
+                        }
                         last_err = Some(e);
                     }
                 }
@@ -903,5 +909,113 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("resume.txt")).unwrap();
         assert_eq!(content, "full content here");
         assert_eq!(result.bytes, body.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn forbidden_file_is_not_retried() {
+        let mock_server = MockServer::start().await;
+
+        let guard = Mock::given(method("GET"))
+            .and(path("/download/test-item/restricted.txt"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Access denied"))
+            .expect(1) // Must be called exactly once — no retries
+            .mount_as_scoped(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("restricted.txt", 100);
+        let opts = DownloadOpts {
+            retries: 3,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, IaError::Http { status: 403, .. }));
+
+        drop(guard); // triggers expect(1) assertion
+    }
+
+    #[tokio::test]
+    async fn forbidden_item_files_fail_immediately() {
+        let mock_server = MockServer::start().await;
+
+        // Mock metadata endpoint
+        Mock::given(method("GET"))
+            .and(path("/metadata/restricted-item"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": "restricted-item"},
+                "files": [
+                    {"name": "a.txt", "size": "5", "source": "original"},
+                    {"name": "b.txt", "size": "5", "source": "original"}
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Both files return 403 — should be hit exactly once each (no retries)
+        for name in &["a.txt", "b.txt"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/restricted-item/{name}")))
+                .respond_with(ResponseTemplate::new(403).set_body_string("Access denied"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+        }
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries: 3,
+            ..Default::default()
+        };
+        let semaphore = Arc::new(Semaphore::new(2));
+
+        let result = download_item(&client, "restricted-item", &opts, semaphore, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.files_total, 2);
+        assert_eq!(result.files_failed, 2);
+        assert_eq!(result.files_downloaded, 0);
+        for r in &result.results {
+            match &r.status {
+                DownloadStatus::Failed(msg) => assert!(msg.contains("403"), "error should mention 403: {msg}"),
+                other => panic!("expected Failed, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_error_is_retried() {
+        let mock_server = MockServer::start().await;
+
+        // 500 should be retried at both middleware and app level.
+        // With reqwest-retry (3 middleware retries) and retries=1 (2 app attempts),
+        // we expect > 1 total request. Use expect(2..) to verify retry happened.
+        let guard = Mock::given(method("GET"))
+            .and(path("/download/test-item/flaky.txt"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(2..)
+            .mount_as_scoped(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("flaky.txt", 100);
+        let opts = DownloadOpts {
+            retries: 1,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), IaError::Http { status: 500, .. }));
+        drop(guard);
     }
 }
