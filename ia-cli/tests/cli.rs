@@ -304,6 +304,33 @@ fn metadata_long_help_has_examples() {
 }
 
 #[test]
+fn list_long_help_has_examples() {
+    ia().args(["list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia list"));
+}
+
+#[test]
+fn status_long_help_has_examples() {
+    ia().args(["status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia status"));
+}
+
+#[test]
+fn completions_long_help_has_examples() {
+    ia().args(["completions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia completions"));
+}
+
+#[test]
 fn metadata_spreadsheet_with_append_list() {
     // --spreadsheet combined with --append-list should be accepted.
     // The flag value is ignored; only the op mode (AppendList) is used.
