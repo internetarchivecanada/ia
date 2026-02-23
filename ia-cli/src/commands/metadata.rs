@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use futures::StreamExt;
 use serde_json::json;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ModifyRequest,
     ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS,
 };
+use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
-use ia_core::IaClient;
+use ia_core::{IaClient, IaError};
 
 #[derive(Args)]
 pub struct MetadataArgs {
@@ -93,6 +97,7 @@ pub async fn run(
     client: &IaClient,
     args: MetadataArgs,
     quiet: u8,
+    jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
     // Determine if this is a write operation
@@ -107,7 +112,7 @@ pub async fn run(
         return run_read(client, &args).await;
     }
 
-    run_write(client, &args, quiet, joblog_path).await
+    run_write(client, &args, quiet, jobs, joblog_path).await
 }
 
 /// Read mode: existing behavior for metadata display, --exists, --formats.
@@ -162,11 +167,12 @@ async fn run_write(
     client: &IaClient,
     args: &MetadataArgs,
     quiet: u8,
+    jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
     // Spreadsheet mode: read records and process each as a modify() call
     if let Some(ref spreadsheet_path) = args.spreadsheet {
-        return run_spreadsheet(client, args, spreadsheet_path, quiet, joblog_path).await;
+        return run_spreadsheet(client, args, spreadsheet_path, quiet, jobs, joblog_path).await;
     }
 
     // Parse changes and determine operation
@@ -244,17 +250,13 @@ async fn run_write(
         .priority
         .unwrap_or(if identifiers.len() > 1 { -5 } else { 0 });
 
-    // Process each identifier
-    let mut error_count = 0usize;
-
-    if args.dry_run && quiet == 0 {
-        println!("Dry run -- no changes will be applied\n");
-    }
-
-    let mut total_dry_run_changes = 0usize;
-
-    for identifier in &identifiers {
-        if args.dry_run {
+    // Dry-run: sequential, no concurrency needed
+    if args.dry_run {
+        if quiet == 0 {
+            println!("Dry run -- no changes will be applied\n");
+        }
+        let mut total_dry_run_changes = 0usize;
+        for identifier in &identifiers {
             for (changes, batch_op) in &change_groups {
                 total_dry_run_changes += run_dry_run(
                     client,
@@ -267,69 +269,111 @@ async fn run_write(
                 )
                 .await?;
             }
-            continue;
         }
+        if quiet == 0 {
+            println!(
+                "\n{} item(s), {} change(s)",
+                identifiers.len(),
+                total_dry_run_changes
+            );
+        }
+        return Ok(());
+    }
 
-        let start = std::time::Instant::now();
-        let file_target = if args.target == "metadata" {
-            ""
-        } else {
-            &args.target
-        };
+    let file_target = if args.target == "metadata" {
+        String::new()
+    } else {
+        args.target.clone()
+    };
 
-        // Process all change groups for this identifier.
-        // For non-insert ops, there is exactly one group. For insert ops,
-        // each --insert arg is a separate group with its own index.
-        let mut batch_error = None;
-        let mut last_task_id = None;
+    // Concurrent batch processing with JoinSet + Semaphore + RateLimiter
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let rate_limiter = RateLimiter::new();
 
-        for (changes, batch_op) in &change_groups {
-            let req = ModifyRequest {
-                identifier: identifier.clone(),
-                changes: changes.clone(),
-                op: batch_op.clone(),
-                target: args.target.clone(),
-                expect: expect.clone(),
-                priority: Some(priority),
-                reduced_priority: args.reduced_priority,
-            };
-            let result = ia_core::metadata::modify(client, &req).await;
+    let mut set = JoinSet::new();
 
-            match result {
-                Ok(resp) => {
-                    last_task_id = resp.task_id;
+    for identifier in identifiers.clone() {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+        let change_groups = change_groups.clone();
+        let target = args.target.clone();
+        let expect = expect.clone();
+        let reduced_priority = args.reduced_priority;
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let start = std::time::Instant::now();
+            let mut batch_error = None;
+            let mut last_task_id = None;
+
+            for (changes, batch_op) in &change_groups {
+                let req = ModifyRequest {
+                    identifier: identifier.clone(),
+                    changes: changes.clone(),
+                    op: batch_op.clone(),
+                    target: target.clone(),
+                    expect: expect.clone(),
+                    priority: Some(priority),
+                    reduced_priority,
+                };
+
+                // Retry loop for 429 rate limiting
+                loop {
+                    rl.wait_if_paused().await;
+                    match ia_core::metadata::modify(&client, &req).await {
+                        Ok(resp) => {
+                            last_task_id = resp.task_id;
+                            break;
+                        }
+                        Err(IaError::RateLimited { retry_after }) => {
+                            rl.pause_for(retry_after, |secs| {
+                                eprintln!(
+                                    "Rate limited. Pausing all workers for {secs}s..."
+                                );
+                            })
+                            .await;
+                            // retry
+                        }
+                        Err(e) => {
+                            batch_error = Some(e);
+                            break;
+                        }
+                    }
                 }
-                Err(e) => {
-                    batch_error = Some(e);
+
+                if batch_error.is_some() {
                     break;
                 }
             }
-        }
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        let outcome = match batch_error {
-            None => Ok(last_task_id),
-            Some(e) => Err(e.to_string()),
-        };
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let outcome = match batch_error {
+                None => Ok(last_task_id),
+                Some(e) => Err(e.to_string()),
+            };
+
+            (identifier, outcome, elapsed_ms)
+        });
+    }
+
+    // Collect results — output is clean because we process one at a time
+    let mut error_count = 0usize;
+    while let Some(result) = set.join_next().await {
+        let (identifier, outcome, elapsed_ms) =
+            result.context("task panicked")?;
 
         if record_modify_outcome(
-            identifier,
+            &identifier,
             &outcome,
             elapsed_ms,
-            file_target,
+            &file_target,
             quiet,
             joblog.as_ref(),
         ) {
             error_count += 1;
         }
-    }
-
-    if args.dry_run && quiet == 0 {
-        println!(
-            "\n{} item(s), {} change(s)",
-            identifiers.len(),
-            total_dry_run_changes
-        );
     }
 
     if error_count > 0 {
@@ -415,6 +459,7 @@ async fn run_spreadsheet(
     args: &MetadataArgs,
     spreadsheet_path: &Path,
     quiet: u8,
+    jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
     let records = ia_core::spreadsheet::read_spreadsheet(spreadsheet_path)
@@ -461,77 +506,121 @@ async fn run_spreadsheet(
         .transpose()
         .context("failed to open joblog")?;
 
-    if args.dry_run && quiet == 0 {
-        println!("Dry run -- no changes will be applied\n");
-    }
+    // Build (identifier, changes) pairs, filtering empty records
+    let work_items: Vec<(String, Vec<(String, serde_json::Value)>)> = records
+        .iter()
+        .filter_map(|(identifier, fields)| {
+            let changes: Vec<(String, serde_json::Value)> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect();
+            if changes.is_empty() {
+                None
+            } else {
+                Some((identifier.clone(), changes))
+            }
+        })
+        .collect();
 
-    let mut error_count = 0usize;
-    let mut item_count = 0usize;
-    let mut total_changes = 0usize;
+    let item_count = work_items.len();
 
-    for (identifier, fields) in &records {
-        let changes: Vec<(String, serde_json::Value)> = fields
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v)))
-            .collect();
-
-        if changes.is_empty() {
-            continue;
+    // Dry-run: sequential
+    if args.dry_run {
+        if quiet == 0 {
+            println!("Dry run -- no changes will be applied\n");
         }
-
-        item_count += 1;
-
-        if args.dry_run {
+        let mut total_changes = 0usize;
+        for (identifier, changes) in &work_items {
             total_changes += run_dry_run(
                 client,
                 identifier,
-                &changes,
+                changes,
                 &op,
                 &args.target,
                 None,
                 quiet,
             )
             .await?;
-            continue;
         }
+        if quiet == 0 {
+            println!("\n{} item(s), {} change(s)", item_count, total_changes);
+        }
+        return Ok(());
+    }
 
-        let start = std::time::Instant::now();
-        let req = ModifyRequest {
-            identifier: identifier.clone(),
-            changes,
-            op: op.clone(),
-            target: args.target.clone(),
-            expect: None,
-            priority: Some(priority),
-            reduced_priority: args.reduced_priority,
-        };
-        let result = ia_core::metadata::modify(client, &req).await;
+    let file_target = if args.target == "metadata" {
+        String::new()
+    } else {
+        args.target.clone()
+    };
 
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        let file_target = if args.target == "metadata" {
-            ""
-        } else {
-            &args.target
-        };
-        let outcome = result
-            .as_ref()
-            .map(|r| r.task_id)
-            .map_err(|e| e.to_string());
+    // Concurrent batch processing with JoinSet + Semaphore + RateLimiter
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let rate_limiter = RateLimiter::new();
+
+    let mut set = JoinSet::new();
+
+    for (identifier, changes) in work_items {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+        let op = op.clone();
+        let target = args.target.clone();
+        let reduced_priority = args.reduced_priority;
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let start = std::time::Instant::now();
+            let req = ModifyRequest {
+                identifier: identifier.clone(),
+                changes,
+                op,
+                target,
+                expect: None,
+                priority: Some(priority),
+                reduced_priority,
+            };
+
+            // Retry loop for 429 rate limiting
+            let outcome = loop {
+                rl.wait_if_paused().await;
+                match ia_core::metadata::modify(&client, &req).await {
+                    Ok(resp) => break Ok(resp.task_id),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        rl.pause_for(retry_after, |secs| {
+                            eprintln!(
+                                "Rate limited. Pausing all workers for {secs}s..."
+                            );
+                        })
+                        .await;
+                        // retry
+                    }
+                    Err(e) => break Err(e.to_string()),
+                }
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            (identifier, outcome, elapsed_ms)
+        });
+    }
+
+    // Collect results — output is clean because we process one at a time
+    let mut error_count = 0usize;
+    while let Some(result) = set.join_next().await {
+        let (identifier, outcome, elapsed_ms) =
+            result.context("task panicked")?;
 
         if record_modify_outcome(
-            identifier,
+            &identifier,
             &outcome,
             elapsed_ms,
-            file_target,
+            &file_target,
             quiet,
             joblog.as_ref(),
         ) {
             error_count += 1;
         }
-    }
-
-    if args.dry_run && quiet == 0 {
-        println!("\n{} item(s), {} change(s)", item_count, total_changes);
     }
 
     if error_count > 0 {

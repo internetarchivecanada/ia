@@ -6,9 +6,13 @@
 use ia_core::metadata::write::{
     compute_patch, modify, prepare_metadata, MetadataOp, ModifyRequest, REMOVE_TAG,
 };
-use ia_core::{IaClient, IaConfig};
+use ia_core::rate_limit::RateLimiter;
+use ia_core::{IaClient, IaConfig, IaError};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1339,4 +1343,370 @@ async fn modify_empty_strings_item_set_description() {
     .await
     .unwrap();
     assert!(resp.success);
+}
+
+// =============================================================================
+// Batch concurrency tests: JoinSet + Semaphore + RateLimiter with modify()
+// =============================================================================
+
+fn batch_item(identifier: &str) -> Value {
+    json!({
+        "metadata": {
+            "identifier": identifier,
+            "title": "Old Title",
+            "collection": ["test-collection"]
+        },
+        "files": []
+    })
+}
+
+#[tokio::test]
+async fn no_retry_client_sees_429_as_rate_limited() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test429"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("test429")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test429"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "5"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let req = ModifyRequest {
+        identifier: "test429".to_string(),
+        changes: vec![("title".to_string(), json!("New"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(0),
+        reduced_priority: false,
+    };
+    let result = modify(&client, &req).await;
+    match &result {
+        Err(IaError::RateLimited { retry_after }) => {
+            assert_eq!(*retry_after, 5);
+        }
+        other => panic!("expected RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn single_worker_429_retry_with_rate_limiter() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("retry-item")))
+        .mount(&server)
+        .await;
+
+    // 429 mock: high priority (1), consumed after 1 response
+    Mock::given(method("POST"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    // Success mock: low priority (10), serves after 429 mock is consumed
+    Mock::given(method("POST"))
+        .and(path("/metadata/retry-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(8001)))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let rl = RateLimiter::new();
+    let mut attempts = 0usize;
+
+    let req = ModifyRequest {
+        identifier: "retry-item".to_string(),
+        changes: vec![("title".to_string(), json!("New"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: Some(0),
+        reduced_priority: false,
+    };
+
+    let result = loop {
+        attempts += 1;
+        rl.wait_if_paused().await;
+        match modify(&client, &req).await {
+            Ok(resp) => break Ok(resp),
+            Err(IaError::RateLimited { retry_after }) => {
+                rl.pause_for(retry_after, |_| {}).await;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+
+    assert!(result.is_ok(), "expected Ok after retry, got: {result:?}");
+    assert_eq!(attempts, 2, "should take 2 attempts (first 429, then success)");
+}
+
+#[tokio::test]
+async fn batch_modify_concurrent_faster_than_sequential() {
+    let server = MockServer::start().await;
+
+    // Mount mocks for 3 items, each POST has 200ms delay
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch_item(id)))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(success_response(5000))
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(3)); // all 3 can run concurrently
+    let rate_limiter = RateLimiter::new();
+
+    let start = std::time::Instant::now();
+    let mut set = JoinSet::new();
+
+    for id in ["batch-a", "batch-b", "batch-c"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            rl.wait_if_paused().await;
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("New Title"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(-5),
+                reduced_priority: false,
+            };
+            modify(&client, &req).await
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result.unwrap());
+    }
+
+    let elapsed = start.elapsed();
+
+    // All 3 should succeed
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        assert!(r.is_ok(), "expected Ok, got: {r:?}");
+    }
+
+    // Concurrent: ~200ms. Sequential would be ~600ms+.
+    // Use 500ms threshold to account for overhead.
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "took {elapsed:?}, expected <500ms for concurrent execution of 3x200ms tasks"
+    );
+}
+
+#[tokio::test]
+async fn batch_modify_429_pauses_all_workers_then_retries() {
+    let server = MockServer::start().await;
+
+    // Mount GET mocks for both items
+    for id in ["rate-a", "rate-b"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch_item(id)))
+            .mount(&server)
+            .await;
+    }
+
+    // rate-a POST: 429 mock (high priority, consumed after 1 response)
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-a"))
+        .respond_with(
+            ResponseTemplate::new(429).insert_header("Retry-After", "1"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    // rate-a POST: success mock (low priority, serves after 429 consumed)
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(6001)))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    // rate-b POST: always success
+    Mock::given(method("POST"))
+        .and(path("/metadata/rate-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(6002)))
+        .mount(&server)
+        .await;
+
+    // Use no-retry client so 429 reaches modify() directly as IaError::RateLimited
+    let client = IaClient::from_config_no_retry(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(2));
+    let rate_limiter = RateLimiter::new();
+    let pause_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let start = std::time::Instant::now();
+    let mut set = JoinSet::new();
+
+    for id in ["rate-a", "rate-b"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+        let pc = Arc::clone(&pause_count);
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("Updated"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(0),
+                reduced_priority: false,
+            };
+
+            loop {
+                rl.wait_if_paused().await;
+                match modify(&client, &req).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        rl.pause_for(retry_after, |_| {}).await;
+                        // retry
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result.unwrap());
+    }
+
+    let elapsed = start.elapsed();
+
+    // Both should succeed (rate-a after RateLimiter-mediated retry)
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(r.is_ok(), "expected Ok, got: {r:?}");
+    }
+
+    // RateLimiter should have been triggered at least once
+    assert!(
+        pause_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "rate limiter should have been triggered by 429"
+    );
+
+    // Should take at least 1 second (the Retry-After pause duration)
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "took {elapsed:?}, expected >=900ms due to rate limit pause"
+    );
+}
+
+#[tokio::test]
+async fn batch_modify_mixed_success_and_error() {
+    let server = MockServer::start().await;
+
+    // mix-ok: succeeds
+    mount_modify_mocks(&server, "mix-ok", batch_item("mix-ok"), 7001).await;
+
+    // mix-fail: GET succeeds, POST returns error response
+    Mock::given(method("GET"))
+        .and(path("/metadata/mix-fail"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(batch_item("mix-fail")))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/mix-fail"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"success": false, "error": "internal error"})),
+        )
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&server.uri())).unwrap();
+    let semaphore = Arc::new(Semaphore::new(2));
+    let rate_limiter = RateLimiter::new();
+
+    let mut set = JoinSet::new();
+
+    for id in ["mix-ok", "mix-fail"] {
+        let client = client.clone();
+        let sem = Arc::clone(&semaphore);
+        let rl = rate_limiter.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            rl.wait_if_paused().await;
+
+            let req = ModifyRequest {
+                identifier: id.to_string(),
+                changes: vec![("title".to_string(), json!("New"))],
+                op: MetadataOp::Set,
+                target: "metadata".to_string(),
+                expect: None,
+                priority: Some(0),
+                reduced_priority: false,
+            };
+
+            loop {
+                rl.wait_if_paused().await;
+                match modify(&client, &req).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        rl.pause_for(retry_after, |_| {}).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+    }
+
+    let mut successes = 0;
+    let mut errors = 0;
+    while let Some(result) = set.join_next().await {
+        match result.unwrap() {
+            Ok(_) => successes += 1,
+            Err(_) => errors += 1,
+        }
+    }
+
+    assert_eq!(successes, 1);
+    assert_eq!(errors, 1);
 }

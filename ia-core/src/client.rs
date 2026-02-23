@@ -88,6 +88,33 @@ impl IaClient {
         &self.config
     }
 
+    /// Create a client without retry middleware.
+    ///
+    /// Useful when application-level retry handling (e.g., RateLimiter for 429)
+    /// needs to see raw HTTP responses without middleware intervention.
+    pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
+        let user_agent = build_user_agent(&config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+
+        let raw_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .pool_max_idle_per_host(10)
+            .build()
+            .map_err(|e| {
+                crate::error::IaError::Config(format!("failed to build HTTP client: {e}"))
+            })?;
+
+        let http = ClientBuilder::new(raw_client).build();
+
+        Ok(Self {
+            http,
+            config,
+            user_agent,
+        })
+    }
+
     pub async fn get_item(&self, identifier: &str) -> Result<crate::types::ItemMetadata> {
         crate::metadata::get(self, identifier).await
     }

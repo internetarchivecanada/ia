@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {
-            commands::metadata::run(&client, args, cli.quiet, cli.joblog.clone()).await?
+            commands::metadata::run(&client, args, cli.quiet, cli.jobs, cli.joblog.clone()).await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
