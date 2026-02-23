@@ -9,7 +9,10 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use ia_core::disk_pool::DiskPool;
-use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
+use ia_core::download::{
+    DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult, ItemDownloadResult,
+};
+use ia_core::error::IaError;
 use ia_core::files::FileFilter;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::search::SearchOpts;
@@ -27,7 +30,8 @@ use crate::output::DownloadDisplay;
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
          \n\n  <dim># Download only MP4 files</dim>\n  <bold>$ ia download nasa --glob \"*.mp4\"</bold>\
-         \n\n  <dim># Batch download items matching a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\n"
+         \n\n  <dim># Batch download items matching a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\
+         \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
 pub struct DownloadArgs {
@@ -93,6 +97,10 @@ pub struct DownloadArgs {
     /// Full-screen dashboard mode
     #[arg(long)]
     pub dashboard: bool,
+
+    /// Output results as JSON (one object per line)
+    #[arg(long)]
+    pub json: bool,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -156,6 +164,10 @@ pub async fn run(
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
+    if args.json && args.dashboard {
+        bail!("--json and --dashboard are mutually exclusive");
+    }
+
     let mut identifiers = collect_identifiers(&args, client).await?;
 
     // Detect file paths passed as identifiers and suggest --itemlist
@@ -261,7 +273,7 @@ pub async fn run(
         };
 
         let multi = indicatif::MultiProgress::new();
-        let display = if quiet == 0 {
+        let display = if !args.json && quiet == 0 {
             Some(Arc::new(DownloadDisplay::new(identifier, &multi)))
         } else {
             None
@@ -290,7 +302,11 @@ pub async fn run(
             write_item_results(jl, identifier, &result.results);
         }
 
-        if quiet == 1 {
+        if args.json {
+            for r in &result.results {
+                print_json_file_result(identifier, r);
+            }
+        } else if quiet == 1 {
             eprintln!(
                 "{}  {} files ({}) in {:.1}s",
                 identifier,
@@ -308,7 +324,8 @@ pub async fn run(
     }
 
     // Batch mode
-    let batch_display = if quiet == 0 {
+    let json_mode = args.json;
+    let batch_display = if !json_mode && quiet == 0 {
         Some(Arc::new(crate::output::BatchDisplay::new(identifiers.len(), jobs)))
     } else {
         None
@@ -324,10 +341,24 @@ pub async fn run(
             Arc::new(move |p: DownloadProgress| bd.on_progress(p))
         });
 
-    let on_item_complete: Option<ia_core::download::OnItemCompleteFn> =
+    let on_item_complete: Option<ia_core::download::OnItemCompleteFn> = if json_mode {
+        Some(Arc::new(move |result: &ItemDownloadResult| {
+            let obj = serde_json::json!({
+                "item": result.identifier,
+                "status": "ok",
+                "files_ok": result.files_downloaded,
+                "files_skipped": result.files_skipped,
+                "files_failed": result.files_failed,
+                "bytes": result.bytes_total,
+                "elapsed_ms": result.elapsed.as_millis() as u64,
+            });
+            println!("{}", obj);
+        }))
+    } else {
         batch_display.clone().map(|bd| -> ia_core::download::OnItemCompleteFn {
             Arc::new(move |result| bd.on_item_complete(result))
-        });
+        })
+    };
 
     let result = ia_core::download::download_batch(
         client,
@@ -340,6 +371,15 @@ pub async fn run(
         args.items,
     )
     .await;
+
+    // Print JSON for failed items (on_item_complete only fires for Ok results)
+    if json_mode {
+        for item_result in &result.item_results {
+            if item_result.is_err() {
+                print_json_item_result(item_result);
+            }
+        }
+    }
 
     // Write batch results to joblog
     if let Some(ref jl) = joblog {
@@ -356,7 +396,7 @@ pub async fn run(
     }
 
     // Print summary
-    if quiet < 2 {
+    if !json_mode && quiet < 2 {
         let disk_statuses = disk_pool.as_ref().map(|p| p.status());
         if let Some(ref bd) = batch_display {
             if disk_pool.is_some() {
@@ -403,6 +443,159 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
             _ => continue,
         };
         jl.write(&entry);
+    }
+}
+
+/// Build a JSON value for a single file download result.
+fn json_file_result(identifier: &str, r: &FileDownloadResult) -> Option<serde_json::Value> {
+    match &r.status {
+        DownloadStatus::Complete => Some(serde_json::json!({
+            "item": identifier,
+            "file": r.file_name,
+            "status": "ok",
+            "bytes": r.bytes,
+            "elapsed_ms": r.elapsed.as_millis() as u64,
+        })),
+        DownloadStatus::Skipped(reason) => Some(serde_json::json!({
+            "item": identifier,
+            "file": r.file_name,
+            "status": "skipped",
+            "reason": reason,
+        })),
+        DownloadStatus::Failed(msg) => Some(serde_json::json!({
+            "item": identifier,
+            "file": r.file_name,
+            "status": "error",
+            "error": {
+                "code": "download_failed",
+                "message": msg,
+            },
+        })),
+        _ => None,
+    }
+}
+
+/// Print a single file download result as a JSON line to stdout.
+fn print_json_file_result(identifier: &str, r: &FileDownloadResult) {
+    if let Some(obj) = json_file_result(identifier, r) {
+        println!("{}", obj);
+    }
+}
+
+/// Build a JSON value for an item-level result (batch mode).
+fn json_item_result(result: &std::result::Result<ItemDownloadResult, (String, IaError)>) -> serde_json::Value {
+    match result {
+        Ok(ir) => serde_json::json!({
+            "item": ir.identifier,
+            "status": "ok",
+            "files_ok": ir.files_downloaded,
+            "files_skipped": ir.files_skipped,
+            "files_failed": ir.files_failed,
+            "bytes": ir.bytes_total,
+            "elapsed_ms": ir.elapsed.as_millis() as u64,
+        }),
+        Err((id, err)) => {
+            let je = err.to_json_error();
+            serde_json::json!({
+                "item": id,
+                "status": "error",
+                "error": {
+                    "code": je.error.code,
+                    "message": je.error.message,
+                },
+            })
+        }
+    }
+}
+
+/// Print an item-level result as a JSON line to stdout (batch mode).
+fn print_json_item_result(result: &std::result::Result<ItemDownloadResult, (String, IaError)>) {
+    println!("{}", json_item_result(result));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn json_file_result_ok() {
+        let r = FileDownloadResult {
+            file_name: "photo.jpg".to_string(),
+            bytes: 4200000,
+            status: DownloadStatus::Complete,
+            elapsed: Duration::from_millis(2100),
+        };
+        let v = json_file_result("nasa", &r).unwrap();
+        assert_eq!(v["item"], "nasa");
+        assert_eq!(v["file"], "photo.jpg");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["bytes"], 4200000);
+        assert_eq!(v["elapsed_ms"], 2100);
+    }
+
+    #[test]
+    fn json_file_result_skipped() {
+        let r = FileDownloadResult {
+            file_name: "thumb.jpg".to_string(),
+            bytes: 0,
+            status: DownloadStatus::Skipped("already_exists".to_string()),
+            elapsed: Duration::ZERO,
+        };
+        let v = json_file_result("nasa", &r).unwrap();
+        assert_eq!(v["item"], "nasa");
+        assert_eq!(v["file"], "thumb.jpg");
+        assert_eq!(v["status"], "skipped");
+        assert_eq!(v["reason"], "already_exists");
+        assert!(v.get("bytes").is_none());
+    }
+
+    #[test]
+    fn json_file_result_error() {
+        let r = FileDownloadResult {
+            file_name: "video.mp4".to_string(),
+            bytes: 0,
+            status: DownloadStatus::Failed("connection reset".to_string()),
+            elapsed: Duration::from_millis(500),
+        };
+        let v = json_file_result("nasa", &r).unwrap();
+        assert_eq!(v["item"], "nasa");
+        assert_eq!(v["file"], "video.mp4");
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["code"], "download_failed");
+        assert_eq!(v["error"]["message"], "connection reset");
+    }
+
+    #[test]
+    fn json_item_result_ok() {
+        let ir = ItemDownloadResult {
+            identifier: "nasa".to_string(),
+            files_total: 15,
+            files_downloaded: 12,
+            files_skipped: 3,
+            files_failed: 0,
+            bytes_total: 42000000,
+            elapsed: Duration::from_millis(8500),
+            results: vec![],
+        };
+        let v = json_item_result(&Ok(ir));
+        assert_eq!(v["item"], "nasa");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["files_ok"], 12);
+        assert_eq!(v["files_skipped"], 3);
+        assert_eq!(v["files_failed"], 0);
+        assert_eq!(v["bytes"], 42000000);
+        assert_eq!(v["elapsed_ms"], 8500);
+    }
+
+    #[test]
+    fn json_item_result_error() {
+        let err = IaError::NotFound("broken".to_string());
+        let v = json_item_result(&Err(("broken".to_string(), err)));
+        assert_eq!(v["item"], "broken");
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["code"], "not_found");
+        assert!(v["error"]["message"].as_str().unwrap().contains("broken"));
     }
 }
 
