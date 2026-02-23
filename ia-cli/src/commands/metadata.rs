@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use color_print::cstr;
 use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -20,6 +21,17 @@ use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
 
 #[derive(Args)]
+#[command(
+    long_about = "Read or modify item metadata. By default, displays the full metadata JSON for \
+        an item. Use --modify, --append, --remove, and related flags to update metadata fields. \
+        Supports bulk operations via --itemlist, --search, or --spreadsheet.",
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># View metadata for an item</dim>\n  <bold>$ ia metadata nasa</bold>\
+         \n\n  <dim># Set a metadata field</dim>\n  <bold>$ ia metadata nasa --modify=\"description:Updated description\"</bold>\
+         \n\n  <dim># Bulk update from a spreadsheet</dim>\n  <bold>$ ia metadata --spreadsheet updates.csv</bold>\n"
+    ),
+)]
 pub struct MetadataArgs {
     /// Item identifier(s)
     #[arg()]
@@ -59,11 +71,11 @@ pub struct MetadataArgs {
     pub remove: Vec<String>,
 
     // --- Write options ---
-    /// Target: "metadata" (default) or "files/filename"
+    /// Target: "metadata" (default) or "files/FILENAME"
     #[arg(long, default_value = "metadata")]
     pub target: String,
 
-    /// Server-side concurrency check: --expect="field:expected_value" (repeatable)
+    /// Optimistic concurrency check: fail if field doesn't match expected value
     #[arg(long, value_name = "K:V")]
     pub expect: Vec<String>,
 
@@ -84,7 +96,7 @@ pub struct MetadataArgs {
     #[arg(long)]
     pub itemlist: Option<PathBuf>,
 
-    /// Use search results as input
+    /// Use search results as input (queries archive.org, modifies each result)
     #[arg(long)]
     pub search: Option<String>,
 

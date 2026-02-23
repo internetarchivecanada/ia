@@ -245,6 +245,92 @@ fn metadata_spreadsheet_no_write_op_accepted() {
 }
 
 #[test]
+fn help_output_contains_examples_section() {
+    ia().arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"));
+}
+
+#[test]
+fn short_help_omits_examples() {
+    ia().arg("-h")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:").not());
+}
+
+#[test]
+fn download_long_help_has_examples() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia download"));
+}
+
+#[test]
+fn download_short_help_omits_examples() {
+    ia().args(["download", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:").not());
+}
+
+#[test]
+fn search_long_help_has_examples() {
+    ia().args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia search"));
+}
+
+#[test]
+fn search_short_help_omits_examples() {
+    ia().args(["search", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:").not());
+}
+
+#[test]
+fn metadata_long_help_has_examples() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia metadata"));
+}
+
+#[test]
+fn list_long_help_has_examples() {
+    ia().args(["list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia list"));
+}
+
+#[test]
+fn status_long_help_has_examples() {
+    ia().args(["status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia status"));
+}
+
+#[test]
+fn completions_long_help_has_examples() {
+    ia().args(["completions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia completions"));
+}
+
+#[test]
 fn metadata_spreadsheet_with_append_list() {
     // --spreadsheet combined with --append-list should be accepted.
     // The flag value is ignored; only the op mode (AppendList) is used.

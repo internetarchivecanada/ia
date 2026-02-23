@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Args;
+use color_print::cstr;
 use comfy_table::{Cell, Color, Table};
 use console::style;
 
@@ -8,6 +9,16 @@ use ia_core::types::FileSource;
 use ia_core::IaClient;
 
 #[derive(Args)]
+#[command(
+    long_about = "List files in an Internet Archive item. Displays a table of files with name, \
+        size, and format by default. Use --columns to customize output, --glob to filter, or \
+        --all for full file metadata as JSON.",
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># List files in an item</dim>\n  <bold>$ ia list nasa</bold>\
+         \n\n  <dim># Show only original files with download URLs</dim>\n  <bold>$ ia list nasa --source original --location</bold>\n"
+    ),
+)]
 pub struct ListArgs {
     /// Item identifier
     pub identifier: String,
@@ -32,7 +43,7 @@ pub struct ListArgs {
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Filter by source type
+    /// Filter by source type (original, derivative, metadata)
     #[arg(long, value_parser = parse_source)]
     pub source: Option<FileSource>,
 }

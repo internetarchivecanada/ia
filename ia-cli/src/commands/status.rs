@@ -1,11 +1,20 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use color_print::cstr;
 use console::style;
 use std::path::PathBuf;
 
 use ia_core::joblog;
 
 #[derive(Args)]
+#[command(
+    long_about = "Show a summary of a job log file. Displays total operations, success/failure/skip \
+        counts, and lists any failed files with error messages.",
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># View job log summary</dim>\n  <bold>$ ia status --joblog downloads.jsonl</bold>\n"
+    ),
+)]
 pub struct StatusArgs {
     /// Path to job log file
     #[arg(long)]
