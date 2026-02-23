@@ -78,6 +78,19 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 - Run `cargo check`, `cargo test`, `cargo clippy` before committing
 - **ALWAYS update help text**: When adding or modifying CLI flags, subcommands, or behaviors, update the corresponding `about`, `long_about`, `after_long_help`, and option-level help strings. Help text is user-facing documentation — it must stay accurate.
 
+## Agent-Friendly Output (`--json`)
+
+Every command must support `--json` as a **subcommand flag** (not global). Design doc: `docs/plans/2026-02-23-agent-friendly-output-design.md`
+
+- `--json` → stdout becomes JSON/JSONL, stderr becomes structured error JSON
+- `--json` is per-subcommand (output shape differs per command), shared error infra in ia-core
+- Errors: `{"error": {"code": "...", "message": "...", ...extra_fields}}`
+- Exit codes: binary 0/1 only. Error details in stderr JSON, not exit codes.
+- Batch operations: JSONL streaming (one object per line as items complete)
+- `--json` suppresses progress bars, color, and decorative output
+- `--json --dashboard` is mutually exclusive (error)
+- ALWAYS add `--json` support when creating new commands
+
 ## Global CLI Short Flags (Reserved)
 
 These short flags are used by global options and MUST NOT be reused in subcommands:
