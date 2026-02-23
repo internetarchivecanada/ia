@@ -478,6 +478,7 @@ async fn run_spreadsheet(
 
     let mut error_count = 0usize;
     let mut item_count = 0usize;
+    let mut total_changes = 0usize;
 
     for (identifier, fields) in &records {
         let changes: Vec<(String, serde_json::Value)> = fields
@@ -492,7 +493,7 @@ async fn run_spreadsheet(
         item_count += 1;
 
         if args.dry_run {
-            run_dry_run(
+            total_changes += run_dry_run(
                 client,
                 identifier,
                 &changes,
@@ -553,7 +554,7 @@ async fn run_spreadsheet(
     }
 
     if args.dry_run && quiet == 0 {
-        println!("\n{} item(s) processed", item_count);
+        println!("\n{} item(s), {} change(s)", item_count, total_changes);
     }
 
     if error_count > 0 {
