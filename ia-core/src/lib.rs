@@ -24,6 +24,6 @@ pub fn version() -> &'static str {
 mod tests {
     #[test]
     fn version_is_set() {
-        assert_eq!(super::version(), "0.4.0");
+        assert_eq!(super::version(), env!("CARGO_PKG_VERSION"));
     }
 }
