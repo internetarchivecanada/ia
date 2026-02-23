@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::Args;
+use color_print::cstr;
 use console::style;
 use futures::StreamExt;
 
@@ -7,6 +8,17 @@ use ia_core::search::{SearchOpts, SearchResult};
 use ia_core::IaClient;
 
 #[derive(Args)]
+#[command(
+    long_about = "Search the Internet Archive. Returns matching items using the scrape API by \
+        default, or the full-text search backend with --fts. Results can be formatted as JSON, \
+        filtered to specific fields, or output as a plain identifier list.",
+    after_long_help = cstr!(
+        "<bold><underline>Examples:</underline></bold>\n\
+         \n  <dim># Search for items in a collection</dim>\n  <bold>$ ia search \"collection:nasa\"</bold>\
+         \n\n  <dim># Get just the identifiers (useful for piping)</dim>\n  <bold>$ ia search \"mediatype:audio\" --itemlist</bold>\
+         \n\n  <dim># Full-text search with JSON output</dim>\n  <bold>$ ia search \"apollo 11\" --fts --json</bold>\n"
+    ),
+)]
 pub struct SearchArgs {
     /// Search query
     pub query: String,

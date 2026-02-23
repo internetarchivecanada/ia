@@ -278,6 +278,23 @@ fn download_short_help_omits_examples() {
 }
 
 #[test]
+fn search_long_help_has_examples() {
+    ia().args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("ia search"));
+}
+
+#[test]
+fn search_short_help_omits_examples() {
+    ia().args(["search", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Examples:").not());
+}
+
+#[test]
 fn metadata_spreadsheet_with_append_list() {
     // --spreadsheet combined with --append-list should be accepted.
     // The flag value is ignored; only the op mode (AppendList) is used.
