@@ -49,7 +49,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": "Small change — update function signature and the one call site in modify(). After US-001 since modify() changes."
     },
     {
@@ -64,7 +64,7 @@
         "cargo clippy --workspace -- -D warnings passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": "Test-only change. After US-001 since test code may change with ModifyRequest refactor."
     },
     {

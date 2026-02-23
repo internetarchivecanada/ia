@@ -325,3 +325,40 @@ Branch: feat/metadata-write
   - Always verify committed state, not just working tree (lesson from US-015 review feedback)
   - Ralph Loop + code review pattern caught a real defect (uncommitted Cargo.toml deps)
 ---
+
+## 2026-02-22 - US-001 (polish)
+- Refactored `modify()` to use `ModifyRequest` struct — clean public API with owned data, no lifetimes
+- Removed `#[allow(clippy::too_many_arguments)]` from `modify()`
+- Re-exported `ModifyRequest` from `metadata/mod.rs`
+- Updated all callers: CLI `run_write()`, `run_spreadsheet()`, all unit and integration tests (17+ call sites)
+- TDD: wrote test using `ModifyRequest` first (RED), then implemented struct and updated signature (GREEN)
+- All 259 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/metadata/write.rs`, `ia-core/src/metadata/mod.rs`, `ia-core/tests/metadata_write.rs`, `ia-cli/src/commands/metadata.rs`
+- **Learnings for future iterations:**
+  - `ModifyRequest` uses all owned types (String, Vec, HashMap) — no lifetime parameters needed
+  - When refactoring function signatures, update tests in parallel with a subagent for efficiency
+  - CLI code needs `.clone()` when constructing `ModifyRequest` from borrowed loop variables
+---
+
+## 2026-02-22 - US-002 (polish)
+- Added `identifier: &str` parameter to `extract_target_metadata()`
+- File-not-found error now includes actual identifier instead of empty string
+- TDD: wrote 2 tests first (file-not-found with identifier, verify error contents), RED → GREEN
+- Updated all callers: `modify()` in write.rs, `run_dry_run()` in CLI metadata.rs, 3 unit tests
+- All 261 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/metadata/write.rs`, `ia-cli/src/commands/metadata.rs`
+- **Learnings for future iterations:**
+  - Small signature changes touch many call sites — grep for all usages before starting
+  - `identifier: &str` avoids allocation; callers already have the string available
+---
+
+## 2026-02-22 - US-003 (polish)
+- Added explicit `header("X-Accept-Reduced-Priority", "1")` wiremock matcher to `modify_reduced_priority_sends_header` test
+- Added `header` to wiremock matchers import
+- Removed stale comment about implicit header checking
+- All 261 workspace tests pass, clippy clean
+- Files changed: `ia-core/src/metadata/write.rs`
+- **Learnings for future iterations:**
+  - wiremock `header(name, value)` matcher from `wiremock::matchers` validates exact header values on requests
+  - Adding header matchers to POST mocks makes tests fail if the header is ever removed from production code (wiremock returns 404 for unmatched requests)
+---
