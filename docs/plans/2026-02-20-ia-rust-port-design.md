@@ -18,6 +18,7 @@ A full Rust port of the [internetarchive](https://github.com/jjjake/internetarch
 - **HTTP excellence**: Connection pooling, keep-alive, 100-continue for uploads, `Retry-After` respect
 - **Disk management**: Multi-disk pool support for large batch downloads
 - **Library-first**: Clean Rust API for building GUIs and custom tools
+- **Agent-friendly**: Every command supports `--json` structured output for AI agents, MCP tool servers, and programmatic consumers ([design doc](2026-02-23-agent-friendly-output-design.md))
 
 ### Non-Goals (for now)
 
