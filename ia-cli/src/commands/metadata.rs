@@ -306,32 +306,20 @@ async fn run_write(
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        let outcome = match batch_error {
+            None => Ok(last_task_id),
+            Some(e) => Err(e.to_string()),
+        };
 
-        match batch_error {
-            None => {
-                if quiet == 0 {
-                    println!(
-                        "{identifier}: success (task_id: {})",
-                        last_task_id.unwrap_or(0)
-                    );
-                }
-                if let Some(ref jl) = joblog {
-                    let entry = JoblogEntry::new("modify", identifier, file_target)
-                        .ok(0, elapsed_ms);
-                    jl.write(&entry);
-                }
-            }
-            Some(e) => {
-                error_count += 1;
-                if quiet < 2 {
-                    eprintln!("error: {identifier}: {e}");
-                }
-                if let Some(ref jl) = joblog {
-                    let entry = JoblogEntry::new("modify", identifier, file_target)
-                        .error(&e.to_string(), 0);
-                    jl.write(&entry);
-                }
-            }
+        if record_modify_outcome(
+            identifier,
+            &outcome,
+            elapsed_ms,
+            file_target,
+            quiet,
+            joblog.as_ref(),
+        ) {
+            error_count += 1;
         }
     }
 
@@ -524,32 +512,20 @@ async fn run_spreadsheet(
         } else {
             &args.target
         };
+        let outcome = result
+            .as_ref()
+            .map(|r| r.task_id)
+            .map_err(|e| e.to_string());
 
-        match &result {
-            Ok(resp) => {
-                if quiet == 0 {
-                    println!(
-                        "{identifier}: success (task_id: {})",
-                        resp.task_id.unwrap_or(0)
-                    );
-                }
-                if let Some(ref jl) = joblog {
-                    let entry = JoblogEntry::new("modify", identifier, file_target)
-                        .ok(0, elapsed_ms);
-                    jl.write(&entry);
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                if quiet < 2 {
-                    eprintln!("error: {identifier}: {e}");
-                }
-                if let Some(ref jl) = joblog {
-                    let entry = JoblogEntry::new("modify", identifier, file_target)
-                        .error(&e.to_string(), 0);
-                    jl.write(&entry);
-                }
-            }
+        if record_modify_outcome(
+            identifier,
+            &outcome,
+            elapsed_ms,
+            file_target,
+            quiet,
+            joblog.as_ref(),
+        ) {
+            error_count += 1;
         }
     }
 
@@ -562,6 +538,45 @@ async fn run_spreadsheet(
     }
 
     Ok(())
+}
+
+/// Record the outcome of a modify() call: print output and write joblog entry.
+/// Returns `true` if the outcome was an error.
+fn record_modify_outcome(
+    identifier: &str,
+    outcome: &Result<Option<u64>, String>,
+    elapsed_ms: u64,
+    file_target: &str,
+    quiet: u8,
+    joblog: Option<&JoblogWriter>,
+) -> bool {
+    match outcome {
+        Ok(task_id) => {
+            if quiet == 0 {
+                println!(
+                    "{identifier}: success (task_id: {})",
+                    task_id.unwrap_or(0)
+                );
+            }
+            if let Some(jl) = joblog {
+                let entry = JoblogEntry::new("modify", identifier, file_target)
+                    .ok(0, elapsed_ms);
+                jl.write(&entry);
+            }
+            false
+        }
+        Err(e) => {
+            if quiet < 2 {
+                eprintln!("error: {identifier}: {e}");
+            }
+            if let Some(jl) = joblog {
+                let entry = JoblogEntry::new("modify", identifier, file_target)
+                    .error(e, 0);
+                jl.write(&entry);
+            }
+            true
+        }
+    }
 }
 
 /// Collect identifiers from all sources (positional, --itemlist, --search, stdin).
