@@ -387,7 +387,7 @@ async fn run_dry_run(
     let resp = client.http().get(&url).send().await?;
     let item: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let source = extract_target_metadata(&item, target)
+    let source = extract_target_metadata(&item, target, identifier)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let patch = ia_core::metadata::compute_patch(&source, changes, op, expect)?;

@@ -301,7 +301,7 @@ pub async fn modify(
         .map_err(reqwest_middleware::Error::from)?;
 
     // 3. Extract source metadata based on target
-    let source = extract_target_metadata(&item, &req.target)?;
+    let source = extract_target_metadata(&item, &req.target, identifier)?;
 
     // 4. Compute patch
     let patch_ops = compute_patch(&source, &req.changes, &req.op, req.expect.as_ref())?;
@@ -373,6 +373,7 @@ pub async fn modify(
 pub fn extract_target_metadata(
     item: &serde_json::Value,
     target: &str,
+    identifier: &str,
 ) -> Result<serde_json::Value> {
     if target == "metadata" {
         return item
@@ -394,7 +395,7 @@ pub fn extract_target_metadata(
         }
 
         return Err(IaError::MetadataWrite {
-            identifier: String::new(),
+            identifier: identifier.to_string(),
             message: format!("file not found in item: {filename}"),
         });
     }
@@ -779,7 +780,7 @@ mod tests {
             "metadata": {"identifier": "test", "title": "Test Item"},
             "files": [{"name": "foo.pdf", "size": "100"}]
         });
-        let source = extract_target_metadata(&item, "metadata").unwrap();
+        let source = extract_target_metadata(&item, "metadata", "test").unwrap();
         assert_eq!(source["identifier"], "test");
         assert_eq!(source["title"], "Test Item");
     }
@@ -793,7 +794,7 @@ mod tests {
                 {"name": "bar.txt", "size": "200", "custom": "hello"}
             ]
         });
-        let source = extract_target_metadata(&item, "files/bar.txt").unwrap();
+        let source = extract_target_metadata(&item, "files/bar.txt", "test").unwrap();
         assert_eq!(source["name"], "bar.txt");
         assert_eq!(source["custom"], "hello");
     }
@@ -804,8 +805,25 @@ mod tests {
             "metadata": {"identifier": "test"},
             "files": [{"name": "foo.pdf"}]
         });
-        let result = extract_target_metadata(&item, "files/missing.txt");
+        let result = extract_target_metadata(&item, "files/missing.txt", "my-item-id");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_target_file_not_found_includes_identifier() {
+        let item = serde_json::json!({
+            "metadata": {"identifier": "test"},
+            "files": [{"name": "foo.pdf"}]
+        });
+        let result = extract_target_metadata(&item, "files/missing.txt", "my-item-id");
+        match result.unwrap_err() {
+            IaError::MetadataWrite { identifier, message } => {
+                assert_eq!(identifier, "my-item-id");
+                assert!(message.contains("file not found"));
+                assert!(message.contains("missing.txt"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     // --- modify() async tests ---
