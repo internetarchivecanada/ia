@@ -40,6 +40,29 @@ The Rust CLI provides:
 - **JSONL job logging** (`--joblog`) that records every operation for auditing and retry
 - **Multi-disk pool** support for spreading large downloads across multiple drives
 
+## Agent and machine integration
+
+The Python CLI was designed for humans at a terminal. The Rust CLI is designed for three audiences:
+
+1. **Humans** — colored output, progress bars, tables, TUI dashboard
+2. **AI coding agents** (Claude Code, Cursor, Copilot) that shell out to CLI tools, read `--help`, construct commands, and parse stdout
+3. **Machine consumers** — MCP tool servers that wrap each command as a typed tool, and internal software like book scanning pipelines and batch archiving systems
+
+In the agentic coding paradigm, a well-designed CLI with structured output is a better integration surface than a language-specific library. The CLI encapsulates all IA API complexity — S3 quirks, rate limiting, retry logic, three search backends, metadata patch format — behind a stable, language-agnostic interface. `--help` is the documentation, flags are the parameters, stdout is the return value.
+
+Every command supports a `--json` flag:
+
+- **stdout**: Data as JSON (single object) or JSONL (one object per line for streaming/batch)
+- **stderr**: Errors as typed JSON objects with stable error codes for programmatic matching
+- **Exit codes**: Binary `0`/`1` — error details live in the structured stderr output
+- **No progress bars, no color, no decorative output** — clean machine-parseable data
+
+Batch operations (download, search, metadata modify) stream JSONL — one object per line, parseable with `jq` while the command is still running. This is the same format used by `--joblog`, so tooling that reads one can read both.
+
+The Python CLI has no equivalent. Adding structured output to a synchronous, print-statement-driven codebase would require touching every command — effectively a rewrite.
+
+See the [agent-friendly output design](plans/2026-02-23-agent-friendly-output-design.md) for the full convention, error schema, and per-command output shapes.
+
 ## Further reading
 
 - [Design document](plans/2026-02-20-ia-rust-port-design.md) — full architecture and rationale
