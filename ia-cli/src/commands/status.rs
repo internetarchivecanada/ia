@@ -12,13 +12,18 @@ use ia_core::joblog;
         counts, and lists any failed files with error messages.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
-         \n  <dim># View job log summary</dim>\n  <bold>$ ia status --joblog downloads.jsonl</bold>\n"
+         \n  <dim># View job log summary</dim>\n  <bold>$ ia status --joblog downloads.jsonl</bold>\n\
+         \n  <dim># Machine-readable status output</dim>\n  <bold>$ ia status --joblog downloads.jsonl --json</bold>\n"
     ),
 )]
 pub struct StatusArgs {
     /// Path to job log file
     #[arg(long)]
     pub joblog: PathBuf,
+
+    /// Output results as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(args: StatusArgs) -> Result<()> {
@@ -31,11 +36,55 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     let entries = joblog::read(path).context("failed to read joblog")?;
 
     if entries.is_empty() {
-        println!("Job log: {} (empty)", path.display());
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "total": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "failures": []
+                })
+            );
+        } else {
+            println!("Job log: {} (empty)", path.display());
+        }
         return Ok(());
     }
 
     let summary = joblog::summarize(&entries);
+
+    if args.json {
+        let failed = joblog::failed_files(&entries);
+        let failures: Vec<serde_json::Value> = failed
+            .iter()
+            .map(|(item, file)| {
+                let error_msg = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.item == *item && e.file == *file && e.status == "error")
+                    .and_then(|e| e.error.clone())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                serde_json::json!({"item": item, "file": file, "error": error_msg})
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "total": summary.total,
+                "succeeded": summary.succeeded,
+                "failed": summary.failed,
+                "skipped": summary.skipped,
+                "failures": failures,
+            })
+        );
+        if summary.failed > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     // File modification time
     let mtime_str = std::fs::metadata(path)
@@ -122,4 +171,40 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_output_shape() {
+        let output = serde_json::json!({
+            "total": 150,
+            "succeeded": 140,
+            "failed": 8,
+            "skipped": 2,
+            "failures": [
+                {"item": "x", "file": "y.jpg", "error": "timeout"},
+            ],
+        });
+        assert_eq!(output["total"], 150);
+        assert_eq!(output["succeeded"], 140);
+        assert_eq!(output["failed"], 8);
+        assert_eq!(output["skipped"], 2);
+        assert_eq!(output["failures"][0]["item"], "x");
+        assert_eq!(output["failures"][0]["file"], "y.jpg");
+        assert_eq!(output["failures"][0]["error"], "timeout");
+    }
+
+    #[test]
+    fn json_empty_output_shape() {
+        let output = serde_json::json!({
+            "total": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "failures": [],
+        });
+        assert_eq!(output["total"], 0);
+        assert!(output["failures"].as_array().unwrap().is_empty());
+    }
 }

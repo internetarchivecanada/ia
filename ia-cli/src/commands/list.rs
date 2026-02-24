@@ -16,7 +16,8 @@ use ia_core::IaClient;
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># List files in an item</dim>\n  <bold>$ ia list nasa</bold>\
-         \n\n  <dim># Show only original files with download URLs</dim>\n  <bold>$ ia list nasa --source original --location</bold>\n"
+         \n\n  <dim># Show only original files with download URLs</dim>\n  <bold>$ ia list nasa --source original --location</bold>\
+         \n\n  <dim># Output file list as JSON (for scripts/agents)</dim>\n  <bold>$ ia list nasa --json</bold>\n"
     ),
 )]
 pub struct ListArgs {
@@ -42,6 +43,10 @@ pub struct ListArgs {
     /// Print column headers
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    /// Output results as JSON (one object per line)
+    #[arg(long)]
+    pub json: bool,
 
     /// Filter by source type (original, derivative, metadata)
     #[arg(long, value_parser = parse_source)]
@@ -72,8 +77,16 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
     let file_list = files::list(&item, &filter);
 
     if file_list.is_empty() {
-        if quiet < 2 {
+        if !args.json && quiet < 2 {
             eprintln!("no files match filters");
+        }
+        return Ok(());
+    }
+
+    // --json: JSONL output (one file object per line)
+    if args.json {
+        for f in &file_list {
+            println!("{}", serde_json::to_string(f).unwrap_or_default());
         }
         return Ok(());
     }
@@ -173,5 +186,53 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_file_output_shape() {
+        let f = ia_core::types::FileMetadata {
+            name: "photo.jpg".to_string(),
+            size: Some(4200000),
+            format: Some("JPEG".to_string()),
+            source: Some("original".to_string()),
+            md5: Some("abc123".to_string()),
+            sha1: None,
+            crc32: None,
+            mtime: None,
+            original: None,
+            rotation: None,
+            extra: Default::default(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["name"], "photo.jpg");
+        assert_eq!(v["size"], 4200000);
+        assert_eq!(v["format"], "JPEG");
+        assert_eq!(v["source"], "original");
+        assert_eq!(v["md5"], "abc123");
+    }
+
+    #[test]
+    fn json_file_output_is_compact() {
+        let f = ia_core::types::FileMetadata {
+            name: "test.txt".to_string(),
+            size: Some(100),
+            format: None,
+            source: None,
+            md5: None,
+            sha1: None,
+            crc32: None,
+            mtime: None,
+            original: None,
+            rotation: None,
+            extra: Default::default(),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        // Must be compact (single line, no pretty printing)
+        assert!(!s.contains('\n'));
+        // Must be valid JSON
+        let _: serde_json::Value = serde_json::from_str(&s).unwrap();
     }
 }

@@ -29,7 +29,8 @@ use ia_core::{IaClient, IaError};
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># View metadata for an item</dim>\n  <bold>$ ia metadata nasa</bold>\
          \n\n  <dim># Set a metadata field</dim>\n  <bold>$ ia metadata nasa --modify=\"description:Updated description\"</bold>\
-         \n\n  <dim># Bulk update from a spreadsheet</dim>\n  <bold>$ ia metadata --spreadsheet updates.csv</bold>\n"
+         \n\n  <dim># Bulk update from a spreadsheet</dim>\n  <bold>$ ia metadata --spreadsheet updates.csv</bold>\
+         \n\n  <dim># Machine-readable metadata output</dim>\n  <bold>$ ia metadata nasa --json</bold>\n"
     ),
 )]
 pub struct MetadataArgs {
@@ -48,6 +49,10 @@ pub struct MetadataArgs {
     /// Pretty-print JSON output
     #[arg(long)]
     pub pretty: bool,
+
+    /// Output results as JSON (structured output for scripts/agents)
+    #[arg(long)]
+    pub json: bool,
 
     // --- Write flags (mutually exclusive via "write_op" group) ---
     /// Set field to value: --modify="field:value" (repeatable)
@@ -139,7 +144,12 @@ async fn run_read(client: &IaClient, args: &MetadataArgs) -> Result<()> {
             .item_exists(identifier)
             .await
             .context(format!("failed to check existence of {identifier}"))?;
-        if !exists {
+        if args.json {
+            println!("{}", serde_json::json!({"identifier": identifier, "exists": exists}));
+            if !exists {
+                std::process::exit(1);
+            }
+        } else if !exists {
             std::process::exit(1);
         }
         return Ok(());
@@ -158,8 +168,12 @@ async fn run_read(client: &IaClient, args: &MetadataArgs) -> Result<()> {
             .collect();
         formats.sort();
         formats.dedup();
-        for fmt in formats {
-            println!("{fmt}");
+        if args.json {
+            println!("{}", serde_json::to_string(&formats).unwrap_or_default());
+        } else {
+            for fmt in formats {
+                println!("{fmt}");
+            }
         }
         return Ok(());
     }
@@ -245,6 +259,9 @@ async fn run_write(
         None
     };
 
+    // Capture json flag before borrowing args in async tasks
+    let json = args.json;
+
     // Collect identifiers from all sources
     let identifiers = collect_identifiers(args, client).await?;
     if identifiers.is_empty() {
@@ -264,7 +281,7 @@ async fn run_write(
 
     // Dry-run: sequential, no concurrency needed
     if args.dry_run {
-        if quiet == 0 {
+        if !json && quiet == 0 {
             println!("Dry run -- no changes will be applied\n");
         }
         let mut total_dry_run_changes = 0usize;
@@ -278,11 +295,12 @@ async fn run_write(
                     &args.target,
                     expect.as_ref(),
                     quiet,
+                    json,
                 )
                 .await?;
             }
         }
-        if quiet == 0 {
+        if !json && quiet == 0 {
             println!(
                 "\n{} item(s), {} change(s)",
                 identifiers.len(),
@@ -384,12 +402,16 @@ async fn run_write(
             &file_target,
             quiet,
             joblog.as_ref(),
+            json,
         ) {
             error_count += 1;
         }
     }
 
     if error_count > 0 {
+        if json {
+            std::process::exit(1);
+        }
         bail!("{error_count} of {total_count} item(s) failed");
     }
 
@@ -417,6 +439,7 @@ fn parse_write_flags(args: &MetadataArgs) -> Result<(Vec<String>, MetadataOp)> {
 
 /// Dry-run: fetch metadata, compute patch, display without writing.
 /// Returns the number of non-test patch operations.
+#[allow(clippy::too_many_arguments)]
 async fn run_dry_run(
     client: &IaClient,
     identifier: &str,
@@ -425,6 +448,7 @@ async fn run_dry_run(
     target: &str,
     expect: Option<&HashMap<String, serde_json::Value>>,
     quiet: u8,
+    json: bool,
 ) -> Result<usize> {
     let url = client.url(&format!("/metadata/{identifier}"));
     let resp = client.http().get(&url).send().await?;
@@ -440,7 +464,26 @@ async fn run_dry_run(
         .filter(|p| p["op"].as_str() != Some("test"))
         .count();
 
-    if quiet == 0 {
+    if json {
+        if patch.is_empty() {
+            println!("{}", serde_json::json!({
+                "item": identifier,
+                "status": "no_changes",
+                "dry_run": true,
+            }));
+        } else {
+            let changes: Vec<serde_json::Value> = patch.iter()
+                .filter(|p| p["op"].as_str() != Some("test"))
+                .cloned()
+                .collect();
+            println!("{}", serde_json::json!({
+                "item": identifier,
+                "status": "would_modify",
+                "dry_run": true,
+                "changes": changes,
+            }));
+        }
+    } else if quiet == 0 {
         if patch.is_empty() {
             println!("  {identifier}: no changes");
         } else {
@@ -472,6 +515,9 @@ async fn run_spreadsheet(
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
+    // Capture json flag before borrowing args in async tasks
+    let json = args.json;
+
     let records = ia_core::spreadsheet::read_spreadsheet(spreadsheet_path)
         .context(format!(
             "failed to read spreadsheet: {}",
@@ -536,7 +582,7 @@ async fn run_spreadsheet(
 
     // Dry-run: sequential
     if args.dry_run {
-        if quiet == 0 {
+        if !json && quiet == 0 {
             println!("Dry run -- no changes will be applied\n");
         }
         let mut total_changes = 0usize;
@@ -549,10 +595,11 @@ async fn run_spreadsheet(
                 &args.target,
                 None,
                 quiet,
+                json,
             )
             .await?;
         }
-        if quiet == 0 {
+        if !json && quiet == 0 {
             println!("\n{} item(s), {} change(s)", item_count, total_changes);
         }
         return Ok(());
@@ -628,12 +675,16 @@ async fn run_spreadsheet(
             &file_target,
             quiet,
             joblog.as_ref(),
+            json,
         ) {
             error_count += 1;
         }
     }
 
     if error_count > 0 {
+        if json {
+            std::process::exit(1);
+        }
         bail!("{error_count} of {item_count} item(s) failed");
     }
 
@@ -649,10 +700,18 @@ fn record_modify_outcome(
     file_target: &str,
     quiet: u8,
     joblog: Option<&JoblogWriter>,
+    json: bool,
 ) -> bool {
     match outcome {
         Ok(task_id) => {
-            if quiet == 0 {
+            if json {
+                println!("{}", serde_json::json!({
+                    "item": identifier,
+                    "status": "ok",
+                    "task_id": task_id.unwrap_or(0),
+                    "elapsed_ms": elapsed_ms,
+                }));
+            } else if quiet == 0 {
                 println!(
                     "{identifier}: success (task_id: {})",
                     task_id.unwrap_or(0)
@@ -666,7 +725,14 @@ fn record_modify_outcome(
             false
         }
         Err(e) => {
-            if quiet < 2 {
+            if json {
+                println!("{}", serde_json::json!({
+                    "item": identifier,
+                    "status": "error",
+                    "error": {"code": "metadata_write", "message": e},
+                    "elapsed_ms": elapsed_ms,
+                }));
+            } else if quiet < 2 {
                 eprintln!("error: {identifier}: {e}");
             }
             if let Some(jl) = joblog {
