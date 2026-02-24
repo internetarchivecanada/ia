@@ -121,5 +121,48 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         );
     }
 
+    // Show AI section if present
+    if let Some(ai) = joblog::ai_summarize(&entries) {
+        println!("\n  {}", style("AI Operations").bold().underlined());
+        println!("  Items analyzed:     {:>6}", ai.items_analyzed);
+        if ai.items_with_changes > 0 {
+            println!(
+                "  Items with changes: {:>6}",
+                ai.items_with_changes
+            );
+        }
+        if ai.changes_applied > 0 {
+            println!(
+                "  Changes applied:    {:>6}",
+                ai.changes_applied
+            );
+        }
+        if ai.items_errored > 0 {
+            println!(
+                "  Items errored:      {:>6}",
+                style(ai.items_errored).red()
+            );
+        }
+        if ai.items_skipped > 0 {
+            println!(
+                "  Items skipped:      {:>6}",
+                ai.items_skipped
+            );
+        }
+        if ai.prompt_tokens > 0 || ai.completion_tokens > 0 {
+            let total_tokens = ai.prompt_tokens + ai.completion_tokens;
+            println!(
+                "  Tokens used:        {:>6} ({} prompt + {} completion)",
+                total_tokens, ai.prompt_tokens, ai.completion_tokens
+            );
+        }
+        if ai.undos > 0 {
+            println!(
+                "  Undo operations:    {:>6} ({} changes reversed)",
+                ai.undos, ai.changes_reversed
+            );
+        }
+    }
+
     Ok(())
 }

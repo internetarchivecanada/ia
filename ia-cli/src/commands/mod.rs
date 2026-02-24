@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod completions;
 pub mod download;
 pub mod list;

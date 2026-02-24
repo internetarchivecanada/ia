@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::ai::types::AiConfig;
 use crate::error::{IaError, Result};
 
 #[derive(Debug, Clone, Default)]
@@ -10,6 +11,7 @@ pub struct IaConfig {
     pub cookies: HashMap<String, String>,
     pub general: GeneralConfig,
     pub logging: LoggingConfig,
+    pub ai: Option<AiConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,29 @@ impl IaConfig {
             config.logging.log_to_stdout = stdout.to_lowercase() == "true";
         }
 
+        // [ai] section
+        if ini.get_map_ref().contains_key("ai") {
+            let mut ai = AiConfig::default();
+            if let Some(url) = ini.get("ai", "base_url") {
+                ai.base_url = url;
+            }
+            ai.api_key = ini.get("ai", "api_key");
+            if let Some(model) = ini.get("ai", "model") {
+                ai.model = model;
+            }
+            if let Some(temp) = ini.get("ai", "temperature") {
+                if let Ok(t) = temp.parse::<f64>() {
+                    ai.temperature = t;
+                }
+            }
+            if let Some(tokens) = ini.get("ai", "max_tokens") {
+                if let Ok(t) = tokens.parse::<u64>() {
+                    ai.max_tokens = t;
+                }
+            }
+            config.ai = Some(ai);
+        }
+
         config.apply_env_overrides();
         Ok(config)
     }
@@ -100,6 +125,24 @@ impl IaConfig {
             if let Ok(secret) = std::env::var("IA_SECRET_ACCESS_KEY") {
                 self.s3_access = Some(access);
                 self.s3_secret = Some(secret);
+            }
+        }
+
+        // AI env var overrides
+        let has_ai_env = std::env::var("IA_AI_BASE_URL").is_ok()
+            || std::env::var("IA_AI_API_KEY").is_ok()
+            || std::env::var("IA_AI_MODEL").is_ok();
+
+        if has_ai_env {
+            let ai = self.ai.get_or_insert_with(AiConfig::default);
+            if let Ok(url) = std::env::var("IA_AI_BASE_URL") {
+                ai.base_url = url;
+            }
+            if let Ok(key) = std::env::var("IA_AI_API_KEY") {
+                ai.api_key = Some(key);
+            }
+            if let Ok(model) = std::env::var("IA_AI_MODEL") {
+                ai.model = model;
             }
         }
     }
@@ -205,4 +248,84 @@ mod tests {
         config.general.secure = false;
         assert_eq!(config.protocol(), "http");
     }
+
+    #[test]
+    fn default_config_has_no_ai() {
+        let config = IaConfig::default();
+        assert!(config.ai.is_none());
+    }
+
+    #[test]
+    fn load_ai_section_from_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai]").unwrap();
+        writeln!(f, "base_url = http://localhost:11434/v1").unwrap();
+        writeln!(f, "api_key = sk-test-key").unwrap();
+        writeln!(f, "model = llama3").unwrap();
+        writeln!(f, "temperature = 0.5").unwrap();
+        writeln!(f, "max_tokens = 2048").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        let ai = config.ai.unwrap();
+        assert_eq!(ai.base_url, "http://localhost:11434/v1");
+        assert_eq!(ai.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(ai.model, "llama3");
+        assert_eq!(ai.temperature, 0.5);
+        assert_eq!(ai.max_tokens, 2048);
+    }
+
+    #[test]
+    fn ai_section_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai]").unwrap();
+        writeln!(f, "api_key = sk-test").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        let ai = config.ai.unwrap();
+        assert_eq!(ai.base_url, "https://api.openai.com/v1");
+        assert_eq!(ai.model, "gpt-4o-mini");
+        assert_eq!(ai.temperature, 0.2);
+        assert_eq!(ai.max_tokens, 4096);
+    }
+
+    #[test]
+    fn missing_ai_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[general]").unwrap();
+        writeln!(f, "host = archive.org").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        assert!(config.ai.is_none());
+    }
+
+    #[test]
+    fn ai_env_var_overrides() {
+        // Use unique env var names to avoid test interference, but we must test
+        // the real env var names. Use a serial approach: set, test, clean up.
+        // Note: these tests can interfere with parallel tests that call
+        // apply_env_overrides(), but the env vars are cleaned up immediately.
+        std::env::set_var("IA_AI_BASE_URL", "http://test:8080/v1");
+        std::env::set_var("IA_AI_API_KEY", "env-key");
+        std::env::set_var("IA_AI_MODEL", "env-model");
+
+        let mut config = IaConfig::default();
+        config.apply_env_overrides();
+
+        // Clean up before assertions to minimize window
+        std::env::remove_var("IA_AI_BASE_URL");
+        std::env::remove_var("IA_AI_API_KEY");
+        std::env::remove_var("IA_AI_MODEL");
+
+        let ai = config.ai.unwrap();
+        assert_eq!(ai.base_url, "http://test:8080/v1");
+        assert_eq!(ai.api_key.as_deref(), Some("env-key"));
+        assert_eq!(ai.model, "env-model");
+    }
+
 }
