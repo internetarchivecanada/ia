@@ -13,7 +13,7 @@ use ia_core::ai::types::{AiConfig, FocusConfig, ItemAnalysis};
 use ia_core::joblog::JoblogWriter;
 use ia_core::search::SearchOpts;
 use ia_core::IaClient;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Args)]
 #[command(
@@ -289,14 +289,23 @@ pub async fn run(
     }
 
     // For interactive mode, create channels to bridge the TUI between
-    // the analyzer and writer stages of the pipeline.
-    let (tui_review_tx, tui_review_rx, tui_channels) = if review_mode == ReviewMode::Interactive {
-        let (analysis_tx, analysis_rx) = mpsc::channel::<ItemAnalysis>(prefetch);
-        let (reviewed_tx, reviewed_rx) = mpsc::channel::<ItemAnalysis>(32);
-        (Some(analysis_tx), Some(reviewed_rx), Some((analysis_rx, reviewed_tx)))
-    } else {
-        (None, None, None)
-    };
+    // the analyzer and writer stages of the pipeline, plus a shared
+    // shutdown signal so the TUI can stop the pipeline when the user quits.
+    let (tui_review_tx, tui_review_rx, shutdown_tx_opt, tui_channels) =
+        if review_mode == ReviewMode::Interactive {
+            let (analysis_tx, analysis_rx) = mpsc::channel::<ItemAnalysis>(prefetch);
+            let (reviewed_tx, reviewed_rx) = mpsc::channel::<ItemAnalysis>(32);
+            let (shutdown_tx, _) = watch::channel(false);
+            let shutdown_for_tui = shutdown_tx.clone();
+            (
+                Some(analysis_tx),
+                Some(reviewed_rx),
+                Some(shutdown_tx),
+                Some((analysis_rx, reviewed_tx, shutdown_for_tui)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     let pipeline_config = PipelineConfig {
         ai_config,
@@ -310,11 +319,12 @@ pub async fn run(
         output_file: args.output.clone(),
         tui_review_tx,
         tui_review_rx,
+        shutdown_tx: shutdown_tx_opt,
     };
 
     let ia_client = Arc::new(client.clone());
 
-    let summary = if let Some((analysis_rx, reviewed_tx)) = tui_channels {
+    let summary = if let Some((analysis_rx, reviewed_tx, shutdown_for_tui)) = tui_channels {
         // Interactive mode: run pipeline and TUI concurrently
         let pipeline_fut = ia_core::ai::pipeline::run_pipeline(
             ia_client,
@@ -324,6 +334,7 @@ pub async fn run(
         let tui_fut = crate::tui::ai::run_ai_tui(
             analysis_rx,
             reviewed_tx,
+            shutdown_for_tui,
             item_count as u64,
         );
 

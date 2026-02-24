@@ -57,6 +57,8 @@ pub struct PipelineConfig {
     pub tui_review_tx: Option<mpsc::Sender<ItemAnalysis>>,
     /// For Interactive mode: receiver for reviewed items (from external TUI reviewer).
     pub tui_review_rx: Option<mpsc::Receiver<ItemAnalysis>>,
+    /// For Interactive mode: shutdown sender so the TUI can signal the pipeline to stop.
+    pub shutdown_tx: Option<watch::Sender<bool>>,
 }
 
 /// Run the four-stage AI pipeline.
@@ -72,8 +74,15 @@ pub async fn run_pipeline(
 ) -> crate::Result<PipelineSummary> {
     let start = Instant::now();
 
-    // Shutdown signal
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Shutdown signal: for Interactive mode, use the provided sender so the TUI
+    // can signal shutdown when the user quits. Otherwise, create a local one.
+    let (shutdown_tx, shutdown_rx) = if let Some(tx) = config.shutdown_tx {
+        let rx = tx.subscribe();
+        (tx, rx)
+    } else {
+        let (tx, rx) = watch::channel(false);
+        (tx, rx)
+    };
 
     // Stage channels
     let (source_tx, source_rx) = mpsc::channel(config.prefetch);
@@ -93,12 +102,16 @@ pub async fn run_pipeline(
     // For Interactive mode, the TUI acts as the reviewer — use external channels.
     // For Headless/RecordOnly, use internal channels with a spawned reviewer task.
     let (analyzer_tx, writer_rx, reviewer_handle) = if review_mode == ReviewMode::Interactive {
-        let tui_tx = config.tui_review_tx.expect(
-            "Interactive mode requires tui_review_tx channel in PipelineConfig",
-        );
-        let tui_rx = config.tui_review_rx.expect(
-            "Interactive mode requires tui_review_rx channel in PipelineConfig",
-        );
+        let tui_tx = config.tui_review_tx.ok_or_else(|| {
+            crate::error::IaError::Config(
+                "Interactive mode requires tui_review_tx channel in PipelineConfig".to_string(),
+            )
+        })?;
+        let tui_rx = config.tui_review_rx.ok_or_else(|| {
+            crate::error::IaError::Config(
+                "Interactive mode requires tui_review_rx channel in PipelineConfig".to_string(),
+            )
+        })?;
         (tui_tx, tui_rx, None)
     } else {
         let (analyzer_tx, analyzer_rx) = mpsc::channel(config.prefetch);
@@ -417,8 +430,6 @@ async fn run_writer(
             item = rx.recv() => {
                 let Some(analysis) = item else { break; };
 
-                if *shutdown.borrow() { break; }
-
                 let result = process_item(&client, &analysis, dry_run).await;
 
                 // Update summary
@@ -469,6 +480,52 @@ async fn run_writer(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
+        }
+    }
+
+    // Drain any remaining items from the channel (e.g. items sent before shutdown signal)
+    while let Ok(analysis) = rx.try_recv() {
+        let result = process_item(&client, &analysis, dry_run).await;
+
+        summary.items_analyzed += 1;
+        if let Some(ref usage) = analysis.token_usage {
+            summary.total_prompt_tokens += usage.prompt_tokens;
+            summary.total_completion_tokens += usage.completion_tokens;
+        }
+
+        match result.status {
+            ApplyStatus::Ok => {
+                summary.items_with_changes += 1;
+                summary.changes_applied += result.changes_applied.len() as u64;
+            }
+            ApplyStatus::Skipped | ApplyStatus::DryRun => {
+                if result.changes_applied.is_empty() {
+                    summary.items_skipped += 1;
+                } else {
+                    summary.items_with_changes += 1;
+                    summary.changes_applied += result.changes_applied.len() as u64;
+                }
+            }
+            ApplyStatus::Error => {
+                summary.items_errored += 1;
+            }
+        }
+
+        for change in &analysis.changes {
+            if change.status == ChangeStatus::Rejected {
+                summary.changes_rejected += 1;
+            }
+        }
+
+        if output_file.is_some() && !result.changes_applied.is_empty() {
+            record_entries.push(serde_json::json!({
+                "identifier": analysis.identifier,
+                "changes": result.changes_applied,
+            }));
+        }
+
+        if let Some(ref writer) = joblog_writer {
+            write_joblog_entry(writer, &analysis, &result);
         }
     }
 

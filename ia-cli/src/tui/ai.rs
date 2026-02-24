@@ -600,9 +600,13 @@ fn format_value(v: &serde_json::Value) -> String {
 /// Receives `ItemAnalysis` objects from the pipeline's analyzer via `analysis_rx`,
 /// presents them for interactive review, and sends confirmed items to the
 /// writer stage via `confirmed_tx`.
+///
+/// The `shutdown_tx` is used to signal the pipeline to stop immediately when
+/// the user quits (so it doesn't keep fetching metadata or calling the LLM).
 pub async fn run_ai_tui(
     mut analysis_rx: tokio::sync::mpsc::Receiver<ItemAnalysis>,
     confirmed_tx: tokio::sync::mpsc::Sender<ItemAnalysis>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     total_items: u64,
 ) -> anyhow::Result<()> {
     if !std::io::stdout().is_terminal() {
@@ -667,6 +671,15 @@ pub async fn run_ai_tui(
             }
         }
     }
+
+    // Flush any remaining confirmed items before exiting
+    for item in state.confirmed_items.drain(..) {
+        let _ = confirmed_tx.send(item).await;
+    }
+
+    // Signal the pipeline to stop immediately (so source/analyzer don't
+    // keep fetching/calling the LLM after the user has quit)
+    let _ = shutdown_tx.send(true);
 
     Ok(())
 }

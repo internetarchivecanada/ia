@@ -6,11 +6,12 @@
 use std::sync::Arc;
 
 use ia_core::ai::pipeline::{PipelineConfig, ReviewMode};
-use ia_core::ai::types::{AiConfig, FocusConfig, JoblogChange, JoblogTokens};
+use ia_core::ai::types::{AiConfig, ChangeStatus, FocusConfig, JoblogChange, JoblogTokens};
 use ia_core::ai::undo::undo_from_joblog;
 use ia_core::joblog::{self, JoblogEntry, JoblogWriter};
 use ia_core::{IaClient, IaConfig};
 use serde_json::json;
+use tokio::sync::{mpsc, watch};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -136,6 +137,7 @@ async fn pipeline_headless_dry_run_single_item() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -196,6 +198,7 @@ async fn pipeline_headless_dry_run_multiple_items() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -258,6 +261,7 @@ async fn pipeline_writes_joblog() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     ia_core::ai::pipeline::run_pipeline(
@@ -323,6 +327,7 @@ async fn pipeline_source_error_tracked_in_summary() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -375,6 +380,7 @@ async fn pipeline_no_changes_from_llm() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -433,6 +439,7 @@ async fn pipeline_record_only_writes_output_file() {
         output_file: Some(output_path.clone()),
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -491,6 +498,7 @@ async fn pipeline_llm_error_tracks_item() {
         output_file: None,
         tui_review_tx: None,
         tui_review_rx: None,
+        shutdown_tx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -715,4 +723,234 @@ async fn undo_writes_joblog() {
     assert_eq!(undo_entries[0].op, "ai-undo");
     assert_eq!(undo_entries[0].item, "test-item");
     assert_eq!(undo_entries[0].status, "ok");
+}
+
+// =============================================================================
+// Interactive mode integration tests
+// =============================================================================
+
+/// Simulates the TUI: receives items, accepts all changes, sends them back.
+#[tokio::test]
+async fn pipeline_interactive_mode_accepts_all() {
+    let ia_server = MockServer::start().await;
+    let llm_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_item("test-item")))
+        .expect(1)
+        .mount(&ia_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
+        )
+        .expect(1)
+        .mount(&llm_server)
+        .await;
+
+    let ia_client = IaClient::from_config(mock_config(&ia_server.uri())).unwrap();
+
+    // Create channels to simulate the TUI
+    let (analysis_tx, mut analysis_rx) = mpsc::channel(5);
+    let (reviewed_tx, reviewed_rx) = mpsc::channel(32);
+    let (shutdown_tx, _) = watch::channel(false);
+
+    let config = PipelineConfig {
+        ai_config: AiConfig {
+            base_url: llm_server.uri(),
+            api_key: Some("test-key".to_string()),
+            model: "test-model".to_string(),
+            temperature: 0.2,
+            max_tokens: 100,
+        },
+        focus: FocusConfig::default(),
+        review_mode: ReviewMode::Interactive,
+        dry_run: true,
+        ai_jobs: 1,
+        prefetch: 5,
+        max_tokens_budget: None,
+        joblog_writer: None,
+        output_file: None,
+        tui_review_tx: Some(analysis_tx),
+        tui_review_rx: Some(reviewed_rx),
+        shutdown_tx: Some(shutdown_tx),
+    };
+
+    // Simulated TUI: receive items, accept all, send back
+    let tui_task = tokio::spawn(async move {
+        while let Some(mut analysis) = analysis_rx.recv().await {
+            for change in &mut analysis.changes {
+                change.status = ChangeStatus::Accepted;
+            }
+            reviewed_tx.send(analysis).await.unwrap();
+        }
+    });
+
+    let summary = ia_core::ai::pipeline::run_pipeline(
+        Arc::new(ia_client),
+        vec!["test-item".to_string()],
+        config,
+    )
+    .await
+    .unwrap();
+
+    tui_task.await.unwrap();
+
+    assert_eq!(summary.items_analyzed, 1);
+    assert_eq!(summary.items_with_changes, 1);
+    assert_eq!(summary.changes_applied, 2);
+    assert_eq!(summary.items_errored, 0);
+}
+
+/// Simulates the TUI rejecting all changes.
+#[tokio::test]
+async fn pipeline_interactive_mode_rejects_all() {
+    let ia_server = MockServer::start().await;
+    let llm_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fake_item("test-item")))
+        .mount(&ia_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
+        )
+        .mount(&llm_server)
+        .await;
+
+    let ia_client = IaClient::from_config(mock_config(&ia_server.uri())).unwrap();
+
+    let (analysis_tx, mut analysis_rx) = mpsc::channel(5);
+    let (reviewed_tx, reviewed_rx) = mpsc::channel(32);
+    let (shutdown_tx, _) = watch::channel(false);
+
+    let config = PipelineConfig {
+        ai_config: AiConfig {
+            base_url: llm_server.uri(),
+            api_key: Some("test-key".to_string()),
+            model: "test-model".to_string(),
+            temperature: 0.2,
+            max_tokens: 100,
+        },
+        focus: FocusConfig::default(),
+        review_mode: ReviewMode::Interactive,
+        dry_run: true,
+        ai_jobs: 1,
+        prefetch: 5,
+        max_tokens_budget: None,
+        joblog_writer: None,
+        output_file: None,
+        tui_review_tx: Some(analysis_tx),
+        tui_review_rx: Some(reviewed_rx),
+        shutdown_tx: Some(shutdown_tx),
+    };
+
+    // Simulated TUI: reject all changes
+    let tui_task = tokio::spawn(async move {
+        while let Some(mut analysis) = analysis_rx.recv().await {
+            for change in &mut analysis.changes {
+                change.status = ChangeStatus::Rejected;
+            }
+            reviewed_tx.send(analysis).await.unwrap();
+        }
+    });
+
+    let summary = ia_core::ai::pipeline::run_pipeline(
+        Arc::new(ia_client),
+        vec!["test-item".to_string()],
+        config,
+    )
+    .await
+    .unwrap();
+
+    tui_task.await.unwrap();
+
+    assert_eq!(summary.items_analyzed, 1);
+    assert_eq!(summary.changes_applied, 0);
+    assert_eq!(summary.changes_rejected, 2);
+    assert_eq!(summary.items_skipped, 1);
+}
+
+/// Simulates early TUI quit via shutdown signal.
+#[tokio::test]
+async fn pipeline_interactive_mode_early_quit() {
+    let ia_server = MockServer::start().await;
+    let llm_server = MockServer::start().await;
+
+    // Two items, but TUI will quit after first
+    for id in ["item-a", "item-b"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fake_item(id)))
+            .mount(&ia_server)
+            .await;
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
+        )
+        .mount(&llm_server)
+        .await;
+
+    let ia_client = IaClient::from_config(mock_config(&ia_server.uri())).unwrap();
+
+    let (analysis_tx, mut analysis_rx) = mpsc::channel(5);
+    let (reviewed_tx, reviewed_rx) = mpsc::channel(32);
+    let (shutdown_tx, _) = watch::channel(false);
+    let shutdown_for_tui = shutdown_tx.clone();
+
+    let config = PipelineConfig {
+        ai_config: AiConfig {
+            base_url: llm_server.uri(),
+            api_key: Some("test-key".to_string()),
+            model: "test-model".to_string(),
+            temperature: 0.2,
+            max_tokens: 100,
+        },
+        focus: FocusConfig::default(),
+        review_mode: ReviewMode::Interactive,
+        dry_run: true,
+        ai_jobs: 1,
+        prefetch: 5,
+        max_tokens_budget: None,
+        joblog_writer: None,
+        output_file: None,
+        tui_review_tx: Some(analysis_tx),
+        tui_review_rx: Some(reviewed_rx),
+        shutdown_tx: Some(shutdown_tx),
+    };
+
+    // Simulated TUI: accept first item, then quit
+    let tui_task = tokio::spawn(async move {
+        if let Some(mut analysis) = analysis_rx.recv().await {
+            for change in &mut analysis.changes {
+                change.status = ChangeStatus::Accepted;
+            }
+            reviewed_tx.send(analysis).await.unwrap();
+        }
+        // Signal shutdown — don't wait for more items
+        let _ = shutdown_for_tui.send(true);
+    });
+
+    let summary = ia_core::ai::pipeline::run_pipeline(
+        Arc::new(ia_client),
+        vec!["item-a".to_string(), "item-b".to_string()],
+        config,
+    )
+    .await
+    .unwrap();
+
+    tui_task.await.unwrap();
+
+    // At least one item analyzed; pipeline should not hang
+    assert!(summary.items_analyzed >= 1);
 }
