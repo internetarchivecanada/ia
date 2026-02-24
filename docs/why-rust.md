@@ -37,9 +37,11 @@ Download, make executable, and run. No package manager required.
 
 ## Agent and machine native
 
-Every command supports `--json` for structured output. AI agents read `--help` and parse stdout. MCP tool servers wrap each command as a typed tool. Pipelines and batch systems consume JSONL streams.
+Every command supports `--json` for structured output. AI agents read `--help` and parse stdout. MCP tool servers wrap each command as a typed tool. Pipelines and batch systems consume JSONL streams. The CLI is a language-agnostic integration surface — any tool that can spawn a process and read stdout can use it.
 
-The CLI is a language-agnostic integration surface — any tool that can spawn a process and read stdout can use it. See [Design philosophy](design-philosophy.md) for how this works and where we're heading.
+Rust is also an unusually good language for AI agents to *maintain*. The compiler catches entire classes of bugs — null references, use-after-free, data races, unhandled error variants — before any test runs. An agent can iterate against `cargo check` the way a human iterates against a linter: make a change, ask the compiler what broke, fix it. Refactoring is safe because changing a type or function signature produces errors at every affected call site. The test suite runs with a single `cargo test` — no virtualenv, no Docker, no setup steps. Typed errors (`IaError` variants) tell an agent *what went wrong* structurally, which is more actionable than parsing Python tracebacks.
+
+See [Design philosophy](design-philosophy.md) for how this works and where we're heading.
 
 ## Further reading
 
