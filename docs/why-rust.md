@@ -4,11 +4,16 @@ The Python [`internetarchive`](https://github.com/jjjake/internetarchive) librar
 
 The Python CLI was designed for humans at a terminal. The Rust CLI is designed for three audiences: humans, AI coding agents, and machine consumers. Everything below follows from that.
 
-## Speed
+## HTTP robustness
 
-The Python CLI downloads one file at a time with no way to parallelize. Every request opens a fresh TCP connection. Resuming interrupted downloads is unreliable.
+The Internet Archive serves petabytes across distributed infrastructure. The HTTP layer matters, and the Python CLI's reliance on `requests`/`urllib3` creates structural limitations that can't be patched away.
 
-The Rust version downloads files concurrently by default, reuses connections across requests, and resumes interrupted downloads with byte-range requests and checksum verification.
+The Python `internetarchive` library explicitly sets `Connection: close` on every request, forcing a fresh TCP+TLS handshake per file — even when downloading thousands of files from the same server. This is partly defensive: `urllib3`'s connection pool struggles with stale keep-alive connections, producing cryptic `ConnectionError` and `ChunkedEncodingError` tracebacks on long-running batch jobs. The Rust HTTP stack (hyper/reqwest) manages connection pools robustly by default, reusing connections without the instability.
+
+Beyond connection handling:
+- **Concurrent downloads.** The Python CLI downloads one file at a time. The Rust version downloads files in parallel by default (`--jobs`).
+- **Byte-range resume.** Interrupted downloads continue where they left off with `Range` headers and checksum verification.
+- **`Expect: 100-continue` for uploads** (future). `requests`/`urllib3` don't support this at all. hyper does natively — avoiding sending a multi-GB upload body only to receive a 4xx rejection.
 
 ## Single binary
 

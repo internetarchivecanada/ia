@@ -59,6 +59,8 @@ See the [agent-friendly output design](plans/2026-02-23-agent-friendly-output-de
 
 The Internet Archive serves petabytes of data across distributed infrastructure. The HTTP layer matters.
 
+The Python `internetarchive` library sets `Connection: close` on every request and relies on `urllib3` for connection management — a combination that produces frequent connection reset errors on large batch jobs. The Rust HTTP stack (hyper → reqwest) handles connection pooling, TLS, and error recovery at a lower level, eliminating entire classes of failures.
+
 - **Connection pooling and keep-alive.** The Python library sets `Connection: close` on every request, forcing a fresh TCP+TLS handshake per file. The Rust client reuses connections, which adds up fast when downloading thousands of small files.
 - **Byte-range resume.** Interrupted downloads continue where they left off via `Range` headers. The completed file's checksum is verified against server metadata.
 - **Retry with backoff.** Transient failures (5xx, timeouts) are retried automatically with exponential backoff via `reqwest-middleware`.
