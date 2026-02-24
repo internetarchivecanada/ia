@@ -89,14 +89,6 @@ fn llm_changes_json() -> String {
     .unwrap()
 }
 
-fn success_response(task_id: u64) -> serde_json::Value {
-    json!({
-        "success": true,
-        "task_id": task_id,
-        "log": format!("https://catalogd.archive.org/log/{task_id}")
-    })
-}
-
 // =============================================================================
 // Pipeline integration tests
 // =============================================================================
@@ -142,6 +134,8 @@ async fn pipeline_headless_dry_run_single_item() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -200,6 +194,8 @@ async fn pipeline_headless_dry_run_multiple_items() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -260,6 +256,8 @@ async fn pipeline_writes_joblog() {
         max_tokens_budget: None,
         joblog_writer: Some(joblog_writer),
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     ia_core::ai::pipeline::run_pipeline(
@@ -323,6 +321,8 @@ async fn pipeline_source_error_tracked_in_summary() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -373,6 +373,8 @@ async fn pipeline_no_changes_from_llm() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -429,6 +431,8 @@ async fn pipeline_record_only_writes_output_file() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: Some(output_path.clone()),
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(
@@ -485,6 +489,8 @@ async fn pipeline_llm_error_tracks_item() {
         max_tokens_budget: None,
         joblog_writer: None,
         output_file: None,
+        tui_review_tx: None,
+        tui_review_rx: None,
     };
 
     let summary = ia_core::ai::pipeline::run_pipeline(

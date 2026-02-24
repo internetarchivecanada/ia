@@ -53,6 +53,10 @@ pub struct PipelineConfig {
     pub joblog_writer: Option<JoblogWriter>,
     /// Output file for record-only mode (JSON array of changes).
     pub output_file: Option<std::path::PathBuf>,
+    /// For Interactive mode: sender for analyzed items (to external TUI reviewer).
+    pub tui_review_tx: Option<mpsc::Sender<ItemAnalysis>>,
+    /// For Interactive mode: receiver for reviewed items (from external TUI reviewer).
+    pub tui_review_rx: Option<mpsc::Receiver<ItemAnalysis>>,
 }
 
 /// Run the four-stage AI pipeline.
@@ -73,8 +77,6 @@ pub async fn run_pipeline(
 
     // Stage channels
     let (source_tx, source_rx) = mpsc::channel(config.prefetch);
-    let (analyzer_tx, analyzer_rx) = mpsc::channel(config.prefetch);
-    let (writer_tx, writer_rx) = mpsc::channel(32);
 
     // Shared state
     let llm_client = Arc::new(LlmClient::new(config.ai_config.clone())?);
@@ -87,6 +89,26 @@ pub async fn run_pipeline(
     let max_tokens_budget = config.max_tokens_budget;
     let output_file = config.output_file.clone();
     let record_only = review_mode == ReviewMode::RecordOnly;
+
+    // For Interactive mode, the TUI acts as the reviewer — use external channels.
+    // For Headless/RecordOnly, use internal channels with a spawned reviewer task.
+    let (analyzer_tx, writer_rx, reviewer_handle) = if review_mode == ReviewMode::Interactive {
+        let tui_tx = config.tui_review_tx.expect(
+            "Interactive mode requires tui_review_tx channel in PipelineConfig",
+        );
+        let tui_rx = config.tui_review_rx.expect(
+            "Interactive mode requires tui_review_rx channel in PipelineConfig",
+        );
+        (tui_tx, tui_rx, None)
+    } else {
+        let (analyzer_tx, analyzer_rx) = mpsc::channel(config.prefetch);
+        let (writer_tx, writer_rx) = mpsc::channel(32);
+        let reviewer_shutdown = shutdown_rx.clone();
+        let handle = tokio::spawn(async move {
+            run_reviewer(review_mode, analyzer_rx, writer_tx, reviewer_shutdown).await;
+        });
+        (analyzer_tx, writer_rx, Some(handle))
+    };
 
     // Stage 1: Source — fetch metadata
     let source_client = client.clone();
@@ -112,12 +134,6 @@ pub async fn run_pipeline(
         .await;
     });
 
-    // Stage 3: Reviewer — auto-accept (headless) or placeholder
-    let reviewer_shutdown = shutdown_rx.clone();
-    let reviewer_handle = tokio::spawn(async move {
-        run_reviewer(review_mode, analyzer_rx, writer_tx, reviewer_shutdown).await;
-    });
-
     // Stage 4: Writer — apply changes (or save to file in record-only mode)
     let writer_client = client.clone();
     let writer_shutdown = shutdown_rx.clone();
@@ -136,7 +152,9 @@ pub async fn run_pipeline(
     // Wait for all stages
     let _ = source_handle.await;
     let _ = analyzer_handle.await;
-    let _ = reviewer_handle.await;
+    if let Some(handle) = reviewer_handle {
+        let _ = handle.await;
+    }
     let summary_data = writer_handle.await.map_err(|e| {
         crate::error::IaError::Config(format!("pipeline writer task panicked: {}", e))
     })?;
@@ -341,7 +359,10 @@ fn parse_category(s: &str) -> Option<ChangeCategory> {
     }
 }
 
-/// Stage 3: Review suggestions (headless auto-accepts, interactive is a placeholder).
+/// Stage 3: Review suggestions (headless/record-only auto-accepts).
+///
+/// Interactive mode bypasses this entirely — the TUI acts as the reviewer
+/// via external channels configured in PipelineConfig.
 async fn run_reviewer(
     mode: ReviewMode,
     mut rx: mpsc::Receiver<ItemAnalysis>,
@@ -355,32 +376,17 @@ async fn run_reviewer(
 
                 if *shutdown.borrow() { break; }
 
-                match mode {
-                    ReviewMode::Headless | ReviewMode::RecordOnly => {
-                        // Auto-accept all changes
-                        for change in &mut analysis.changes {
-                            change.status = ChangeStatus::Accepted;
-                        }
-                        // Print JSONL to stdout in headless mode
-                        if mode == ReviewMode::Headless && !analysis.changes.is_empty() {
-                            let output = serde_json::json!({
-                                "identifier": analysis.identifier,
-                                "changes": analysis.changes,
-                            });
-                            println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                        }
-                    }
-                    ReviewMode::Interactive => {
-                        // Interactive TUI is not yet wired in.
-                        // This code path should not be reached — the CLI
-                        // validates and rejects interactive mode before
-                        // calling run_pipeline. If it somehow gets here,
-                        // auto-accept so the pipeline doesn't hang.
-                        warn!("interactive review not yet implemented, auto-accepting changes");
-                        for change in &mut analysis.changes {
-                            change.status = ChangeStatus::Accepted;
-                        }
-                    }
+                // Auto-accept all changes
+                for change in &mut analysis.changes {
+                    change.status = ChangeStatus::Accepted;
+                }
+                // Print JSONL to stdout in headless mode
+                if mode == ReviewMode::Headless && !analysis.changes.is_empty() {
+                    let output = serde_json::json!({
+                        "identifier": analysis.identifier,
+                        "changes": analysis.changes,
+                    });
+                    println!("{}", serde_json::to_string(&output).unwrap_or_default());
                 }
 
                 if tx.send(analysis).await.is_err() {

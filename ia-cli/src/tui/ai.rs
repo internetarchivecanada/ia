@@ -1,5 +1,4 @@
 use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
@@ -531,6 +530,12 @@ fn draw_status_bar(f: &mut ratatui::Frame, state: &AiTuiState, area: Rect) {
             ),
         ])
     } else {
+        let pending = state.pending_count();
+        let pending_str = if pending > 0 {
+            format!(" ({} pending)", pending)
+        } else {
+            String::new()
+        };
         Line::from(vec![
             Span::styled(" A", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("ccept All  "),
@@ -546,6 +551,7 @@ fn draw_status_bar(f: &mut ratatui::Frame, state: &AiTuiState, area: Rect) {
             Span::raw("=confirm  "),
             Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw("uit  ↑↓=navigate"),
+            Span::styled(pending_str, Style::default().fg(Color::DarkGray)),
         ])
     };
 
@@ -591,10 +597,11 @@ fn format_value(v: &serde_json::Value) -> String {
 
 /// Run the interactive AI review TUI.
 ///
-/// Receives `ItemAnalysis` objects from the pipeline's analyzer via the receiver,
-/// presents them for review, and sends confirmed items back through the sender.
+/// Receives `ItemAnalysis` objects from the pipeline's analyzer via `analysis_rx`,
+/// presents them for interactive review, and sends confirmed items to the
+/// writer stage via `confirmed_tx`.
 pub async fn run_ai_tui(
-    analysis_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<ItemAnalysis>>>,
+    mut analysis_rx: tokio::sync::mpsc::Receiver<ItemAnalysis>,
     confirmed_tx: tokio::sync::mpsc::Sender<ItemAnalysis>,
     total_items: u64,
 ) -> anyhow::Result<()> {
@@ -605,7 +612,7 @@ pub async fn run_ai_tui(
         );
     }
 
-    let state = Arc::new(Mutex::new(AiTuiState::new(total_items)));
+    let mut state = AiTuiState::new(total_items);
 
     // Set up terminal
     enable_raw_mode()?;
@@ -618,55 +625,45 @@ pub async fn run_ai_tui(
     let tick_rate = Duration::from_millis(100);
 
     loop {
-        // Try to receive new items from the pipeline
-        {
-            let mut rx = analysis_rx.lock().unwrap();
-            while let Ok(item) = rx.try_recv() {
-                let mut s = state.lock().unwrap();
-                s.pending_items.push(item);
-                // Auto-advance if no current item
-                if s.current_item.is_none() {
-                    s.advance();
+        // Try to receive new items from the pipeline (non-blocking)
+        loop {
+            match analysis_rx.try_recv() {
+                Ok(item) => {
+                    state.pending_items.push(item);
+                    if state.current_item.is_none() {
+                        state.advance();
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    state.done = true;
+                    break;
                 }
             }
         }
 
         // Draw
-        {
-            let s = state.lock().unwrap();
-            terminal.draw(|f| draw(f, &s))?;
+        terminal.draw(|f| draw(f, &state))?;
 
-            if s.quit_requested {
-                break;
-            }
-            if s.done && s.current_item.is_none() && s.pending_items.is_empty() {
-                break;
-            }
+        if state.quit_requested {
+            break;
+        }
+        if state.done && state.current_item.is_none() && state.pending_items.is_empty() {
+            break;
         }
 
         // Handle input
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                let mut s = state.lock().unwrap();
-                s.handle_key(key.code, key.modifiers);
+                state.handle_key(key.code, key.modifiers);
 
                 // Send confirmed items to the writer
-                let confirmed: Vec<ItemAnalysis> = s.confirmed_items.drain(..).collect();
-                drop(s); // Release lock before sending
-
+                let confirmed: Vec<ItemAnalysis> = state.confirmed_items.drain(..).collect();
                 for item in confirmed {
                     if confirmed_tx.send(item).await.is_err() {
                         break;
                     }
                 }
-            }
-        }
-
-        // Check if pipeline is done (no more items will come)
-        {
-            let s = state.lock().unwrap();
-            if s.done && s.current_item.is_none() && s.pending_items.is_empty() {
-                break;
             }
         }
     }

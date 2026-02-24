@@ -9,10 +9,11 @@ use console::style;
 use futures::StreamExt;
 
 use ia_core::ai::pipeline::{PipelineConfig, PipelineSummary, ReviewMode};
-use ia_core::ai::types::{AiConfig, FocusConfig};
+use ia_core::ai::types::{AiConfig, FocusConfig, ItemAnalysis};
 use ia_core::joblog::JoblogWriter;
 use ia_core::search::SearchOpts;
 use ia_core::IaClient;
+use tokio::sync::mpsc;
 
 #[derive(Args)]
 #[command(
@@ -265,19 +266,7 @@ pub async fn run(
     } else if args.record_only {
         ReviewMode::RecordOnly
     } else {
-        // Interactive TUI is not yet implemented.
-        // Default to headless with a notice.
-        if quiet == 0 {
-            eprintln!(
-                "{} Interactive review not yet implemented — running in headless mode.",
-                style("note:").yellow().bold()
-            );
-            eprintln!(
-                "  Use {} to suppress this message.\n",
-                style("--headless").cyan()
-            );
-        }
-        ReviewMode::Headless
+        ReviewMode::Interactive
     };
 
     let joblog_writer = joblog_path
@@ -286,6 +275,9 @@ pub async fn run(
         .transpose()?;
 
     let item_count = identifiers.len();
+    let dry_run = args.dry_run;
+    let json_output = args.json;
+    let prefetch = args.prefetch;
 
     if quiet == 0 && !args.headless {
         eprintln!(
@@ -296,31 +288,64 @@ pub async fn run(
         );
     }
 
+    // For interactive mode, create channels to bridge the TUI between
+    // the analyzer and writer stages of the pipeline.
+    let (tui_review_tx, tui_review_rx, tui_channels) = if review_mode == ReviewMode::Interactive {
+        let (analysis_tx, analysis_rx) = mpsc::channel::<ItemAnalysis>(prefetch);
+        let (reviewed_tx, reviewed_rx) = mpsc::channel::<ItemAnalysis>(32);
+        (Some(analysis_tx), Some(reviewed_rx), Some((analysis_rx, reviewed_tx)))
+    } else {
+        (None, None, None)
+    };
+
     let pipeline_config = PipelineConfig {
         ai_config,
         focus,
         review_mode,
-        dry_run: args.dry_run,
+        dry_run,
         ai_jobs: args.ai_jobs,
-        prefetch: args.prefetch,
+        prefetch,
         max_tokens_budget: args.max_tokens_budget,
         joblog_writer,
         output_file: args.output.clone(),
+        tui_review_tx,
+        tui_review_rx,
     };
 
-    let summary = ia_core::ai::pipeline::run_pipeline(
-        Arc::new(client.clone()),
-        identifiers,
-        pipeline_config,
-    )
-    .await?;
+    let ia_client = Arc::new(client.clone());
+
+    let summary = if let Some((analysis_rx, reviewed_tx)) = tui_channels {
+        // Interactive mode: run pipeline and TUI concurrently
+        let pipeline_fut = ia_core::ai::pipeline::run_pipeline(
+            ia_client,
+            identifiers,
+            pipeline_config,
+        );
+        let tui_fut = crate::tui::ai::run_ai_tui(
+            analysis_rx,
+            reviewed_tx,
+            item_count as u64,
+        );
+
+        let (pipeline_result, tui_result) = tokio::join!(pipeline_fut, tui_fut);
+        tui_result?;
+        pipeline_result?
+    } else {
+        // Headless / record-only: no TUI
+        ia_core::ai::pipeline::run_pipeline(
+            ia_client,
+            identifiers,
+            pipeline_config,
+        )
+        .await?
+    };
 
     // Print summary
-    if quiet == 0 && !args.json {
-        print_summary(&summary, args.dry_run);
+    if quiet == 0 && !json_output {
+        print_summary(&summary, dry_run);
     }
 
-    if args.json {
+    if json_output {
         println!(
             "{}",
             serde_json::to_string(&summary).unwrap_or_default()
