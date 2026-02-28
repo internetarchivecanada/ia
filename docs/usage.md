@@ -403,10 +403,11 @@ Currently supported on: `ia download`, `ia search`.
 
 ## Architecture
 
-The project is a Cargo workspace with three crates:
+The project is a Cargo workspace with two crates:
 
-- **ia-core** -- Library crate with the client, API types, download engine, search backends, and utilities
+- **ia-core** -- Library crate with the client, API types, download engine, search backends, and utilities. Designed as a standalone library for external consumers.
 - **ia-cli** -- Binary crate with the CLI interface, progress display, and TUI dashboard
-- **ia-gui** -- Desktop GUI application built with Slint
+
+A desktop GUI ([ia-gui](https://github.com/jjjake/ia-gui)) is developed separately and consumes `ia-core` as a library dependency.
 
 See [the design doc](plans/2026-02-20-ia-rust-port-design.md) for full architectural details.
