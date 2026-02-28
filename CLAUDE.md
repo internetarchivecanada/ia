@@ -37,6 +37,7 @@ These rules are non-negotiable and must NEVER be violated:
 - **Cargo workspace**: `ia-core` (library) + `ia-cli` (binary with TUI)
 - `IaClient` wraps `reqwest::Client`, module-level operation functions
 - Design doc: `docs/plans/2026-02-20-ia-rust-port-design.md`
+- **External consumers**: `ia-core` is a standalone library. The desktop GUI ([jjjake/ia-gui](https://github.com/jjjake/ia-gui)) consumes it as a git dependency. Public API design must consider third-party usage.
 
 ## Crate Stack
 
