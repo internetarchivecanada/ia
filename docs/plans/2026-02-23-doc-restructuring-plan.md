@@ -137,11 +137,12 @@ There are trade-offs. Process spawning has higher latency than an in-process fun
 
 ## Library-first architecture
 
-The project is a [Cargo workspace](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html) with three crates:
+The project is a [Cargo workspace](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html) with two crates:
 
 - **`ia-core`** — the library. HTTP client, API types, download engine, search backends, metadata read/write, error types. This is a real library with a public API, not CLI internals exposed through `pub`.
 - **`ia-cli`** — the CLI. A thin presentation layer that parses arguments, calls `ia-core` functions, and formats output for humans or machines.
-- **`ia-gui`** — a desktop GUI built with [Slint](https://slint.dev/). Proves the library works independently of the CLI.
+
+A separate [desktop GUI](https://github.com/jjjake/ia-gui) built with [Slint](https://slint.dev/) consumes `ia-core` as an external dependency, proving the library works independently of the CLI.
 
 This separation matters: the CLI is one consumer of the library, not the library itself. If you need in-process Rust integration — building a custom tool, embedding IA access in a larger system — `ia-core` is the right dependency. The CLI is for everything else.
 
