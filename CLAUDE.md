@@ -112,7 +112,10 @@ Stop and verify each item. Do not skip ahead.
 
 ### Post-Merge Checklist (MUST complete after PR is merged)
 
-- [ ] Remove the worktree (`git worktree remove <path>`)
+Order matters — worktree must be removed before branch deletion.
+
+- [ ] Remove the worktree first (`git worktree remove <path>`) — git won't delete a branch with an active worktree
+- [ ] Merge via `gh pr merge --merge --delete-branch` (or merge + manual branch cleanup)
 - [ ] Pull main to get the merge commit (`git pull` on main)
 - [ ] Update MEMORY.md status (e.g., "IN PROGRESS" → "COMPLETE")
 
