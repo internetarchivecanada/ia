@@ -171,6 +171,92 @@ pub fn replace_binary(source: &Path, target: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Result of a successful update.
+#[derive(Debug)]
+pub struct UpdateResult {
+    pub current_version: String,
+    pub new_version: String,
+}
+
+/// Perform the full update: check -> download -> replace.
+///
+/// `current_exe` is the path to the running binary (use `std::env::current_exe()`).
+/// `skip_verify` skips the post-replace --version check (for testing with non-executable content).
+pub async fn perform_update(
+    current_version: &str,
+    target: &str,
+    current_exe: &Path,
+    api_base: &str,
+    skip_verify: bool,
+) -> crate::Result<UpdateResult> {
+    let check = check_for_update(current_version, api_base).await?;
+
+    if !check.update_available {
+        return Ok(UpdateResult {
+            current_version: check.current_version,
+            new_version: check.latest_version,
+        });
+    }
+
+    let release = check.release.as_ref().unwrap();
+    let asset = find_matching_asset(&release.assets, target).ok_or_else(|| {
+        IaError::UpdateNoAsset {
+            target: target.to_string(),
+        }
+    })?;
+
+    // Download to a temp file in the same directory (for atomic rename)
+    let temp_path = current_exe.with_extension("update-tmp");
+    let _ = std::fs::remove_file(&temp_path);
+
+    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = replace_binary(&temp_path, current_exe) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    // Verify the new binary works
+    if !skip_verify {
+        let output = std::process::Command::new(current_exe)
+            .arg("--version")
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let version_output = String::from_utf8_lossy(&out.stdout);
+                if !version_output.contains(&check.latest_version) {
+                    return Err(IaError::UpdateVerifyFailed {
+                        expected: check.latest_version,
+                        actual: version_output.trim().to_string(),
+                    });
+                }
+            }
+            Ok(out) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: check.latest_version,
+                    actual: format!("exit code {}", out.status),
+                });
+            }
+            Err(e) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: check.latest_version,
+                    actual: format!("failed to run: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(UpdateResult {
+        current_version: check.current_version,
+        new_version: check.latest_version,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +478,89 @@ mod tests {
 
         assert_eq!(std::fs::read(&original).unwrap(), b"new");
         assert!(!replacement.exists());
+    }
+
+    #[tokio::test]
+    async fn perform_update_full_flow() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-binary-content";
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "tag_name": "v99.0.0",
+                    "assets": [{
+                        "name": "ia-test-target",
+                        "browser_download_url": format!("{}/download/ia-test-target", mock_server.uri()),
+                        "size": fake_binary.len()
+                    }]
+                }),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/ia-test-target"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(fake_binary.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let result = perform_update(
+            "0.4.3",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true, // skip_verify -- can't run --version on fake binary
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.new_version, "99.0.0");
+        assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    #[tokio::test]
+    async fn perform_update_no_matching_asset() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "tag_name": "v99.0.0",
+                    "assets": [{
+                        "name": "ia-some-other-target",
+                        "browser_download_url": "https://example.com/ia-other",
+                        "size": 100
+                    }]
+                }),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old").unwrap();
+
+        let result = perform_update(
+            "0.4.3",
+            "aarch64-apple-darwin",
+            &exe_path,
+            &mock_server.uri(),
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::UpdateNoAsset { .. }
+        ));
     }
 }
