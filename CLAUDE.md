@@ -71,13 +71,23 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 
 ## Development Workflow
 
-- **ALWAYS use git worktrees** for feature/fix branches (see global CLAUDE.md) — `feat/`, `fix/`, or `refactor/` prefix
+### Feature Development Order
+
+1. **Design first** — Brainstorm, explore approaches, write design doc (`docs/plans/`)
+2. **Create GitHub issue(s)** — After the design is finalized, create issue(s) on `jjjake/ia` based on what the design/plan reveals. A single feature may need multiple issues.
+3. **Create worktree** — `git worktree add` from main with `feat/`, `fix/`, or `refactor/` prefix
+4. **Implement** — TDD, frequent commits, link issues in commit messages
+5. **PR** — Push branch, create PR with `Closes #N` for every issue it resolves
+
+### Rules
+
+- **ALWAYS use git worktrees** for feature/fix branches (see global CLAUDE.md) — NEVER work directly on main or on unrelated feature branches
+- **ALWAYS create GitHub issues before implementation** — Issues come after design but before any code. Every piece of work must be tracked.
+- **ALWAYS link issues in PRs**: Use `Closes #N` in the PR body for every issue the PR resolves, so they auto-close on merge. List each issue on its own line.
 - **ALWAYS add tests**: Every change must include tests that verify the new behavior.
 - **ALWAYS push as a PR**: Push the feature branch and create a GitHub PR for review.
-- Use GitHub issues on `jjjake/ia` to organize work
-- Ralph Loop for iterating through issues
-- Run `cargo check`, `cargo test`, `cargo clippy` before committing
 - **ALWAYS update help text**: When adding or modifying CLI flags, subcommands, or behaviors, update the corresponding `about`, `long_about`, `after_long_help`, and option-level help strings. Help text is user-facing documentation — it must stay accurate.
+- Run `cargo check`, `cargo test`, `cargo clippy` before committing
 
 ## Agent-Friendly Output (`--json`)
 
