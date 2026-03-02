@@ -110,6 +110,12 @@ Stop and verify each item. Do not skip ahead.
 - [ ] MEMORY.md updated with new modules, commands, or status changes
 - [ ] PR body includes `Closes #N` for every linked issue
 
+### Post-Merge Checklist (MUST complete after PR is merged)
+
+- [ ] Remove the worktree (`git worktree remove <path>`)
+- [ ] Pull main to get the merge commit (`git pull` on main)
+- [ ] Update MEMORY.md status (e.g., "IN PROGRESS" → "COMPLETE")
+
 ## Agent-Friendly Output (`--json`)
 
 Every command must support `--json` as a **subcommand flag** (not global). Design doc: `docs/plans/2026-02-23-agent-friendly-output-design.md`
