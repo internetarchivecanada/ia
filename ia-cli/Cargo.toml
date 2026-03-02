@@ -29,6 +29,7 @@ color-print = "0.3"
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
+self-update = []
 
 [dependencies.ratatui]
 version = "0.29"
