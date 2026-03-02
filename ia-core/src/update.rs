@@ -1,4 +1,7 @@
+use crate::error::IaError;
 use serde::Deserialize;
+use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 /// A GitHub release from the releases API.
 #[derive(Debug, Deserialize)]
@@ -53,6 +56,53 @@ pub fn find_matching_asset<'a>(assets: &'a [GitHubAsset], target: &str) -> Optio
     let name = format!("ia-{target}");
     let name_exe = format!("ia-{target}.exe");
     assets.iter().find(|a| a.name == name || a.name == name_exe)
+}
+
+pub const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Check GitHub Releases for a newer version.
+///
+/// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
+pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::Result<UpdateCheck> {
+    let url = format!("{api_base}/repos/jjjake/ia/releases/latest");
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("ia/{current_version}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UpdateApiError {
+            status: 0,
+            message: e.to_string(),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(IaError::UpdateApiError {
+            status: response.status().as_u16(),
+            message: format!("GitHub API returned {}", response.status()),
+        });
+    }
+
+    let release: GitHubRelease = response.json().await.map_err(|e| IaError::UpdateApiError {
+        status: 0,
+        message: format!("failed to parse release JSON: {e}"),
+    })?;
+
+    let latest_version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name)
+        .to_string();
+
+    let update_available = is_newer(current_version, &latest_version);
+
+    Ok(UpdateCheck {
+        current_version: current_version.to_string(),
+        latest_version,
+        update_available,
+        release: if update_available { Some(release) } else { None },
+    })
 }
 
 #[cfg(test)]
@@ -176,5 +226,67 @@ mod tests {
         let assets: Vec<GitHubAsset> = vec![];
         let result = find_matching_asset(&assets, "aarch64-apple-darwin");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_for_update_newer_version() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "tag_name": "v99.0.0",
+                    "assets": [{
+                        "name": "ia-aarch64-apple-darwin",
+                        "browser_download_url": "https://example.com/ia-aarch64-apple-darwin",
+                        "size": 100
+                    }]
+                }),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let check = check_for_update("0.4.3", &mock_server.uri()).await.unwrap();
+        assert!(check.update_available);
+        assert_eq!(check.latest_version, "99.0.0");
+        assert_eq!(check.current_version, "0.4.3");
+        assert!(check.release.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_for_update_already_current() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "tag_name": "v0.4.3",
+                    "assets": []
+                }),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let check = check_for_update("0.4.3", &mock_server.uri()).await.unwrap();
+        assert!(!check.update_available);
+        assert_eq!(check.latest_version, "0.4.3");
+    }
+
+    #[tokio::test]
+    async fn check_for_update_api_error() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .respond_with(wiremock::ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+
+        let result = check_for_update("0.4.3", &mock_server.uri()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::IaError::UpdateApiError { status: 403, .. }
+        ));
     }
 }
