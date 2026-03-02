@@ -53,6 +53,9 @@ pub enum IaError {
     #[error("metadata write failed for {identifier}: {message}")]
     MetadataWrite { identifier: String, message: String },
 
+    #[error("LLM API error ({status}): {message}")]
+    LlmApi { status: u16, message: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -84,6 +87,10 @@ impl IaError {
             IaError::Io(_) => true,
             IaError::ChecksumMismatch { .. } => true,
             IaError::ResumeFailed { .. } => true,
+            // LLM API errors: retry on 429/5xx, not on 4xx
+            IaError::LlmApi { status, .. } => {
+                *status == 429 || *status >= 500
+            }
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -139,6 +146,10 @@ impl IaError {
             IaError::MetadataWrite { identifier, .. } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 "metadata_write"
+            }
+            IaError::LlmApi { status, .. } => {
+                extra.insert("status".into(), (*status).into());
+                "llm_api"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",

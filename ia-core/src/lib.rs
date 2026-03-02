@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod client;
 pub mod config;
 pub mod disk_pool;

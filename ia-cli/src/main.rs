@@ -88,6 +88,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// AI-assisted metadata cleanup
+    Ai(commands::ai::AiArgs),
     /// Download files from one or more items
     Download(commands::download::DownloadArgs),
     /// List files in an item with filtering and formatting
@@ -156,6 +158,9 @@ async fn main() -> Result<()> {
     let client = ia_core::IaClient::from_config(config)?;
 
     match cli.command {
+        Commands::Ai(args) => {
+            commands::ai::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
+        }
         Commands::Download(args) => {
             commands::download::run(&client, args, cli.quiet, cli.jobs, cli.joblog, cli.retry_failed).await?
         }

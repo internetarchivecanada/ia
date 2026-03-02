@@ -1,3 +1,4 @@
+pub mod ai;
 mod app;
 mod ui;
 

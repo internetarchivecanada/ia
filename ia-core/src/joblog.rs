@@ -6,16 +6,18 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::ai::types::{JoblogChange, JoblogTokens};
+
 /// A single joblog entry (one JSON line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoblogEntry {
     /// ISO 8601 timestamp.
     pub ts: String,
-    /// Operation type (e.g. "download").
+    /// Operation type (e.g. "download", "ai", "ai-undo").
     pub op: String,
     /// Item identifier.
     pub item: String,
-    /// File name within the item.
+    /// File name within the item (empty for AI operations).
     pub file: String,
     /// Status: "ok", "skipped", or "error".
     pub status: String,
@@ -31,6 +33,12 @@ pub struct JoblogEntry {
     /// Number of retries attempted (only for errors).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retries: Option<usize>,
+    /// Metadata changes (for AI operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<JoblogChange>>,
+    /// Token usage (for AI operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<JoblogTokens>,
 }
 
 /// Thread-safe append-only JSONL writer.
@@ -87,6 +95,8 @@ impl JoblogEntry {
             elapsed_ms: None,
             error: None,
             retries: None,
+            changes: None,
+            tokens: None,
         }
     }
 
@@ -106,6 +116,41 @@ impl JoblogEntry {
         self.status = "error".to_string();
         self.error = Some(msg.to_string());
         self.retries = Some(retries);
+        self
+    }
+
+    /// Set metadata changes (for AI operations).
+    pub fn with_changes(mut self, changes: Vec<JoblogChange>) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
+    /// Set token usage (for AI operations).
+    pub fn with_tokens(mut self, tokens: JoblogTokens) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
+
+    /// Create an AI operation entry with status "ok".
+    pub fn ai_ok(
+        mut self,
+        changes: Vec<JoblogChange>,
+        tokens: Option<JoblogTokens>,
+        elapsed_ms: u64,
+    ) -> Self {
+        self.status = "ok".to_string();
+        self.changes = Some(changes);
+        self.tokens = tokens;
+        self.elapsed_ms = Some(elapsed_ms);
+        self
+    }
+
+    /// Create an AI operation entry with status "error".
+    pub fn ai_error(mut self, msg: &str, elapsed_ms: u64) -> Self {
+        self.status = "error".to_string();
+        self.error = Some(msg.to_string());
+        self.changes = Some(vec![]);
+        self.elapsed_ms = Some(elapsed_ms);
         self
     }
 }
@@ -173,6 +218,29 @@ pub struct JoblogSummary {
     pub skipped: usize,
 }
 
+/// AI-specific summary statistics from a joblog.
+#[derive(Debug, Default)]
+pub struct AiSummary {
+    /// Total AI analysis operations.
+    pub items_analyzed: usize,
+    /// Items that had changes applied successfully.
+    pub items_with_changes: usize,
+    /// Items that errored during AI processing.
+    pub items_errored: usize,
+    /// Items that were skipped.
+    pub items_skipped: usize,
+    /// Total number of field changes applied.
+    pub changes_applied: usize,
+    /// Total prompt tokens used.
+    pub prompt_tokens: u64,
+    /// Total completion tokens used.
+    pub completion_tokens: u64,
+    /// Number of undo operations performed.
+    pub undos: usize,
+    /// Number of changes reversed by undo.
+    pub changes_reversed: usize,
+}
+
 /// Compute summary statistics from entries.
 pub fn summarize(entries: &[JoblogEntry]) -> JoblogSummary {
     let mut summary = JoblogSummary {
@@ -188,6 +256,64 @@ pub fn summarize(entries: &[JoblogEntry]) -> JoblogSummary {
         }
     }
     summary
+}
+
+/// Compute AI-specific summary statistics from entries.
+///
+/// Returns `None` if there are no AI entries in the joblog.
+pub fn ai_summarize(entries: &[JoblogEntry]) -> Option<AiSummary> {
+    let ai_entries: Vec<&JoblogEntry> = entries
+        .iter()
+        .filter(|e| e.op == "ai" || e.op == "ai-undo")
+        .collect();
+
+    if ai_entries.is_empty() {
+        return None;
+    }
+
+    let mut summary = AiSummary::default();
+
+    for entry in &ai_entries {
+        match entry.op.as_str() {
+            "ai" => match entry.status.as_str() {
+                "ok" => {
+                    summary.items_analyzed += 1;
+                    if let Some(ref changes) = entry.changes {
+                        if !changes.is_empty() {
+                            summary.items_with_changes += 1;
+                            summary.changes_applied += changes.len();
+                        }
+                    }
+                    if let Some(ref tokens) = entry.tokens {
+                        summary.prompt_tokens += tokens.prompt;
+                        summary.completion_tokens += tokens.completion;
+                    }
+                }
+                "error" => {
+                    summary.items_errored += 1;
+                    if let Some(ref tokens) = entry.tokens {
+                        summary.prompt_tokens += tokens.prompt;
+                        summary.completion_tokens += tokens.completion;
+                    }
+                }
+                "skipped" => {
+                    summary.items_skipped += 1;
+                }
+                _ => {}
+            },
+            "ai-undo" => {
+                if entry.status == "ok" {
+                    summary.undos += 1;
+                    if let Some(ref changes) = entry.changes {
+                        summary.changes_reversed += changes.len();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(summary)
 }
 
 #[cfg(test)]
@@ -303,5 +429,304 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let entries = read(&path).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    // --- AI joblog extension tests ---
+
+    #[test]
+    fn ai_entry_serializes_with_changes_and_tokens() {
+        let entry = JoblogEntry::new("ai", "nasa_photo", "").ai_ok(
+            vec![
+                JoblogChange {
+                    field: "date".to_string(),
+                    old: None,
+                    new: serde_json::json!("1969-07-20"),
+                },
+                JoblogChange {
+                    field: "title".to_string(),
+                    old: Some(serde_json::json!("nasa photo")),
+                    new: serde_json::json!("NASA Photo"),
+                },
+            ],
+            Some(JoblogTokens {
+                prompt: 1200,
+                completion: 300,
+            }),
+            2100,
+        );
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"op\":\"ai\""));
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"changes\""));
+        assert!(json.contains("\"tokens\""));
+        assert!(json.contains("\"date\""));
+        assert!(json.contains("\"1969-07-20\""));
+        assert!(json.contains("\"prompt\":1200"));
+    }
+
+    #[test]
+    fn ai_error_entry_has_empty_changes() {
+        let entry = JoblogEntry::new("ai", "bad_item", "")
+            .ai_error("metadata write failed: 403", 500);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"metadata write failed: 403\""));
+        assert!(json.contains("\"changes\":[]"));
+        assert!(!json.contains("\"tokens\""));
+    }
+
+    #[test]
+    fn ai_entry_roundtrip() {
+        let entry = JoblogEntry::new("ai", "test_item", "").ai_ok(
+            vec![JoblogChange {
+                field: "title".to_string(),
+                old: Some(serde_json::json!("old")),
+                new: serde_json::json!("new"),
+            }],
+            Some(JoblogTokens {
+                prompt: 500,
+                completion: 100,
+            }),
+            1000,
+        );
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: JoblogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.op, "ai");
+        assert_eq!(parsed.item, "test_item");
+        assert_eq!(parsed.status, "ok");
+        let changes = parsed.changes.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].field, "title");
+        let tokens = parsed.tokens.unwrap();
+        assert_eq!(tokens.prompt, 500);
+        assert_eq!(tokens.completion, 100);
+    }
+
+    #[test]
+    fn backward_compat_download_entry_has_no_ai_fields() {
+        let entry = JoblogEntry::new("download", "nasa", "photo.jpg").ok(4200000, 2100);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("\"changes\""));
+        assert!(!json.contains("\"tokens\""));
+    }
+
+    #[test]
+    fn backward_compat_parse_old_download_entries() {
+        let old_json = r#"{"ts":"2026-02-20T15:30:00Z","op":"download","item":"nasa","file":"a.jpg","status":"ok","bytes":100,"elapsed_ms":50}"#;
+        let entry: JoblogEntry = serde_json::from_str(old_json).unwrap();
+        assert_eq!(entry.op, "download");
+        assert_eq!(entry.item, "nasa");
+        assert!(entry.changes.is_none());
+        assert!(entry.tokens.is_none());
+    }
+
+    #[test]
+    fn ai_entry_with_builder_methods() {
+        let entry = JoblogEntry::new("ai", "test", "")
+            .with_changes(vec![JoblogChange {
+                field: "date".to_string(),
+                old: None,
+                new: serde_json::json!("2026-01-01"),
+            }])
+            .with_tokens(JoblogTokens {
+                prompt: 800,
+                completion: 200,
+            });
+
+        assert!(entry.changes.is_some());
+        assert!(entry.tokens.is_some());
+        assert_eq!(entry.changes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_items_includes_ai_ops() {
+        let entries = vec![
+            JoblogEntry::new("ai", "good_item", "").ai_ok(vec![], None, 100),
+            JoblogEntry::new("ai", "bad_item", "")
+                .ai_error("write failed", 200),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], "bad_item");
+    }
+
+    #[test]
+    fn write_and_read_mixed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+
+        let writer = JoblogWriter::open(&path).unwrap();
+        writer.write(&JoblogEntry::new("download", "nasa", "a.jpg").ok(100, 50));
+        writer.write(
+            &JoblogEntry::new("ai", "nasa", "").ai_ok(
+                vec![JoblogChange {
+                    field: "title".to_string(),
+                    old: Some(serde_json::json!("old")),
+                    new: serde_json::json!("new"),
+                }],
+                Some(JoblogTokens {
+                    prompt: 1000,
+                    completion: 200,
+                }),
+                1500,
+            ),
+        );
+
+        let entries = read(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].op, "download");
+        assert!(entries[0].changes.is_none());
+        assert_eq!(entries[1].op, "ai");
+        assert!(entries[1].changes.is_some());
+    }
+
+    // --- AI summary tests ---
+
+    #[test]
+    fn ai_summarize_returns_none_for_no_ai_entries() {
+        let entries = vec![
+            JoblogEntry::new("download", "nasa", "a.jpg").ok(100, 50),
+            JoblogEntry::new("download", "nasa", "b.jpg").ok(200, 60),
+        ];
+        assert!(ai_summarize(&entries).is_none());
+    }
+
+    #[test]
+    fn ai_summarize_returns_none_for_empty() {
+        assert!(ai_summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn ai_summarize_counts_analyzed_and_changes() {
+        let entries = vec![
+            JoblogEntry::new("ai", "item1", "").ai_ok(
+                vec![
+                    JoblogChange {
+                        field: "title".to_string(),
+                        old: Some(serde_json::json!("old")),
+                        new: serde_json::json!("New"),
+                    },
+                    JoblogChange {
+                        field: "date".to_string(),
+                        old: None,
+                        new: serde_json::json!("2026-01-01"),
+                    },
+                ],
+                Some(JoblogTokens {
+                    prompt: 1000,
+                    completion: 200,
+                }),
+                500,
+            ),
+            JoblogEntry::new("ai", "item2", "").ai_ok(
+                vec![JoblogChange {
+                    field: "title".to_string(),
+                    old: Some(serde_json::json!("bad")),
+                    new: serde_json::json!("Good"),
+                }],
+                Some(JoblogTokens {
+                    prompt: 800,
+                    completion: 150,
+                }),
+                400,
+            ),
+            // Item with no changes (ok but empty changes)
+            JoblogEntry::new("ai", "item3", "").ai_ok(vec![], None, 100),
+        ];
+
+        let summary = ai_summarize(&entries).unwrap();
+        assert_eq!(summary.items_analyzed, 3);
+        assert_eq!(summary.items_with_changes, 2);
+        assert_eq!(summary.changes_applied, 3);
+        assert_eq!(summary.prompt_tokens, 1800);
+        assert_eq!(summary.completion_tokens, 350);
+        assert_eq!(summary.items_errored, 0);
+        assert_eq!(summary.items_skipped, 0);
+        assert_eq!(summary.undos, 0);
+    }
+
+    #[test]
+    fn ai_summarize_counts_errors_and_skips() {
+        let entries = vec![
+            JoblogEntry::new("ai", "item1", "").ai_ok(
+                vec![JoblogChange {
+                    field: "title".to_string(),
+                    old: None,
+                    new: serde_json::json!("Title"),
+                }],
+                None,
+                100,
+            ),
+            JoblogEntry::new("ai", "item2", "").ai_error("write failed", 200),
+            JoblogEntry::new("ai", "item3", "").skipped(),
+        ];
+
+        let summary = ai_summarize(&entries).unwrap();
+        assert_eq!(summary.items_analyzed, 1);
+        assert_eq!(summary.items_errored, 1);
+        assert_eq!(summary.items_skipped, 1);
+    }
+
+    #[test]
+    fn ai_summarize_counts_undos() {
+        let entries = vec![
+            JoblogEntry::new("ai", "item1", "").ai_ok(
+                vec![JoblogChange {
+                    field: "title".to_string(),
+                    old: Some(serde_json::json!("old")),
+                    new: serde_json::json!("new"),
+                }],
+                Some(JoblogTokens {
+                    prompt: 500,
+                    completion: 100,
+                }),
+                100,
+            ),
+            JoblogEntry::new("ai-undo", "item1", "").ai_ok(
+                vec![JoblogChange {
+                    field: "title".to_string(),
+                    old: Some(serde_json::json!("new")),
+                    new: serde_json::json!("old"),
+                }],
+                None,
+                50,
+            ),
+        ];
+
+        let summary = ai_summarize(&entries).unwrap();
+        assert_eq!(summary.items_analyzed, 1);
+        assert_eq!(summary.changes_applied, 1);
+        assert_eq!(summary.undos, 1);
+        assert_eq!(summary.changes_reversed, 1);
+        assert_eq!(summary.prompt_tokens, 500);
+        assert_eq!(summary.completion_tokens, 100);
+    }
+
+    #[test]
+    fn ai_summarize_ignores_download_entries() {
+        let entries = vec![
+            JoblogEntry::new("download", "nasa", "a.jpg").ok(100, 50),
+            JoblogEntry::new("ai", "nasa", "").ai_ok(
+                vec![JoblogChange {
+                    field: "date".to_string(),
+                    old: None,
+                    new: serde_json::json!("1969-07-20"),
+                }],
+                Some(JoblogTokens {
+                    prompt: 1200,
+                    completion: 300,
+                }),
+                1500,
+            ),
+            JoblogEntry::new("download", "nasa", "b.jpg").ok(200, 60),
+        ];
+
+        let summary = ai_summarize(&entries).unwrap();
+        assert_eq!(summary.items_analyzed, 1);
+        assert_eq!(summary.changes_applied, 1);
+        assert_eq!(summary.prompt_tokens, 1200);
     }
 }
