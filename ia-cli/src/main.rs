@@ -103,16 +103,26 @@ enum Commands {
     Status(commands::status::StatusArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
+    /// Update ia to the latest version
+    #[cfg(feature = "self-update")]
+    Update(commands::update::UpdateArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle completions early (no client/config needed)
-    if let Commands::Completions(args) = cli.command {
-        let mut cmd = Cli::command();
-        return commands::completions::run(args, &mut cmd);
+    // Handle commands that don't need IA config/client
+    match cli.command {
+        Commands::Completions(args) => {
+            let mut cmd = Cli::command();
+            return commands::completions::run(args, &mut cmd);
+        }
+        #[cfg(feature = "self-update")]
+        Commands::Update(args) => {
+            return commands::update::run(args).await;
+        }
+        _ => {}
     }
 
     // Initialize logging
@@ -171,6 +181,8 @@ async fn main() -> Result<()> {
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
         Commands::Completions(_) => unreachable!("handled above"),
+        #[cfg(feature = "self-update")]
+        Commands::Update(_) => unreachable!("handled above"),
     }
 
     Ok(())

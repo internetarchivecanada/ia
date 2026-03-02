@@ -5,3 +5,5 @@ pub mod list;
 pub mod metadata;
 pub mod search;
 pub mod status;
+#[cfg(feature = "self-update")]
+pub mod update;
