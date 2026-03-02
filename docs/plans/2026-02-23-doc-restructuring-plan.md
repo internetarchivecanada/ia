@@ -133,15 +133,16 @@ A long-term goal of this project is for the Rust CLI to serve both of those role
 - **Stable contract.** `--json` output shapes and `--help` text form a stable interface. Changes are versioned and documented.
 - **Composable.** Pipe JSONL through `jq`, feed it to another command, or parse it in any language's JSON library.
 
-There are trade-offs. Process spawning has higher latency than an in-process function call. You lose in-process callbacks and streaming iterators. For those cases, the Rust library (`ia-core`) exists and powers both the CLI and the [desktop GUI](plans/2026-02-21-gui-design.md). But for the common patterns — searching, downloading, reading metadata, modifying metadata — the CLI with `--json` is often the simpler path.
+There are trade-offs. Process spawning has higher latency than an in-process function call. You lose in-process callbacks and streaming iterators. For those cases, the Rust library (`ia-core`) exists and powers both the CLI and the [desktop GUI](https://github.com/jjjake/ia-gui) (separate repo). But for the common patterns — searching, downloading, reading metadata, modifying metadata — the CLI with `--json` is often the simpler path.
 
 ## Library-first architecture
 
-The project is a [Cargo workspace](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html) with three crates:
+The project is a [Cargo workspace](https://doc.rust-lang.org/book/ch14-03-cargo-workspaces.html) with two crates:
 
 - **`ia-core`** — the library. HTTP client, API types, download engine, search backends, metadata read/write, error types. This is a real library with a public API, not CLI internals exposed through `pub`.
 - **`ia-cli`** — the CLI. A thin presentation layer that parses arguments, calls `ia-core` functions, and formats output for humans or machines.
-- **`ia-gui`** — a desktop GUI built with [Slint](https://slint.dev/). Proves the library works independently of the CLI.
+
+A separate [desktop GUI](https://github.com/jjjake/ia-gui) built with [Slint](https://slint.dev/) consumes `ia-core` as an external dependency, proving the library works independently of the CLI.
 
 This separation matters: the CLI is one consumer of the library, not the library itself. If you need in-process Rust integration — building a custom tool, embedding IA access in a larger system — `ia-core` is the right dependency. The CLI is for everything else.
 
@@ -206,7 +207,7 @@ Design documents in `docs/plans/` cover specific subsystems in detail:
 | [Metadata write](plans/2026-02-22-metadata-write-design.md) | RFC 6902 JSON Patch approach for metadata modification |
 | [CLI help text](plans/2026-02-23-cli-help-design.md) | Layered `-h`/`--help`, colored examples, audience-aware help |
 | [Download output](plans/2026-02-20-download-output-redesign.md) | Progress display, dashboard mode, batch output |
-| [GUI design](plans/2026-02-21-gui-design.md) | Slint desktop app for non-technical users |
+| [GUI design](https://github.com/jjjake/ia-gui) | Desktop app (separate repo, paused) |
 | [AI command](../docs/plans/2026-02-21-ai-command-design.md) | LLM-powered metadata cleanup pipeline |
 ```
 

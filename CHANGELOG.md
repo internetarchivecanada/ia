@@ -6,18 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **GUI desktop app** (`ia-gui`) — Slint-based desktop application for browsing the Internet Archive
-  - **Search page** with scrape/advanced/FTS backends, result table, thumbnail support, and export (JSONL/CSV/identifiers)
-  - **Item detail page** with metadata summary, files tab with size/format info, and raw JSON viewer
-  - **Downloads page** with active download progress, file counts, and download history from job log
-  - **Lists page** with create/delete/select lists, add/remove items, download all, export
-  - **Metadata browse page** with identifier lookup, file listing, JSON viewer, and save-to-disk
-  - **Settings page** with connection config (host, UA suffix, insecure) and download preferences (directory, concurrency, job log)
-  - **Status bar** showing connection host, active download count, and list count (updates in real-time)
-  - **Sidebar navigation** with page routing between all sections
-  - Cross-section integration: "Add to List" from search/metadata, auto-track completed downloads
-  - Async backend infrastructure with tokio runtime and IaClient integration
-  - Persistent settings (JSON) and list storage
+- **GUI desktop app** — Slint-based desktop application for browsing the Internet Archive (now a [separate repo](https://github.com/jjjake/ia-gui))
 
 ### Fixed
 

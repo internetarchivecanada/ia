@@ -72,7 +72,7 @@ ia/                          # GitHub: jjjake/ia (private)
 │           └── ...
 ```
 
-Future addition: `ia-gui/` crate for desktop GUI.
+Desktop GUI is developed separately at [jjjake/ia-gui](https://github.com/jjjake/ia-gui), consuming `ia-core` as a git dependency.
 
 ### Approach: Client + Typed Operations (B → C)
 
