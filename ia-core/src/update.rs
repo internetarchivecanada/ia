@@ -47,6 +47,14 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
     }
 }
 
+/// Find the release asset matching the given target triple.
+/// Looks for `ia-{target}` or `ia-{target}.exe`.
+pub fn find_matching_asset<'a>(assets: &'a [GitHubAsset], target: &str) -> Option<&'a GitHubAsset> {
+    let name = format!("ia-{target}");
+    let name_exe = format!("ia-{target}.exe");
+    assets.iter().find(|a| a.name == name || a.name == name_exe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +127,54 @@ mod tests {
         assert_eq!(release.tag_name, "v0.4.4");
         assert_eq!(release.assets.len(), 2);
         assert_eq!(release.assets[0].name, "ia-aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn find_asset_matches_target() {
+        let assets = vec![
+            GitHubAsset {
+                name: "ia-aarch64-apple-darwin".into(),
+                browser_download_url: "https://example.com/ia-aarch64-apple-darwin".into(),
+                size: 100,
+            },
+            GitHubAsset {
+                name: "ia-x86_64-unknown-linux-musl".into(),
+                browser_download_url: "https://example.com/ia-x86_64-unknown-linux-musl".into(),
+                size: 200,
+            },
+        ];
+        let result = find_matching_asset(&assets, "aarch64-apple-darwin");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "ia-aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn find_asset_matches_windows() {
+        let assets = vec![GitHubAsset {
+            name: "ia-x86_64-pc-windows-msvc.exe".into(),
+            browser_download_url: "https://example.com/ia-x86_64-pc-windows-msvc.exe".into(),
+            size: 300,
+        }];
+        let result = find_matching_asset(&assets, "x86_64-pc-windows-msvc");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "ia-x86_64-pc-windows-msvc.exe");
+    }
+
+    #[test]
+    fn find_asset_returns_none_when_missing() {
+        let assets = vec![GitHubAsset {
+            name: "ia-x86_64-unknown-linux-musl".into(),
+            browser_download_url: "https://example.com/ia-x86_64-unknown-linux-musl".into(),
+            size: 200,
+        }];
+        let result = find_matching_asset(&assets, "aarch64-apple-darwin");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_asset_empty_list() {
+        let assets: Vec<GitHubAsset> = vec![];
+        let result = find_matching_asset(&assets, "aarch64-apple-darwin");
+        assert!(result.is_none());
     }
 }
