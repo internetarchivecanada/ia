@@ -11,6 +11,7 @@ pub mod rate_limit;
 pub mod search;
 pub mod spreadsheet;
 pub mod types;
+pub mod update;
 pub mod user_agent;
 
 pub use client::IaClient;
