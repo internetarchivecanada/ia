@@ -15,7 +15,6 @@ serde_json = "1"
 configparser = "3"
 thiserror = "2"
 tracing = "0.1"
-backon = "1"
 md-5 = "0.10"
 globset = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
