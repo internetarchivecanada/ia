@@ -89,6 +89,33 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 - **ALWAYS update help text**: When adding or modifying CLI flags, subcommands, or behaviors, update the corresponding `about`, `long_about`, `after_long_help`, and option-level help strings. Help text is user-facing documentation — it must stay accurate.
 - Run `cargo check`, `cargo test`, `cargo clippy` before committing
 
+### Pre-Implementation Checklist (MUST complete before writing any code)
+
+Stop and verify each item. Do not skip ahead.
+
+- [ ] On a clean worktree created from main (NOT main, NOT an unrelated branch)
+- [ ] `git status` is clean — no stale changes from other work
+- [ ] Design doc exists in `docs/plans/` AND is committed to the feature branch
+- [ ] Implementation plan exists in `docs/plans/` AND is committed to the feature branch
+- [ ] GitHub issue(s) created and number(s) noted for PR linking
+
+### Pre-PR Checklist (MUST complete before creating a PR)
+
+Stop and verify each item. Do not skip ahead.
+
+- [ ] `git status` — no uncommitted files that belong in the PR
+- [ ] `cargo test -p ia-core -p ia-cli` — all tests pass
+- [ ] `cargo clippy -p ia-core -p ia-cli -- -D warnings` — zero warnings
+- [ ] Design/plan docs are committed (not just written to disk)
+- [ ] MEMORY.md updated with new modules, commands, or status changes
+- [ ] PR body includes `Closes #N` for every linked issue
+
+### Post-Merge Checklist (MUST complete after PR is merged)
+
+- [ ] Remove the worktree (`git worktree remove <path>`)
+- [ ] Pull main to get the merge commit (`git pull` on main)
+- [ ] Update MEMORY.md status (e.g., "IN PROGRESS" → "COMPLETE")
+
 ## Agent-Friendly Output (`--json`)
 
 Every command must support `--json` as a **subcommand flag** (not global). Design doc: `docs/plans/2026-02-23-agent-friendly-output-design.md`

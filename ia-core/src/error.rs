@@ -56,6 +56,15 @@ pub enum IaError {
     #[error("LLM API error ({status}): {message}")]
     LlmApi { status: u16, message: String },
 
+    #[error("no release asset found for target {target}")]
+    UpdateNoAsset { target: String },
+
+    #[error("update API error ({status}): {message}")]
+    UpdateApiError { status: u16, message: String },
+
+    #[error("update verification failed: expected {expected}, got {actual}")]
+    UpdateVerifyFailed { expected: String, actual: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -91,6 +100,12 @@ impl IaError {
             IaError::LlmApi { status, .. } => {
                 *status == 429 || *status >= 500
             }
+            // Update errors: API errors retry on 5xx, others are permanent
+            IaError::UpdateApiError { status, .. } => {
+                *status == 429 || *status >= 500
+            }
+            IaError::UpdateNoAsset { .. } => false,
+            IaError::UpdateVerifyFailed { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -150,6 +165,19 @@ impl IaError {
             IaError::LlmApi { status, .. } => {
                 extra.insert("status".into(), (*status).into());
                 "llm_api"
+            }
+            IaError::UpdateNoAsset { target } => {
+                extra.insert("target".into(), target.clone().into());
+                "update_no_asset"
+            }
+            IaError::UpdateApiError { status, .. } => {
+                extra.insert("status".into(), (*status).into());
+                "update_api_error"
+            }
+            IaError::UpdateVerifyFailed { expected, actual } => {
+                extra.insert("expected".into(), expected.clone().into());
+                extra.insert("actual".into(), actual.clone().into());
+                "update_verify_failed"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -491,5 +519,89 @@ mod tests {
             actual: "def".into(),
         };
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn update_no_asset_displays_target() {
+        let err = IaError::UpdateNoAsset {
+            target: "aarch64-apple-darwin".into(),
+        };
+        assert!(err.to_string().contains("aarch64-apple-darwin"));
+    }
+
+    #[test]
+    fn update_api_error_displays_status() {
+        let err = IaError::UpdateApiError {
+            status: 403,
+            message: "rate limited".into(),
+        };
+        assert!(err.to_string().contains("403"));
+    }
+
+    #[test]
+    fn update_verify_failed_displays_versions() {
+        let err = IaError::UpdateVerifyFailed {
+            expected: "0.4.4".into(),
+            actual: "0.4.3".into(),
+        };
+        assert!(err.to_string().contains("0.4.4"));
+        assert!(err.to_string().contains("0.4.3"));
+    }
+
+    #[test]
+    fn json_update_no_asset() {
+        let err = IaError::UpdateNoAsset {
+            target: "aarch64-apple-darwin".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_no_asset");
+        assert_eq!(v["error"]["target"], "aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn json_update_api_error() {
+        let err = IaError::UpdateApiError {
+            status: 403,
+            message: "rate limited".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_api_error");
+        assert_eq!(v["error"]["status"], 403);
+    }
+
+    #[test]
+    fn json_update_verify_failed() {
+        let err = IaError::UpdateVerifyFailed {
+            expected: "0.4.4".into(),
+            actual: "0.4.3".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_verify_failed");
+        assert_eq!(v["error"]["expected"], "0.4.4");
+        assert_eq!(v["error"]["actual"], "0.4.3");
+    }
+
+    #[test]
+    fn update_errors_are_not_retryable() {
+        assert!(!IaError::UpdateNoAsset { target: "x".into() }.is_retryable());
+        assert!(!IaError::UpdateVerifyFailed {
+            expected: "a".into(),
+            actual: "b".into(),
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn update_api_error_retryable_on_5xx() {
+        assert!(IaError::UpdateApiError {
+            status: 500,
+            message: "error".into(),
+        }
+        .is_retryable());
+        assert!(!IaError::UpdateApiError {
+            status: 403,
+            message: "forbidden".into(),
+        }
+        .is_retryable());
     }
 }
