@@ -105,6 +105,72 @@ pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::R
     })
 }
 
+/// Download a release asset to a local file path.
+pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> crate::Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .header("User-Agent", format!("ia/{current_version}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UpdateApiError {
+            status: 0,
+            message: format!("download failed: {e}"),
+        })?;
+
+    if !response.status().is_success() {
+        return Err(IaError::UpdateApiError {
+            status: response.status().as_u16(),
+            message: format!("download returned {}", response.status()),
+        });
+    }
+
+    let bytes = response.bytes().await.map_err(|e| IaError::UpdateApiError {
+        status: 0,
+        message: format!("failed to read download body: {e}"),
+    })?;
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+
+    Ok(())
+}
+
+/// Atomically replace the binary at `target` with the file at `source`.
+///
+/// On Unix: atomic rename (same filesystem required).
+/// On Windows: rename target to .old first, then rename source to target.
+pub fn replace_binary(source: &Path, target: &Path) -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        // Copy permissions from original binary
+        if let Ok(metadata) = std::fs::metadata(target) {
+            let permissions = metadata.permissions();
+            std::fs::set_permissions(source, permissions)?;
+        } else {
+            // If we can't read the original, at least make executable
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(source, target)?;
+    }
+
+    #[cfg(windows)]
+    {
+        let backup = target.with_extension("old.exe");
+        let _ = std::fs::remove_file(&backup);
+        std::fs::rename(target, &backup)?;
+        if let Err(e) = std::fs::rename(source, target) {
+            let _ = std::fs::rename(&backup, target);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +354,43 @@ mod tests {
             err,
             crate::error::IaError::UpdateApiError { status: 403, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn download_asset_to_temp_file() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"#!/bin/sh\necho hello";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/ia-test"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(fake_binary.to_vec())
+                    .insert_header("content-length", fake_binary.len().to_string()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("{}/download/ia-test", mock_server.uri());
+        let dest = dir.path().join("ia-new");
+        download_asset(&url, &dest, "0.4.3").await.unwrap();
+
+        assert!(dest.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), fake_binary);
+    }
+
+    #[test]
+    fn atomic_replace_swaps_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("ia");
+        let replacement = dir.path().join("ia-new");
+
+        std::fs::write(&original, b"old").unwrap();
+        std::fs::write(&replacement, b"new").unwrap();
+
+        replace_binary(&replacement, &original).unwrap();
+
+        assert_eq!(std::fs::read(&original).unwrap(), b"new");
+        assert!(!replacement.exists());
     }
 }
