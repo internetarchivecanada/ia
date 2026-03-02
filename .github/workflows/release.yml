@@ -41,7 +41,7 @@ jobs:
         run: cargo test -p ia-core -p ia-cli
 
       - name: Build release binary
-        run: cargo build -p ia-cli --release --target ${{ matrix.target }}
+        run: cargo build -p ia-cli --release --target ${{ matrix.target }} --features self-update
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
