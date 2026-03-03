@@ -316,7 +316,7 @@ pub async fn download_file(
     // If we asked for a Range but got 200 (not 206), the server ignored our
     // Range header and is sending the full file.  Truncate the .part file so
     // we don't corrupt it by appending the full content after existing bytes.
-    let resume_from = if resume_from.is_some() && status == reqwest::StatusCode::OK {
+    let mut resume_from = if resume_from.is_some() && status == reqwest::StatusCode::OK {
         debug!(file = %file.name, "server returned 200 for Range request, restarting download");
         // Will create/truncate below
         None
@@ -337,6 +337,10 @@ pub async fn download_file(
         if meta.file_type().is_symlink() {
             warn!(file = %file.name, "removing symlink .part file");
             fs::remove_file(&part_path).await?;
+            // Reset resume so we create a fresh file instead of trying to
+            // append to the now-deleted path (which would fail with NotFound
+            // if the server returned 206).
+            resume_from = None;
         }
     }
 
@@ -1267,6 +1271,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_curdir_then_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        // CurDir (.) is harmless, but ParentDir (..) after it must still be caught
+        assert!(matches!(
+            validate_download_path(dir, "./../../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "././../secret"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn download_rejects_traversal_filename() {
         // Integration test: verify download_file returns PathTraversal error
@@ -1401,6 +1419,7 @@ mod tests {
 
     // -- Symlink and TOCTOU security tests --
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_in_download_path_detected() {
         // Create a temp dir with a symlink pointing outside
@@ -1434,6 +1453,7 @@ mod tests {
         assert!(!target_dir.path().join("payload.txt").exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlink_in_nested_download_path_detected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1463,6 +1483,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn part_file_symlink_skips_resume() {
         // If .part file is a symlink, resume should be skipped (not followed).
@@ -1507,6 +1528,72 @@ mod tests {
         assert_eq!(
             target_content, "original content",
             "symlink target should not be modified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn part_file_symlink_works_with_206_response() {
+        // Regression test: when a .part symlink is detected and removed,
+        // resume_from must be reset to None. Otherwise, if the server
+        // returns 206 (keeping resume_from as Some), the append-mode open
+        // on the deleted path would fail with NotFound.
+        use wiremock::matchers::header_exists;
+
+        let mock_server = MockServer::start().await;
+        let full_body = b"complete file data here";
+
+        // Return 206 Partial Content when Range header is present
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/ranged.txt"))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(b"data here".to_vec())
+                    .insert_header("Content-Range", "bytes 13-21/22"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Fallback: return full content when no Range header
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/ranged.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink .part file pointing to another location
+        let target_file = target_dir.path().join("target.txt");
+        std::fs::write(&target_file, "original content").unwrap();
+        let part_path = dir.path().join("ranged.txt.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+
+        let file = test_file_meta("ranged.txt", full_body.len() as u64);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+
+        // The symlink target should NOT have been modified
+        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            target_content, "original content",
+            "symlink target should not be modified even with 206 response"
         );
     }
 }
