@@ -183,12 +183,20 @@ pub struct PrintAuthArgs {
 /// Run the config command.
 pub async fn run(
     args: ConfigArgs,
-    _config: ia_core::IaConfig,
-    _config_path: Option<PathBuf>,
+    config: ia_core::IaConfig,
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     match args.command {
+        ConfigCommand::Show(show_args) => {
+            let json_value = config.to_json(true);
+            if show_args.json {
+                println!("{}", serde_json::to_string(&json_value)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&json_value)?);
+            }
+            Ok(())
+        }
         ConfigCommand::Login(_login_args) => todo!("login"),
-        ConfigCommand::Show(_show_args) => todo!("show"),
         ConfigCommand::Check(_check_args) => todo!("check"),
         ConfigCommand::Whoami(_whoami_args) => todo!("whoami"),
         ConfigCommand::PrintCookies(_print_cookies_args) => todo!("print-cookies"),
