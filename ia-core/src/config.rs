@@ -192,6 +192,67 @@ impl IaConfig {
     pub fn protocol(&self) -> &str {
         if self.general.secure { "https" } else { "http" }
     }
+
+    /// Write authentication credentials to a config file, merging with existing content.
+    ///
+    /// Creates parent directories (mode 0o700) and sets file permissions to 0o600.
+    pub fn write_config_file(auth: &crate::auth::AuthConfig, path: &Path) -> Result<()> {
+        // Create parent directories if needed
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+        }
+
+        // Load existing config or start fresh
+        let mut ini = configparser::ini::Ini::new();
+        if path.exists() {
+            let _ = ini.load(path); // ignore errors on existing file — we'll overwrite
+        }
+
+        // Merge auth values
+        ini.set("s3", "access", Some(auth.s3_access.clone()));
+        ini.set("s3", "secret", Some(auth.s3_secret.clone()));
+        ini.set("cookies", "logged-in-user", Some(auth.logged_in_user.clone()));
+        ini.set("cookies", "logged-in-sig", Some(auth.logged_in_sig.clone()));
+        ini.set("general", "screenname", Some(auth.screenname.clone()));
+
+        // Write the INI file
+        ini.write(path).map_err(|e| IaError::Config(format!("failed to write config: {e}")))?;
+
+        // Set file permissions to 0o600 (owner read/write only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
+    }
+
+    /// Find the config file to write to, falling back to the XDG default.
+    ///
+    /// Priority: existing file (same search as `find_config_file`) then XDG default path.
+    pub fn find_or_default_config_path() -> PathBuf {
+        if let Some(existing) = Self::find_config_file() {
+            return existing;
+        }
+
+        // Default to XDG location
+        let config_home = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty() && PathBuf::from(s).is_absolute())
+            .map(PathBuf::from)
+            .or_else(|| dirs_path().map(|h| h.join(".config")))
+            .unwrap_or_else(|| PathBuf::from(".config"));
+
+        config_home.join("internetarchive").join("ia.ini")
+    }
 }
 
 fn dirs_path() -> Option<PathBuf> {
@@ -326,6 +387,110 @@ mod tests {
         assert_eq!(ai.base_url, "http://test:8080/v1");
         assert_eq!(ai.api_key.as_deref(), Some("env-key"));
         assert_eq!(ai.model, "env-model");
+    }
+
+    #[test]
+    fn write_config_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+
+        let auth = crate::auth::AuthConfig {
+            s3_access: "new-access".into(),
+            s3_secret: "new-secret".into(),
+            logged_in_user: "user%40example.com".into(),
+            logged_in_sig: "sig-value".into(),
+            screenname: "testuser".into(),
+            itemname: Some("@testuser".into()),
+        };
+
+        let result = IaConfig::write_config_file(&auth, &ini_path);
+        assert!(result.is_ok(), "write_config_file failed: {:?}", result.err());
+
+        // Read it back and verify
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        assert_eq!(config.s3_access.as_deref(), Some("new-access"));
+        assert_eq!(config.s3_secret.as_deref(), Some("new-secret"));
+        assert_eq!(config.cookies.get("logged-in-user").map(|s| s.as_str()), Some("user%40example.com"));
+        assert_eq!(config.cookies.get("logged-in-sig").map(|s| s.as_str()), Some("sig-value"));
+        assert_eq!(config.general.screenname.as_deref(), Some("testuser"));
+    }
+
+    #[test]
+    fn write_config_merges_with_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+
+        // Create an existing config with custom settings
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[general]").unwrap();
+        writeln!(f, "host = custom.archive.org").unwrap();
+        writeln!(f, "user_agent_suffix = MyApp/1.0").unwrap();
+        writeln!(f, "[logging]").unwrap();
+        writeln!(f, "level = debug").unwrap();
+        drop(f);
+
+        let auth = crate::auth::AuthConfig {
+            s3_access: "merged-access".into(),
+            s3_secret: "merged-secret".into(),
+            logged_in_user: "user%40example.com".into(),
+            logged_in_sig: "sig-value".into(),
+            screenname: "testuser".into(),
+            itemname: None,
+        };
+
+        IaConfig::write_config_file(&auth, &ini_path).unwrap();
+
+        // Verify auth values were written
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        assert_eq!(config.s3_access.as_deref(), Some("merged-access"));
+        assert_eq!(config.s3_secret.as_deref(), Some("merged-secret"));
+
+        // Verify existing settings were preserved
+        assert_eq!(config.general.host, "custom.archive.org");
+        assert_eq!(config.general.user_agent_suffix.as_deref(), Some("MyApp/1.0"));
+        assert_eq!(config.logging.level.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn write_config_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("subdir").join("nested").join("ia.ini");
+
+        let auth = crate::auth::AuthConfig {
+            s3_access: "access".into(),
+            s3_secret: "secret".into(),
+            logged_in_user: "user".into(),
+            logged_in_sig: "sig".into(),
+            screenname: "test".into(),
+            itemname: None,
+        };
+
+        let result = IaConfig::write_config_file(&auth, &ini_path);
+        assert!(result.is_ok());
+        assert!(ini_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+
+        let auth = crate::auth::AuthConfig {
+            s3_access: "access".into(),
+            s3_secret: "secret".into(),
+            logged_in_user: "user".into(),
+            logged_in_sig: "sig".into(),
+            screenname: "test".into(),
+            itemname: None,
+        };
+
+        IaConfig::write_config_file(&auth, &ini_path).unwrap();
+
+        let perms = std::fs::metadata(&ini_path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
     }
 
 }
