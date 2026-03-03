@@ -189,8 +189,25 @@ pub async fn download_file(
     let start = std::time::Instant::now();
     let file_path = validate_download_path(dest_dir, &file.name)?;
 
-    // Ensure parent directory exists
+    // Check for symlinks in the destination path before creating directories.
+    // A symlink in the path could redirect writes outside dest_dir.
     if let Some(parent) = file_path.parent() {
+        if let Ok(relative) = parent.strip_prefix(dest_dir) {
+            let mut check = dest_dir.to_path_buf();
+            for component in relative.components() {
+                check.push(component);
+                // Use symlink_metadata to detect symlinks without following them
+                if let Ok(meta) = fs::symlink_metadata(&check).await {
+                    if meta.file_type().is_symlink() {
+                        return Err(IaError::PathTraversal {
+                            path: check.display().to_string(),
+                            dest_dir: dest_dir.display().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         fs::create_dir_all(parent).await?;
     }
 
@@ -251,13 +268,21 @@ pub async fn download_file(
     let encoded_name = urlencoding::encode(&file.name);
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
 
-    // Check for partial file (.part) for resume
+    // Check for partial file (.part) for resume.
+    // Open first, then stat the fd — avoids TOCTOU race where the .part file
+    // could be replaced with a symlink between exists() and metadata().
     let part_path = PathBuf::from(format!("{}.part", file_path.display()));
-    let resume_from = if part_path.exists() {
-        let meta = fs::metadata(&part_path).await?;
-        Some(meta.len())
-    } else {
-        None
+    let resume_from = match fs::File::open(&part_path).await {
+        Ok(f) => {
+            let meta = f.metadata().await?;
+            if !meta.is_file() {
+                warn!(file = %file.name, "skipping resume: .part path is not a regular file");
+                None
+            } else {
+                Some(meta.len())
+            }
+        }
+        Err(_) => None,
     };
 
     // Build request
@@ -305,6 +330,15 @@ pub async fn download_file(
         .get("last-modified")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| httpdate::parse_http_date(s).ok());
+
+    // If .part exists and is a symlink, remove it before writing.
+    // Prevents writing through a symlink planted by an attacker.
+    if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+        if meta.file_type().is_symlink() {
+            warn!(file = %file.name, "removing symlink .part file");
+            fs::remove_file(&part_path).await?;
+        }
+    }
 
     // Stream to .part file
     let mut output = if resume_from.is_some() {
@@ -1363,5 +1397,116 @@ mod tests {
             received: 2000,
         };
         assert!(!err.is_retryable());
+    }
+
+    // -- Symlink and TOCTOU security tests --
+
+    #[tokio::test]
+    async fn symlink_in_download_path_detected() {
+        // Create a temp dir with a symlink pointing outside
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink: dest_dir/evil -> /some/other/place
+        let symlink_path = dir.path().join("evil");
+        std::os::unix::fs::symlink(target_dir.path(), &symlink_path).unwrap();
+
+        // Try to download a file into the symlinked directory
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let file = test_file_meta("evil/payload.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaError::PathTraversal { .. })),
+            "symlink in download path should be detected: {result:?}"
+        );
+
+        // Verify no file was written through the symlink
+        assert!(!target_dir.path().join("payload.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn symlink_in_nested_download_path_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create legitimate dir, then symlink inside it
+        std::fs::create_dir_all(dir.path().join("legit")).unwrap();
+        let symlink_path = dir.path().join("legit/evil");
+        std::os::unix::fs::symlink(target_dir.path(), &symlink_path).unwrap();
+
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let file = test_file_meta("legit/evil/payload.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaError::PathTraversal { .. })),
+            "nested symlink should be detected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn part_file_symlink_skips_resume() {
+        // If .part file is a symlink, resume should be skipped (not followed).
+        // The download should start fresh instead of appending to the symlink target.
+        let mock_server = MockServer::start().await;
+        let body = b"fresh content";
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/data.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(body.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink .part file pointing to another location
+        let target_file = target_dir.path().join("target.txt");
+        std::fs::write(&target_file, "original content").unwrap();
+        let part_path = dir.path().join("data.txt.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+
+        let file = test_file_meta("data.txt", body.len() as u64);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        // The symlink target should NOT have been modified
+        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            target_content, "original content",
+            "symlink target should not be modified"
+        );
     }
 }
