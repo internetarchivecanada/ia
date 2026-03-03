@@ -103,6 +103,8 @@ enum Commands {
     Status(commands::status::StatusArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
+    /// Configure credentials and settings
+    Config(commands::config::ConfigArgs),
     /// Update ia to the latest version
     #[cfg(feature = "self-update")]
     Update(commands::update::UpdateArgs),
@@ -121,6 +123,16 @@ async fn main() -> Result<()> {
         #[cfg(feature = "self-update")]
         Commands::Update(args) => {
             return commands::update::run(args).await;
+        }
+        Commands::Config(args) => {
+            // Config command handles its own config/client creation
+            // because some subcommands (login) don't require existing credentials
+            let config = if let Some(path) = &cli.config {
+                ia_core::IaConfig::load_from_file(path)?
+            } else {
+                ia_core::IaConfig::load()?
+            };
+            return commands::config::run(args, config, cli.config.clone()).await;
         }
         _ => {}
     }
@@ -181,6 +193,7 @@ async fn main() -> Result<()> {
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
         Commands::Completions(_) => unreachable!("handled above"),
+        Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]
         Commands::Update(_) => unreachable!("handled above"),
     }

@@ -9,21 +9,20 @@ Design doc: `docs/plans/2026-02-20-ia-rust-port-design.md`
 
 These rules are non-negotiable and must NEVER be violated:
 
-### 1. NEVER Write to archive.org During Development/Testing
-- NEVER send POST, PUT, DELETE, or PATCH requests to any live archive.org service
-- NEVER run metadata modify, upload, or delete against live archive.org
-- ALL write operation tests MUST use wiremock mocks — ZERO live requests
-- Read-only GET requests to archive.org are OK for development
-- POST to search endpoints (scrape API, FTS) is OK (read-only queries)
-- Note: metadata write (`metadata::modify()`) is implemented in ia-core but must only be tested with mocks
+### 1. NEVER Send Write Requests to Live archive.org
+- NEVER send POST, PUT, DELETE, or PATCH requests that modify data on live archive.org
+- NEVER run metadata modify, upload, delete, or any data-altering operation against live archive.org
+- ALL write operation tests MUST use wiremock mocks — ZERO live write requests
+- Read-only operations (GET requests, search queries, auth login/check) are OK
+- POST to read-only endpoints (search scrape API, FTS, xauthn login) is OK
+- The developer will perform manual live testing of write operations
 
-### 2. NEVER Use Authentication with archive.org
-- NEVER read, load, or use IA S3 credentials (access key, secret key)
-- NEVER read, load, or use IA cookies (logged-in-user, logged-in-sig)
-- NEVER read `~/.config/internetarchive/ia.ini` or `~/.ia` for credentials
-- NEVER read `IA_ACCESS_KEY_ID` or `IA_SECRET_ACCESS_KEY` environment variables
-- NEVER send `Authorization: LOW` headers to archive.org
-- Config file reading for non-auth settings (host, user_agent_suffix) is OK
+### 2. Authentication: Allowed for Read, Never for Live Writes
+- Reading credentials from config files and environment variables is OK
+- Sending `Authorization: LOW` headers for read operations is OK
+- Loading and using S3 keys and cookies in code and tests is OK
+- NEVER use real credentials in automated tests against live write endpoints
+- All authenticated write tests MUST use wiremock mocks
 
 ### 3. GitHub: jjjake Account Only
 - This repo is `jjjake/ia` (PRIVATE) — direnv handles auth (see global CLAUDE.md)
@@ -52,6 +51,7 @@ These rules are non-negotiable and must NEVER be violated:
 - TUI: `ratatui` (default feature, `--dashboard` flag)
 - Metadata write: `json-patch` 3 — archive.org API requires RFC 6902 JSON Patch format; `urlencoding` 2
 - Spreadsheet: `calamine` 0.26 — single API for XLSX/ODS/XLS, pure Rust; `csv` 1 (CSV/TSV)
+- Auth: `rpassword` 5 — hidden password input for interactive login
 - Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
 
 **Adding dependencies**: Don't add crates without asking first. Prefer `std`, existing deps, or small focused code over new dependencies. Every crate must have a clear justification — "it's easy to add" is not one. When a new crate is approved, update the crate stack above with the crate and a one-liner rationale.
@@ -83,6 +83,7 @@ ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}
 
 - **ALWAYS use git worktrees** for feature/fix branches (see global CLAUDE.md) — NEVER work directly on main or on unrelated feature branches
 - **ALWAYS create GitHub issues before implementation** — Issues come after design but before any code. Every piece of work must be tracked.
+- **ALWAYS make high-quality issues** — Every issue must have: appropriate labels, detailed description with context, and references to relevant design docs/plans (file paths like `docs/plans/YYYY-MM-DD-<topic>-design.md`). Issues should be self-contained enough for someone to understand the work without digging through other issues.
 - **ALWAYS link issues in PRs**: Use `Closes #N` in the PR body for every issue the PR resolves, so they auto-close on merge. List each issue on its own line.
 - **ALWAYS add tests**: Every change must include tests that verify the new behavior.
 - **ALWAYS push as a PR**: Push the feature branch and create a GitHub PR for review.
