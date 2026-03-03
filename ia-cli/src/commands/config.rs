@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use color_print::cstr;
+use console::style;
 
 /// Configure Internet Archive credentials and settings.
 #[derive(Debug, Args)]
@@ -180,6 +181,10 @@ pub struct PrintAuthArgs {
     pub json: bool,
 }
 
+fn dirs_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+}
+
 /// Run the config command.
 pub async fn run(
     args: ConfigArgs,
@@ -196,7 +201,69 @@ pub async fn run(
             }
             Ok(())
         }
-        ConfigCommand::Login(_login_args) => todo!("login"),
+        ConfigCommand::Login(login_args) => {
+            let (email, password) = if login_args.netrc {
+                let netrc_path = dirs_path()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                    .join(".netrc");
+                ia_core::auth::parse_netrc(&netrc_path)?
+            } else {
+                let email = match login_args.username {
+                    Some(u) => u,
+                    None => {
+                        if !atty::is(atty::Stream::Stdin) {
+                            anyhow::bail!(
+                                "no username provided and stdin is not a terminal.\n\
+                                 Use -u/--username and -p/--password for non-interactive login."
+                            );
+                        }
+                        eprint!("Email address: ");
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        input.trim().to_string()
+                    }
+                };
+                let password = match login_args.password {
+                    Some(p) => p,
+                    None => {
+                        if !atty::is(atty::Stream::Stdin) {
+                            anyhow::bail!(
+                                "no password provided and stdin is not a terminal.\n\
+                                 Use -u/--username and -p/--password for non-interactive login."
+                            );
+                        }
+                        rpassword::prompt_password_stderr("Password: ")?
+                    }
+                };
+                (email, password)
+            };
+
+            // Build a minimal client for the login request
+            let client = ia_core::IaClient::from_config(config)?;
+            let auth = ia_core::auth::login(&client, &email, &password).await?;
+
+            // Determine where to write the config
+            let write_path = config_path
+                .unwrap_or_else(ia_core::IaConfig::find_or_default_config_path);
+
+            ia_core::IaConfig::write_config_file(&auth, &write_path)?;
+
+            if login_args.json {
+                let json = serde_json::json!({
+                    "config_file": write_path.display().to_string(),
+                    "screenname": auth.screenname,
+                });
+                println!("{}", serde_json::to_string(&json)?);
+            } else {
+                eprintln!(
+                    "{} Config saved to {}",
+                    style("✓").green().bold(),
+                    style(write_path.display()).cyan()
+                );
+            }
+
+            Ok(())
+        }
         ConfigCommand::Check(_check_args) => todo!("check"),
         ConfigCommand::Whoami(_whoami_args) => todo!("whoami"),
         ConfigCommand::PrintCookies(_print_cookies_args) => todo!("print-cookies"),
