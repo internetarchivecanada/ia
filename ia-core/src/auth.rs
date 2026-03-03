@@ -57,6 +57,82 @@ struct XauthnCookies {
     logged_in_sig: String,
 }
 
+/// Response from the xauthn info endpoint.
+#[derive(Debug, Deserialize)]
+struct XauthnInfoResponse {
+    success: bool,
+    values: Option<XauthnInfoValues>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XauthnInfoValues {
+    screenname: Option<String>,
+    itemname: Option<String>,
+}
+
+/// Validate S3 keys by calling the IA API.
+///
+/// Uses the xauthn info endpoint to verify credentials are valid.
+/// Returns an [`AccountInfo`] on success.
+pub async fn check_keys(client: &IaClient) -> Result<AccountInfo> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!(
+        "{}://{}/services/xauthn/?op=info",
+        client.protocol(),
+        client.host()
+    );
+    let resp = client
+        .http()
+        .post(&url)
+        .header("user-agent", client.user_agent())
+        .header("authorization", format!("LOW {access}:{secret}"))
+        .send()
+        .await
+        .map_err(|e| IaError::Auth(format!("key check request failed: {e}")))?;
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| IaError::Auth(format!("failed to read response: {e}")))?;
+
+    let parsed: XauthnInfoResponse = serde_json::from_str(&body)
+        .map_err(|e| IaError::Auth(format!("failed to parse response: {e}")))?;
+
+    if !parsed.success {
+        let msg = parsed
+            .error
+            .unwrap_or_else(|| "invalid credentials".into());
+        return Err(IaError::Auth(msg));
+    }
+
+    let values = parsed.values.unwrap_or(XauthnInfoValues {
+        screenname: None,
+        itemname: None,
+    });
+
+    // Extract email from cookies in client config
+    let email = client
+        .config()
+        .cookies
+        .get("logged-in-user")
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(AccountInfo {
+        screenname: values.screenname.unwrap_or_default(),
+        email,
+        itemname: values.itemname,
+    })
+}
+
+/// Retrieve account info from archive.org (alias for `check_keys`).
+///
+/// Uses the same endpoint as [`check_keys`] but is semantically "who am I?"
+pub async fn whoami(client: &IaClient) -> Result<AccountInfo> {
+    check_keys(client).await
+}
+
 /// Authenticate with archive.org and return credentials.
 ///
 /// POSTs to `/services/xauthn/?op=login` with email and password.
@@ -216,5 +292,60 @@ mod tests {
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Incorrect password"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_valid() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "success": true,
+            "values": {
+                "screenname": "testuser",
+                "itemname": "@testuser"
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/services/xauthn/"))
+            .and(query_param("op", "info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let host = server.uri().replace("http://", "");
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = host;
+        config.general.secure = false;
+        config.s3_access = Some("test-access".into());
+        config.s3_secret = Some("test-secret".into());
+        let client = IaClient::from_config(config).unwrap();
+
+        let info = check_keys(&client).await.unwrap();
+        assert_eq!(info.screenname, "testuser");
+    }
+
+    #[tokio::test]
+    async fn check_keys_invalid() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "success": false,
+            "error": "invalid credentials"
+        });
+        Mock::given(method("POST"))
+            .and(path("/services/xauthn/"))
+            .and(query_param("op", "info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let host = server.uri().replace("http://", "");
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = host;
+        config.general.secure = false;
+        config.s3_access = Some("bad-access".into());
+        config.s3_secret = Some("bad-secret".into());
+        let client = IaClient::from_config(config).unwrap();
+
+        let result = check_keys(&client).await;
+        assert!(result.is_err());
     }
 }
