@@ -65,6 +65,16 @@ pub enum IaError {
     #[error("update verification failed: expected {expected}, got {actual}")]
     UpdateVerifyFailed { expected: String, actual: String },
 
+    #[error("path traversal blocked: {path} escapes destination directory {dest_dir}")]
+    PathTraversal { path: String, dest_dir: String },
+
+    #[error("download too large for {file}: expected {expected} bytes, received {received} bytes")]
+    DownloadTooLarge {
+        file: String,
+        expected: u64,
+        received: u64,
+    },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -106,6 +116,9 @@ impl IaError {
             }
             IaError::UpdateNoAsset { .. } => false,
             IaError::UpdateVerifyFailed { .. } => false,
+            // Security — never retry
+            IaError::PathTraversal { .. } => false,
+            IaError::DownloadTooLarge { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -178,6 +191,21 @@ impl IaError {
                 extra.insert("expected".into(), expected.clone().into());
                 extra.insert("actual".into(), actual.clone().into());
                 "update_verify_failed"
+            }
+            IaError::PathTraversal { path, dest_dir } => {
+                extra.insert("path".into(), path.clone().into());
+                extra.insert("dest_dir".into(), dest_dir.clone().into());
+                "path_traversal"
+            }
+            IaError::DownloadTooLarge {
+                file,
+                expected,
+                received,
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert("expected".into(), (*expected).into());
+                extra.insert("received".into(), (*received).into());
+                "download_too_large"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",

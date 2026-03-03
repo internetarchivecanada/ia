@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -12,6 +12,102 @@ use crate::client::IaClient;
 use crate::error::{IaError, Result};
 use crate::files::FileFilter;
 use crate::types::FileMetadata;
+
+/// Validate that a file name from server metadata produces a safe download path.
+///
+/// Rejects:
+/// - Parent directory traversal (`..`)
+/// - Absolute paths (`/etc/passwd`)
+/// - Windows prefix paths (`C:\`)
+/// - Null bytes
+/// - Control characters (0x00-0x1F)
+/// - Empty names
+///
+/// Allows:
+/// - Nested paths (`subdir/file.txt`) — legitimate for IA items
+/// - Normal filenames with spaces, unicode, etc.
+///
+/// Uses both component-level validation and belt-and-suspenders normalized
+/// path check to defend against edge cases.
+pub fn validate_download_path(dest_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    if file_name.is_empty() {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    // Reject null bytes
+    if file_name.contains('\0') {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    // Reject control characters (0x00-0x1F)
+    if file_name.bytes().any(|b| b < 0x20) {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    let path = Path::new(file_name);
+
+    // Validate each component — reject traversal and absolute paths
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {} // OK
+            Component::CurDir => {}    // "." is harmless, normalized away
+            Component::ParentDir => {
+                return Err(IaError::PathTraversal {
+                    path: file_name.to_string(),
+                    dest_dir: dest_dir.display().to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(IaError::PathTraversal {
+                    path: file_name.to_string(),
+                    dest_dir: dest_dir.display().to_string(),
+                });
+            }
+        }
+    }
+
+    let joined = dest_dir.join(file_name);
+
+    // Belt-and-suspenders: verify the normalized path starts with dest_dir.
+    // This catches edge cases that component iteration might miss.
+    let normalized = normalize_path(&joined);
+    let normalized_dest = normalize_path(dest_dir);
+    if !normalized.starts_with(&normalized_dest) {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    Ok(joined)
+}
+
+/// Normalize a path without requiring it to exist (unlike `canonicalize()`).
+///
+/// Resolves `.` and `..` components logically. Used as a belt-and-suspenders
+/// check alongside component-level validation.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
 
 /// Options for downloading files.
 #[derive(Debug, Clone)]
@@ -91,10 +187,27 @@ pub async fn download_file(
     progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
 ) -> Result<FileDownloadResult> {
     let start = std::time::Instant::now();
-    let file_path = dest_dir.join(&file.name);
+    let file_path = validate_download_path(dest_dir, &file.name)?;
 
-    // Ensure parent directory exists
+    // Check for symlinks in the destination path before creating directories.
+    // A symlink in the path could redirect writes outside dest_dir.
     if let Some(parent) = file_path.parent() {
+        if let Ok(relative) = parent.strip_prefix(dest_dir) {
+            let mut check = dest_dir.to_path_buf();
+            for component in relative.components() {
+                check.push(component);
+                // Use symlink_metadata to detect symlinks without following them
+                if let Ok(meta) = fs::symlink_metadata(&check).await {
+                    if meta.file_type().is_symlink() {
+                        return Err(IaError::PathTraversal {
+                            path: check.display().to_string(),
+                            dest_dir: dest_dir.display().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         fs::create_dir_all(parent).await?;
     }
 
@@ -155,13 +268,21 @@ pub async fn download_file(
     let encoded_name = urlencoding::encode(&file.name);
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
 
-    // Check for partial file (.part) for resume
+    // Check for partial file (.part) for resume.
+    // Open first, then stat the fd — avoids TOCTOU race where the .part file
+    // could be replaced with a symlink between exists() and metadata().
     let part_path = PathBuf::from(format!("{}.part", file_path.display()));
-    let resume_from = if part_path.exists() {
-        let meta = fs::metadata(&part_path).await?;
-        Some(meta.len())
-    } else {
-        None
+    let resume_from = match fs::File::open(&part_path).await {
+        Ok(f) => {
+            let meta = f.metadata().await?;
+            if !meta.is_file() {
+                warn!(file = %file.name, "skipping resume: .part path is not a regular file");
+                None
+            } else {
+                Some(meta.len())
+            }
+        }
+        Err(_) => None,
     };
 
     // Build request
@@ -195,7 +316,7 @@ pub async fn download_file(
     // If we asked for a Range but got 200 (not 206), the server ignored our
     // Range header and is sending the full file.  Truncate the .part file so
     // we don't corrupt it by appending the full content after existing bytes.
-    let resume_from = if resume_from.is_some() && status == reqwest::StatusCode::OK {
+    let mut resume_from = if resume_from.is_some() && status == reqwest::StatusCode::OK {
         debug!(file = %file.name, "server returned 200 for Range request, restarting download");
         // Will create/truncate below
         None
@@ -209,6 +330,19 @@ pub async fn download_file(
         .get("last-modified")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| httpdate::parse_http_date(s).ok());
+
+    // If .part exists and is a symlink, remove it before writing.
+    // Prevents writing through a symlink planted by an attacker.
+    if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+        if meta.file_type().is_symlink() {
+            warn!(file = %file.name, "removing symlink .part file");
+            fs::remove_file(&part_path).await?;
+            // Reset resume so we create a fresh file instead of trying to
+            // append to the now-deleted path (which would fail with NotFound
+            // if the server returned 206).
+            resume_from = None;
+        }
+    }
 
     // Stream to .part file
     let mut output = if resume_from.is_some() {
@@ -228,6 +362,20 @@ pub async fn download_file(
         let chunk = chunk.map_err(reqwest_middleware::Error::from)?;
         output.write_all(&chunk).await?;
         bytes_downloaded += chunk.len() as u64;
+
+        // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
+        if let Some(expected) = file.size {
+            let max_allowed = expected + (expected / 10).max(1024);
+            if bytes_downloaded > max_allowed {
+                drop(output);
+                let _ = fs::remove_file(&part_path).await;
+                return Err(IaError::DownloadTooLarge {
+                    file: file.name.clone(),
+                    expected,
+                    received: bytes_downloaded,
+                });
+            }
+        }
 
         // Rate-limit progress updates to every 256KB to reduce lock contention
         if let Some(p) = progress {
@@ -1017,5 +1165,435 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), IaError::Http { status: 500, .. }));
         drop(guard);
+    }
+
+    // -- Path traversal security tests (CVE-2025-58438 equivalent) --
+
+    #[test]
+    fn rejects_parent_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "../../root/.bashrc"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "subdir/../../etc/shadow"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "/etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "file\0name.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "file\x01name.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "file\x0aname.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "file\x1fname.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, ""),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn allows_legitimate_nested_paths() {
+        let dir = Path::new("/tmp/downloads");
+        let result = validate_download_path(dir, "subdir/test.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Path::new("/tmp/downloads/subdir/test.txt"));
+
+        let result = validate_download_path(dir, "a/b/c/deep.txt");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            Path::new("/tmp/downloads/a/b/c/deep.txt")
+        );
+    }
+
+    #[test]
+    fn allows_simple_filenames() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(validate_download_path(dir, "test.txt").is_ok());
+        assert!(validate_download_path(dir, "file with spaces.txt").is_ok());
+        assert!(validate_download_path(dir, "image.jpg").is_ok());
+        assert!(validate_download_path(dir, "archive.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn allows_dot_prefixed_filenames() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(validate_download_path(dir, ".hidden").is_ok());
+        assert!(validate_download_path(dir, ".gitignore").is_ok());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        // Even if there are legitimate components before the traversal
+        assert!(matches!(
+            validate_download_path(dir, "a/b/c/../../../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_curdir_then_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        // CurDir (.) is harmless, but ParentDir (..) after it must still be caught
+        assert!(matches!(
+            validate_download_path(dir, "./../../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "././../secret"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_rejects_traversal_filename() {
+        // Integration test: verify download_file returns PathTraversal error
+        // without making any HTTP requests (fails before network call).
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("../../../etc/passwd", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::PathTraversal { .. })));
+
+        // Verify no files were created outside the temp dir
+        assert!(!Path::new("/etc/passwd.part").exists());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_absolute_path_filename() {
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("/etc/passwd", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::PathTraversal { .. })));
+    }
+
+    #[test]
+    fn path_traversal_is_not_retryable() {
+        let err = IaError::PathTraversal {
+            path: "../etc/passwd".into(),
+            dest_dir: "/tmp/downloads".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    // -- Download size validation tests --
+
+    #[tokio::test]
+    async fn download_aborts_on_oversized_response() {
+        let mock_server = MockServer::start().await;
+        // File metadata says 10 bytes, but server sends 100 bytes.
+        // Max allowed = 10 + max(10/10, 1024) = 10 + 1024 = 1034 bytes.
+        // But we'll send way more than that.
+        let oversized_body = vec![b'X'; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/small.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(oversized_body),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("small.txt", 10);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::DownloadTooLarge { .. })));
+
+        // .part file should be cleaned up
+        assert!(!dir.path().join("small.txt.part").exists());
+    }
+
+    #[tokio::test]
+    async fn download_allows_slightly_oversized_response() {
+        let mock_server = MockServer::start().await;
+        // File metadata says 100 bytes. Max = 100 + max(10, 1024) = 1124.
+        // Sending 105 bytes (5% over) should succeed.
+        let body = vec![b'Y'; 105];
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/normal.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("normal.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 105);
+    }
+
+    #[test]
+    fn download_too_large_is_not_retryable() {
+        let err = IaError::DownloadTooLarge {
+            file: "test.txt".into(),
+            expected: 100,
+            received: 2000,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    // -- Symlink and TOCTOU security tests --
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_in_download_path_detected() {
+        // Create a temp dir with a symlink pointing outside
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink: dest_dir/evil -> /some/other/place
+        let symlink_path = dir.path().join("evil");
+        std::os::unix::fs::symlink(target_dir.path(), &symlink_path).unwrap();
+
+        // Try to download a file into the symlinked directory
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let file = test_file_meta("evil/payload.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaError::PathTraversal { .. })),
+            "symlink in download path should be detected: {result:?}"
+        );
+
+        // Verify no file was written through the symlink
+        assert!(!target_dir.path().join("payload.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_in_nested_download_path_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create legitimate dir, then symlink inside it
+        std::fs::create_dir_all(dir.path().join("legit")).unwrap();
+        let symlink_path = dir.path().join("legit/evil");
+        std::os::unix::fs::symlink(target_dir.path(), &symlink_path).unwrap();
+
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let file = test_file_meta("legit/evil/payload.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(IaError::PathTraversal { .. })),
+            "nested symlink should be detected: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn part_file_symlink_skips_resume() {
+        // If .part file is a symlink, resume should be skipped (not followed).
+        // The download should start fresh instead of appending to the symlink target.
+        let mock_server = MockServer::start().await;
+        let body = b"fresh content";
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/data.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(body.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink .part file pointing to another location
+        let target_file = target_dir.path().join("target.txt");
+        std::fs::write(&target_file, "original content").unwrap();
+        let part_path = dir.path().join("data.txt.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+
+        let file = test_file_meta("data.txt", body.len() as u64);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        // The symlink target should NOT have been modified
+        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            target_content, "original content",
+            "symlink target should not be modified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn part_file_symlink_works_with_206_response() {
+        // Regression test: when a .part symlink is detected and removed,
+        // resume_from must be reset to None. Otherwise, if the server
+        // returns 206 (keeping resume_from as Some), the append-mode open
+        // on the deleted path would fail with NotFound.
+        use wiremock::matchers::header_exists;
+
+        let mock_server = MockServer::start().await;
+        let full_body = b"complete file data here";
+
+        // Return 206 Partial Content when Range header is present
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/ranged.txt"))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(b"data here".to_vec())
+                    .insert_header("Content-Range", "bytes 13-21/22"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Fallback: return full content when no Range header
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/ranged.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink .part file pointing to another location
+        let target_file = target_dir.path().join("target.txt");
+        std::fs::write(&target_file, "original content").unwrap();
+        let part_path = dir.path().join("ranged.txt.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+
+        let file = test_file_meta("ranged.txt", full_body.len() as u64);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+
+        // The symlink target should NOT have been modified
+        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(
+            target_content, "original content",
+            "symlink target should not be modified even with 206 response"
+        );
     }
 }
