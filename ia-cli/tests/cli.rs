@@ -672,6 +672,7 @@ fn ai_undo_help_no_headless() {
         .stdout(predicate::str::contains("--headless").not());
 }
 
+#[test]
 fn metadata_import_with_column_prefixes() {
     // import with column prefixes should be accepted
     let dir = tempfile::tempdir().unwrap();
