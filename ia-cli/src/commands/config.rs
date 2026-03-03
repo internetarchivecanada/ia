@@ -322,7 +322,44 @@ pub async fn run(
 
             Ok(())
         }
-        ConfigCommand::PrintCookies(_print_cookies_args) => todo!("print-cookies"),
-        ConfigCommand::PrintAuth(_print_auth_args) => todo!("print-auth"),
+        ConfigCommand::PrintCookies(args) => {
+            if config.cookies.is_empty() {
+                anyhow::bail!("no cookies found in config. Run `ia config login` first.");
+            }
+
+            if args.json {
+                let json = serde_json::json!(config.cookies);
+                println!("{}", serde_json::to_string(&json)?);
+            } else {
+                for (name, value) in &config.cookies {
+                    println!(
+                        ".archive.org\tTRUE\t/\tTRUE\t0\t{}\t{}",
+                        name, value
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        ConfigCommand::PrintAuth(args) => {
+            let access = config
+                .s3_access
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("no S3 access key found in config. Run `ia config login` first."))?;
+            let secret = config
+                .s3_secret
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("no S3 secret key found in config. Run `ia config login` first."))?;
+
+            let header = format!("Authorization: LOW {access}:{secret}");
+
+            if args.json {
+                let json = serde_json::json!({"header": header});
+                println!("{}", serde_json::to_string(&json)?);
+            } else {
+                println!("{header}");
+            }
+            Ok(())
+        }
     }
 }
