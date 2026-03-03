@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -12,6 +12,102 @@ use crate::client::IaClient;
 use crate::error::{IaError, Result};
 use crate::files::FileFilter;
 use crate::types::FileMetadata;
+
+/// Validate that a file name from server metadata produces a safe download path.
+///
+/// Rejects:
+/// - Parent directory traversal (`..`)
+/// - Absolute paths (`/etc/passwd`)
+/// - Windows prefix paths (`C:\`)
+/// - Null bytes
+/// - Control characters (0x00-0x1F)
+/// - Empty names
+///
+/// Allows:
+/// - Nested paths (`subdir/file.txt`) — legitimate for IA items
+/// - Normal filenames with spaces, unicode, etc.
+///
+/// Uses both component-level validation and belt-and-suspenders normalized
+/// path check to defend against edge cases.
+pub fn validate_download_path(dest_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    if file_name.is_empty() {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    // Reject null bytes
+    if file_name.contains('\0') {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    // Reject control characters (0x00-0x1F)
+    if file_name.bytes().any(|b| b < 0x20) {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    let path = Path::new(file_name);
+
+    // Validate each component — reject traversal and absolute paths
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {} // OK
+            Component::CurDir => {}    // "." is harmless, normalized away
+            Component::ParentDir => {
+                return Err(IaError::PathTraversal {
+                    path: file_name.to_string(),
+                    dest_dir: dest_dir.display().to_string(),
+                });
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(IaError::PathTraversal {
+                    path: file_name.to_string(),
+                    dest_dir: dest_dir.display().to_string(),
+                });
+            }
+        }
+    }
+
+    let joined = dest_dir.join(file_name);
+
+    // Belt-and-suspenders: verify the normalized path starts with dest_dir.
+    // This catches edge cases that component iteration might miss.
+    let normalized = normalize_path(&joined);
+    let normalized_dest = normalize_path(dest_dir);
+    if !normalized.starts_with(&normalized_dest) {
+        return Err(IaError::PathTraversal {
+            path: file_name.to_string(),
+            dest_dir: dest_dir.display().to_string(),
+        });
+    }
+
+    Ok(joined)
+}
+
+/// Normalize a path without requiring it to exist (unlike `canonicalize()`).
+///
+/// Resolves `.` and `..` components logically. Used as a belt-and-suspenders
+/// check alongside component-level validation.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
 
 /// Options for downloading files.
 #[derive(Debug, Clone)]
@@ -91,7 +187,7 @@ pub async fn download_file(
     progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
 ) -> Result<FileDownloadResult> {
     let start = std::time::Instant::now();
-    let file_path = dest_dir.join(&file.name);
+    let file_path = validate_download_path(dest_dir, &file.name)?;
 
     // Ensure parent directory exists
     if let Some(parent) = file_path.parent() {
@@ -1017,5 +1113,161 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), IaError::Http { status: 500, .. }));
         drop(guard);
+    }
+
+    // -- Path traversal security tests (CVE-2025-58438 equivalent) --
+
+    #[test]
+    fn rejects_parent_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "../../root/.bashrc"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "subdir/../../etc/shadow"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "/etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "file\0name.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, "file\x01name.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "file\x0aname.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+        assert!(matches!(
+            validate_download_path(dir, "file\x1fname.txt"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(matches!(
+            validate_download_path(dir, ""),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[test]
+    fn allows_legitimate_nested_paths() {
+        let dir = Path::new("/tmp/downloads");
+        let result = validate_download_path(dir, "subdir/test.txt");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Path::new("/tmp/downloads/subdir/test.txt"));
+
+        let result = validate_download_path(dir, "a/b/c/deep.txt");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            Path::new("/tmp/downloads/a/b/c/deep.txt")
+        );
+    }
+
+    #[test]
+    fn allows_simple_filenames() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(validate_download_path(dir, "test.txt").is_ok());
+        assert!(validate_download_path(dir, "file with spaces.txt").is_ok());
+        assert!(validate_download_path(dir, "image.jpg").is_ok());
+        assert!(validate_download_path(dir, "archive.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn allows_dot_prefixed_filenames() {
+        let dir = Path::new("/tmp/downloads");
+        assert!(validate_download_path(dir, ".hidden").is_ok());
+        assert!(validate_download_path(dir, ".gitignore").is_ok());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_traversal() {
+        let dir = Path::new("/tmp/downloads");
+        // Even if there are legitimate components before the traversal
+        assert!(matches!(
+            validate_download_path(dir, "a/b/c/../../../etc/passwd"),
+            Err(IaError::PathTraversal { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_rejects_traversal_filename() {
+        // Integration test: verify download_file returns PathTraversal error
+        // without making any HTTP requests (fails before network call).
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("../../../etc/passwd", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::PathTraversal { .. })));
+
+        // Verify no files were created outside the temp dir
+        assert!(!Path::new("/etc/passwd.part").exists());
+    }
+
+    #[tokio::test]
+    async fn download_rejects_absolute_path_filename() {
+        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("/etc/passwd", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::PathTraversal { .. })));
+    }
+
+    #[test]
+    fn path_traversal_is_not_retryable() {
+        let err = IaError::PathTraversal {
+            path: "../etc/passwd".into(),
+            dest_dir: "/tmp/downloads".into(),
+        };
+        assert!(!err.is_retryable());
     }
 }
