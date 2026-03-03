@@ -2,6 +2,8 @@
 //!
 //! Handles login via the xauthn API, credential validation, and account info retrieval.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::client::IaClient;
@@ -199,6 +201,58 @@ pub async fn login(client: &IaClient, email: &str, password: &str) -> Result<Aut
     })
 }
 
+/// Parse a netrc file and extract archive.org credentials.
+///
+/// Looks for a `machine archive.org` entry with `login` and `password` fields.
+pub fn parse_netrc(path: &Path) -> Result<(String, String)> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| IaError::Auth(format!("failed to read netrc file: {e}")))?;
+
+    let mut machine_match = false;
+    let mut login = None;
+    let mut password = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "machine" if i + 1 < tokens.len() => {
+                    if machine_match && login.is_some() && password.is_some() {
+                        break;
+                    }
+                    machine_match = tokens[i + 1] == "archive.org";
+                    if !machine_match {
+                        login = None;
+                        password = None;
+                    }
+                    i += 2;
+                }
+                "login" if machine_match && i + 1 < tokens.len() => {
+                    login = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "password" if machine_match && i + 1 < tokens.len() => {
+                    password = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    match (login, password) {
+        (Some(l), Some(p)) => Ok((l, p)),
+        _ => Err(IaError::Auth(
+            "no archive.org entry found in netrc file".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +400,43 @@ mod tests {
         let client = IaClient::from_config(config).unwrap();
 
         let result = check_keys(&client).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_netrc_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let netrc_path = dir.path().join(".netrc");
+        std::fs::write(
+            &netrc_path,
+            "machine archive.org\n  login user@example.com\n  password secret123\n",
+        )
+        .unwrap();
+
+        let (email, password) = parse_netrc(&netrc_path).unwrap();
+        assert_eq!(email, "user@example.com");
+        assert_eq!(password, "secret123");
+    }
+
+    #[test]
+    fn parse_netrc_missing_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let netrc_path = dir.path().join(".netrc");
+        std::fs::write(
+            &netrc_path,
+            "machine github.com\n  login user\n  password pass\n",
+        )
+        .unwrap();
+
+        let result = parse_netrc(&netrc_path);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("archive.org"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_netrc_file_not_found() {
+        let result = parse_netrc(Path::new("/nonexistent/.netrc"));
         assert!(result.is_err());
     }
 }
