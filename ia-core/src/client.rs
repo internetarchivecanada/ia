@@ -168,7 +168,7 @@ impl IaClient {
         match (&self.config.s3_access, &self.config.s3_secret) {
             (Some(a), Some(s)) => Ok((a.as_str(), s.as_str())),
             _ => Err(crate::error::IaError::Auth(
-                "S3 credentials required. Run `ia configure` or set \
+                "S3 credentials required. Run `ia config login` or set \
                  IA_ACCESS_KEY_ID/IA_SECRET_ACCESS_KEY environment variables."
                     .into(),
             )),
