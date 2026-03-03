@@ -264,8 +264,64 @@ pub async fn run(
 
             Ok(())
         }
-        ConfigCommand::Check(_check_args) => todo!("check"),
-        ConfigCommand::Whoami(_whoami_args) => todo!("whoami"),
+        ConfigCommand::Check(check_args) => {
+            let client = ia_core::IaClient::from_config(config)?;
+            match ia_core::auth::check_keys(&client).await {
+                Ok(info) => {
+                    if check_args.json {
+                        let json = serde_json::json!({
+                            "valid": true,
+                            "screenname": info.screenname,
+                            "email": info.email,
+                            "itemname": info.itemname,
+                        });
+                        println!("{}", serde_json::to_string(&json)?);
+                    } else {
+                        eprintln!(
+                            "{} Credentials valid ({})",
+                            style("✓").green().bold(),
+                            style(&info.screenname).cyan()
+                        );
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if check_args.json {
+                        let json = serde_json::json!({
+                            "valid": false,
+                            "error": e.to_string(),
+                        });
+                        println!("{}", serde_json::to_string(&json)?);
+                        std::process::exit(1);
+                    } else {
+                        eprintln!("{} {}", style("✗").red().bold(), e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
+        ConfigCommand::Whoami(whoami_args) => {
+            let client = ia_core::IaClient::from_config(config)?;
+            let info = ia_core::auth::whoami(&client).await?;
+
+            if whoami_args.json {
+                let json = serde_json::json!({
+                    "screenname": info.screenname,
+                    "email": info.email,
+                    "itemname": info.itemname,
+                });
+                println!("{}", serde_json::to_string(&json)?);
+            } else {
+                println!("Screenname: {}", style(&info.screenname).cyan());
+                println!("Email:      {}", info.email);
+                if let Some(itemname) = &info.itemname {
+                    println!("Itemname:   {}", itemname);
+                }
+            }
+
+            Ok(())
+        }
         ConfigCommand::PrintCookies(_print_cookies_args) => todo!("print-cookies"),
         ConfigCommand::PrintAuth(_print_auth_args) => todo!("print-auth"),
     }
