@@ -193,6 +193,84 @@ impl IaConfig {
         if self.general.secure { "https" } else { "http" }
     }
 
+    /// Serialize config to JSON, optionally redacting secrets.
+    ///
+    /// When `redact` is true, S3 keys, cookies, and AI API key are replaced
+    /// with `"REDACTED"`. Used by `ia config show` to safely display config.
+    pub fn to_json(&self, redact: bool) -> serde_json::Value {
+        let redacted = serde_json::json!("REDACTED");
+
+        let s3 = serde_json::json!({
+            "access": if redact {
+                redacted.clone()
+            } else {
+                self.s3_access.as_deref()
+                    .map(|s| serde_json::Value::String(s.to_owned()))
+                    .unwrap_or(serde_json::Value::Null)
+            },
+            "secret": if redact {
+                redacted.clone()
+            } else {
+                self.s3_secret.as_deref()
+                    .map(|s| serde_json::Value::String(s.to_owned()))
+                    .unwrap_or(serde_json::Value::Null)
+            },
+        });
+
+        let cookies: serde_json::Value = if redact {
+            let mut map = serde_json::Map::new();
+            for key in self.cookies.keys() {
+                map.insert(key.clone(), redacted.clone());
+            }
+            serde_json::Value::Object(map)
+        } else {
+            serde_json::json!(self.cookies)
+        };
+
+        let general = serde_json::json!({
+            "host": self.general.host,
+            "secure": self.general.secure,
+            "screenname": self.general.screenname,
+            "user_agent_suffix": self.general.user_agent_suffix,
+        });
+
+        let logging = serde_json::json!({
+            "level": self.logging.level,
+            "file": self.logging.file.as_ref().map(|p| p.display().to_string()),
+            "log_to_stdout": self.logging.log_to_stdout,
+        });
+
+        let mut obj = serde_json::json!({
+            "s3": s3,
+            "cookies": cookies,
+            "general": general,
+            "logging": logging,
+        });
+
+        if let Some(ai) = &self.ai {
+            let ai_val = if redact {
+                serde_json::json!({
+                    "base_url": ai.base_url,
+                    "api_key": redacted,
+                    "model": ai.model,
+                    "temperature": ai.temperature,
+                    "max_tokens": ai.max_tokens,
+                })
+            } else {
+                serde_json::json!({
+                    "base_url": ai.base_url,
+                    "api_key": ai.api_key,
+                    "model": ai.model,
+                    "temperature": ai.temperature,
+                    "max_tokens": ai.max_tokens,
+                })
+            };
+            obj["ai"] = ai_val;
+        }
+
+        obj
+    }
+
     /// Write authentication credentials to a config file, merging with existing content.
     ///
     /// Creates parent directories (mode 0o700) and sets file permissions to 0o600.
@@ -491,6 +569,45 @@ mod tests {
 
         let perms = std::fs::metadata(&ini_path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn config_to_json_redacts_secrets() {
+        let mut config = IaConfig::default();
+        config.s3_access = Some("my-access-key".into());
+        config.s3_secret = Some("my-secret-key".into());
+        config.cookies.insert("logged-in-user".into(), "user%40example.com".into());
+        config.cookies.insert("logged-in-sig".into(), "secret-sig".into());
+        config.general.screenname = Some("testuser".into());
+
+        let json = config.to_json(true);
+        let obj = json.as_object().unwrap();
+
+        // S3 keys should be redacted
+        let s3 = obj["s3"].as_object().unwrap();
+        assert_eq!(s3["access"], "REDACTED");
+        assert_eq!(s3["secret"], "REDACTED");
+
+        // Cookies should be redacted
+        let cookies = obj["cookies"].as_object().unwrap();
+        assert_eq!(cookies["logged-in-user"], "REDACTED");
+        assert_eq!(cookies["logged-in-sig"], "REDACTED");
+
+        // General should NOT be redacted
+        let general = obj["general"].as_object().unwrap();
+        assert_eq!(general["screenname"], "testuser");
+    }
+
+    #[test]
+    fn config_to_json_no_redact() {
+        let mut config = IaConfig::default();
+        config.s3_access = Some("my-access-key".into());
+        config.s3_secret = Some("my-secret-key".into());
+
+        let json = config.to_json(false);
+        let s3 = json["s3"].as_object().unwrap();
+        assert_eq!(s3["access"], "my-access-key");
+        assert_eq!(s3["secret"], "my-secret-key");
     }
 
 }
