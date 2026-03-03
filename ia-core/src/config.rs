@@ -195,36 +195,42 @@ impl IaConfig {
 
     /// Serialize config to JSON, optionally redacting secrets.
     ///
-    /// When `redact` is true, S3 keys, cookies, and AI API key are replaced
-    /// with `"REDACTED"`. Used by `ia config show` to safely display config.
-    pub fn to_json(&self, redact: bool) -> serde_json::Value {
+    /// Identifiers (S3 access key, logged-in-user cookie) are always shown.
+    /// Secrets (S3 secret key, logged-in-sig cookie, AI API key) are redacted
+    /// unless `show_secrets` is true.
+    pub fn to_json(&self, show_secrets: bool) -> serde_json::Value {
         let redacted = serde_json::json!("REDACTED");
 
+        let s3_access = self
+            .s3_access
+            .as_deref()
+            .map(|s| serde_json::Value::String(s.to_owned()))
+            .unwrap_or(serde_json::Value::Null);
+        let s3_secret = if show_secrets {
+            self.s3_secret
+                .as_deref()
+                .map(|s| serde_json::Value::String(s.to_owned()))
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            redacted.clone()
+        };
+
         let s3 = serde_json::json!({
-            "access": if redact {
-                redacted.clone()
-            } else {
-                self.s3_access.as_deref()
-                    .map(|s| serde_json::Value::String(s.to_owned()))
-                    .unwrap_or(serde_json::Value::Null)
-            },
-            "secret": if redact {
-                redacted.clone()
-            } else {
-                self.s3_secret.as_deref()
-                    .map(|s| serde_json::Value::String(s.to_owned()))
-                    .unwrap_or(serde_json::Value::Null)
-            },
+            "access": s3_access,
+            "secret": s3_secret,
         });
 
-        let cookies: serde_json::Value = if redact {
+        let cookies: serde_json::Value = {
             let mut map = serde_json::Map::new();
-            for key in self.cookies.keys() {
-                map.insert(key.clone(), redacted.clone());
+            for (key, value) in &self.cookies {
+                let is_secret = key == "logged-in-sig";
+                if is_secret && !show_secrets {
+                    map.insert(key.clone(), redacted.clone());
+                } else {
+                    map.insert(key.clone(), serde_json::Value::String(value.clone()));
+                }
             }
             serde_json::Value::Object(map)
-        } else {
-            serde_json::json!(self.cookies)
         };
 
         let general = serde_json::json!({
@@ -248,23 +254,17 @@ impl IaConfig {
         });
 
         if let Some(ai) = &self.ai {
-            let ai_val = if redact {
-                serde_json::json!({
-                    "base_url": ai.base_url,
-                    "api_key": redacted,
-                    "model": ai.model,
-                    "temperature": ai.temperature,
-                    "max_tokens": ai.max_tokens,
-                })
-            } else {
-                serde_json::json!({
-                    "base_url": ai.base_url,
-                    "api_key": ai.api_key,
-                    "model": ai.model,
-                    "temperature": ai.temperature,
-                    "max_tokens": ai.max_tokens,
-                })
-            };
+            let ai_val = serde_json::json!({
+                "base_url": ai.base_url,
+                "api_key": if show_secrets {
+                    serde_json::json!(ai.api_key)
+                } else {
+                    redacted
+                },
+                "model": ai.model,
+                "temperature": ai.temperature,
+                "max_tokens": ai.max_tokens,
+            });
             obj["ai"] = ai_val;
         }
 
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn config_to_json_redacts_secrets() {
+    fn config_to_json_redacts_secrets_but_shows_identifiers() {
         let mut config = IaConfig::default();
         config.s3_access = Some("my-access-key".into());
         config.s3_secret = Some("my-secret-key".into());
@@ -580,17 +580,19 @@ mod tests {
         config.cookies.insert("logged-in-sig".into(), "secret-sig".into());
         config.general.screenname = Some("testuser".into());
 
-        let json = config.to_json(true);
+        let json = config.to_json(false); // show_secrets=false (default)
         let obj = json.as_object().unwrap();
 
-        // S3 keys should be redacted
+        // S3 access (identifier) should be shown
         let s3 = obj["s3"].as_object().unwrap();
-        assert_eq!(s3["access"], "REDACTED");
+        assert_eq!(s3["access"], "my-access-key");
+        // S3 secret should be redacted
         assert_eq!(s3["secret"], "REDACTED");
 
-        // Cookies should be redacted
+        // logged-in-user (identifier) should be shown
         let cookies = obj["cookies"].as_object().unwrap();
-        assert_eq!(cookies["logged-in-user"], "REDACTED");
+        assert_eq!(cookies["logged-in-user"], "user%40example.com");
+        // logged-in-sig (secret) should be redacted
         assert_eq!(cookies["logged-in-sig"], "REDACTED");
 
         // General should NOT be redacted
@@ -599,15 +601,21 @@ mod tests {
     }
 
     #[test]
-    fn config_to_json_no_redact() {
+    fn config_to_json_show_secrets() {
         let mut config = IaConfig::default();
         config.s3_access = Some("my-access-key".into());
         config.s3_secret = Some("my-secret-key".into());
+        config.cookies.insert("logged-in-user".into(), "user%40example.com".into());
+        config.cookies.insert("logged-in-sig".into(), "secret-sig".into());
 
-        let json = config.to_json(false);
+        let json = config.to_json(true); // show_secrets=true
         let s3 = json["s3"].as_object().unwrap();
         assert_eq!(s3["access"], "my-access-key");
         assert_eq!(s3["secret"], "my-secret-key");
+
+        let cookies = json["cookies"].as_object().unwrap();
+        assert_eq!(cookies["logged-in-user"], "user%40example.com");
+        assert_eq!(cookies["logged-in-sig"], "secret-sig");
     }
 
 }

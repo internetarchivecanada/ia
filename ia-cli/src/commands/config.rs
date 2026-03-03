@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -60,7 +61,9 @@ pub enum ConfigCommand {
              <dim># Show config with redacted secrets</dim>\n  \
              ia config show\n\n  \
              <dim># Machine-readable JSON output</dim>\n  \
-             ia config show --json"
+             ia config show --json\n\n  \
+             <dim># Show all values including secrets</dim>\n  \
+             ia config show --show-secrets"
         )
     )]
     Show(ShowArgs),
@@ -151,6 +154,10 @@ pub struct ShowArgs {
     /// Output as JSON (machine-readable, no color)
     #[arg(long)]
     pub json: bool,
+
+    /// Show secret values instead of redacting them
+    #[arg(long)]
+    pub show_secrets: bool,
 }
 
 #[derive(Debug, Args)]
@@ -193,7 +200,7 @@ pub async fn run(
 ) -> Result<()> {
     match args.command {
         ConfigCommand::Show(show_args) => {
-            let json_value = config.to_json(true);
+            let json_value = config.to_json(show_args.show_secrets);
             if show_args.json {
                 println!("{}", serde_json::to_string(&json_value)?);
             } else {
@@ -211,7 +218,7 @@ pub async fn run(
                 let email = match login_args.username {
                     Some(u) => u,
                     None => {
-                        if !atty::is(atty::Stream::Stdin) {
+                        if !std::io::stdin().is_terminal() {
                             anyhow::bail!(
                                 "no username provided and stdin is not a terminal.\n\
                                  Use -u/--username and -p/--password for non-interactive login."
@@ -226,7 +233,7 @@ pub async fn run(
                 let password = match login_args.password {
                     Some(p) => p,
                     None => {
-                        if !atty::is(atty::Stream::Stdin) {
+                        if !std::io::stdin().is_terminal() {
                             anyhow::bail!(
                                 "no password provided and stdin is not a terminal.\n\
                                  Use -u/--username and -p/--password for non-interactive login."

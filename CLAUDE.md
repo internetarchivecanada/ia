@@ -51,7 +51,7 @@ These rules are non-negotiable and must NEVER be violated:
 - TUI: `ratatui` (default feature, `--dashboard` flag)
 - Metadata write: `json-patch` 3 — archive.org API requires RFC 6902 JSON Patch format; `urlencoding` 2
 - Spreadsheet: `calamine` 0.26 — single API for XLSX/ODS/XLS, pure Rust; `csv` 1 (CSV/TSV)
-- Auth: `rpassword` 5 — hidden password input for interactive login; `atty` 0.2 — TTY detection for interactive/non-interactive mode
+- Auth: `rpassword` 5 — hidden password input for interactive login
 - Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
 
 **Adding dependencies**: Don't add crates without asking first. Prefer `std`, existing deps, or small focused code over new dependencies. Every crate must have a clear justification — "it's easy to add" is not one. When a new crate is approved, update the crate stack above with the crate and a one-liner rationale.

@@ -482,6 +482,13 @@ fn all_commands_show_json_in_help() {
             .success()
             .stdout(predicate::str::contains("--json"));
     }
+    // Config subcommands each have their own --json flag
+    for subcmd in ["show", "login", "check", "whoami", "print-cookies", "print-auth"] {
+        ia().args(["config", subcmd, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--json"));
+    }
 }
 
 // Verify --json examples in long help
