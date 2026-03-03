@@ -31,6 +31,8 @@ pub struct SearchOpts {
     pub timeout: Option<u64>,
     /// Extra query parameters.
     pub params: Vec<(String, String)>,
+    /// FTS: skip `!L` prefix for raw Elasticsearch DSL queries.
+    pub dsl: bool,
 }
 
 // ─── Scrape API ───────────────────────────────────────────────────────────────
@@ -270,13 +272,22 @@ struct FtsHit {
 }
 
 /// Search using the full-text search API (scroll-based pagination).
+///
+/// By default, prepends `!L` to the query for literal text matching
+/// (matching Python `internetarchive` behavior). Set `opts.dsl = true`
+/// to skip the prefix for raw Elasticsearch DSL queries.
 pub fn fts<'a>(
     client: &'a IaClient,
     query: &str,
     opts: &SearchOpts,
 ) -> Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + 'a>> {
     let count = opts.count;
-    let query = query.to_string();
+    // Prepend !L for literal text search unless DSL mode is active
+    let query = if opts.dsl {
+        query.to_string()
+    } else {
+        format!("!L {query}")
+    };
     let extra_params = opts.params.clone();
 
     // FTS uses a different host

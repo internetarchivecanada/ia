@@ -63,9 +63,49 @@ fn search_subcommand_help() {
     ia().args(["search", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--itemlist"))
-        .stdout(predicate::str::contains("--num-found"))
-        .stdout(predicate::str::contains("--fts"));
+        .stdout(predicate::str::contains("scrape"))
+        .stdout(predicate::str::contains("advanced"))
+        .stdout(predicate::str::contains("fts"));
+}
+
+#[test]
+fn search_scrape_help_has_sort() {
+    ia().args(["search", "scrape", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sort"));
+}
+
+#[test]
+fn search_fts_help_has_dsl() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dsl"));
+}
+
+#[test]
+fn search_fts_help_has_scope() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--scope"));
+}
+
+#[test]
+fn search_advanced_help_no_dsl() {
+    ia().args(["search", "advanced", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dsl").not());
+}
+
+#[test]
+fn search_fts_help_no_sort() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sort").not());
 }
 
 #[test]
