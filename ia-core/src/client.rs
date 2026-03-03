@@ -6,6 +6,22 @@ use crate::config::IaConfig;
 use crate::error::Result;
 use crate::user_agent::build_user_agent;
 
+/// Error returned when a redirect targets a non-archive.org domain.
+#[derive(Debug)]
+struct RedirectBlockedError(reqwest::Url);
+
+impl std::fmt::Display for RedirectBlockedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "redirect to non-archive.org domain blocked: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RedirectBlockedError {}
+
 /// The central HTTP client for interacting with the Internet Archive.
 ///
 /// Wraps a `reqwest::Client` with IA-specific configuration:
@@ -34,9 +50,22 @@ impl IaClient {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
 
+        // Only follow redirects to *.archive.org domains.
+        // Blocks SSRF and prevents credential leakage if auth is added later.
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            if let Some(host) = attempt.url().host_str() {
+                if host == "archive.org" || host.ends_with(".archive.org") {
+                    return attempt.follow();
+                }
+            }
+            let target_url = attempt.url().clone();
+            attempt.error(RedirectBlockedError(target_url))
+        });
+
         let raw_client = reqwest::Client::builder()
             .default_headers(headers)
             .pool_max_idle_per_host(10)
+            .redirect(redirect_policy)
             .build()
             .map_err(|e| crate::error::IaError::Config(format!("failed to build HTTP client: {e}")))?;
 
@@ -224,5 +253,80 @@ mod tests {
         // s3_secret is None
         let client = IaClient::from_config(config).unwrap();
         assert!(client.require_auth().is_err());
+    }
+
+    // -- Redirect policy tests --
+
+    fn mock_config(server_uri: &str) -> IaConfig {
+        let mut config = IaConfig::default();
+        let host = server_uri
+            .strip_prefix("http://")
+            .or_else(|| server_uri.strip_prefix("https://"))
+            .unwrap_or(server_uri);
+        config.general.host = host.to_string();
+        config.general.secure = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn redirect_to_non_archive_org_is_blocked() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+
+        // Return a 302 redirect to a localhost URL.
+        // The wiremock host is 127.0.0.1 — NOT archive.org.
+        // So the redirect policy should BLOCK this redirect.
+        Mock::given(method("GET"))
+            .and(path("/step1"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/step2", mock_server.uri())),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/step2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let result = client.http().get(format!("{}/step1", mock_server.uri())).send().await;
+        // Should fail because 127.0.0.1 is not *.archive.org
+        assert!(result.is_err(), "redirect to non-archive.org should be blocked");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("redirect") || err_msg.contains("non-archive.org"),
+            "error should mention redirect blocking: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_redirect_request_succeeds() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        // Verify that normal (non-redirect) requests still work fine.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let resp = client
+            .http()
+            .get(format!("{}/metadata/test", mock_server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }

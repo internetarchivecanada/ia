@@ -325,6 +325,20 @@ pub async fn download_file(
         output.write_all(&chunk).await?;
         bytes_downloaded += chunk.len() as u64;
 
+        // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
+        if let Some(expected) = file.size {
+            let max_allowed = expected + (expected / 10).max(1024);
+            if bytes_downloaded > max_allowed {
+                drop(output);
+                let _ = fs::remove_file(&part_path).await;
+                return Err(IaError::DownloadTooLarge {
+                    file: file.name.clone(),
+                    expected,
+                    received: bytes_downloaded,
+                });
+            }
+        }
+
         // Rate-limit progress updates to every 256KB to reduce lock contention
         if let Some(p) = progress {
             if bytes_downloaded - last_progress_at >= 256 * 1024 {
@@ -1267,6 +1281,86 @@ mod tests {
         let err = IaError::PathTraversal {
             path: "../etc/passwd".into(),
             dest_dir: "/tmp/downloads".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    // -- Download size validation tests --
+
+    #[tokio::test]
+    async fn download_aborts_on_oversized_response() {
+        let mock_server = MockServer::start().await;
+        // File metadata says 10 bytes, but server sends 100 bytes.
+        // Max allowed = 10 + max(10/10, 1024) = 10 + 1024 = 1034 bytes.
+        // But we'll send way more than that.
+        let oversized_body = vec![b'X'; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/small.txt"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(oversized_body),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("small.txt", 10);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::DownloadTooLarge { .. })));
+
+        // .part file should be cleaned up
+        assert!(!dir.path().join("small.txt.part").exists());
+    }
+
+    #[tokio::test]
+    async fn download_allows_slightly_oversized_response() {
+        let mock_server = MockServer::start().await;
+        // File metadata says 100 bytes. Max = 100 + max(10, 1024) = 1124.
+        // Sending 105 bytes (5% over) should succeed.
+        let body = vec![b'Y'; 105];
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/normal.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("normal.txt", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 105);
+    }
+
+    #[test]
+    fn download_too_large_is_not_retryable() {
+        let err = IaError::DownloadTooLarge {
+            file: "test.txt".into(),
+            expected: 100,
+            received: 2000,
         };
         assert!(!err.is_retryable());
     }
