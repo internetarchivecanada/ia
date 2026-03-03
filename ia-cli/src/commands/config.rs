@@ -1,0 +1,197 @@
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Args, Subcommand};
+use color_print::cstr;
+
+/// Configure Internet Archive credentials and settings.
+#[derive(Debug, Args)]
+#[command(
+    long_about = "Configure Internet Archive credentials and settings.\n\n\
+        Log in to archive.org, view configuration, validate credentials, and \
+        retrieve account information.",
+    after_long_help = cstr!(
+        "<bold><green>Examples:</green></bold>\n  \
+         <dim># Interactive login (prompts for email and password)</dim>\n  \
+         ia config login\n\n  \
+         <dim># Non-interactive login</dim>\n  \
+         ia config login -u user@example.com -p mypassword\n\n  \
+         <dim># Show current config (secrets redacted)</dim>\n  \
+         ia config show\n\n  \
+         <dim># Check if stored credentials are valid</dim>\n  \
+         ia config check\n\n  \
+         <dim># Show account info</dim>\n  \
+         ia config whoami"
+    )
+)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Log in to archive.org and save credentials
+    #[command(
+        long_about = "Log in to archive.org and save credentials to the config file.\n\n\
+            Authenticates with archive.org using your email and password, then \
+            writes S3 keys and cookies to the config file. If a config file already \
+            exists, existing settings (host, logging, etc.) are preserved.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Interactive login</dim>\n  \
+             ia config login\n\n  \
+             <dim># Non-interactive login</dim>\n  \
+             ia config login -u user@example.com -p mypassword\n\n  \
+             <dim># Login using .netrc credentials</dim>\n  \
+             ia config login --netrc"
+        )
+    )]
+    Login(LoginArgs),
+
+    /// Print current configuration
+    #[command(
+        long_about = "Print the current configuration as JSON.\n\n\
+            Shows all config sections (s3, cookies, general, logging, ai). \
+            Secrets (S3 keys, cookies, AI API key) are redacted by default.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Show config with redacted secrets</dim>\n  \
+             ia config show\n\n  \
+             <dim># Machine-readable JSON output</dim>\n  \
+             ia config show --json"
+        )
+    )]
+    Show(ShowArgs),
+
+    /// Validate stored S3 credentials
+    #[command(
+        long_about = "Check if the stored S3 credentials are valid by contacting archive.org.\n\n\
+            Exits with code 0 if valid, 1 if invalid.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Check credentials</dim>\n  \
+             ia config check\n\n  \
+             <dim># Check with JSON output</dim>\n  \
+             ia config check --json"
+        )
+    )]
+    Check(CheckArgs),
+
+    /// Show account information
+    #[command(
+        long_about = "Retrieve and display account information from archive.org.\n\n\
+            Shows your screenname, email, and itemname.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Show account info</dim>\n  \
+             ia config whoami\n\n  \
+             <dim># JSON output</dim>\n  \
+             ia config whoami --json"
+        )
+    )]
+    Whoami(WhoamiArgs),
+
+    /// Print cookies in Netscape format
+    #[command(
+        name = "print-cookies",
+        long_about = "Print stored cookies in Netscape cookie format.\n\n\
+            Outputs cookies suitable for use with curl, wget, or other tools \
+            that accept Netscape-format cookie files.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Print cookies</dim>\n  \
+             ia config print-cookies\n\n  \
+             <dim># Save to cookie file for curl</dim>\n  \
+             ia config print-cookies > cookies.txt\n  \
+             curl -b cookies.txt https://archive.org/..."
+        )
+    )]
+    PrintCookies(PrintCookiesArgs),
+
+    /// Print the Authorization header
+    #[command(
+        name = "print-auth",
+        long_about = "Print the Authorization header value for S3 API requests.\n\n\
+            Outputs the header in the format: Authorization: LOW {access}:{secret}\n\
+            Useful for scripting with curl or other HTTP tools.",
+        after_long_help = cstr!(
+            "<bold><green>Examples:</green></bold>\n  \
+             <dim># Print auth header</dim>\n  \
+             ia config print-auth\n\n  \
+             <dim># Use with curl</dim>\n  \
+             curl -H \"$(ia config print-auth)\" https://s3.us.archive.org/..."
+        )
+    )]
+    PrintAuth(PrintAuthArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Email address for login
+    #[arg(short, long)]
+    pub username: Option<String>,
+
+    /// Password for login
+    #[arg(short, long)]
+    pub password: Option<String>,
+
+    /// Read credentials from ~/.netrc
+    #[arg(short, long)]
+    pub netrc: bool,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// Output as JSON (machine-readable, no color)
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WhoamiArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrintCookiesArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrintAuthArgs {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Run the config command.
+pub async fn run(
+    args: ConfigArgs,
+    _config: ia_core::IaConfig,
+    _config_path: Option<PathBuf>,
+) -> Result<()> {
+    match args.command {
+        ConfigCommand::Login(_login_args) => todo!("login"),
+        ConfigCommand::Show(_show_args) => todo!("show"),
+        ConfigCommand::Check(_check_args) => todo!("check"),
+        ConfigCommand::Whoami(_whoami_args) => todo!("whoami"),
+        ConfigCommand::PrintCookies(_print_cookies_args) => todo!("print-cookies"),
+        ConfigCommand::PrintAuth(_print_auth_args) => todo!("print-auth"),
+    }
+}
