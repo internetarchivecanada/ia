@@ -524,6 +524,51 @@ fn status_help_shows_json_example() {
         .stdout(predicate::str::contains("--json"));
 }
 
+// --- ia ai subcommand restructuring ---
+
+#[test]
+fn ai_undo_subcommand_shown_in_help() {
+    ia().args(["ai", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("undo"));
+}
+
+#[test]
+fn ai_undo_subcommand_requires_joblog() {
+    ia().args(["ai", "undo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("JOBLOG").or(predicate::str::contains("joblog")));
+}
+
+#[test]
+fn ai_bare_no_input_errors() {
+    // Bare `ia ai` with no args should error about missing input, NOT about subcommands
+    ia().args(["ai"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no input specified"));
+}
+
+#[test]
+fn ai_undo_help_has_dry_run_and_json() {
+    ia().args(["ai", "undo", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn ai_undo_help_no_headless() {
+    // Undo subcommand should NOT have --headless
+    ia().args(["ai", "undo", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--headless").not());
+}
+
 fn metadata_spreadsheet_with_append_list() {
     // --spreadsheet combined with --append-list should be accepted.
     // The flag value is ignored; only the op mode (AppendList) is used.

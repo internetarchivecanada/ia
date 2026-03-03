@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{Args, Subcommand};
 use color_print::cstr;
 use console::style;
 use futures::StreamExt;
@@ -14,6 +14,35 @@ use ia_core::joblog::JoblogWriter;
 use ia_core::search::SearchOpts;
 use ia_core::IaClient;
 use tokio::sync::{mpsc, watch};
+
+#[derive(Debug, Subcommand)]
+pub enum AiCommand {
+    /// Reverse changes recorded in a previous session's joblog
+    #[command(
+        long_about = "Reverse metadata changes from a previous AI session. Reads the joblog \
+            file, finds all successful AI changes, and applies the reverse operations.",
+        after_long_help = cstr!(
+            "<bold><underline>Examples:</underline></bold>\n\
+             \n  <dim># Undo all changes from a session</dim>\n  <bold>$ ia ai undo session.jsonl</bold>\
+             \n\n  <dim># Preview what would be undone</dim>\n  <bold>$ ia ai undo session.jsonl --dry-run</bold>\n"
+        ),
+    )]
+    Undo(UndoArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UndoArgs {
+    /// Path to the joblog file containing changes to reverse
+    pub joblog: PathBuf,
+
+    /// Preview reversals without applying
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output results as JSON
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(Args)]
 #[command(
@@ -27,8 +56,9 @@ use tokio::sync::{mpsc, watch};
          \n\n  <dim># Headless batch processing (auto-accept all)</dim>\n  <bold>$ ia ai --headless --search \"collection:nasa\"</bold>\
          \n\n  <dim># Dry run — show suggestions without applying</dim>\n  <bold>$ ia ai --dry-run nasa</bold>\
          \n\n  <dim># Focus on date fixes only</dim>\n  <bold>$ ia ai --dates-only --itemlist items.txt</bold>\
-         \n\n  <dim># Undo changes from a previous session</dim>\n  <bold>$ ia ai --undo session.jsonl</bold>\n"
+         \n\n  <dim># Undo changes from a previous session</dim>\n  <bold>$ ia ai undo session.jsonl</bold>\n"
     ),
+    subcommand_required = false,
 )]
 pub struct AiArgs {
     /// Item identifier(s) to analyze
@@ -46,15 +76,15 @@ pub struct AiArgs {
 
     // --- Modes ---
     /// Auto-accept all suggestions, output JSONL to stdout (no TUI)
-    #[arg(long, conflicts_with = "undo")]
+    #[arg(long)]
     pub headless: bool,
 
     /// TUI review, save to local JSON instead of writing to IA
-    #[arg(long, conflicts_with = "undo")]
+    #[arg(long)]
     pub record_only: bool,
 
     /// Show suggestions without applying any changes
-    #[arg(long, conflicts_with = "undo")]
+    #[arg(long)]
     pub dry_run: bool,
 
     // --- LLM configuration ---
@@ -133,11 +163,6 @@ pub struct AiArgs {
     #[arg(long)]
     pub max_tokens_budget: Option<u64>,
 
-    // --- Undo ---
-    /// Reverse changes recorded in a joblog file
-    #[arg(long)]
-    pub undo: Option<PathBuf>,
-
     // --- Output ---
     /// Write accepted changes to JSON file (record-only mode)
     #[arg(short = 'o', long)]
@@ -146,6 +171,9 @@ pub struct AiArgs {
     /// Output results as JSON/JSONL
     #[arg(long)]
     pub json: bool,
+
+    #[command(subcommand)]
+    pub command: Option<AiCommand>,
 }
 
 impl AiArgs {
@@ -192,22 +220,22 @@ pub async fn run(
     _jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
-    // Handle --undo separately
-    if let Some(ref undo_path) = args.undo {
+    // Handle undo subcommand
+    if let Some(AiCommand::Undo(undo_args)) = args.command {
         let undo_writer = joblog_path
             .as_ref()
             .map(|p| JoblogWriter::open(p))
             .transpose()?;
         let summary = ia_core::ai::undo::undo_from_joblog(
             client,
-            undo_path,
+            &undo_args.joblog,
             undo_writer.as_ref(),
-            args.dry_run,
+            undo_args.dry_run,
         )
         .await?;
 
-        if quiet == 0 {
-            if args.dry_run {
+        if quiet == 0 && !undo_args.json {
+            if undo_args.dry_run {
                 eprintln!("{}", style("Undo dry run complete").yellow());
             } else {
                 eprintln!("{}", style("Undo complete").green().bold());
@@ -224,6 +252,12 @@ pub async fn run(
                 );
             }
         }
+        if undo_args.json {
+            println!(
+                "{}",
+                serde_json::to_string(&summary).unwrap_or_default()
+            );
+        }
         return Ok(());
     }
 
@@ -233,7 +267,7 @@ pub async fn run(
         && args.search.is_none()
     {
         bail!(
-            "no input specified. Provide identifiers, --itemlist, --search, or --undo.\n\
+            "no input specified. Provide identifiers, --itemlist, or --search.\n\
              Run 'ia ai --help' for usage."
         );
     }

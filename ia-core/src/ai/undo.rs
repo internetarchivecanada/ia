@@ -9,7 +9,7 @@ use crate::joblog::{self, JoblogEntry, JoblogWriter};
 use crate::metadata::write::{MetadataOp, ModifyRequest};
 
 /// Result of an undo operation.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct UndoSummary {
     pub items_undone: u64,
     pub items_skipped: u64,
