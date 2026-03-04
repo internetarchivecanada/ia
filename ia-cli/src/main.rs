@@ -112,7 +112,15 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Pre-scan argv for compound metadata operations (+ separator)
+    // before clap parsing, since clap would choke on bare + tokens.
+    let raw_args: Vec<String> = std::env::args().collect();
+    let compound_continuations = commands::metadata::extract_compound_from_argv(&raw_args)?;
+    let cli = if let Some(ref split) = compound_continuations {
+        Cli::try_parse_from(&split.filtered_argv)?
+    } else {
+        Cli::parse()
+    };
 
     // Handle commands that don't need IA config/client
     match cli.command {
@@ -188,7 +196,9 @@ async fn main() -> Result<()> {
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {
-            commands::metadata::run(&client, args, cli.quiet, cli.jobs, cli.joblog.clone()).await?
+            let conts = compound_continuations.map(|c| c.continuations);
+            commands::metadata::run(&client, args, conts, cli.quiet, cli.jobs, cli.joblog.clone())
+                .await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,

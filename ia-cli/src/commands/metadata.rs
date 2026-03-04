@@ -13,8 +13,8 @@ use tokio::task::JoinSet;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
-    extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ModifyRequest,
-    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
+    extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ADMIN_ONLY_FIELDS,
+    IMMUTABLE_FIELDS, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
@@ -284,59 +284,60 @@ pub struct MetadataArgs {
 pub async fn run(
     client: &IaClient,
     args: MetadataArgs,
+    continuations: Option<Vec<(String, Vec<String>)>>,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
     match args.command {
-        Some(MetadataCommand::Export(sub)) => run_export(client, sub, quiet).await,
+        Some(MetadataCommand::Export(sub)) => {
+            if continuations.is_some() {
+                bail!("compound operations (+) cannot be used with export");
+            }
+            run_export(client, sub, quiet).await
+        }
         Some(MetadataCommand::Modify(sub)) => {
-            run_write(client, sub.input, sub.write, MetadataOp::Set, quiet, jobs, joblog_path)
-                .await
+            run_write(
+                client, sub.input, sub.write, MetadataOp::Set, continuations, quiet, jobs,
+                joblog_path,
+            )
+            .await
         }
         Some(MetadataCommand::Append(sub)) => {
             run_write(
-                client,
-                sub.input,
-                sub.write,
-                MetadataOp::Append,
-                quiet,
-                jobs,
+                client, sub.input, sub.write, MetadataOp::Append, continuations, quiet, jobs,
                 joblog_path,
             )
             .await
         }
         Some(MetadataCommand::AppendList(sub)) => {
             run_write(
-                client,
-                sub.input,
-                sub.write,
-                MetadataOp::AppendList,
-                quiet,
-                jobs,
+                client, sub.input, sub.write, MetadataOp::AppendList, continuations, quiet, jobs,
                 joblog_path,
             )
             .await
         }
         Some(MetadataCommand::Insert(sub)) => {
-            run_write_insert(client, sub.input, sub.write, quiet, jobs, joblog_path).await
+            run_write_insert(client, sub.input, sub.write, continuations, quiet, jobs, joblog_path)
+                .await
         }
         Some(MetadataCommand::Remove(sub)) => {
             run_write(
-                client,
-                sub.input,
-                sub.write,
-                MetadataOp::Remove,
-                quiet,
-                jobs,
+                client, sub.input, sub.write, MetadataOp::Remove, continuations, quiet, jobs,
                 joblog_path,
             )
             .await
         }
         Some(MetadataCommand::Import(sub)) => {
+            if continuations.is_some() {
+                bail!("compound operations (+) cannot be used with import");
+            }
             run_import(client, sub, quiet, jobs, joblog_path).await
         }
         None => {
+            if continuations.is_some() {
+                bail!("compound operations (+) require a write subcommand (modify, append, etc.)");
+            }
             // Bare read mode
             let identifier = args.identifier.ok_or_else(|| {
                 anyhow::anyhow!("identifier required. Run 'ia metadata --help' for usage.")
@@ -512,15 +513,16 @@ async fn run_write(
     input: BatchInput,
     write: WriteOpts,
     op: MetadataOp,
+    continuations: Option<Vec<(String, Vec<String>)>>,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
-    if write.metadata.is_empty() {
+    if write.metadata.is_empty() && continuations.is_none() {
         bail!("no -m/--metadata values specified");
     }
 
-    // Parse changes
+    // Parse primary changes
     let changes: Vec<(String, serde_json::Value)> = write
         .metadata
         .iter()
@@ -531,8 +533,14 @@ async fn run_write(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Build change groups (single group for non-Insert ops)
-    let change_groups = vec![(changes, op)];
+    // Build change groups: primary + continuations
+    let mut change_groups = vec![(changes, op)];
+    if let Some(conts) = continuations {
+        for (op_name, raw_changes) in &conts {
+            let group = parse_continuation_group(op_name, raw_changes)?;
+            change_groups.push(group);
+        }
+    }
 
     run_write_inner(client, input, write, change_groups, quiet, jobs, joblog_path).await
 }
@@ -541,16 +549,17 @@ async fn run_write_insert(
     client: &IaClient,
     input: BatchInput,
     write: WriteOpts,
+    continuations: Option<Vec<(String, Vec<String>)>>,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
-    if write.metadata.is_empty() {
+    if write.metadata.is_empty() && continuations.is_none() {
         bail!("no -m/--metadata values specified");
     }
 
     // Each --metadata arg gets its own group with its own index
-    let change_groups: Vec<(Vec<(String, serde_json::Value)>, MetadataOp)> = write
+    let mut change_groups: Vec<(Vec<(String, serde_json::Value)>, MetadataOp)> = write
         .metadata
         .iter()
         .map(|s| {
@@ -560,6 +569,14 @@ async fn run_write_insert(
             Ok((vec![(field, json!(value))], MetadataOp::Insert(index)))
         })
         .collect::<Result<Vec<_>>>()?;
+
+    // Add continuations
+    if let Some(conts) = continuations {
+        for (op_name, raw_changes) in &conts {
+            let group = parse_continuation_group(op_name, raw_changes)?;
+            change_groups.push(group);
+        }
+    }
 
     run_write_inner(client, input, write, change_groups, quiet, jobs, joblog_path).await
 }
@@ -574,6 +591,8 @@ async fn run_write_inner(
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
+    use ia_core::metadata::write::CompoundModifyRequest;
+
     // Warn about immutable/admin-only fields
     for (changes, _) in &change_groups {
         for (key, _) in changes {
@@ -620,26 +639,23 @@ async fn run_write_inner(
         .priority
         .unwrap_or(if identifiers.len() > 1 { -5 } else { 0 });
 
-    // Dry-run
+    // Dry-run: uses compute_compound_patch for a combined diff
     if write.dry_run {
         if !json && quiet == 0 {
             println!("Dry run -- no changes will be applied\n");
         }
         let mut total_dry_run_changes = 0usize;
         for identifier in &identifiers {
-            for (changes, batch_op) in &change_groups {
-                total_dry_run_changes += run_dry_run(
-                    client,
-                    identifier,
-                    changes,
-                    batch_op,
-                    &write.target,
-                    expect.as_ref(),
-                    quiet,
-                    json,
-                )
-                .await?;
-            }
+            total_dry_run_changes += run_dry_run_compound(
+                client,
+                identifier,
+                &change_groups,
+                &write.target,
+                expect.as_ref(),
+                quiet,
+                json,
+            )
+            .await?;
         }
         if !json && quiet == 0 {
             println!(
@@ -657,7 +673,7 @@ async fn run_write_inner(
         write.target.clone()
     };
 
-    // Concurrent batch processing
+    // Concurrent batch processing — single POST per item via modify_compound
     let semaphore = Arc::new(Semaphore::new(jobs));
     let rate_limiter = RateLimiter::new();
     let mut set = JoinSet::new();
@@ -675,49 +691,31 @@ async fn run_write_inner(
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let start = std::time::Instant::now();
-            let mut batch_error = None;
-            let mut last_task_id = None;
 
-            'groups: for (changes, batch_op) in &change_groups {
-                let req = ModifyRequest {
-                    identifier: identifier.clone(),
-                    changes: changes.clone(),
-                    op: batch_op.clone(),
-                    target: target.clone(),
-                    expect: expect.clone(),
-                    priority: Some(priority),
-                    reduced_priority,
-                };
-
-                loop {
-                    rl.wait_if_paused().await;
-                    match ia_core::metadata::modify(&client, &req).await {
-                        Ok(resp) => {
-                            last_task_id = resp.task_id;
-                            break;
-                        }
-                        Err(IaError::RateLimited { retry_after }) => {
-                            rl.pause_for(retry_after, |secs| {
-                                eprintln!(
-                                    "Rate limited. Pausing all workers for {secs}s..."
-                                );
-                            })
-                            .await;
-                        }
-                        Err(e) => {
-                            batch_error = Some(e);
-                            break 'groups;
-                        }
-                    }
-                }
-            }
-
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let outcome = match batch_error {
-                None => Ok(last_task_id),
-                Some(e) => Err(e.to_string()),
+            let compound_req = CompoundModifyRequest {
+                identifier: identifier.clone(),
+                groups: change_groups,
+                target,
+                expect,
+                priority: Some(priority),
+                reduced_priority,
             };
 
+            let outcome = loop {
+                rl.wait_if_paused().await;
+                match ia_core::metadata::modify_compound(&client, &compound_req).await {
+                    Ok(resp) => break Ok(resp.task_id),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        rl.pause_for(retry_after, |secs| {
+                            eprintln!("Rate limited. Pausing all workers for {secs}s...");
+                        })
+                        .await;
+                    }
+                    Err(e) => break Err(e.to_string()),
+                }
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
             (identifier, outcome, elapsed_ms)
         });
     }
@@ -895,19 +893,16 @@ async fn run_import(
         }
         let mut total_changes = 0usize;
         for (identifier, groups) in &work_items {
-            for (changes, op) in groups {
-                total_changes += run_dry_run(
-                    client,
-                    identifier,
-                    changes,
-                    op,
-                    &args.target,
-                    None,
-                    quiet,
-                    json,
-                )
-                .await?;
-            }
+            total_changes += run_dry_run_compound(
+                client,
+                identifier,
+                groups,
+                &args.target,
+                None,
+                quiet,
+                json,
+            )
+            .await?;
         }
         if !json && quiet == 0 {
             println!("\n{} item(s), {} change(s)", item_count, total_changes);
@@ -927,6 +922,8 @@ async fn run_import(
     let mut set = JoinSet::new();
 
     for (identifier, groups) in work_items {
+        use ia_core::metadata::write::CompoundModifyRequest;
+
         let client = client.clone();
         let sem = Arc::clone(&semaphore);
         let rl = rate_limiter.clone();
@@ -936,49 +933,31 @@ async fn run_import(
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let start = std::time::Instant::now();
-            let mut batch_error = None;
-            let mut last_task_id = None;
 
-            'groups: for (changes, op) in &groups {
-                let req = ModifyRequest {
-                    identifier: identifier.clone(),
-                    changes: changes.clone(),
-                    op: op.clone(),
-                    target: target.clone(),
-                    expect: None,
-                    priority: Some(priority),
-                    reduced_priority,
-                };
-
-                loop {
-                    rl.wait_if_paused().await;
-                    match ia_core::metadata::modify(&client, &req).await {
-                        Ok(resp) => {
-                            last_task_id = resp.task_id;
-                            break;
-                        }
-                        Err(IaError::RateLimited { retry_after }) => {
-                            rl.pause_for(retry_after, |secs| {
-                                eprintln!(
-                                    "Rate limited. Pausing all workers for {secs}s..."
-                                );
-                            })
-                            .await;
-                        }
-                        Err(e) => {
-                            batch_error = Some(e);
-                            break 'groups;
-                        }
-                    }
-                }
-            }
-
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let outcome = match batch_error {
-                None => Ok(last_task_id),
-                Some(e) => Err(e.to_string()),
+            let compound_req = CompoundModifyRequest {
+                identifier: identifier.clone(),
+                groups,
+                target,
+                expect: None,
+                priority: Some(priority),
+                reduced_priority,
             };
 
+            let outcome = loop {
+                rl.wait_if_paused().await;
+                match ia_core::metadata::modify_compound(&client, &compound_req).await {
+                    Ok(resp) => break Ok(resp.task_id),
+                    Err(IaError::RateLimited { retry_after }) => {
+                        rl.pause_for(retry_after, |secs| {
+                            eprintln!("Rate limited. Pausing all workers for {secs}s...");
+                        })
+                        .await;
+                    }
+                    Err(e) => break Err(e.to_string()),
+                }
+            };
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
             (identifier, outcome, elapsed_ms)
         });
     }
@@ -1012,14 +991,13 @@ async fn run_import(
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Dry-run: fetch metadata, compute patch, display without writing.
+/// Dry-run: fetch metadata, compute compound patch, display without writing.
 /// Returns the number of non-test patch operations.
 #[allow(clippy::too_many_arguments)]
-async fn run_dry_run(
+async fn run_dry_run_compound(
     client: &IaClient,
     identifier: &str,
-    changes: &[(String, serde_json::Value)],
-    op: &MetadataOp,
+    groups: &[(Vec<(String, serde_json::Value)>, MetadataOp)],
     target: &str,
     expect: Option<&HashMap<String, serde_json::Value>>,
     quiet: u8,
@@ -1032,7 +1010,8 @@ async fn run_dry_run(
     let source = extract_target_metadata(&item, target, identifier)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let patch = ia_core::metadata::compute_patch(&source, changes, op, expect, identifier)?;
+    let patch =
+        ia_core::metadata::compute_compound_patch(&source, groups, expect, identifier)?;
 
     let change_count = patch
         .iter()
