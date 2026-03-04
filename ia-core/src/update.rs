@@ -1,5 +1,5 @@
 use crate::error::IaError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -59,6 +59,29 @@ pub fn find_matching_asset<'a>(assets: &'a [GitHubAsset], target: &str) -> Optio
 }
 
 pub const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Serializable summary of a single GitHub release for `ia update list`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseInfo {
+    pub version: String,
+    pub installed: bool,
+    pub has_asset: bool,
+}
+
+/// Oldest version that ships the `update` command and can therefore be
+/// installed via `ia update install`. Versions below this lack
+/// self-update support, so installing them would strand the user.
+pub const MIN_INSTALLABLE_VERSION: &str = "0.6.0";
+
+/// Returns `true` if `version` is at or above [`MIN_INSTALLABLE_VERSION`].
+///
+/// Returns `false` for unparseable version strings.
+pub fn is_at_or_above_minimum(version: &str) -> bool {
+    match (parse_version(version), parse_version(MIN_INSTALLABLE_VERSION)) {
+        (Some(v), Some(min)) => v >= min,
+        _ => false,
+    }
+}
 
 /// Check GitHub Releases for a newer version.
 ///
@@ -525,6 +548,28 @@ mod tests {
 
         assert_eq!(result.new_version, "99.0.0");
         assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    #[test]
+    fn release_info_serializes_to_json() {
+        let info = ReleaseInfo {
+            version: "0.5.0".into(),
+            installed: true,
+            has_asset: true,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["version"], "0.5.0");
+        assert_eq!(json["installed"], true);
+        assert_eq!(json["has_asset"], true);
+    }
+
+    #[test]
+    fn is_at_or_above_minimum_filters_correctly() {
+        assert!(is_at_or_above_minimum("1.0.0"));
+        assert!(is_at_or_above_minimum("99.0.0"));
+        assert!(is_at_or_above_minimum(MIN_INSTALLABLE_VERSION));
+        assert!(!is_at_or_above_minimum("0.1.0"));
+        assert!(!is_at_or_above_minimum("0.0.1"));
     }
 
     #[tokio::test]
