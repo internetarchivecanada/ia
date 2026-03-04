@@ -674,6 +674,18 @@ fn ai_undo_help_no_headless() {
 }
 
 #[test]
+fn metadata_export_help_shows_supported_formats() {
+    // -o should be accepted (not bail with "not yet implemented")
+    // and help text should mention supported formats
+    ia().args(["metadata", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CSV"))
+        .stdout(predicate::str::contains("XLSX"))
+        .stdout(predicate::str::contains("JSONL"));
+}
+
+#[test]
 fn metadata_import_with_column_prefixes() {
     // import with column prefixes should be accepted
     let dir = tempfile::tempdir().unwrap();
@@ -685,4 +697,12 @@ fn metadata_import_with_column_prefixes() {
         .failure()
         // Should fail with auth error, not parse error
         .stderr(predicate::str::contains("not yet implemented").not());
+}
+
+#[test]
+fn search_advanced_help_has_rows() {
+    ia().args(["search", "advanced", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--rows"));
 }

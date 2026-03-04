@@ -9,6 +9,36 @@ use futures::StreamExt;
 use ia_core::search::{SearchOpts, SearchResult};
 use ia_core::IaClient;
 
+/// Backend selector for the `--num-found` count query.
+enum NumFoundBackend {
+    Scrape,
+    Advanced,
+    Fts { dsl: bool },
+}
+
+/// Handle `--num-found` for any search backend: print the total count and exit.
+async fn handle_num_found(
+    client: &IaClient,
+    query: &str,
+    backend: NumFoundBackend,
+    json: bool,
+) -> Result<()> {
+    let count = match backend {
+        NumFoundBackend::Scrape | NumFoundBackend::Advanced => {
+            ia_core::search::num_found(client, query).await?
+        }
+        NumFoundBackend::Fts { dsl } => {
+            ia_core::search::fts_num_found(client, query, dsl).await?
+        }
+    };
+    if json {
+        println!("{}", serde_json::json!({"num_found": count}));
+    } else {
+        println!("{count}");
+    }
+    Ok(())
+}
+
 /// Shared output/control options available on all search subcommands.
 #[derive(Debug, Args)]
 pub struct SharedSearchArgs {
@@ -52,8 +82,8 @@ pub enum SearchCommand {
     /// Search via advanced search API (page-based, single page)
     #[command(
         long_about = "Search the Internet Archive using the advanced search API. Returns a \
-            single page of results. Use -p rows=N to control page size and -p page=N to \
-            select a page.",
+            single page of results. Use --rows to control page size (default 50) and \
+            -p page=N to select a page.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Single page of results</dim>\n  <bold>$ ia search advanced \"collection:nasa\"</bold>\
@@ -105,6 +135,10 @@ pub struct AdvancedArgs {
     /// Fields to return (repeatable, default: all)
     #[arg(short = 'f', long, visible_alias = "fields")]
     pub field: Vec<String>,
+
+    /// Results per page (default: 50)
+    #[arg(short = 'r', long, default_value = "50")]
+    pub rows: usize,
 
     #[command(flatten)]
     pub shared: SharedSearchArgs,
@@ -192,7 +226,7 @@ pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
             run_scrape(client, sub.query, sub.sort, sub.field, sub.shared, quiet).await
         }
         Some(SearchCommand::Advanced(sub)) => {
-            run_advanced(client, sub.query, sub.sort, sub.field, sub.shared, quiet).await
+            run_advanced(client, sub.query, sub.sort, sub.field, sub.rows, sub.shared, quiet).await
         }
         Some(SearchCommand::Fts(sub)) => run_fts(client, sub, quiet).await,
         None => {
@@ -220,15 +254,8 @@ async fn run_scrape(
     shared: SharedSearchArgs,
     quiet: u8,
 ) -> Result<()> {
-    // --num-found: just print count and exit
     if shared.num_found {
-        let count = ia_core::search::num_found(client, &query).await?;
-        if shared.json {
-            println!("{}", serde_json::json!({"num_found": count}));
-        } else {
-            println!("{count}");
-        }
-        return Ok(());
+        return handle_num_found(client, &query, NumFoundBackend::Scrape, shared.json).await;
     }
 
     let opts = build_search_opts(&field, &sort, &shared);
@@ -241,26 +268,19 @@ async fn run_advanced(
     query: String,
     sort: Vec<String>,
     field: Vec<String>,
+    rows: usize,
     shared: SharedSearchArgs,
     quiet: u8,
 ) -> Result<()> {
     if shared.num_found {
-        let count = ia_core::search::num_found(client, &query).await?;
-        if shared.json {
-            println!("{}", serde_json::json!({"num_found": count}));
-        } else {
-            println!("{count}");
-        }
-        return Ok(());
+        return handle_num_found(client, &query, NumFoundBackend::Advanced, shared.json).await;
     }
 
     let mut opts = build_search_opts(&field, &sort, &shared);
-    // Single page only: set count to page size (default 500 via rows param)
-    // The advanced backend auto-paginates in ia-core, so we limit to one page
-    // by setting count to the page size.
+    opts.rows = rows;
+    // Single page only: limit result count to one page worth of rows.
     if opts.count == 0 {
-        // Default to one page of 500 results
-        opts.count = 500;
+        opts.count = rows;
     }
     let stream = ia_core::search::advanced(client, &query, &opts);
     run_output(stream, &shared, &field, &query, quiet).await
@@ -268,9 +288,13 @@ async fn run_advanced(
 
 async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
     if args.shared.num_found {
-        // FTS doesn't have a dedicated count endpoint; just run the search
-        // and count results. For now, error out.
-        bail!("--num-found is not supported for full-text search");
+        return handle_num_found(
+            client,
+            &args.query,
+            NumFoundBackend::Fts { dsl: args.dsl },
+            args.shared.json,
+        )
+        .await;
     }
 
     let extra_params = parse_extra_params(&args.shared.parameters);
@@ -352,17 +376,30 @@ async fn run_output(
         count += 1;
 
         if shared.json {
-            let mut obj = item.fields.clone();
+            let mut obj = if fields_requested.is_empty() {
+                item.fields.clone()
+            } else {
+                item.fields
+                    .iter()
+                    .filter(|(k, _)| fields_requested.iter().any(|f| f.as_str() == k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
             obj.insert(
                 "identifier".to_string(),
                 serde_json::Value::String(item.identifier),
             );
-            println!("{}", serde_json::to_string(&obj).unwrap_or_default());
+            println!("{}", serde_json::to_string(&obj)?);
         } else if shared.itemlist {
             println!("{}", item.identifier);
         } else if quiet == 0 && !item.fields.is_empty() {
             print!("{}", style(&item.identifier).bold());
             for (key, value) in &item.fields {
+                if !fields_requested.is_empty()
+                    && !fields_requested.iter().any(|f| f == key)
+                {
+                    continue;
+                }
                 let display = match value {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -386,9 +423,6 @@ async fn run_output(
     if count == 0 {
         bail!("no results found for query: {query}");
     }
-
-    // Suppress unused variable warning
-    let _ = fields_requested;
 
     Ok(())
 }

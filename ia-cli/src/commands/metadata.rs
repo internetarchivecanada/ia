@@ -400,11 +400,7 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
         bail!("no identifiers to export");
     }
 
-    // TODO: -o file output (CSV/TSV/XLSX) is a future enhancement.
-    // For now, always output JSONL to stdout.
-    if args.output.is_some() {
-        bail!("file output (-o) is not yet implemented for export. Use JSONL to stdout.");
-    }
+    let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
     for identifier in &identifiers {
         let item = client
@@ -412,15 +408,56 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
             .await
             .context(format!("failed to fetch metadata for {identifier}"))?;
 
-        let output = if args.pretty {
-            serde_json::to_string_pretty(&item)?
-        } else {
-            serde_json::to_string(&item)?
-        };
-        println!("{output}");
+        // For stdout mode: output immediately (streaming)
+        if args.output.is_none() {
+            let output = if args.pretty {
+                serde_json::to_string_pretty(&item)?
+            } else {
+                serde_json::to_string(&item)?
+            };
+            println!("{output}");
+        }
+
+        // For file mode: collect flattened records
+        if args.output.is_some() {
+            let metadata_json = serde_json::to_value(&item.metadata)?;
+            let mut fields = HashMap::new();
+            if let serde_json::Value::Object(map) = metadata_json {
+                for (key, value) in map {
+                    if key == "identifier" {
+                        continue;
+                    }
+                    let s = match &value {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        serde_json::Value::Null => continue,
+                        other => other.to_string(),
+                    };
+                    if !s.is_empty() {
+                        fields.insert(key, s);
+                    }
+                }
+            }
+            records.push((identifier.clone(), fields));
+        }
     }
 
-    if quiet < 2 && !args.json && !args.pretty {
+    // Write to file if -o specified
+    if let Some(ref path) = args.output {
+        ia_core::spreadsheet::write_spreadsheet(path, &records)
+            .context(format!("failed to write export file: {}", path.display()))?;
+
+        if quiet < 2 {
+            eprintln!("{} item(s) exported to {}", records.len(), path.display());
+        }
+    } else if quiet < 2 && !args.json && !args.pretty {
         eprintln!("{} item(s) exported", identifiers.len());
     }
 
