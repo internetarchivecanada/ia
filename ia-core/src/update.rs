@@ -358,6 +358,96 @@ pub fn replace_binary(source: &Path, target: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Install a specific version by tag.
+///
+/// Downloads and replaces the current binary with the specified version.
+/// Returns `IaError::UpdateBelowMinimum` if the version is below [`MIN_INSTALLABLE_VERSION`],
+/// `IaError::UpdateVersionNotFound` if the release doesn't exist on GitHub,
+/// `IaError::UpdateNoAsset` if there's no matching asset for the target platform.
+///
+/// If `skip_verify` is false, runs `current_exe --version` after replacing to verify the install.
+pub async fn install_version(
+    version: &str,
+    target: &str,
+    current_exe: &Path,
+    api_base: &str,
+    skip_verify: bool,
+) -> crate::Result<UpdateResult> {
+    // Strip `v` prefix if present for the version string we use internally.
+    let clean_version = version.strip_prefix('v').unwrap_or(version);
+
+    // Check minimum version floor.
+    if !is_at_or_above_minimum(clean_version) {
+        return Err(IaError::UpdateBelowMinimum {
+            version: clean_version.to_string(),
+            minimum: MIN_INSTALLABLE_VERSION.to_string(),
+        });
+    }
+
+    let current_version = crate::version();
+
+    // Fetch the release from GitHub.
+    let release = fetch_release_by_tag(clean_version, current_version, api_base).await?;
+
+    // Find the matching asset for this platform.
+    let asset =
+        find_matching_asset(&release.assets, target).ok_or_else(|| IaError::UpdateNoAsset {
+            target: target.to_string(),
+        })?;
+
+    // Download to a temp file in the same directory (for atomic rename).
+    let temp_path = current_exe.with_extension("update-tmp");
+    let _ = std::fs::remove_file(&temp_path);
+
+    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    // Atomically swap the binary.
+    if let Err(e) = replace_binary(&temp_path, current_exe) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    // Verify the new binary works.
+    if !skip_verify {
+        let output = std::process::Command::new(current_exe)
+            .arg("--version")
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let version_output = String::from_utf8_lossy(&out.stdout);
+                if !version_output.contains(clean_version) {
+                    return Err(IaError::UpdateVerifyFailed {
+                        expected: clean_version.to_string(),
+                        actual: version_output.trim().to_string(),
+                    });
+                }
+            }
+            Ok(out) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: clean_version.to_string(),
+                    actual: format!("exit code {}", out.status),
+                });
+            }
+            Err(e) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: clean_version.to_string(),
+                    actual: format!("failed to run: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(UpdateResult {
+        current_version: current_version.to_string(),
+        new_version: clean_version.to_string(),
+    })
+}
+
 /// Result of a successful update.
 #[derive(Debug)]
 pub struct UpdateResult {
@@ -904,6 +994,126 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             crate::error::IaError::UpdateNoAsset { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_version_below_minimum_returns_error() {
+        let result = install_version(
+            "0.1.0",
+            "test-target",
+            Path::new("/tmp/fake"),
+            "https://unused.example.com",
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::UpdateBelowMinimum { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_version_full_flow() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/jjjake/ia/releases/tags/v99.0.0",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"tag_name": "v99.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": format!("{}/download/ia-test-target", mock_server.uri()), "size": fake_binary.len()}]}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download/ia-test-target"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let result = install_version(
+            "99.0.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.new_version, "99.0.0");
+        assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    #[tokio::test]
+    async fn install_version_no_matching_asset() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/jjjake/ia/releases/tags/v99.0.0",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"tag_name": "v99.0.0", "assets": [{"name": "ia-other-target", "browser_download_url": "https://example.com/other", "size": 100}]}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old").unwrap();
+
+        let result = install_version(
+            "99.0.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::UpdateNoAsset { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn install_version_not_found() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/jjjake/ia/releases/tags/v99.99.99",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message": "Not Found"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old").unwrap();
+
+        let result = install_version(
+            "99.99.99",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::UpdateVersionNotFound { .. }
         ));
     }
 }
