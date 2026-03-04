@@ -253,10 +253,7 @@ pub async fn run(
             }
         }
         if undo_args.json {
-            println!(
-                "{}",
-                serde_json::to_string(&summary).unwrap_or_default()
-            );
+            println!("{}", serde_json::to_string(&summary)?);
         }
         return Ok(());
     }
@@ -391,10 +388,7 @@ pub async fn run(
     }
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string(&summary).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&summary)?);
     }
 
     Ok(())
