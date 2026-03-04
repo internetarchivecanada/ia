@@ -408,18 +408,16 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
             .await
             .context(format!("failed to fetch metadata for {identifier}"))?;
 
-        // For stdout mode: output immediately (streaming)
         if args.output.is_none() {
+            // Stdout mode: output immediately (streaming)
             let output = if args.pretty {
                 serde_json::to_string_pretty(&item)?
             } else {
                 serde_json::to_string(&item)?
             };
             println!("{output}");
-        }
-
-        // For file mode: collect flattened records
-        if args.output.is_some() {
+        } else {
+            // File mode: collect flattened records
             let metadata_json = serde_json::to_value(&item.metadata)?;
             let mut fields = HashMap::new();
             if let serde_json::Value::Object(map) = metadata_json {
@@ -715,8 +713,8 @@ async fn run_write_inner(
 // ─── Import ──────────────────────────────────────────────────────────────────
 
 /// Parse column prefixes for import mode.
-fn parse_column_op(column_name: &str) -> (MetadataOp, String) {
-    if let Some(field) = column_name.strip_prefix("append-list:") {
+fn parse_column_op(column_name: &str) -> Result<(MetadataOp, String)> {
+    let (op, field) = if let Some(field) = column_name.strip_prefix("append-list:") {
         (MetadataOp::AppendList, field.to_string())
     } else if let Some(field) = column_name.strip_prefix("append:") {
         (MetadataOp::Append, field.to_string())
@@ -730,8 +728,14 @@ fn parse_column_op(column_name: &str) -> (MetadataOp, String) {
         }
     } else {
         // Default: modify (set)
-        (MetadataOp::Set, column_name.to_string())
+        return Ok((MetadataOp::Set, column_name.to_string()));
+    };
+
+    if field.is_empty() {
+        bail!("column prefix '{column_name}' has no field name after the colon");
     }
+
+    Ok((op, field))
 }
 
 async fn run_import(
@@ -759,36 +763,32 @@ async fn run_import(
     // Build (identifier, change_groups) pairs from records.
     // Each record's columns are parsed for operation prefixes.
     type ChangeGroup = (Vec<(String, serde_json::Value)>, MetadataOp);
-    let work_items: Vec<(String, Vec<ChangeGroup>)> = records
-        .iter()
-        .filter_map(|(identifier, fields)| {
-            if fields.is_empty() {
-                return None;
-            }
+    let mut work_items: Vec<(String, Vec<ChangeGroup>)> = Vec::new();
+    for (identifier, fields) in &records {
+        if fields.is_empty() {
+            continue;
+        }
 
-            // Build change groups from column prefixes.
-            // Group consecutive same-op columns together for efficiency,
-            // but each distinct op gets its own group.
-            let mut groups: Vec<(Vec<(String, serde_json::Value)>, MetadataOp)> = Vec::new();
-            for (col_name, value) in fields {
-                let (op, field) = parse_column_op(col_name);
-                // Try to merge with last group if same op
-                if let Some(last) = groups.last_mut() {
-                    if last.1 == op {
-                        last.0.push((field, json!(value)));
-                        continue;
-                    }
+        // Build change groups from column prefixes.
+        // Group consecutive same-op columns together for efficiency,
+        // but each distinct op gets its own group.
+        let mut groups: Vec<ChangeGroup> = Vec::new();
+        for (col_name, value) in fields {
+            let (op, field) = parse_column_op(col_name)?;
+            // Try to merge with last group if same op
+            if let Some(last) = groups.last_mut() {
+                if last.1 == op {
+                    last.0.push((field, json!(value)));
+                    continue;
                 }
-                groups.push((vec![(field, json!(value))], op));
             }
+            groups.push((vec![(field, json!(value))], op));
+        }
 
-            if groups.is_empty() {
-                None
-            } else {
-                Some((identifier.clone(), groups))
-            }
-        })
-        .collect();
+        if !groups.is_empty() {
+            work_items.push((identifier.clone(), groups));
+        }
+    }
 
     let item_count = work_items.len();
 
@@ -1109,57 +1109,58 @@ mod tests {
 
     #[test]
     fn parse_column_op_default_is_set() {
-        let (op, field) = parse_column_op("title");
+        let (op, field) = parse_column_op("title").unwrap();
         assert_eq!(op, MetadataOp::Set);
         assert_eq!(field, "title");
     }
 
     #[test]
     fn parse_column_op_append_prefix() {
-        let (op, field) = parse_column_op("append:description");
+        let (op, field) = parse_column_op("append:description").unwrap();
         assert_eq!(op, MetadataOp::Append);
         assert_eq!(field, "description");
     }
 
     #[test]
     fn parse_column_op_append_list_prefix() {
-        let (op, field) = parse_column_op("append-list:subject");
+        let (op, field) = parse_column_op("append-list:subject").unwrap();
         assert_eq!(op, MetadataOp::AppendList);
         assert_eq!(field, "subject");
     }
 
     #[test]
     fn parse_column_op_remove_prefix() {
-        let (op, field) = parse_column_op("remove:subject");
+        let (op, field) = parse_column_op("remove:subject").unwrap();
         assert_eq!(op, MetadataOp::Remove);
         assert_eq!(field, "subject");
     }
 
     #[test]
     fn parse_column_op_insert_with_index() {
-        let (op, field) = parse_column_op("insert:subject[2]");
+        let (op, field) = parse_column_op("insert:subject[2]").unwrap();
         assert_eq!(op, MetadataOp::Insert(2));
         assert_eq!(field, "subject");
     }
 
     #[test]
     fn parse_column_op_insert_without_index() {
-        let (op, field) = parse_column_op("insert:subject");
+        let (op, field) = parse_column_op("insert:subject").unwrap();
         assert_eq!(op, MetadataOp::Insert(0));
         assert_eq!(field, "subject");
     }
 
     #[test]
-    fn parse_column_op_empty_field_after_prefix() {
-        let (op, field) = parse_column_op("append:");
-        assert_eq!(op, MetadataOp::Append);
-        assert_eq!(field, "");
+    fn parse_column_op_empty_field_after_prefix_errors() {
+        assert!(parse_column_op("append:").is_err());
+        assert!(parse_column_op("remove:").is_err());
+        assert!(parse_column_op("append-list:").is_err());
+        assert!(parse_column_op("insert:").is_err());
     }
 
     #[test]
     fn parse_column_op_colon_in_field_name() {
         // "some:random:field" doesn't match any known prefix, so it falls through to Set
-        let (op, field) = parse_column_op("some:random:field");
+        let (op, field) = parse_column_op("some:random:field").unwrap();
         assert_eq!(op, MetadataOp::Set);
         assert_eq!(field, "some:random:field");
     }

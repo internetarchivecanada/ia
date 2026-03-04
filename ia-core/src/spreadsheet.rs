@@ -218,14 +218,14 @@ fn write_csv(path: &Path, records: &[SpreadsheetRecord], delimiter: u8) -> Resul
     let mut writer = csv::WriterBuilder::new()
         .delimiter(delimiter)
         .from_path(path)
-        .map_err(|e| IaError::Config(format!("failed to create CSV writer: {e}")))?;
+        .map_err(std::io::Error::other)?;
 
     // Header row: identifier + field names
     let mut header = vec!["identifier".to_string()];
     header.extend(field_names.iter().cloned());
     writer
         .write_record(&header)
-        .map_err(|e| IaError::Config(format!("failed to write CSV header: {e}")))?;
+        .map_err(std::io::Error::other)?;
 
     // Data rows
     for (identifier, fields) in records {
@@ -235,12 +235,10 @@ fn write_csv(path: &Path, records: &[SpreadsheetRecord], delimiter: u8) -> Resul
         }
         writer
             .write_record(&row)
-            .map_err(|e| IaError::Config(format!("failed to write CSV row: {e}")))?;
+            .map_err(std::io::Error::other)?;
     }
 
-    writer
-        .flush()
-        .map_err(|e| IaError::Config(format!("failed to flush CSV writer: {e}")))?;
+    writer.flush()?;
 
     Ok(())
 }
@@ -256,11 +254,11 @@ fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
     // Header row
     worksheet
         .write_string(0, 0, "identifier")
-        .map_err(|e| IaError::Config(format!("failed to write XLSX header: {e}")))?;
+        .map_err(std::io::Error::other)?;
     for (col, name) in field_names.iter().enumerate() {
         worksheet
             .write_string(0, (col + 1) as u16, name)
-            .map_err(|e| IaError::Config(format!("failed to write XLSX header: {e}")))?;
+            .map_err(std::io::Error::other)?;
     }
 
     // Data rows
@@ -268,18 +266,18 @@ fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
         let row = (row_idx + 1) as u32;
         worksheet
             .write_string(row, 0, identifier)
-            .map_err(|e| IaError::Config(format!("failed to write XLSX cell: {e}")))?;
+            .map_err(std::io::Error::other)?;
         for (col_idx, name) in field_names.iter().enumerate() {
             let value = fields.get(name).cloned().unwrap_or_default();
             worksheet
                 .write_string(row, (col_idx + 1) as u16, &value)
-                .map_err(|e| IaError::Config(format!("failed to write XLSX cell: {e}")))?;
+                .map_err(std::io::Error::other)?;
         }
     }
 
     workbook
         .save(path)
-        .map_err(|e| IaError::Config(format!("failed to save XLSX file: {e}")))?;
+        .map_err(std::io::Error::other)?;
 
     Ok(())
 }
@@ -296,8 +294,7 @@ fn write_jsonl_file(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
         for (key, value) in fields {
             obj.insert(key.clone(), serde_json::Value::String(value.clone()));
         }
-        let line = serde_json::to_string(&serde_json::Value::Object(obj))
-            .map_err(|e| IaError::Config(format!("failed to serialize JSONL: {e}")))?;
+        let line = serde_json::to_string(&serde_json::Value::Object(obj))?;
         writeln!(file, "{line}")?;
     }
 

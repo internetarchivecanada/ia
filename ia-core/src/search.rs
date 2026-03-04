@@ -7,6 +7,9 @@ use tracing::{debug, warn};
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
 
+/// Default page size for advanced search queries.
+pub const DEFAULT_ADVANCED_ROWS: usize = 50;
+
 /// A single search result from any backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -27,7 +30,7 @@ pub struct SearchOpts {
     pub sorts: Vec<String>,
     /// Maximum number of results (0 = unlimited).
     pub count: usize,
-    /// Page size for advanced search (0 = use default of 50).
+    /// Page size for advanced search (0 = use [`DEFAULT_ADVANCED_ROWS`]).
     pub rows: usize,
     /// Timeout per request in seconds.
     pub timeout: Option<u64>,
@@ -207,7 +210,7 @@ pub fn advanced<'a>(
     };
     let count = opts.count;
     let query = query.to_string();
-    let rows = if opts.rows > 0 { opts.rows } else { 50 };
+    let rows = if opts.rows > 0 { opts.rows } else { DEFAULT_ADVANCED_ROWS };
     let extra_params = opts.params.clone();
 
     Box::pin(async_stream::try_stream! {

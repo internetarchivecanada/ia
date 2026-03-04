@@ -6,7 +6,7 @@ use color_print::cstr;
 use console::style;
 use futures::StreamExt;
 
-use ia_core::search::{SearchOpts, SearchResult};
+use ia_core::search::{SearchOpts, SearchResult, DEFAULT_ADVANCED_ROWS};
 use ia_core::IaClient;
 
 /// Backend selector for the `--num-found` count query.
@@ -136,8 +136,8 @@ pub struct AdvancedArgs {
     #[arg(short = 'f', long, visible_alias = "fields")]
     pub field: Vec<String>,
 
-    /// Results per page (default: 50)
-    #[arg(short = 'r', long, default_value = "50")]
+    /// Results per page
+    #[arg(short = 'r', long, default_value_t = DEFAULT_ADVANCED_ROWS)]
     pub rows: usize,
 
     #[command(flatten)]
