@@ -17,6 +17,8 @@ pub struct IaConfig {
 #[derive(Debug, Clone)]
 pub struct GeneralConfig {
     pub host: String,
+    /// Override the FTS API host (default: `be-api.us.archive.org`).
+    pub fts_host: Option<String>,
     pub secure: bool,
     pub user_agent_suffix: Option<String>,
     pub screenname: Option<String>,
@@ -33,6 +35,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             host: "archive.org".to_string(),
+            fts_host: None,
             secure: true,
             user_agent_suffix: None,
             screenname: None,
@@ -77,6 +80,7 @@ impl IaConfig {
         if let Some(host) = ini.get("general", "host") {
             config.general.host = host;
         }
+        config.general.fts_host = ini.get("general", "fts_host");
         if let Some(secure) = ini.get("general", "secure") {
             config.general.secure = secure.to_lowercase() == "true";
         }

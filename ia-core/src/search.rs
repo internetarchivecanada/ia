@@ -68,6 +68,36 @@ pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
     Ok(body.total.unwrap_or(0))
 }
 
+/// Count total FTS results matching a query without fetching items.
+///
+/// Uses GET to the FTS endpoint (matching Python `internetarchive` behavior).
+/// Reads `hits.total` from the response.
+pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<u64> {
+    let base_url = client.fts_base_url();
+    let q = if dsl {
+        query.to_string()
+    } else {
+        format!("!L {query}")
+    };
+
+    let resp = client
+        .http()
+        .get(&base_url)
+        .query(&[("q", &q)])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(IaError::Http {
+            status: resp.status().as_u16(),
+            message: resp.text().await.unwrap_or_default(),
+        });
+    }
+
+    let body: FtsResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
+    Ok(body.hits.and_then(|h| h.total).unwrap_or(0))
+}
+
 /// Search using the scrape API (cursor-based pagination).
 /// Returns a stream of search results.
 pub fn scrape<'a>(
@@ -292,8 +322,8 @@ pub fn fts<'a>(
     };
     let extra_params = opts.params.clone();
 
-    // FTS uses a different host
-    let base_url = format!("{}://be-api.us.archive.org/ia-pub-fts-api", client.protocol());
+    // FTS uses a different host — configurable for testability
+    let base_url = client.fts_base_url();
 
     Box::pin(async_stream::try_stream! {
         let mut scroll_id: Option<String> = None;
@@ -416,6 +446,7 @@ mod tests {
             .or_else(|| server_uri.strip_prefix("https://"))
             .unwrap_or(server_uri);
         config.general.host = host.to_string();
+        config.general.fts_host = Some(host.to_string());
         config.general.secure = false;
         config
     }
@@ -597,5 +628,47 @@ mod tests {
                 .await;
 
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_returns_total() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("q", "!L test query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1234,
+                    "hits": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "test query", false).await.unwrap();
+        assert_eq!(count, 1234);
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_dsl_skips_prefix() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("q", "raw dsl query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 42,
+                    "hits": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "raw dsl query", true).await.unwrap();
+        assert_eq!(count, 42);
     }
 }

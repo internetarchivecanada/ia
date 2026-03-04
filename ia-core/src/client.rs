@@ -109,6 +109,20 @@ impl IaClient {
         format!("{}://{}{}", self.protocol(), self.host(), path)
     }
 
+    /// The base URL for the Full-Text Search API.
+    ///
+    /// Uses `fts_host` from config if set, otherwise defaults to
+    /// `be-api.us.archive.org`. This makes FTS testable with wiremock.
+    pub fn fts_base_url(&self) -> String {
+        let host = self
+            .config
+            .general
+            .fts_host
+            .as_deref()
+            .unwrap_or("be-api.us.archive.org");
+        format!("{}://{host}/ia-pub-fts-api", self.protocol())
+    }
+
     /// The User-Agent string being sent with requests.
     pub fn user_agent(&self) -> &str {
         &self.user_agent
