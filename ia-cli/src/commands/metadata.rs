@@ -1194,6 +1194,196 @@ async fn collect_identifiers_from_batch(
     Ok(ids)
 }
 
+// ─── Compound arg splitting ───────────────────────────────────────────────────
+
+/// Valid operation names for compound continuations.
+const VALID_OPS: &[&str] = &["modify", "append", "append-list", "insert", "remove"];
+
+/// Shared options that must appear only in the first segment.
+const SHARED_OPTIONS: &[&str] = &[
+    "--target",
+    "--expect",
+    "--priority",
+    "--reduced-priority",
+    "--dry-run",
+    "--json",
+    "--pretty",
+    "--exists",
+    "--formats",
+    "--itemlist",
+    "--search",
+    "--spreadsheet",
+    "-e",
+    "-F",
+    "-s",
+];
+
+/// Result of splitting compound args: the primary args (for clap) and continuations.
+#[derive(Debug)]
+pub struct CompoundSplit {
+    /// Args for the primary segment (everything before first +), for clap to parse.
+    pub primary_args: Vec<String>,
+    /// Continuation segments: (op_name, change_strings).
+    pub continuations: Vec<(String, Vec<String>)>,
+}
+
+/// Split argv-style args on bare `+` tokens.
+///
+/// Returns `Ok(None)` if no `+` found (single-op mode).
+/// Returns the primary args (for clap) and parsed continuations.
+fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
+    // Check if any bare + exists
+    if !args.iter().any(|a| a == "+") {
+        return Ok(None);
+    }
+
+    // Split into segments
+    let mut segments: Vec<Vec<String>> = vec![vec![]];
+    for arg in args {
+        if arg == "+" {
+            segments.push(vec![]);
+        } else {
+            segments.last_mut().unwrap().push(arg.clone());
+        }
+    }
+
+    // Validate: no empty continuations
+    for (i, seg) in segments.iter().enumerate().skip(1) {
+        if seg.is_empty() {
+            if i == segments.len() - 1 {
+                bail!("expected operation after + (trailing + with no operation)");
+            } else {
+                bail!("expected operation after + (empty continuation segment)");
+            }
+        }
+    }
+
+    let primary_args = segments[0].clone();
+
+    // Parse continuations
+    let mut continuations = Vec::new();
+    for seg in &segments[1..] {
+        let op_name = &seg[0];
+
+        // Validate operation name
+        if !VALID_OPS.contains(&op_name.as_str()) {
+            bail!(
+                "unknown operation {op_name:?} after +. \
+                 Valid operations: {}",
+                VALID_OPS.join(", ")
+            );
+        }
+
+        // Check for shared options that shouldn't be here
+        for arg in &seg[1..] {
+            if SHARED_OPTIONS.contains(&arg.as_str()) {
+                bail!(
+                    "{arg} must appear in the first operation segment (before any +)"
+                );
+            }
+        }
+
+        // Extract -m / --metadata values
+        let mut changes = Vec::new();
+        let mut iter = seg[1..].iter();
+        while let Some(arg) = iter.next() {
+            if arg == "-m" || arg == "--metadata" {
+                let value = iter.next().ok_or_else(|| {
+                    anyhow::anyhow!("{arg} requires a value in {op_name} continuation")
+                })?;
+                changes.push(value.clone());
+            } else if let Some(value) = arg.strip_prefix("-m=") {
+                changes.push(value.to_string());
+            } else if let Some(value) = arg.strip_prefix("--metadata=") {
+                changes.push(value.to_string());
+            } else {
+                bail!(
+                    "unexpected argument {arg:?} in {op_name} continuation \
+                     (only -m/--metadata is allowed after +)"
+                );
+            }
+        }
+
+        continuations.push((op_name.clone(), changes));
+    }
+
+    Ok(Some(CompoundSplit {
+        primary_args,
+        continuations,
+    }))
+}
+
+/// Parse a continuation segment into a ChangeGroup.
+fn parse_continuation_group(
+    op_name: &str,
+    raw_changes: &[String],
+) -> Result<ia_core::metadata::write::ChangeGroup> {
+    if raw_changes.is_empty() {
+        bail!("{op_name} continuation has no -m values");
+    }
+
+    if op_name == "insert" {
+        // Insert: each change may have a different index
+        let mut changes = Vec::new();
+        let mut last_index = 0;
+        for s in raw_changes {
+            let (key, value) =
+                parse_key_value(s).context(format!("invalid key:value format: {s:?}"))?;
+            let (field, index) = parse_indexed_key(&key).unwrap_or((key, 0));
+            last_index = index;
+            changes.push((field, json!(value)));
+        }
+        Ok((changes, MetadataOp::Insert(last_index)))
+    } else {
+        let op = match op_name {
+            "modify" => MetadataOp::Set,
+            "append" => MetadataOp::Append,
+            "append-list" => MetadataOp::AppendList,
+            "remove" => MetadataOp::Remove,
+            _ => bail!("unknown operation: {op_name}"),
+        };
+        let changes: Vec<(String, serde_json::Value)> = raw_changes
+            .iter()
+            .map(|s| {
+                let (key, value) =
+                    parse_key_value(s).context(format!("invalid key:value format: {s:?}"))?;
+                Ok((key, json!(value)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((changes, op))
+    }
+}
+
+/// Pre-scan raw argv for compound metadata operations.
+/// Returns filtered argv (with + segments removed) and parsed continuations.
+#[derive(Debug)]
+pub struct CompoundFromArgv {
+    pub filtered_argv: Vec<String>,
+    pub continuations: Vec<(String, Vec<String>)>,
+}
+
+pub fn extract_compound_from_argv(raw_args: &[String]) -> Result<Option<CompoundFromArgv>> {
+    // Find the "metadata" subcommand position
+    let meta_pos = raw_args.iter().position(|a| a == "metadata");
+    let Some(meta_pos) = meta_pos else {
+        return Ok(None);
+    };
+
+    let args_after_metadata = &raw_args[meta_pos + 1..];
+    let Some(split) = split_compound_args(args_after_metadata)? else {
+        return Ok(None);
+    };
+
+    // Reconstruct filtered argv: everything up to and including "metadata" + primary args
+    let mut filtered = raw_args[..=meta_pos].to_vec();
+    filtered.extend(split.primary_args);
+
+    Ok(Some(CompoundFromArgv {
+        filtered_argv: filtered,
+        continuations: split.continuations,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,5 +1539,155 @@ mod tests {
         assert_eq!(merged.len(), 1);
         // Emits REMOVE_TAG sentinel so MetadataOp::Set removes the field
         assert_eq!(merged[0], ("subject".into(), json!("REMOVE_TAG")));
+    }
+}
+
+#[cfg(test)]
+mod compound_tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn split_no_plus_returns_none() {
+        let a = args("my-item -m title:New");
+        let result = split_compound_args(&a).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn split_single_continuation() {
+        let a = args("modify my-item -m title:New + insert -m collection[0]:featured");
+        let result = split_compound_args(&a).unwrap().unwrap();
+        assert_eq!(result.continuations.len(), 1);
+        assert_eq!(result.continuations[0].0, "insert");
+        assert_eq!(result.continuations[0].1, vec!["collection[0]:featured"]);
+    }
+
+    #[test]
+    fn split_multiple_continuations() {
+        let a = args("modify my-item -m title:New + insert -m x:y + remove -m z:w");
+        let result = split_compound_args(&a).unwrap().unwrap();
+        assert_eq!(result.continuations.len(), 2);
+        assert_eq!(result.continuations[0].0, "insert");
+        assert_eq!(result.continuations[1].0, "remove");
+    }
+
+    #[test]
+    fn split_trailing_plus_errors() {
+        let a = args("modify my-item -m title:New +");
+        let result = split_compound_args(&a);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("expected operation after"), "{msg}");
+    }
+
+    #[test]
+    fn split_empty_continuation_errors() {
+        let a = args("modify my-item -m title:New + + remove -m x:y");
+        let result = split_compound_args(&a);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn split_shared_option_in_continuation_errors() {
+        let a = args("modify my-item -m title:New + insert --dry-run -m x:y");
+        let result = split_compound_args(&a);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--dry-run"), "{msg}");
+        assert!(msg.contains("first operation segment"), "{msg}");
+    }
+
+    #[test]
+    fn split_shared_option_target_in_continuation_errors() {
+        let a = args("modify my-item -m title:New + insert --target files/x -m y:z");
+        let result = split_compound_args(&a);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn split_invalid_op_name_errors() {
+        let a = args("modify my-item -m title:New + download -m x:y");
+        let result = split_compound_args(&a);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown operation"), "{msg}");
+    }
+
+    #[test]
+    fn split_continuation_with_long_metadata_flag() {
+        let a = args("modify my-item -m title:New + append --metadata desc:more");
+        let result = split_compound_args(&a).unwrap().unwrap();
+        assert_eq!(result.continuations[0].1, vec!["desc:more"]);
+    }
+
+    #[test]
+    fn parse_continuation_modify() {
+        let group =
+            parse_continuation_group("modify", &["title:New".to_string()]).unwrap();
+        assert!(matches!(group.1, MetadataOp::Set));
+        assert_eq!(group.0[0].0, "title");
+    }
+
+    #[test]
+    fn parse_continuation_insert_with_index() {
+        let group = parse_continuation_group(
+            "insert",
+            &["collection[0]:featured".to_string()],
+        )
+        .unwrap();
+        assert!(matches!(group.1, MetadataOp::Insert(0)));
+    }
+
+    #[test]
+    fn parse_continuation_remove() {
+        let group =
+            parse_continuation_group("remove", &["subject:old".to_string()]).unwrap();
+        assert!(matches!(group.1, MetadataOp::Remove));
+    }
+
+    #[test]
+    fn parse_continuation_no_changes_errors() {
+        let result = parse_continuation_group("modify", &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_continuation_append_list() {
+        let group = parse_continuation_group(
+            "append-list",
+            &["subject:physics".to_string()],
+        )
+        .unwrap();
+        assert!(matches!(group.1, MetadataOp::AppendList));
+    }
+
+    #[test]
+    fn extract_compound_no_metadata_returns_none() {
+        let a = args("ia download test-item");
+        let result = extract_compound_from_argv(&a).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_compound_metadata_no_plus_returns_none() {
+        let a = args("ia metadata modify test-item -m title:New");
+        let result = extract_compound_from_argv(&a).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_compound_metadata_with_plus() {
+        let a = args("ia metadata modify test-item -m title:New + remove -m x:y");
+        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        assert_eq!(
+            result.filtered_argv,
+            args("ia metadata modify test-item -m title:New")
+        );
+        assert_eq!(result.continuations.len(), 1);
+        assert_eq!(result.continuations[0].0, "remove");
     }
 }
