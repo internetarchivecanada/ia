@@ -436,7 +436,7 @@ fn parse_search_result(value: serde_json::Value) -> Result<SearchResult> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_config(server_uri: &str) -> crate::config::IaConfig {
@@ -670,5 +670,80 @@ mod tests {
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let count = fts_num_found(&client, "raw dsl query", true).await.unwrap();
         assert_eq!(count, 42);
+    }
+
+    #[tokio::test]
+    async fn fts_prepends_literal_prefix() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(body_string_contains("!L test query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1,
+                    "hits": [
+                        {
+                            "_id": "item1|abc123",
+                            "_source": {},
+                            "fields": {"identifier": ["item1"]}
+                        }
+                    ]
+                },
+                "_scroll_id": ""
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results: Vec<Result<SearchResult>> =
+            fts(&client, "test query", &SearchOpts::default())
+                .collect()
+                .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
+    }
+
+    #[tokio::test]
+    async fn fts_dsl_mode_skips_prefix() {
+        let mock_server = MockServer::start().await;
+
+        // Mock that matches the raw query WITHOUT !L prefix.
+        // body_string_contains("raw dsl") matches the query in the JSON body.
+        // We also verify !L is NOT present by using a strict mock: if the
+        // code incorrectly prepends !L, the query field would be "!L raw dsl"
+        // which still contains "raw dsl", so we add an explicit assertion
+        // via a second mock that would catch the !L prefix.
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(body_string_contains("\"query\":\"raw dsl\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1,
+                    "hits": [
+                        {
+                            "_id": "item1|abc123",
+                            "_source": {},
+                            "fields": {"identifier": ["item1"]}
+                        }
+                    ]
+                },
+                "_scroll_id": ""
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            dsl: true,
+            ..Default::default()
+        };
+        let results: Vec<Result<SearchResult>> =
+            fts(&client, "raw dsl", &opts).collect().await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
     }
 }
