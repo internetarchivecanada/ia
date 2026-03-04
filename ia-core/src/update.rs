@@ -83,6 +83,170 @@ pub fn is_at_or_above_minimum(version: &str) -> bool {
     }
 }
 
+/// Parse the GitHub `Link` header to extract the `rel="next"` URL.
+///
+/// GitHub uses RFC 5988 `Link` headers for pagination, e.g.:
+/// `<https://api.github.com/repos/…?page=2>; rel="next", <…>; rel="last"`
+fn parse_next_link(link_header: &str) -> Option<String> {
+    for part in link_header.split(',') {
+        let part = part.trim();
+        if part.contains("rel=\"next\"") {
+            if let Some(url) = part.split(';').next() {
+                let url = url.trim().trim_start_matches('<').trim_end_matches('>');
+                return Some(url.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Fetch all GitHub releases, filtered to [`MIN_INSTALLABLE_VERSION`] and above,
+/// sorted oldest-to-newest by semver.
+///
+/// Each release is converted to a [`ReleaseInfo`] with:
+/// - `installed`: `true` if the version matches `current_version`
+/// - `has_asset`: `true` if a matching binary asset exists for `target`
+///
+/// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
+pub async fn list_releases(
+    api_base: &str,
+    current_version: &str,
+    target: &str,
+) -> crate::Result<Vec<ReleaseInfo>> {
+    let client = reqwest::Client::new();
+    let mut url = format!("{api_base}/repos/jjjake/ia/releases?page=1");
+    let mut all_releases: Vec<GitHubRelease> = Vec::new();
+
+    loop {
+        let response = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("ia/{current_version}"))
+            .send()
+            .await
+            .map_err(|e| IaError::UpdateApiError {
+                status: 0,
+                message: e.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            return Err(IaError::UpdateApiError {
+                status: response.status().as_u16(),
+                message: format!("GitHub API returned {}", response.status()),
+            });
+        }
+
+        // Extract the Link header before consuming the response body.
+        let next_link = response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_next_link);
+
+        let page: Vec<GitHubRelease> =
+            response.json().await.map_err(|e| IaError::UpdateApiError {
+                status: 0,
+                message: format!("failed to parse releases JSON: {e}"),
+            })?;
+
+        if page.is_empty() {
+            break;
+        }
+
+        all_releases.extend(page);
+
+        match next_link {
+            Some(next) => url = next,
+            None => break,
+        }
+    }
+
+    let mut results: Vec<ReleaseInfo> = all_releases
+        .iter()
+        .filter_map(|release| {
+            let version = release
+                .tag_name
+                .strip_prefix('v')
+                .unwrap_or(&release.tag_name)
+                .to_string();
+
+            if !is_at_or_above_minimum(&version) {
+                return None;
+            }
+
+            let has_asset = find_matching_asset(&release.assets, target).is_some();
+            let installed = version == current_version;
+
+            Some(ReleaseInfo {
+                version,
+                installed,
+                has_asset,
+            })
+        })
+        .collect();
+
+    // Sort oldest-to-newest by semver.
+    results.sort_by(|a, b| {
+        let va = parse_version(&a.version).unwrap_or((0, 0, 0));
+        let vb = parse_version(&b.version).unwrap_or((0, 0, 0));
+        va.cmp(&vb)
+    });
+
+    Ok(results)
+}
+
+/// Fetch a single GitHub release by its version tag.
+///
+/// Adds a `v` prefix if not already present (e.g. `"1.2.3"` -> `"v1.2.3"`).
+///
+/// Returns `IaError::UpdateVersionNotFound` on 404, `IaError::UpdateApiError`
+/// on other HTTP errors.
+pub async fn fetch_release_by_tag(
+    version: &str,
+    current_version: &str,
+    api_base: &str,
+) -> crate::Result<GitHubRelease> {
+    let tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    };
+
+    let url = format!("{api_base}/repos/jjjake/ia/releases/tags/{tag}");
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("ia/{current_version}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UpdateApiError {
+            status: 0,
+            message: e.to_string(),
+        })?;
+
+    if response.status().as_u16() == 404 {
+        return Err(IaError::UpdateVersionNotFound {
+            version: version.to_string(),
+        });
+    }
+
+    if !response.status().is_success() {
+        return Err(IaError::UpdateApiError {
+            status: response.status().as_u16(),
+            message: format!("GitHub API returned {}", response.status()),
+        });
+    }
+
+    let release: GitHubRelease =
+        response.json().await.map_err(|e| IaError::UpdateApiError {
+            status: 0,
+            message: format!("failed to parse release JSON: {e}"),
+        })?;
+
+    Ok(release)
+}
+
 /// Check GitHub Releases for a newer version.
 ///
 /// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
@@ -570,6 +734,140 @@ mod tests {
         assert!(is_at_or_above_minimum(MIN_INSTALLABLE_VERSION));
         assert!(!is_at_or_above_minimum("0.1.0"));
         assert!(!is_at_or_above_minimum("0.0.1"));
+    }
+
+    #[test]
+    fn parse_next_link_extracts_next_url() {
+        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=2>; rel="next", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        assert_eq!(
+            parse_next_link(header),
+            Some("https://api.github.com/repos/jjjake/ia/releases?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_without_next() {
+        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=1>; rel="prev", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        assert_eq!(parse_next_link(header), None);
+    }
+
+    #[test]
+    fn parse_next_link_returns_none_for_empty() {
+        assert_eq!(parse_next_link(""), None);
+    }
+
+    #[tokio::test]
+    async fn list_releases_returns_sorted_versions() {
+        let mock_server = wiremock::MockServer::start().await;
+        let page2_url = format!("{}/repos/jjjake/ia/releases?page=2", mock_server.uri());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::query_param("page", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([
+                        {"tag_name": "v99.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/1", "size": 100}]},
+                        {"tag_name": "v98.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/2", "size": 100}]}
+                    ]))
+                    .insert_header("Link", format!("<{page2_url}>; rel=\"next\"")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::query_param("page", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([
+                        {"tag_name": "v97.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/3", "size": 100}]}
+                    ])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let releases = list_releases(&mock_server.uri(), "98.0.0", "test-target").await.unwrap();
+        assert_eq!(releases.len(), 3);
+        assert_eq!(releases[0].version, "97.0.0");
+        assert_eq!(releases[1].version, "98.0.0");
+        assert_eq!(releases[2].version, "99.0.0");
+        assert!(!releases[0].installed);
+        assert!(releases[1].installed);
+        assert!(!releases[2].installed);
+        assert!(releases.iter().all(|r| r.has_asset));
+    }
+
+    #[tokio::test]
+    async fn list_releases_filters_below_minimum() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::query_param("page", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([
+                        {"tag_name": "v0.1.0", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/1", "size": 100}]},
+                        {"tag_name": "v99.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/2", "size": 100}]}
+                    ])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target").await.unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].version, "99.0.0");
+    }
+
+    #[tokio::test]
+    async fn list_releases_detects_missing_asset() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::query_param("page", "1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([
+                        {"tag_name": "v99.0.0", "assets": [{"name": "ia-other-target", "browser_download_url": "https://example.com/1", "size": 100}]}
+                    ])),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target").await.unwrap();
+        assert_eq!(releases.len(), 1);
+        assert!(!releases[0].has_asset);
+    }
+
+    #[tokio::test]
+    async fn fetch_release_by_tag_success() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v1.2.3"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"tag_name": "v1.2.3", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/ia-test", "size": 100}]}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let release = fetch_release_by_tag("1.2.3", "0.5.0", &mock_server.uri()).await.unwrap();
+        assert_eq!(release.tag_name, "v1.2.3");
+        assert_eq!(release.assets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_release_by_tag_not_found() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.99.99"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_json(
+                serde_json::json!({"message": "Not Found"}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let result = fetch_release_by_tag("99.99.99", "0.5.0", &mock_server.uri()).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), crate::error::IaError::UpdateVersionNotFound { .. }));
     }
 
     #[tokio::test]
