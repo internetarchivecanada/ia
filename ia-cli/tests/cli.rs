@@ -607,7 +607,8 @@ fn metadata_bare_read_still_requires_identifier() {
     // Bare `ia metadata` with no args or subcommand should error
     ia().args(["metadata"])
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains("identifier"));
 }
 
 #[test]

@@ -1064,3 +1064,66 @@ async fn collect_identifiers_from_batch(
 
     Ok(ids)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ia_core::metadata::write::MetadataOp;
+
+    #[test]
+    fn parse_column_op_default_is_set() {
+        let (op, field) = parse_column_op("title");
+        assert_eq!(op, MetadataOp::Set);
+        assert_eq!(field, "title");
+    }
+
+    #[test]
+    fn parse_column_op_append_prefix() {
+        let (op, field) = parse_column_op("append:description");
+        assert_eq!(op, MetadataOp::Append);
+        assert_eq!(field, "description");
+    }
+
+    #[test]
+    fn parse_column_op_append_list_prefix() {
+        let (op, field) = parse_column_op("append-list:subject");
+        assert_eq!(op, MetadataOp::AppendList);
+        assert_eq!(field, "subject");
+    }
+
+    #[test]
+    fn parse_column_op_remove_prefix() {
+        let (op, field) = parse_column_op("remove:subject");
+        assert_eq!(op, MetadataOp::Remove);
+        assert_eq!(field, "subject");
+    }
+
+    #[test]
+    fn parse_column_op_insert_with_index() {
+        let (op, field) = parse_column_op("insert:subject[2]");
+        assert_eq!(op, MetadataOp::Insert(2));
+        assert_eq!(field, "subject");
+    }
+
+    #[test]
+    fn parse_column_op_insert_without_index() {
+        let (op, field) = parse_column_op("insert:subject");
+        assert_eq!(op, MetadataOp::Insert(0));
+        assert_eq!(field, "subject");
+    }
+
+    #[test]
+    fn parse_column_op_empty_field_after_prefix() {
+        let (op, field) = parse_column_op("append:");
+        assert_eq!(op, MetadataOp::Append);
+        assert_eq!(field, "");
+    }
+
+    #[test]
+    fn parse_column_op_colon_in_field_name() {
+        // "some:random:field" doesn't match any known prefix, so it falls through to Set
+        let (op, field) = parse_column_op("some:random:field");
+        assert_eq!(op, MetadataOp::Set);
+        assert_eq!(field, "some:random:field");
+    }
+}
