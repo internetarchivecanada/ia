@@ -700,6 +700,24 @@ fn metadata_import_with_column_prefixes() {
 }
 
 #[test]
+fn metadata_import_indexed_columns_accepted() {
+    // CSV with subject[0], subject[1] columns should be parsed correctly
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(
+        &csv_path,
+        "identifier,subject[0],subject[1],title\ntest-item,science,nasa,Apollo 11\n",
+    )
+    .unwrap();
+
+    ia().args(["metadata", "import", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        // Should fail with auth error, not parse error — indexed columns are valid
+        .stderr(predicate::str::contains("parse").not());
+}
+
+#[test]
 fn search_advanced_help_has_rows() {
     ia().args(["search", "advanced", "--help"])
         .assert()

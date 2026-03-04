@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ModifyRequest,
-    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS,
+    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
@@ -77,11 +77,16 @@ pub enum MetadataCommand {
     /// Bulk export metadata to stdout or file
     #[command(
         long_about = "Export metadata for multiple items. Outputs JSONL to stdout by default, \
-            or writes to a file in CSV, TSV, XLSX, or JSONL format (inferred from extension).",
+            or writes to a file in CSV, TSV, XLSX, or JSONL format (inferred from extension).\n\n\
+            In file mode, multi-value fields are expanded into indexed columns: \
+            subject[0], subject[1], etc. Single-element arrays use a bare column name. \
+            These columns round-trip correctly with 'ia metadata import'.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Export search results as JSONL</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-             \n\n  <dim># Export to CSV file</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.csv</bold>\n"
+             \n\n  <dim># Export to CSV file</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.csv</bold>\
+             \n\n  <dim># Export to XLSX for editing, then re-import</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.xlsx</bold>\
+             \n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\n"
         ),
     )]
     Export(ExportArgs),
@@ -149,13 +154,25 @@ pub enum MetadataCommand {
     /// Bulk write metadata from a spreadsheet or data file
     #[command(
         long_about = "Import metadata changes from a CSV, TSV, XLSX, ODS, or JSONL file. \
-            The file must have an 'identifier' column. By default, all columns are treated as \
-            modify operations. Use column prefixes for other operations: append:field, \
-            append-list:field, insert:field[N], remove:field.",
+            The file must have an 'identifier' column. All other columns are metadata fields.\n\n\
+            By default, columns are treated as modify (set/replace) operations. \
+            Use column prefixes for other operations:\n\
+            \x20 append:field       — append text to string field\n\
+            \x20 append-list:field  — append value to list field\n\
+            \x20 insert:field[N]    — insert at index N in list\n\
+            \x20 remove:field       — remove value from field\n\n\
+            Multi-value fields use indexed columns: subject[0], subject[1], etc. \
+            These are merged into an array and set as a whole (not per-index). \
+            A single indexed column (e.g. only subject[0]) is treated as a bare field. \
+            Use REMOVE_TAG as a value to delete entries or entire fields.\n\n\
+            Empty cells are skipped — they do not modify the field.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Import from CSV</dim>\n  <bold>$ ia metadata import data.csv</bold>\
-             \n\n  <dim># Preview changes</dim>\n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\n"
+             \n\n  <dim># Preview changes</dim>\n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\
+             \n\n  <dim># CSV with mixed operations</dim>\n  <bold>$ cat data.csv</bold>\
+             \n  <dim>identifier,title,append-list:subject,remove:subject</dim>\
+             \n  <dim>myitem,New Title,astronomy,old_tag</dim>\n"
         ),
     )]
     Import(ImportArgs),
@@ -760,6 +777,61 @@ fn parse_column_op(column_name: &str) -> Result<(MetadataOp, String)> {
     Ok((op, field))
 }
 
+/// Merge indexed bare columns (e.g. `subject[0]`, `subject[1]`) into single
+/// array-valued entries. Matches the Python `ia` CSV convention where
+/// multi-value fields use indexed columns that combine into an array on import.
+///
+/// Non-indexed columns and prefixed columns (e.g. `append:subject`) pass
+/// through unchanged. Merged entries appear at the position of their first
+/// indexed column.
+fn merge_indexed_columns(
+    fields: &HashMap<String, String>,
+) -> Vec<(String, serde_json::Value)> {
+    let mut resolved: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut indexed: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+
+    for (col_name, value) in fields {
+        // Only bare columns (no op-prefix) can be indexed
+        if !col_name.contains(':') {
+            if let Some((base_field, idx)) = parse_indexed_key(col_name) {
+                indexed
+                    .entry(base_field)
+                    .or_default()
+                    .push((idx, value.clone()));
+                continue;
+            }
+        }
+        resolved.push((col_name.clone(), json!(value)));
+    }
+
+    // Append merged indexed fields as array values.
+    // - Single index (e.g. only subject[0]) → bare scalar (same as unindexed)
+    // - REMOVE_TAG entries are filtered out; if all are REMOVE_TAG, remove field
+    for (base_field, mut entries) in indexed {
+        entries.sort_by_key(|(idx, _)| *idx);
+        let values: Vec<serde_json::Value> = entries
+            .into_iter()
+            .filter(|(_, v)| v != REMOVE_TAG)
+            .map(|(_, v)| json!(v))
+            .collect();
+        match values.len() {
+            0 => {
+                // All entries were REMOVE_TAG → delete the field
+                resolved.push((base_field, json!(REMOVE_TAG)));
+            }
+            1 => {
+                // Single value → bare scalar (matches export of single-element arrays)
+                resolved.push((base_field, values.into_iter().next().unwrap()));
+            }
+            _ => {
+                resolved.push((base_field, serde_json::Value::Array(values)));
+            }
+        }
+    }
+
+    resolved
+}
+
 async fn run_import(
     client: &IaClient,
     args: ImportArgs,
@@ -791,20 +863,22 @@ async fn run_import(
             continue;
         }
 
+        let resolved = merge_indexed_columns(fields);
+
         // Build change groups from column prefixes.
         // Group consecutive same-op columns together for efficiency,
         // but each distinct op gets its own group.
         let mut groups: Vec<ChangeGroup> = Vec::new();
-        for (col_name, value) in fields {
+        for (col_name, value) in &resolved {
             let (op, field) = parse_column_op(col_name)?;
             // Try to merge with last group if same op
             if let Some(last) = groups.last_mut() {
                 if last.1 == op {
-                    last.0.push((field, json!(value)));
+                    last.0.push((field, value.clone()));
                     continue;
                 }
             }
-            groups.push((vec![(field, json!(value))], op));
+            groups.push((vec![(field, value.clone())], op));
         }
 
         if !groups.is_empty() {
@@ -1181,5 +1255,99 @@ mod tests {
         let (op, field) = parse_column_op("some:random:field").unwrap();
         assert_eq!(op, MetadataOp::Set);
         assert_eq!(field, "some:random:field");
+    }
+
+    #[test]
+    fn merge_indexed_columns_combines_into_array() {
+        let fields: HashMap<String, String> = [
+            ("title".into(), "Apollo 11".into()),
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "nasa".into()),
+            ("description".into(), "Moon landing".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        // 3 entries: title, description, and subject (merged)
+        assert_eq!(merged.len(), 3);
+        // Find each by field name since HashMap order is non-deterministic
+        let subject = merged.iter().find(|(k, _)| k == "subject").unwrap();
+        assert_eq!(subject.1, json!(["science", "nasa"]));
+        let title = merged.iter().find(|(k, _)| k == "title").unwrap();
+        assert_eq!(title.1, json!("Apollo 11"));
+        let desc = merged.iter().find(|(k, _)| k == "description").unwrap();
+        assert_eq!(desc.1, json!("Moon landing"));
+    }
+
+    #[test]
+    fn merge_indexed_columns_sorts_by_index() {
+        let fields: HashMap<String, String> = [
+            ("subject[2]".into(), "history".into()),
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "nasa".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0],
+            ("subject".into(), json!(["science", "nasa", "history"]))
+        );
+    }
+
+    #[test]
+    fn merge_indexed_columns_preserves_prefixed_columns() {
+        let fields: HashMap<String, String> = [
+            ("append:subject".into(), "new-tag".into()),
+            ("title".into(), "Test".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|(k, v)| k == "append:subject" && v == &json!("new-tag")));
+        assert!(merged.iter().any(|(k, v)| k == "title" && v == &json!("Test")));
+    }
+
+    #[test]
+    fn merge_indexed_columns_single_index_becomes_scalar() {
+        // Single indexed column treated as bare field (matches export behavior)
+        let fields: HashMap<String, String> =
+            [("subject[0]".into(), "science".into())].into_iter().collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0], ("subject".into(), json!("science")));
+    }
+
+    #[test]
+    fn merge_indexed_columns_remove_tag_filters_entries() {
+        let fields: HashMap<String, String> = [
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "REMOVE_TAG".into()),
+            ("subject[2]".into(), "nasa".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0],
+            ("subject".into(), json!(["science", "nasa"]))
+        );
+    }
+
+    #[test]
+    fn merge_indexed_columns_all_remove_tag_deletes_field() {
+        let fields: HashMap<String, String> = [
+            ("subject[0]".into(), "REMOVE_TAG".into()),
+            ("subject[1]".into(), "REMOVE_TAG".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        // Emits REMOVE_TAG sentinel so MetadataOp::Set removes the field
+        assert_eq!(merged[0], ("subject".into(), json!("REMOVE_TAG")));
     }
 }
