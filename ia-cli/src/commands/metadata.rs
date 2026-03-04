@@ -520,6 +520,7 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
 
 // ─── Write ───────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_write(
     client: &IaClient,
     input: BatchInput,

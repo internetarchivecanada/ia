@@ -1841,3 +1841,104 @@ async fn modify_compound_backwards_compat_with_modify() {
     let resp = modify(&client, &req).await.unwrap();
     assert!(resp.success);
 }
+
+#[tokio::test]
+async fn modify_compound_three_groups_single_post() {
+    let mock_server = MockServer::start().await;
+    let item = json!({
+        "metadata": {
+            "identifier": "test-item",
+            "title": "Old",
+            "subject": ["math"],
+            "collection": ["opensource"]
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org"
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&item))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(11111)))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let req = CompoundModifyRequest {
+        identifier: "test-item".to_string(),
+        groups: vec![
+            (
+                vec![("title".to_string(), json!("New"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("subject".to_string(), json!("physics"))],
+                MetadataOp::AppendList,
+            ),
+            (
+                vec![("collection".to_string(), json!("featured"))],
+                MetadataOp::Insert(0),
+            ),
+        ],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let resp = modify_compound(&client, &req).await.unwrap();
+    assert!(resp.success);
+    assert_eq!(resp.task_id, Some(11111));
+}
+
+#[tokio::test]
+async fn modify_compound_overlapping_fields_last_wins() {
+    let mock_server = MockServer::start().await;
+    let item = json!({
+        "metadata": {
+            "identifier": "test-item",
+            "title": "Original"
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org"
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&item))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(22222)))
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let req = CompoundModifyRequest {
+        identifier: "test-item".to_string(),
+        groups: vec![
+            (
+                vec![("title".to_string(), json!("First"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("title".to_string(), json!("Second"))],
+                MetadataOp::Set,
+            ),
+        ],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let resp = modify_compound(&client, &req).await.unwrap();
+    assert!(resp.success);
+}

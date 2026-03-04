@@ -724,3 +724,63 @@ fn search_advanced_help_has_rows() {
         .success()
         .stdout(predicate::str::contains("--rows"));
 }
+
+// =============================================================================
+// Compound metadata operations
+// =============================================================================
+
+#[test]
+fn metadata_compound_trailing_plus_error() {
+    ia().args(["metadata", "modify", "test-item", "-m", "title:New", "+"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expected operation after +"));
+}
+
+#[test]
+fn metadata_compound_unknown_op_error() {
+    ia().args([
+        "metadata", "modify", "test-item", "-m", "title:New", "+", "download", "-m", "x:y",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("unknown operation"));
+}
+
+#[test]
+fn metadata_compound_shared_option_in_continuation_error() {
+    ia().args([
+        "metadata", "modify", "test-item", "-m", "title:New", "+", "remove", "--dry-run",
+        "-m", "x:y",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("first operation segment"));
+}
+
+#[test]
+fn metadata_compound_empty_continuation_error() {
+    ia().args([
+        "metadata", "modify", "test-item", "-m", "title:New", "+", "+", "remove", "-m",
+        "x:y",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("expected operation after +"));
+}
+
+#[test]
+fn metadata_help_mentions_compound_ops() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compound operations (single request)"));
+}
+
+#[test]
+fn metadata_modify_help_mentions_compound_ops() {
+    ia().args(["metadata", "modify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Chain multiple operations with +"));
+}
