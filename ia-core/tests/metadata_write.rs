@@ -4,7 +4,8 @@
 //! All metadata fixtures are FAKE — no real archive.org items.
 
 use ia_core::metadata::write::{
-    compute_patch, modify, prepare_metadata, MetadataOp, ModifyRequest, REMOVE_TAG,
+    compute_patch, modify, modify_compound, prepare_metadata, CompoundModifyRequest, MetadataOp,
+    ModifyRequest, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::{IaClient, IaConfig, IaError};
@@ -1708,4 +1709,135 @@ async fn batch_modify_mixed_success_and_error() {
 
     assert_eq!(successes, 1);
     assert_eq!(errors, 1);
+}
+
+// =============================================================================
+// Compound modify tests
+// =============================================================================
+
+fn standard_item_fixture() -> Value {
+    json!({
+        "metadata": {
+            "identifier": "test-item",
+            "title": "Old Title",
+            "mediatype": "texts",
+            "subject": ["math", "science"],
+            "collection": ["opensource"],
+            "description": "A test item"
+        },
+        "files": [
+            {"name": "test.pdf", "size": "1000", "source": "original", "md5": "abc123"}
+        ],
+        "server": "ia000000.us.archive.org"
+    })
+}
+
+#[tokio::test]
+async fn modify_compound_set_and_remove_single_post() {
+    let mock_server = MockServer::start().await;
+    let item = standard_item_fixture();
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&item))
+        .expect(1) // exactly 1 GET
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test-item"))
+        .and(body_string_contains("-target=metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(99999)))
+        .expect(1) // exactly 1 POST
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let req = CompoundModifyRequest {
+        identifier: "test-item".to_string(),
+        groups: vec![
+            (
+                vec![("title".to_string(), json!("New Title"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("subject".to_string(), json!("science"))],
+                MetadataOp::Remove,
+            ),
+        ],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let resp = modify_compound(&client, &req).await.unwrap();
+    assert!(resp.success);
+    assert_eq!(resp.task_id, Some(99999));
+}
+
+#[tokio::test]
+async fn modify_compound_no_net_changes_errors() {
+    let mock_server = MockServer::start().await;
+    let item = standard_item_fixture();
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&item))
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let req = CompoundModifyRequest {
+        identifier: "test-item".to_string(),
+        groups: vec![(
+            vec![("title".to_string(), json!("Old Title"))],
+            MetadataOp::Set,
+        )],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let result = modify_compound(&client, &req).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn modify_compound_auth_required() {
+    let config = IaConfig::default(); // no credentials
+    let client = IaClient::from_config(config).unwrap();
+    let req = CompoundModifyRequest {
+        identifier: "test-item".to_string(),
+        groups: vec![(
+            vec![("title".to_string(), json!("New"))],
+            MetadataOp::Set,
+        )],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let result = modify_compound(&client, &req).await;
+    assert!(matches!(result.unwrap_err(), IaError::Auth(_)));
+}
+
+#[tokio::test]
+async fn modify_compound_backwards_compat_with_modify() {
+    // Verify modify() still works (it delegates to modify_compound internally)
+    let mock_server = MockServer::start().await;
+    let item = standard_item_fixture();
+    mount_modify_mocks(&mock_server, "test-item", item, 12345).await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let req = ModifyRequest {
+        identifier: "test-item".to_string(),
+        changes: vec![("title".to_string(), json!("New Title"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    let resp = modify(&client, &req).await.unwrap();
+    assert!(resp.success);
 }

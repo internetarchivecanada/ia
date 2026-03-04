@@ -303,18 +303,35 @@ pub struct ModifyRequest {
     pub reduced_priority: bool,
 }
 
-/// Modify metadata on an Internet Archive item.
+/// Request parameters for compound metadata modification.
+#[derive(Debug, Clone)]
+pub struct CompoundModifyRequest {
+    /// Item identifier on archive.org
+    pub identifier: String,
+    /// List of operation groups to apply sequentially
+    pub groups: Vec<ChangeGroup>,
+    /// Target: "metadata" (default) or "files/filename"
+    pub target: String,
+    /// Optimistic concurrency checks: field -> expected value
+    pub expect: Option<HashMap<String, serde_json::Value>>,
+    /// Task priority (default 0 for single, -5 for batch)
+    pub priority: Option<i32>,
+    /// Whether to send X-Accept-Reduced-Priority header
+    pub reduced_priority: bool,
+}
+
+/// Modify metadata using multiple chained operation groups in a single HTTP round-trip.
 ///
 /// 1. Validates auth credentials
 /// 2. Fetches current metadata via GET /metadata/{identifier}
 /// 3. Extracts the target metadata (item-level or file-level)
-/// 4. Applies changes and computes RFC 6902 JSON Patch
-/// 5. POSTs the patch to /metadata/{identifier}
+/// 4. Chains all groups via `compute_compound_patch()` to produce one JSON Patch
+/// 5. POSTs the single combined patch to /metadata/{identifier}
 ///
 /// Returns `ModifyResponse` with task_id on success.
-pub async fn modify(
+pub async fn modify_compound(
     client: &IaClient,
-    req: &ModifyRequest,
+    req: &CompoundModifyRequest,
 ) -> Result<ModifyResponse> {
     let identifier = &req.identifier;
 
@@ -345,8 +362,9 @@ pub async fn modify(
     // 3. Extract source metadata based on target
     let source = extract_target_metadata(&item, &req.target, identifier)?;
 
-    // 4. Compute patch
-    let patch_ops = compute_patch(&source, &req.changes, &req.op, req.expect.as_ref(), identifier)?;
+    // 4. Compute compound patch
+    let patch_ops =
+        compute_compound_patch(&source, &req.groups, req.expect.as_ref(), identifier)?;
     if patch_ops.is_empty() {
         return Err(IaError::MetadataWrite {
             identifier: identifier.to_string(),
@@ -406,6 +424,26 @@ pub async fn modify(
     }
 
     Ok(resp)
+}
+
+/// Modify metadata on an Internet Archive item.
+///
+/// This is a convenience wrapper around `modify_compound` for single-operation use.
+///
+/// Returns `ModifyResponse` with task_id on success.
+pub async fn modify(
+    client: &IaClient,
+    req: &ModifyRequest,
+) -> Result<ModifyResponse> {
+    let compound_req = CompoundModifyRequest {
+        identifier: req.identifier.clone(),
+        groups: vec![(req.changes.clone(), req.op.clone())],
+        target: req.target.clone(),
+        expect: req.expect.clone(),
+        priority: req.priority,
+        reduced_priority: req.reduced_priority,
+    };
+    modify_compound(client, &compound_req).await
 }
 
 /// Extract the metadata for the specified target from the full item metadata.
