@@ -420,7 +420,11 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
             };
             println!("{output}");
         } else {
-            // File mode: collect flattened records
+            // File mode: flatten metadata into tabular columns.
+            // Multi-value fields expand into indexed columns:
+            //   subject: ["science", "nasa"] → subject[0]="science", subject[1]="nasa"
+            // Single-value fields use the bare field name:
+            //   title: "Apollo 11" → title="Apollo 11"
             let metadata_json = serde_json::to_value(&item.metadata)?;
             let mut fields = HashMap::new();
             if let serde_json::Value::Object(map) = metadata_json {
@@ -428,17 +432,40 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
                     if key == "identifier" {
                         continue;
                     }
-                    // Serialize values to strings for tabular formats.
-                    // Strings pass through as-is; arrays and objects are
-                    // JSON-encoded so they round-trip losslessly on import.
-                    let s = match &value {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Null => continue,
-                        other => serde_json::to_string(other)
-                            .unwrap_or_else(|_| other.to_string()),
-                    };
-                    if !s.is_empty() {
-                        fields.insert(key, s);
+                    match &value {
+                        serde_json::Value::String(s) => {
+                            if !s.is_empty() {
+                                fields.insert(key, s.clone());
+                            }
+                        }
+                        serde_json::Value::Array(arr) if arr.len() == 1 => {
+                            // Single-element array: use bare field name
+                            let s = match &arr[0] {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            if !s.is_empty() {
+                                fields.insert(key, s);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for (i, elem) in arr.iter().enumerate() {
+                                let s = match elem {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                if !s.is_empty() {
+                                    fields.insert(format!("{key}[{i}]"), s);
+                                }
+                            }
+                        }
+                        serde_json::Value::Null => {}
+                        other => {
+                            let s = other.to_string();
+                            if !s.is_empty() {
+                                fields.insert(key, s);
+                            }
+                        }
                     }
                 }
             }
