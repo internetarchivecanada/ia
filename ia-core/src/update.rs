@@ -1,7 +1,31 @@
 use crate::error::IaError;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
+
+/// Build a configured HTTP client for GitHub API requests.
+///
+/// Includes retry middleware (3 retries with exponential backoff) so
+/// transient GitHub 5xx errors are handled automatically.
+fn github_client(current_version: &str) -> ClientWithMiddleware {
+    let raw = reqwest::Client::builder()
+        .user_agent(format!("ia/{current_version}"))
+        .build()
+        .expect("failed to build HTTP client");
+
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        )
+        .build_with_max_retries(3);
+
+    ClientBuilder::new(raw)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build()
+}
 
 /// A GitHub release from the releases API.
 #[derive(Debug, Deserialize)]
@@ -113,7 +137,7 @@ pub async fn list_releases(
     current_version: &str,
     target: &str,
 ) -> crate::Result<Vec<ReleaseInfo>> {
-    let client = reqwest::Client::new();
+    let client = github_client(current_version);
     let mut url = format!("{api_base}/repos/jjjake/ia/releases?page=1");
     let mut all_releases: Vec<GitHubRelease> = Vec::new();
 
@@ -121,7 +145,6 @@ pub async fn list_releases(
         let response = client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", format!("ia/{current_version}"))
             .send()
             .await
             .map_err(|e| IaError::UpdateApiError {
@@ -213,11 +236,10 @@ pub async fn fetch_release_by_tag(
     };
 
     let url = format!("{api_base}/repos/jjjake/ia/releases/tags/{tag}");
-    let client = reqwest::Client::new();
+    let client = github_client(current_version);
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("ia/{current_version}"))
         .send()
         .await
         .map_err(|e| IaError::UpdateApiError {
@@ -252,11 +274,10 @@ pub async fn fetch_release_by_tag(
 /// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
 pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::Result<UpdateCheck> {
     let url = format!("{api_base}/repos/jjjake/ia/releases/latest");
-    let client = reqwest::Client::new();
+    let client = github_client(current_version);
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("ia/{current_version}"))
         .send()
         .await
         .map_err(|e| IaError::UpdateApiError {
@@ -294,10 +315,9 @@ pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::R
 
 /// Download a release asset to a local file path.
 pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> crate::Result<()> {
-    let client = reqwest::Client::new();
+    let client = github_client(current_version);
     let response = client
         .get(url)
-        .header("User-Agent", format!("ia/{current_version}"))
         .send()
         .await
         .map_err(|e| IaError::UpdateApiError {
@@ -358,6 +378,71 @@ pub fn replace_binary(source: &Path, target: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Result of a successful update.
+#[derive(Debug)]
+pub struct UpdateResult {
+    pub current_version: String,
+    pub new_version: String,
+}
+
+/// Download a release asset, atomically replace the binary, and optionally
+/// verify the new binary by running `--version`.
+///
+/// This is the shared implementation for both `install_version` and `perform_update`.
+async fn download_and_replace(
+    asset: &GitHubAsset,
+    current_exe: &Path,
+    current_version: &str,
+    expected_version: &str,
+    skip_verify: bool,
+) -> crate::Result<()> {
+    let temp_path = current_exe.with_extension("update-tmp");
+    let _ = std::fs::remove_file(&temp_path);
+
+    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = replace_binary(&temp_path, current_exe) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    if !skip_verify {
+        let output = std::process::Command::new(current_exe)
+            .arg("--version")
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let version_output = String::from_utf8_lossy(&out.stdout);
+                if !version_output.contains(expected_version) {
+                    return Err(IaError::UpdateVerifyFailed {
+                        expected: expected_version.to_string(),
+                        actual: version_output.trim().to_string(),
+                    });
+                }
+            }
+            Ok(out) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: expected_version.to_string(),
+                    actual: format!("exit code {}", out.status),
+                });
+            }
+            Err(e) => {
+                return Err(IaError::UpdateVerifyFailed {
+                    expected: expected_version.to_string(),
+                    actual: format!("failed to run: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Install a specific version by tag.
 ///
 /// Downloads and replaces the current binary with the specified version.
@@ -368,15 +453,14 @@ pub fn replace_binary(source: &Path, target: &Path) -> crate::Result<()> {
 /// If `skip_verify` is false, runs `current_exe --version` after replacing to verify the install.
 pub async fn install_version(
     version: &str,
+    current_version: &str,
     target: &str,
     current_exe: &Path,
     api_base: &str,
     skip_verify: bool,
 ) -> crate::Result<UpdateResult> {
-    // Strip `v` prefix if present for the version string we use internally.
     let clean_version = version.strip_prefix('v').unwrap_or(version);
 
-    // Check minimum version floor.
     if !is_at_or_above_minimum(clean_version) {
         return Err(IaError::UpdateBelowMinimum {
             version: clean_version.to_string(),
@@ -384,75 +468,19 @@ pub async fn install_version(
         });
     }
 
-    let current_version = crate::version();
-
-    // Fetch the release from GitHub.
     let release = fetch_release_by_tag(clean_version, current_version, api_base).await?;
 
-    // Find the matching asset for this platform.
     let asset =
         find_matching_asset(&release.assets, target).ok_or_else(|| IaError::UpdateNoAsset {
             target: target.to_string(),
         })?;
 
-    // Download to a temp file in the same directory (for atomic rename).
-    let temp_path = current_exe.with_extension("update-tmp");
-    let _ = std::fs::remove_file(&temp_path);
-
-    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
-    {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    // Atomically swap the binary.
-    if let Err(e) = replace_binary(&temp_path, current_exe) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    // Verify the new binary works.
-    if !skip_verify {
-        let output = std::process::Command::new(current_exe)
-            .arg("--version")
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let version_output = String::from_utf8_lossy(&out.stdout);
-                if !version_output.contains(clean_version) {
-                    return Err(IaError::UpdateVerifyFailed {
-                        expected: clean_version.to_string(),
-                        actual: version_output.trim().to_string(),
-                    });
-                }
-            }
-            Ok(out) => {
-                return Err(IaError::UpdateVerifyFailed {
-                    expected: clean_version.to_string(),
-                    actual: format!("exit code {}", out.status),
-                });
-            }
-            Err(e) => {
-                return Err(IaError::UpdateVerifyFailed {
-                    expected: clean_version.to_string(),
-                    actual: format!("failed to run: {e}"),
-                });
-            }
-        }
-    }
+    download_and_replace(asset, current_exe, current_version, clean_version, skip_verify).await?;
 
     Ok(UpdateResult {
         current_version: current_version.to_string(),
         new_version: clean_version.to_string(),
     })
-}
-
-/// Result of a successful update.
-#[derive(Debug)]
-pub struct UpdateResult {
-    pub current_version: String,
-    pub new_version: String,
 }
 
 /// Perform the full update: check -> download -> replace.
@@ -482,51 +510,8 @@ pub async fn perform_update(
         }
     })?;
 
-    // Download to a temp file in the same directory (for atomic rename)
-    let temp_path = current_exe.with_extension("update-tmp");
-    let _ = std::fs::remove_file(&temp_path);
-
-    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
-    {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    if let Err(e) = replace_binary(&temp_path, current_exe) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    // Verify the new binary works
-    if !skip_verify {
-        let output = std::process::Command::new(current_exe)
-            .arg("--version")
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let version_output = String::from_utf8_lossy(&out.stdout);
-                if !version_output.contains(&check.latest_version) {
-                    return Err(IaError::UpdateVerifyFailed {
-                        expected: check.latest_version,
-                        actual: version_output.trim().to_string(),
-                    });
-                }
-            }
-            Ok(out) => {
-                return Err(IaError::UpdateVerifyFailed {
-                    expected: check.latest_version,
-                    actual: format!("exit code {}", out.status),
-                });
-            }
-            Err(e) => {
-                return Err(IaError::UpdateVerifyFailed {
-                    expected: check.latest_version,
-                    actual: format!("failed to run: {e}"),
-                });
-            }
-        }
-    }
+    download_and_replace(asset, current_exe, current_version, &check.latest_version, skip_verify)
+        .await?;
 
     Ok(UpdateResult {
         current_version: check.current_version,
@@ -1001,6 +986,7 @@ mod tests {
     async fn install_version_below_minimum_returns_error() {
         let result = install_version(
             "0.1.0",
+            "0.5.0",
             "test-target",
             Path::new("/tmp/fake"),
             "https://unused.example.com",
@@ -1043,6 +1029,7 @@ mod tests {
 
         let result = install_version(
             "99.0.0",
+            "0.5.0",
             "test-target",
             &exe_path,
             &mock_server.uri(),
@@ -1051,6 +1038,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.new_version, "99.0.0");
+        assert_eq!(result.current_version, "0.5.0");
         assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
     }
 
@@ -1073,6 +1061,7 @@ mod tests {
 
         let result = install_version(
             "99.0.0",
+            "0.5.0",
             "test-target",
             &exe_path,
             &mock_server.uri(),
@@ -1105,6 +1094,7 @@ mod tests {
 
         let result = install_version(
             "99.99.99",
+            "0.5.0",
             "test-target",
             &exe_path,
             &mock_server.uri(),

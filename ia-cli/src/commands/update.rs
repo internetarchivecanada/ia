@@ -83,9 +83,12 @@ pub struct InstallArgs {
 }
 
 pub async fn run(args: UpdateArgs) -> Result<()> {
+    let parent_json = args.json;
     match args.subcommand {
-        Some(UpdateSubcommand::List(list_args)) => run_list(list_args).await,
-        Some(UpdateSubcommand::Install(install_args)) => run_install(install_args).await,
+        Some(UpdateSubcommand::List(list_args)) => run_list(list_args, parent_json).await,
+        Some(UpdateSubcommand::Install(install_args)) => {
+            run_install(install_args, parent_json).await
+        }
         None => run_default(args).await,
     }
 }
@@ -214,7 +217,8 @@ async fn run_check(current_version: &str, args: &UpdateArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_list(args: ListArgs) -> Result<()> {
+async fn run_list(args: ListArgs, parent_json: bool) -> Result<()> {
+    let json = args.json || parent_json;
     let current_version = ia_core::version();
     let target = env!("IA_TARGET");
 
@@ -226,11 +230,10 @@ async fn run_list(args: ListArgs) -> Result<()> {
         Ok(mut releases) => {
             // Default: show only the 5 most recent
             if !args.all && releases.len() > 5 {
-                let start = releases.len() - 5;
-                releases = releases.split_off(start);
+                releases.drain(..releases.len() - 5);
             }
 
-            if args.json {
+            if json {
                 println!("{}", serde_json::to_string(&releases)?);
             } else {
                 for release in &releases {
@@ -240,6 +243,12 @@ async fn run_list(args: ListArgs) -> Result<()> {
                             style("\u{2192}").green(),
                             style(&release.version).green().bold(),
                             style("(installed)").dim(),
+                        );
+                    } else if !release.has_asset {
+                        println!(
+                            "  {} {}",
+                            release.version,
+                            style("(no binary for this platform)").dim(),
                         );
                     } else {
                         println!("  {}", release.version);
@@ -251,7 +260,7 @@ async fn run_list(args: ListArgs) -> Result<()> {
             }
         }
         Err(e) => {
-            if args.json {
+            if json {
                 ia_core::write_json_error(&e);
                 std::process::exit(1);
             } else {
@@ -263,18 +272,39 @@ async fn run_list(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_install(args: InstallArgs) -> Result<()> {
+async fn run_install(args: InstallArgs, parent_json: bool) -> Result<()> {
+    let json = args.json || parent_json;
     let current_version = ia_core::version();
     let target = env!("IA_TARGET");
     let current_exe =
         std::env::current_exe().context("failed to determine current executable path")?;
 
-    if !args.json {
-        println!("Installing ia {}...", style(&args.version).bold());
+    // Validate the version floor before printing progress — avoids a
+    // misleading "Installing..." message when the version is rejected.
+    let clean_version = args
+        .version
+        .strip_prefix('v')
+        .unwrap_or(&args.version);
+    if !ia_core::update::is_at_or_above_minimum(clean_version) {
+        let err = ia_core::error::IaError::UpdateBelowMinimum {
+            version: clean_version.to_string(),
+            minimum: ia_core::update::MIN_INSTALLABLE_VERSION.to_string(),
+        };
+        if json {
+            ia_core::write_json_error(&err);
+            std::process::exit(1);
+        } else {
+            return Err(err).context("install failed");
+        }
+    }
+
+    if !json {
+        println!("Installing ia {}...", style(clean_version).bold());
     }
 
     let result = ia_core::update::install_version(
         &args.version,
+        current_version,
         target,
         &current_exe,
         ia_core::update::GITHUB_API_BASE,
@@ -284,7 +314,7 @@ async fn run_install(args: InstallArgs) -> Result<()> {
 
     match result {
         Ok(update_result) => {
-            if args.json {
+            if json {
                 println!(
                     "{}",
                     serde_json::json!({
@@ -303,7 +333,7 @@ async fn run_install(args: InstallArgs) -> Result<()> {
             }
         }
         Err(e) => {
-            if args.json {
+            if json {
                 ia_core::write_json_error(&e);
                 std::process::exit(1);
             } else {
