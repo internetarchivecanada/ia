@@ -1,5 +1,6 @@
 use crate::error::{IaError, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::path::Path;
 
 /// A single record from a spreadsheet: (identifier, field_name → value).
@@ -180,6 +181,129 @@ fn read_jsonl(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
     Ok(records)
 }
 
+/// Write records to a spreadsheet file.
+/// Format auto-detected by file extension: .csv, .tsv, .xlsx, .jsonl
+pub fn write_spreadsheet(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "csv" => write_csv(path, records, b','),
+        "tsv" => write_csv(path, records, b'\t'),
+        "xlsx" => write_xlsx(path, records),
+        "jsonl" | "ndjson" => write_jsonl_file(path, records),
+        other => Err(IaError::Config(format!(
+            "unsupported export format: .{other} (supported: .csv, .tsv, .xlsx, .jsonl)"
+        ))),
+    }
+}
+
+/// Collect all unique field names across records in sorted order.
+fn collect_field_names(records: &[SpreadsheetRecord]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for (_, fields) in records {
+        for key in fields.keys() {
+            names.insert(key.clone());
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn write_csv(path: &Path, records: &[SpreadsheetRecord], delimiter: u8) -> Result<()> {
+    let field_names = collect_field_names(records);
+
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_path(path)
+        .map_err(|e| IaError::Config(format!("failed to create CSV writer: {e}")))?;
+
+    // Header row: identifier + field names
+    let mut header = vec!["identifier".to_string()];
+    header.extend(field_names.iter().cloned());
+    writer
+        .write_record(&header)
+        .map_err(|e| IaError::Config(format!("failed to write CSV header: {e}")))?;
+
+    // Data rows
+    for (identifier, fields) in records {
+        let mut row = vec![identifier.clone()];
+        for name in &field_names {
+            row.push(fields.get(name).cloned().unwrap_or_default());
+        }
+        writer
+            .write_record(&row)
+            .map_err(|e| IaError::Config(format!("failed to write CSV row: {e}")))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|e| IaError::Config(format!("failed to flush CSV writer: {e}")))?;
+
+    Ok(())
+}
+
+fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
+    use rust_xlsxwriter::Workbook;
+
+    let field_names = collect_field_names(records);
+
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+
+    // Header row
+    worksheet
+        .write_string(0, 0, "identifier")
+        .map_err(|e| IaError::Config(format!("failed to write XLSX header: {e}")))?;
+    for (col, name) in field_names.iter().enumerate() {
+        worksheet
+            .write_string(0, (col + 1) as u16, name)
+            .map_err(|e| IaError::Config(format!("failed to write XLSX header: {e}")))?;
+    }
+
+    // Data rows
+    for (row_idx, (identifier, fields)) in records.iter().enumerate() {
+        let row = (row_idx + 1) as u32;
+        worksheet
+            .write_string(row, 0, identifier)
+            .map_err(|e| IaError::Config(format!("failed to write XLSX cell: {e}")))?;
+        for (col_idx, name) in field_names.iter().enumerate() {
+            let value = fields.get(name).cloned().unwrap_or_default();
+            worksheet
+                .write_string(row, (col_idx + 1) as u16, &value)
+                .map_err(|e| IaError::Config(format!("failed to write XLSX cell: {e}")))?;
+        }
+    }
+
+    workbook
+        .save(path)
+        .map_err(|e| IaError::Config(format!("failed to save XLSX file: {e}")))?;
+
+    Ok(())
+}
+
+fn write_jsonl_file(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
+    let mut file = std::fs::File::create(path)?;
+
+    for (identifier, fields) in records {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "identifier".to_string(),
+            serde_json::Value::String(identifier.clone()),
+        );
+        for (key, value) in fields {
+            obj.insert(key.clone(), serde_json::Value::String(value.clone()));
+        }
+        let line = serde_json::to_string(&serde_json::Value::Object(obj))
+            .map_err(|e| IaError::Config(format!("failed to serialize JSONL: {e}")))?;
+        writeln!(file, "{line}")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +400,119 @@ mod tests {
         let path = dir.path().join("test.xyz");
         std::fs::write(&path, "data").unwrap();
         assert!(read_spreadsheet(&path).is_err());
+    }
+
+    #[test]
+    fn write_and_read_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.csv");
+        let records = vec![
+            ("nasa".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("title".to_string(), "NASA Images".to_string());
+                m.insert("date".to_string(), "2024-01-01".to_string());
+                m
+            }),
+            ("mars".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("title".to_string(), "Mars Rover".to_string());
+                m
+            }),
+        ];
+
+        write_spreadsheet(&path, &records).unwrap();
+        let read_back = read_spreadsheet(&path).unwrap();
+        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back[0].0, "nasa");
+        assert_eq!(read_back[0].1.get("title").unwrap(), "NASA Images");
+        assert_eq!(read_back[1].0, "mars");
+        assert_eq!(read_back[1].1.get("title").unwrap(), "Mars Rover");
+    }
+
+    #[test]
+    fn write_and_read_tsv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.tsv");
+        let records = vec![("item1".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("title".to_string(), "Test".to_string());
+            m
+        })];
+
+        write_spreadsheet(&path, &records).unwrap();
+        let read_back = read_spreadsheet(&path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].1.get("title").unwrap(), "Test");
+    }
+
+    #[test]
+    fn write_and_read_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        let records = vec![("nasa".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("title".to_string(), "NASA".to_string());
+            m
+        })];
+
+        write_spreadsheet(&path, &records).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(line["identifier"], "nasa");
+        assert_eq!(line["title"], "NASA");
+    }
+
+    #[test]
+    fn write_and_read_xlsx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.xlsx");
+        let records = vec![("nasa".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("title".to_string(), "NASA".to_string());
+            m
+        })];
+
+        write_spreadsheet(&path, &records).unwrap();
+        let read_back = read_spreadsheet(&path).unwrap();
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].0, "nasa");
+    }
+
+    #[test]
+    fn write_csv_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("round.csv");
+        let original = vec![
+            ("a".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("x".to_string(), "1".to_string());
+                m.insert("y".to_string(), "2".to_string());
+                m
+            }),
+            ("b".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("x".to_string(), "3".to_string());
+                m
+            }),
+        ];
+
+        write_spreadsheet(&path, &original).unwrap();
+        let read_back = read_spreadsheet(&path).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back[0].0, "a");
+        assert_eq!(read_back[0].1.get("x").unwrap(), "1");
+        assert_eq!(read_back[0].1.get("y").unwrap(), "2");
+        assert_eq!(read_back[1].0, "b");
+        assert_eq!(read_back[1].1.get("x").unwrap(), "3");
+        assert!(read_back[1].1.get("y").is_none());
+    }
+
+    #[test]
+    fn write_unsupported_format_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.ods");
+        let records = vec![];
+        assert!(write_spreadsheet(&path, &records).is_err());
     }
 }
