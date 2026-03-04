@@ -65,6 +65,12 @@ pub enum IaError {
     #[error("update verification failed: expected {expected}, got {actual}")]
     UpdateVerifyFailed { expected: String, actual: String },
 
+    #[error("version {version} is below minimum installable version ({minimum})")]
+    UpdateBelowMinimum { version: String, minimum: String },
+
+    #[error("version {version} not found")]
+    UpdateVersionNotFound { version: String },
+
     #[error("path traversal blocked: {path} escapes destination directory {dest_dir}")]
     PathTraversal { path: String, dest_dir: String },
 
@@ -116,6 +122,8 @@ impl IaError {
             }
             IaError::UpdateNoAsset { .. } => false,
             IaError::UpdateVerifyFailed { .. } => false,
+            IaError::UpdateBelowMinimum { .. } => false,
+            IaError::UpdateVersionNotFound { .. } => false,
             // Security — never retry
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
@@ -191,6 +199,15 @@ impl IaError {
                 extra.insert("expected".into(), expected.clone().into());
                 extra.insert("actual".into(), actual.clone().into());
                 "update_verify_failed"
+            }
+            IaError::UpdateBelowMinimum { version, minimum } => {
+                extra.insert("version".into(), version.clone().into());
+                extra.insert("minimum".into(), minimum.clone().into());
+                "update_below_minimum"
+            }
+            IaError::UpdateVersionNotFound { version } => {
+                extra.insert("version".into(), version.clone().into());
+                "update_version_not_found"
             }
             IaError::PathTraversal { path, dest_dir } => {
                 extra.insert("path".into(), path.clone().into());
@@ -631,5 +648,66 @@ mod tests {
             message: "forbidden".into(),
         }
         .is_retryable());
+    }
+
+    // -- UpdateBelowMinimum tests --
+
+    #[test]
+    fn update_below_minimum_displays_versions() {
+        let err = IaError::UpdateBelowMinimum {
+            version: "0.3.0".into(),
+            minimum: "0.6.0".into(),
+        };
+        assert!(err.to_string().contains("0.3.0"));
+        assert!(err.to_string().contains("0.6.0"));
+    }
+
+    #[test]
+    fn json_update_below_minimum() {
+        let err = IaError::UpdateBelowMinimum {
+            version: "0.3.0".into(),
+            minimum: "0.6.0".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_below_minimum");
+        assert_eq!(v["error"]["version"], "0.3.0");
+        assert_eq!(v["error"]["minimum"], "0.6.0");
+    }
+
+    #[test]
+    fn update_below_minimum_is_not_retryable() {
+        let err = IaError::UpdateBelowMinimum {
+            version: "0.3.0".into(),
+            minimum: "0.6.0".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    // -- UpdateVersionNotFound tests --
+
+    #[test]
+    fn update_version_not_found_displays_version() {
+        let err = IaError::UpdateVersionNotFound {
+            version: "99.99.99".into(),
+        };
+        assert!(err.to_string().contains("99.99.99"));
+    }
+
+    #[test]
+    fn json_update_version_not_found() {
+        let err = IaError::UpdateVersionNotFound {
+            version: "99.99.99".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_version_not_found");
+        assert_eq!(v["error"]["version"], "99.99.99");
+    }
+
+    #[test]
+    fn update_version_not_found_is_not_retryable() {
+        let err = IaError::UpdateVersionNotFound {
+            version: "99.99.99".into(),
+        };
+        assert!(!err.is_retryable());
     }
 }

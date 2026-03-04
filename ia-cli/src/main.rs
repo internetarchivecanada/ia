@@ -105,7 +105,7 @@ enum Commands {
     Completions(commands::completions::CompletionsArgs),
     /// Configure credentials and settings
     Config(commands::config::ConfigArgs),
-    /// Update ia to the latest version
+    /// Update ia to a specific or latest version
     #[cfg(feature = "self-update")]
     Update(commands::update::UpdateArgs),
 }
