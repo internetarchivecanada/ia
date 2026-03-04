@@ -94,12 +94,20 @@ pub enum MetadataCommand {
     /// Set or replace metadata field values
     #[command(
         long_about = "Set metadata fields to new values. Replaces existing values. \
-            Use -m/--metadata to specify field:value pairs.",
+            Use -m/--metadata to specify field:value pairs.\n\n\
+            Chain multiple operations with + to apply them in a single request:\n\
+            \x20 ia metadata modify ID -m field:val + remove -m field:val\n\n\
+            Valid operations after +: modify, append, append-list, insert, remove.\n\
+            Shared options (--target, --dry-run, --json, etc.) go before the first +.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Set title</dim>\n  <bold>$ ia metadata modify myitem -m \"title:New Title\"</bold>\
              \n\n  <dim># Set multiple fields</dim>\n  <bold>$ ia metadata modify myitem -m \"title:X\" -m \"date:2024\"</bold>\
-             \n\n  <dim># Batch modify via search</dim>\n  <bold>$ ia metadata modify --search \"collection:test\" -m \"subject:updated\"</bold>\n"
+             \n\n  <dim># Batch modify via search</dim>\n  <bold>$ ia metadata modify --search \"collection:test\" -m \"subject:updated\"</bold>\
+             \n\n  <dim># Compound: set title and remove a subject in one request</dim>\
+             \n  <bold>$ ia metadata modify myitem -m \"title:New\" + remove -m \"subject:old-tag\"</bold>\
+             \n\n  <dim># Compound: modify + insert at position + append-list</dim>\
+             \n  <bold>$ ia metadata modify myitem -m \"title:New\" + insert -m \"collection[0]:featured\" + append-list -m \"subject:physics\"</bold>\n"
         ),
     )]
     Modify(WriteSubArgs),
@@ -243,12 +251,16 @@ pub struct ImportArgs {
 #[derive(Args)]
 #[command(
     long_about = "Read or modify Internet Archive item metadata. Shows metadata as JSON \
-        by default. Use subcommands for write operations, bulk export, or bulk import.",
+        by default. Use subcommands for write operations, bulk export, or bulk import.\n\n\
+        Chain multiple write operations with + for a single HTTP request:\n\
+        \x20 ia metadata modify ID -m field:val + remove -m field:val",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Show item metadata</dim>\n  <bold>$ ia metadata nasa</bold>\
          \n\n  <dim># Check if item exists</dim>\n  <bold>$ ia metadata nasa --exists</bold>\
          \n\n  <dim># Modify metadata</dim>\n  <bold>$ ia metadata modify nasa -m \"title:New\"</bold>\
+         \n\n  <dim># Compound operations (single request)</dim>\
+         \n  <bold>$ ia metadata modify nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
          \n\n  <dim># Bulk export</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
          \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\n"
     ),
