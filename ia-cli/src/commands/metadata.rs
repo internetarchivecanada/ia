@@ -428,21 +428,14 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
                     if key == "identifier" {
                         continue;
                     }
-                    // Flatten JSON values to strings for tabular formats.
-                    // Arrays are joined with "; " (semicolon-space), matching the
-                    // IA metadata convention used by the Python library's CSV export.
+                    // Serialize values to strings for tabular formats.
+                    // Strings pass through as-is; arrays and objects are
+                    // JSON-encoded so they round-trip losslessly on import.
                     let s = match &value {
                         serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Array(arr) => arr
-                            .iter()
-                            .map(|v| match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; "),
                         serde_json::Value::Null => continue,
-                        other => other.to_string(),
+                        other => serde_json::to_string(other)
+                            .unwrap_or_else(|_| other.to_string()),
                     };
                     if !s.is_empty() {
                         fields.insert(key, s);
