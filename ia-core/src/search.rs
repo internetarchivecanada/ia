@@ -27,6 +27,8 @@ pub struct SearchOpts {
     pub sorts: Vec<String>,
     /// Maximum number of results (0 = unlimited).
     pub count: usize,
+    /// Page size for advanced search (0 = use default of 50).
+    pub rows: usize,
     /// Timeout per request in seconds.
     pub timeout: Option<u64>,
     /// Extra query parameters.
@@ -175,7 +177,7 @@ pub fn advanced<'a>(
     };
     let count = opts.count;
     let query = query.to_string();
-    let page_size = 500usize;
+    let rows = if opts.rows > 0 { opts.rows } else { 50 };
     let extra_params = opts.params.clone();
 
     Box::pin(async_stream::try_stream! {
@@ -189,7 +191,7 @@ pub fn advanced<'a>(
                 .query(&[
                     ("q", query.as_str()),
                     ("fl[]", fields.as_str()),
-                    ("rows", &page_size.to_string()),
+                    ("rows", &rows.to_string()),
                     ("page", &page.to_string()),
                     ("output", "json"),
                 ]);
@@ -236,7 +238,7 @@ pub fn advanced<'a>(
                 }
             }
 
-            // If we got fewer than page_size, we're done
+            // If we've yielded all results, we're done
             if yielded >= body.response.num_found as usize {
                 break;
             }
@@ -533,6 +535,33 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(title, "Item A");
+    }
+
+    #[tokio::test]
+    async fn advanced_search_uses_rows_param() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(query_param("rows", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 1,
+                    "docs": [{"identifier": "item1", "title": "Test"}]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            rows: 50,
+            ..Default::default()
+        };
+        let results: Vec<Result<SearchResult>> =
+            advanced(&client, "test", &opts).collect().await;
+
+        assert_eq!(results.len(), 1);
     }
 
     #[tokio::test]
