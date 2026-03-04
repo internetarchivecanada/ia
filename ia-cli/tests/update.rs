@@ -16,4 +16,20 @@ mod without_feature {
             .failure()
             .stderr(predicate::str::contains("unrecognized subcommand"));
     }
+
+    #[test]
+    fn update_list_not_available_without_feature() {
+        ia().args(["update", "list"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand"));
+    }
+
+    #[test]
+    fn update_install_not_available_without_feature() {
+        ia().args(["update", "install", "0.5.0"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand"));
+    }
 }
