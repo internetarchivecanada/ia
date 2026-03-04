@@ -195,6 +195,9 @@ pub fn write_spreadsheet(path: &Path, records: &[SpreadsheetRecord]) -> Result<(
         "tsv" => write_csv(path, records, b'\t'),
         "xlsx" => write_xlsx(path, records),
         "jsonl" | "ndjson" => write_jsonl_file(path, records),
+        "ods" | "xls" => Err(IaError::Config(format!(
+            "export to .{ext} is not supported (import reads .{ext}, but export only writes .csv, .tsv, .xlsx, .jsonl)"
+        ))),
         other => Err(IaError::Config(format!(
             "unsupported export format: .{other} (supported: .csv, .tsv, .xlsx, .jsonl)"
         ))),
@@ -248,6 +251,15 @@ fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
 
     let field_names = collect_field_names(records);
 
+    // XLSX columns are u16 (max 65536). Validate upfront.
+    let total_cols = field_names.len() + 1; // +1 for identifier column
+    if total_cols > u16::MAX as usize {
+        return Err(IaError::Config(format!(
+            "too many columns for XLSX format: {total_cols} (max {})",
+            u16::MAX
+        )));
+    }
+
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
 
@@ -256,21 +268,23 @@ fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
         .write_string(0, 0, "identifier")
         .map_err(std::io::Error::other)?;
     for (col, name) in field_names.iter().enumerate() {
+        let col_idx = u16::try_from(col + 1).map_err(std::io::Error::other)?;
         worksheet
-            .write_string(0, (col + 1) as u16, name)
+            .write_string(0, col_idx, name)
             .map_err(std::io::Error::other)?;
     }
 
     // Data rows
     for (row_idx, (identifier, fields)) in records.iter().enumerate() {
-        let row = (row_idx + 1) as u32;
+        let row = u32::try_from(row_idx + 1).map_err(std::io::Error::other)?;
         worksheet
             .write_string(row, 0, identifier)
             .map_err(std::io::Error::other)?;
         for (col_idx, name) in field_names.iter().enumerate() {
+            let col = u16::try_from(col_idx + 1).map_err(std::io::Error::other)?;
             let value = fields.get(name).cloned().unwrap_or_default();
             worksheet
-                .write_string(row, (col_idx + 1) as u16, &value)
+                .write_string(row, col, &value)
                 .map_err(std::io::Error::other)?;
         }
     }
@@ -506,10 +520,22 @@ mod tests {
     }
 
     #[test]
-    fn write_unsupported_format_errors() {
+    fn write_ods_gives_read_only_hint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.ods");
         let records = vec![];
-        assert!(write_spreadsheet(&path, &records).is_err());
+        let err = write_spreadsheet(&path, &records).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("import reads .ods"), "error should hint that ODS is read-only: {msg}");
+    }
+
+    #[test]
+    fn write_unknown_format_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.parquet");
+        let records = vec![];
+        let err = write_spreadsheet(&path, &records).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported export format"), "error should say unsupported: {msg}");
     }
 }

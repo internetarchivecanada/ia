@@ -400,6 +400,9 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
         bail!("no identifiers to export");
     }
 
+    // When writing to a file (-o), we collect all records into memory first so we can
+    // compute a unified column set across all items. For large exports this may use
+    // significant memory; stdout mode streams items one at a time.
     let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
     for identifier in &identifiers {
@@ -425,6 +428,9 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
                     if key == "identifier" {
                         continue;
                     }
+                    // Flatten JSON values to strings for tabular formats.
+                    // Arrays are joined with "; " (semicolon-space), matching the
+                    // IA metadata convention used by the Python library's CSV export.
                     let s = match &value {
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Array(arr) => arr
@@ -635,7 +641,7 @@ async fn run_write_inner(
             let mut batch_error = None;
             let mut last_task_id = None;
 
-            for (changes, batch_op) in &change_groups {
+            'groups: for (changes, batch_op) in &change_groups {
                 let req = ModifyRequest {
                     identifier: identifier.clone(),
                     changes: changes.clone(),
@@ -663,13 +669,9 @@ async fn run_write_inner(
                         }
                         Err(e) => {
                             batch_error = Some(e);
-                            break;
+                            break 'groups;
                         }
                     }
-                }
-
-                if batch_error.is_some() {
-                    break;
                 }
             }
 
@@ -843,7 +845,7 @@ async fn run_import(
             let mut batch_error = None;
             let mut last_task_id = None;
 
-            for (changes, op) in &groups {
+            'groups: for (changes, op) in &groups {
                 let req = ModifyRequest {
                     identifier: identifier.clone(),
                     changes: changes.clone(),
@@ -871,13 +873,9 @@ async fn run_import(
                         }
                         Err(e) => {
                             batch_error = Some(e);
-                            break;
+                            break 'groups;
                         }
                     }
-                }
-
-                if batch_error.is_some() {
-                    break;
                 }
             }
 
