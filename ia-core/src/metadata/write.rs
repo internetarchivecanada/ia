@@ -23,6 +23,9 @@ pub enum MetadataOp {
     Remove,
 }
 
+/// A single operation group: changes to apply and which operation to use.
+pub type ChangeGroup = (Vec<(String, serde_json::Value)>, MetadataOp);
+
 /// Response from the IA metadata write API.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModifyResponse {
@@ -213,6 +216,8 @@ pub fn prepare_metadata(
 /// 3. Prepends `test` operations from `expect` for optimistic concurrency
 ///
 /// Returns the patch as a Vec of serde_json::Value operations.
+///
+/// This is a convenience wrapper around `compute_compound_patch` for single-op use.
 pub fn compute_patch(
     source: &serde_json::Value,
     changes: &[(String, serde_json::Value)],
@@ -220,10 +225,33 @@ pub fn compute_patch(
     expect: Option<&HashMap<String, serde_json::Value>>,
     identifier: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    let destination = prepare_metadata(source, changes, op, identifier)?;
-    let patch = json_patch::diff(source, &destination);
+    compute_compound_patch(source, &[(changes.to_vec(), op.clone())], expect, identifier)
+}
 
-    // Convert patch to Vec<Value> for serialization
+/// Compute a single JSON Patch from multiple chained operation groups.
+///
+/// Chains `prepare_metadata` calls sequentially:
+///   source → group1 → intermediate1 → group2 → ... → final
+/// Then diffs source vs final ONCE to produce one combined patch.
+/// Prepends `test` operations from `expect` for optimistic concurrency.
+pub fn compute_compound_patch(
+    source: &serde_json::Value,
+    groups: &[ChangeGroup],
+    expect: Option<&HashMap<String, serde_json::Value>>,
+    identifier: &str,
+) -> Result<Vec<serde_json::Value>> {
+    if groups.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Chain prepare_metadata calls: each group's output is the next group's input
+    let mut current = source.clone();
+    for (changes, op) in groups {
+        current = prepare_metadata(&current, changes, op, identifier)?;
+    }
+
+    // Diff original source vs final destination
+    let patch = json_patch::diff(source, &current);
     let patch_value = serde_json::to_value(&patch)
         .map_err(|e| IaError::Config(format!("failed to serialize patch: {e}")))?;
     let mut ops: Vec<serde_json::Value> = match patch_value {
@@ -1175,5 +1203,161 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    // --- compute_compound_patch tests ---
+
+    #[test]
+    fn compound_patch_single_group_matches_compute_patch() {
+        let source = serde_json::json!({"title": "Old", "date": "2020"});
+        let changes = vec![("title".to_string(), serde_json::json!("New"))];
+        let single =
+            compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
+        let compound = compute_compound_patch(
+            &source,
+            &[(changes, MetadataOp::Set)],
+            None,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(single, compound);
+    }
+
+    #[test]
+    fn compound_patch_set_then_remove() {
+        let source = serde_json::json!({"title": "Old", "subject": ["math", "science"]});
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("title".to_string(), serde_json::json!("New"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("subject".to_string(), serde_json::json!("science"))],
+                MetadataOp::Remove,
+            ),
+        ];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        let ops: Vec<&str> = patch.iter().filter_map(|p| p["op"].as_str()).collect();
+        assert!(ops.contains(&"replace")); // title
+        assert!(patch.len() >= 2);
+    }
+
+    #[test]
+    fn compound_patch_set_then_append_list() {
+        let source = serde_json::json!({"title": "Old", "subject": ["math"]});
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("title".to_string(), serde_json::json!("New"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("subject".to_string(), serde_json::json!("physics"))],
+                MetadataOp::AppendList,
+            ),
+        ];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        assert!(!patch.is_empty());
+    }
+
+    #[test]
+    fn compound_patch_same_field_last_wins() {
+        let source = serde_json::json!({"title": "Original"});
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("title".to_string(), serde_json::json!("First"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("title".to_string(), serde_json::json!("Second"))],
+                MetadataOp::Set,
+            ),
+        ];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0]["value"], "Second");
+    }
+
+    #[test]
+    fn compound_patch_set_then_remove_same_field_net_remove() {
+        let source = serde_json::json!({"title": "Old", "description": "Remove me"});
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("title".to_string(), serde_json::json!("New"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("description".to_string(), serde_json::json!("Remove me"))],
+                MetadataOp::Remove,
+            ),
+        ];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        let remove_ops: Vec<_> = patch.iter().filter(|p| p["op"] == "remove").collect();
+        assert_eq!(remove_ops.len(), 1);
+        assert_eq!(remove_ops[0]["path"], "/description");
+    }
+
+    #[test]
+    fn compound_patch_empty_groups_returns_empty() {
+        let source = serde_json::json!({"title": "Test"});
+        let groups: Vec<ChangeGroup> = vec![];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn compound_patch_with_expect_prepends_test_ops() {
+        let source = serde_json::json!({"title": "Old"});
+        let groups: Vec<ChangeGroup> = vec![(
+            vec![("title".to_string(), serde_json::json!("New"))],
+            MetadataOp::Set,
+        )];
+        let expect = HashMap::from([("title".to_string(), serde_json::json!("Old"))]);
+        let patch =
+            compute_compound_patch(&source, &groups, Some(&expect), "test").unwrap();
+        assert!(patch.len() >= 2);
+        assert_eq!(patch[0]["op"], "test");
+    }
+
+    #[test]
+    fn compound_patch_error_in_second_group_propagates() {
+        let source = serde_json::json!({"subject": ["math", "science"]});
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("subject".to_string(), serde_json::json!("physics"))],
+                MetadataOp::AppendList,
+            ),
+            // Append (string concat) on an array field should error
+            (
+                vec![("subject".to_string(), serde_json::json!("more"))],
+                MetadataOp::Append,
+            ),
+        ];
+        let result = compute_compound_patch(&source, &groups, None, "test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compound_patch_three_groups() {
+        let source = serde_json::json!({
+            "title": "Old",
+            "subject": ["math"],
+            "collection": ["opensource"]
+        });
+        let groups: Vec<ChangeGroup> = vec![
+            (
+                vec![("title".to_string(), serde_json::json!("New"))],
+                MetadataOp::Set,
+            ),
+            (
+                vec![("subject".to_string(), serde_json::json!("physics"))],
+                MetadataOp::AppendList,
+            ),
+            (
+                vec![("collection".to_string(), serde_json::json!("featured"))],
+                MetadataOp::Insert(0),
+            ),
+        ];
+        let patch = compute_compound_patch(&source, &groups, None, "test").unwrap();
+        assert!(patch.len() >= 3);
     }
 }
