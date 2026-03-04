@@ -50,7 +50,7 @@ These rules are non-negotiable and must NEVER be violated:
 - Console: `indicatif` 0.17 + `console` 0.15 + `comfy-table` 7 — lightweight ASCII table rendering for `ia list`
 - TUI: `ratatui` (default feature, `--dashboard` flag)
 - Metadata write: `json-patch` 3 — archive.org API requires RFC 6902 JSON Patch format; `urlencoding` 2
-- Spreadsheet: `calamine` 0.26 — single API for XLSX/ODS/XLS, pure Rust; `csv` 1 (CSV/TSV)
+- Spreadsheet: `calamine` 0.26 — single API for XLSX/ODS/XLS read, pure Rust; `rust_xlsxwriter` 0.79 — XLSX write; `csv` 1 (CSV/TSV)
 - Auth: `rpassword` 5 — hidden password input for interactive login
 - Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
 

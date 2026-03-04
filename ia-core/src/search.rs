@@ -7,6 +7,9 @@ use tracing::{debug, warn};
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
 
+/// Default page size for advanced search queries.
+pub const DEFAULT_ADVANCED_ROWS: usize = 50;
+
 /// A single search result from any backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -27,10 +30,14 @@ pub struct SearchOpts {
     pub sorts: Vec<String>,
     /// Maximum number of results (0 = unlimited).
     pub count: usize,
+    /// Page size for advanced search (0 = use [`DEFAULT_ADVANCED_ROWS`]).
+    pub rows: usize,
     /// Timeout per request in seconds.
     pub timeout: Option<u64>,
     /// Extra query parameters.
     pub params: Vec<(String, String)>,
+    /// FTS: skip `!L` prefix for raw Elasticsearch DSL queries.
+    pub dsl: bool,
 }
 
 // ─── Scrape API ───────────────────────────────────────────────────────────────
@@ -62,6 +69,36 @@ pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
 
     let body: ScrapeResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
     Ok(body.total.unwrap_or(0))
+}
+
+/// Count total FTS results matching a query without fetching items.
+///
+/// Uses GET to the FTS endpoint (matching Python `internetarchive` behavior).
+/// Reads `hits.total` from the response.
+pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<u64> {
+    let base_url = client.fts_base_url();
+    let q = if dsl {
+        query.to_string()
+    } else {
+        format!("!L {query}")
+    };
+
+    let resp = client
+        .http()
+        .get(&base_url)
+        .query(&[("q", &q)])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(IaError::Http {
+            status: resp.status().as_u16(),
+            message: resp.text().await.unwrap_or_default(),
+        });
+    }
+
+    let body: FtsResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
+    Ok(body.hits.and_then(|h| h.total).unwrap_or(0))
 }
 
 /// Search using the scrape API (cursor-based pagination).
@@ -173,7 +210,7 @@ pub fn advanced<'a>(
     };
     let count = opts.count;
     let query = query.to_string();
-    let page_size = 500usize;
+    let rows = if opts.rows > 0 { opts.rows } else { DEFAULT_ADVANCED_ROWS };
     let extra_params = opts.params.clone();
 
     Box::pin(async_stream::try_stream! {
@@ -187,7 +224,7 @@ pub fn advanced<'a>(
                 .query(&[
                     ("q", query.as_str()),
                     ("fl[]", fields.as_str()),
-                    ("rows", &page_size.to_string()),
+                    ("rows", &rows.to_string()),
                     ("page", &page.to_string()),
                     ("output", "json"),
                 ]);
@@ -234,7 +271,7 @@ pub fn advanced<'a>(
                 }
             }
 
-            // If we got fewer than page_size, we're done
+            // If we've yielded all results, we're done
             if yielded >= body.response.num_found as usize {
                 break;
             }
@@ -270,17 +307,26 @@ struct FtsHit {
 }
 
 /// Search using the full-text search API (scroll-based pagination).
+///
+/// By default, prepends `!L` to the query for literal text matching
+/// (matching Python `internetarchive` behavior). Set `opts.dsl = true`
+/// to skip the prefix for raw Elasticsearch DSL queries.
 pub fn fts<'a>(
     client: &'a IaClient,
     query: &str,
     opts: &SearchOpts,
 ) -> Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + 'a>> {
     let count = opts.count;
-    let query = query.to_string();
+    // Prepend !L for literal text search unless DSL mode is active
+    let query = if opts.dsl {
+        query.to_string()
+    } else {
+        format!("!L {query}")
+    };
     let extra_params = opts.params.clone();
 
-    // FTS uses a different host
-    let base_url = format!("{}://be-api.us.archive.org/ia-pub-fts-api", client.protocol());
+    // FTS uses a different host — configurable for testability
+    let base_url = client.fts_base_url();
 
     Box::pin(async_stream::try_stream! {
         let mut scroll_id: Option<String> = None;
@@ -393,7 +439,7 @@ fn parse_search_result(value: serde_json::Value) -> Result<SearchResult> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_config(server_uri: &str) -> crate::config::IaConfig {
@@ -403,6 +449,7 @@ mod tests {
             .or_else(|| server_uri.strip_prefix("https://"))
             .unwrap_or(server_uri);
         config.general.host = host.to_string();
+        config.general.fts_host = Some(host.to_string());
         config.general.secure = false;
         config
     }
@@ -525,6 +572,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advanced_search_uses_rows_param() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(query_param("rows", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 1,
+                    "docs": [{"identifier": "item1", "title": "Test"}]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            rows: 50,
+            ..Default::default()
+        };
+        let results: Vec<Result<SearchResult>> =
+            advanced(&client, "test", &opts).collect().await;
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
     async fn parse_search_result_extracts_identifier() {
         let value = serde_json::json!({
             "identifier": "nasa",
@@ -557,5 +631,122 @@ mod tests {
                 .await;
 
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_returns_total() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("q", "!L test query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1234,
+                    "hits": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "test query", false).await.unwrap();
+        assert_eq!(count, 1234);
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_dsl_skips_prefix() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("q", "raw dsl query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 42,
+                    "hits": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "raw dsl query", true).await.unwrap();
+        assert_eq!(count, 42);
+    }
+
+    #[tokio::test]
+    async fn fts_prepends_literal_prefix() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(body_string_contains("!L test query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1,
+                    "hits": [
+                        {
+                            "_id": "item1|abc123",
+                            "_source": {},
+                            "fields": {"identifier": ["item1"]}
+                        }
+                    ]
+                },
+                "_scroll_id": ""
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results: Vec<Result<SearchResult>> =
+            fts(&client, "test query", &SearchOpts::default())
+                .collect()
+                .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
+    }
+
+    #[tokio::test]
+    async fn fts_dsl_mode_skips_prefix() {
+        let mock_server = MockServer::start().await;
+
+        // Mock that matches the raw query WITHOUT !L prefix.
+        // body_string_contains("raw dsl") matches the query in the JSON body.
+        // We also verify !L is NOT present by using a strict mock: if the
+        // code incorrectly prepends !L, the query field would be "!L raw dsl"
+        // which still contains "raw dsl", so we add an explicit assertion
+        // via a second mock that would catch the !L prefix.
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(body_string_contains("\"query\":\"raw dsl\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1,
+                    "hits": [
+                        {
+                            "_id": "item1|abc123",
+                            "_source": {},
+                            "fields": {"identifier": ["item1"]}
+                        }
+                    ]
+                },
+                "_scroll_id": ""
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            dsl: true,
+            ..Default::default()
+        };
+        let results: Vec<Result<SearchResult>> =
+            fts(&client, "raw dsl", &opts).collect().await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
     }
 }

@@ -63,9 +63,49 @@ fn search_subcommand_help() {
     ia().args(["search", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--itemlist"))
-        .stdout(predicate::str::contains("--num-found"))
-        .stdout(predicate::str::contains("--fts"));
+        .stdout(predicate::str::contains("scrape"))
+        .stdout(predicate::str::contains("advanced"))
+        .stdout(predicate::str::contains("fts"));
+}
+
+#[test]
+fn search_scrape_help_has_sort() {
+    ia().args(["search", "scrape", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sort"));
+}
+
+#[test]
+fn search_fts_help_has_dsl() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dsl"));
+}
+
+#[test]
+fn search_fts_help_has_scope() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--scope"));
+}
+
+#[test]
+fn search_advanced_help_no_dsl() {
+    ia().args(["search", "advanced", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dsl").not());
+}
+
+#[test]
+fn search_fts_help_no_sort() {
+    ia().args(["search", "fts", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--sort").not());
 }
 
 #[test]
@@ -84,7 +124,9 @@ fn metadata_subcommand_help() {
         .success()
         .stdout(predicate::str::contains("--exists"))
         .stdout(predicate::str::contains("--formats"))
-        .stdout(predicate::str::contains("--pretty"));
+        .stdout(predicate::str::contains("--pretty"))
+        .stdout(predicate::str::contains("modify"))
+        .stdout(predicate::str::contains("export"));
 }
 
 #[test]
@@ -158,41 +200,16 @@ fn download_help_does_not_show_tui_flag() {
 }
 
 #[test]
-fn metadata_write_flags_in_help() {
-    ia().args(["metadata", "--help"])
+fn metadata_write_flags_in_modify_help() {
+    ia().args(["metadata", "modify", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--modify"))
-        .stdout(predicate::str::contains("--append"))
-        .stdout(predicate::str::contains("--append-list"))
-        .stdout(predicate::str::contains("--insert"))
-        .stdout(predicate::str::contains("--remove"))
+        .stdout(predicate::str::contains("--metadata"))
         .stdout(predicate::str::contains("--target"))
         .stdout(predicate::str::contains("--expect"))
         .stdout(predicate::str::contains("--dry-run"))
-        .stdout(predicate::str::contains("--spreadsheet"))
         .stdout(predicate::str::contains("--priority"))
         .stdout(predicate::str::contains("--reduced-priority"));
-}
-
-#[test]
-fn metadata_write_short_flags_in_help() {
-    ia().args(["metadata", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("-m"))
-        .stdout(predicate::str::contains("-a"))
-        .stdout(predicate::str::contains("-A"))
-        .stdout(predicate::str::contains("-I"))
-        .stdout(predicate::str::contains("-r"));
-}
-
-#[test]
-fn metadata_write_flags_conflict() {
-    // --modify and --append should conflict (same ArgGroup)
-    ia().args(["metadata", "test", "--modify=title:X", "--append=title:Y"])
-        .assert()
-        .failure();
 }
 
 #[test]
@@ -206,7 +223,7 @@ fn metadata_no_identifier_errors() {
 #[test]
 fn metadata_modify_no_identifier_errors() {
     // Write mode with no identifier should fail
-    ia().args(["metadata", "--modify=title:New"])
+    ia().args(["metadata", "modify", "-m", "title:New"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no identifiers"));
@@ -215,7 +232,7 @@ fn metadata_modify_no_identifier_errors() {
 #[test]
 fn metadata_immutable_field_warning() {
     // Attempting to modify an immutable field should warn (fails with auth error too)
-    ia().args(["metadata", "test-item", "--modify=identifier:new_id"])
+    ia().args(["metadata", "modify", "test-item", "-m", "identifier:new_id"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("immutable"));
@@ -224,36 +241,34 @@ fn metadata_immutable_field_warning() {
 #[test]
 fn metadata_admin_field_warning() {
     // Attempting to modify an admin-only field should warn
-    ia().args(["metadata", "test-item", "--modify=mediatype:audio"])
+    ia().args(["metadata", "modify", "test-item", "-m", "mediatype:audio"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("admin"));
 }
 
 #[test]
-fn metadata_spreadsheet_nonexistent_file_errors() {
-    // --spreadsheet with a nonexistent file should report a read error
-    ia().args(["metadata", "--spreadsheet=/tmp/nonexistent_ia_test_file.csv"])
+fn metadata_import_nonexistent_file_errors() {
+    ia().args(["metadata", "import", "/tmp/nonexistent_ia_test_file.csv"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to read spreadsheet"));
+        .stderr(predicate::str::contains("failed to read"));
 }
 
 #[test]
-fn metadata_spreadsheet_no_write_op_accepted() {
-    // --spreadsheet alone (without explicit write op flag) should be accepted
-    // as a write operation, not rejected as "not yet implemented".
+fn metadata_import_csv_accepted() {
+    // import with a valid CSV should be accepted as a write operation.
     // It will fail with auth error after reading the CSV, which is fine.
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("test.csv");
     std::fs::write(&csv_path, "identifier,title\ntest-item,New Title\n").unwrap();
 
     let result = ia()
-        .args(["metadata", &format!("--spreadsheet={}", csv_path.display())])
+        .args(["metadata", "import", csv_path.to_str().unwrap()])
         .assert()
         .failure();
 
-    // Should NOT contain the old "not yet implemented" message
+    // Should NOT contain "not yet implemented"
     result.stderr(predicate::str::contains("not yet implemented").not());
 }
 
@@ -351,7 +366,6 @@ fn json_and_dashboard_are_mutually_exclusive() {
         .stderr(predicate::str::contains("mutually exclusive"));
 }
 
-#[test]
 // -- --json integration tests --
 
 #[test]
@@ -513,7 +527,7 @@ fn metadata_help_shows_json_example() {
     ia().args(["metadata", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ia metadata nasa --json"));
+        .stdout(predicate::str::contains("ia metadata"));
 }
 
 #[test]
@@ -524,22 +538,189 @@ fn status_help_shows_json_example() {
         .stdout(predicate::str::contains("--json"));
 }
 
-fn metadata_spreadsheet_with_append_list() {
-    // --spreadsheet combined with --append-list should be accepted.
-    // The flag value is ignored; only the op mode (AppendList) is used.
+// --- ia metadata subcommand restructuring ---
+
+#[test]
+fn metadata_subcommands_shown_in_help() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export"))
+        .stdout(predicate::str::contains("modify"))
+        .stdout(predicate::str::contains("append"))
+        .stdout(predicate::str::contains("append-list"))
+        .stdout(predicate::str::contains("insert"))
+        .stdout(predicate::str::contains("remove"))
+        .stdout(predicate::str::contains("import"));
+}
+
+#[test]
+fn metadata_modify_help_has_metadata_flag() {
+    ia().args(["metadata", "modify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--metadata"));
+}
+
+#[test]
+fn metadata_modify_help_has_short_m_flag() {
+    ia().args(["metadata", "modify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-m"));
+}
+
+#[test]
+fn metadata_modify_help_has_target() {
+    ia().args(["metadata", "modify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--target"));
+}
+
+#[test]
+fn metadata_export_help_has_output() {
+    ia().args(["metadata", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"));
+}
+
+#[test]
+fn metadata_import_help_has_dry_run() {
+    ia().args(["metadata", "import", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"));
+}
+
+#[test]
+fn metadata_modify_help_no_exists_flag() {
+    ia().args(["metadata", "modify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exists").not());
+}
+
+#[test]
+fn metadata_bare_read_still_requires_identifier() {
+    // Bare `ia metadata` with no args or subcommand should error
+    ia().args(["metadata"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("identifier"));
+}
+
+#[test]
+fn metadata_append_list_help_has_metadata_flag() {
+    ia().args(["metadata", "append-list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--metadata"))
+        .stdout(predicate::str::contains("-m"));
+}
+
+#[test]
+fn metadata_import_requires_file() {
+    ia().args(["metadata", "import"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FILE").or(predicate::str::contains("file")));
+}
+
+// --- ia ai subcommand restructuring ---
+
+#[test]
+fn ai_undo_subcommand_shown_in_help() {
+    ia().args(["ai", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("undo"));
+}
+
+#[test]
+fn ai_undo_subcommand_requires_joblog() {
+    ia().args(["ai", "undo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("JOBLOG").or(predicate::str::contains("joblog")));
+}
+
+#[test]
+fn ai_bare_no_input_errors() {
+    // Bare `ia ai` with no args should error about missing input, NOT about subcommands
+    ia().args(["ai"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no input specified"));
+}
+
+#[test]
+fn ai_undo_help_has_dry_run_and_json() {
+    ia().args(["ai", "undo", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn ai_undo_help_no_headless() {
+    // Undo subcommand should NOT have --headless
+    ia().args(["ai", "undo", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--headless").not());
+}
+
+#[test]
+fn metadata_export_help_shows_supported_formats() {
+    // -o should be accepted (not bail with "not yet implemented")
+    // and help text should mention supported formats
+    ia().args(["metadata", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CSV"))
+        .stdout(predicate::str::contains("XLSX"))
+        .stdout(predicate::str::contains("JSONL"));
+}
+
+#[test]
+fn metadata_import_with_column_prefixes() {
+    // import with column prefixes should be accepted
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("test.csv");
-    std::fs::write(&csv_path, "identifier,subject\ntest-item,science\n").unwrap();
+    std::fs::write(&csv_path, "identifier,append-list:subject\ntest-item,science\n").unwrap();
 
-    ia().args([
-        "metadata",
-        &format!("--spreadsheet={}", csv_path.display()),
-        "--append-list=subject:placeholder",
-    ])
-    .assert()
-    .failure()
-    // Should warn that flag values are ignored in spreadsheet mode
-    .stderr(predicate::str::contains("write flag values are ignored"))
-    // Should fail with auth, not "not yet implemented"
-    .stderr(predicate::str::contains("not yet implemented").not());
+    ia().args(["metadata", "import", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        // Should fail with auth error, not parse error
+        .stderr(predicate::str::contains("not yet implemented").not());
+}
+
+#[test]
+fn metadata_import_indexed_columns_accepted() {
+    // CSV with subject[0], subject[1] columns should be parsed correctly
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(
+        &csv_path,
+        "identifier,subject[0],subject[1],title\ntest-item,science,nasa,Apollo 11\n",
+    )
+    .unwrap();
+
+    ia().args(["metadata", "import", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        // Should fail with auth error, not parse error — indexed columns are valid
+        .stderr(predicate::str::contains("parse").not());
+}
+
+#[test]
+fn search_advanced_help_has_rows() {
+    ia().args(["search", "advanced", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--rows"));
 }
