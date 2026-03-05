@@ -110,12 +110,34 @@ enum Commands {
     Update(commands::update::UpdateArgs),
 }
 
+/// Derive the list of global flags that consume the next argv element as a value
+/// directly from clap's parser. This keeps the compound-args pre-scanner in sync
+/// with Cli's actual global options — no hardcoded list to maintain.
+fn value_taking_global_flags() -> Vec<String> {
+    Cli::command()
+        .get_arguments()
+        .filter(|a| a.is_global_set() && a.get_action().takes_values())
+        .flat_map(|a| {
+            let mut flags = Vec::new();
+            if let Some(l) = a.get_long() {
+                flags.push(format!("--{l}"));
+            }
+            if let Some(s) = a.get_short() {
+                flags.push(format!("-{s}"));
+            }
+            flags
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Pre-scan argv for compound metadata operations (+ separator)
     // before clap parsing, since clap would choke on bare + tokens.
     let raw_args: Vec<String> = std::env::args().collect();
-    let compound_continuations = commands::metadata::extract_compound_from_argv(&raw_args)?;
+    let value_flags = value_taking_global_flags();
+    let compound_continuations =
+        commands::metadata::extract_compound_from_argv(&raw_args, &value_flags)?;
     let cli = if let Some(ref split) = compound_continuations {
         Cli::try_parse_from(&split.filtered_argv)?
     } else {

@@ -1942,3 +1942,51 @@ async fn modify_compound_overlapping_fields_last_wins() {
     let resp = modify_compound(&client, &req).await.unwrap();
     assert!(resp.success);
 }
+
+#[test]
+fn compound_patch_json_output_shape_for_dry_run() {
+    // Verifies the JSON shape that --json --dry-run would render:
+    // compute_compound_patch returns patch ops that serialize correctly.
+    let source = json!({
+        "title": "Old",
+        "subject": ["math", "science"],
+        "collection": ["opensource"]
+    });
+    let groups = vec![
+        ChangeGroup {
+            changes: vec![("title".to_string(), json!("New Title"))],
+            op: MetadataOp::Set,
+        },
+        ChangeGroup {
+            changes: vec![("subject".to_string(), json!("science"))],
+            op: MetadataOp::Remove,
+        },
+        ChangeGroup {
+            changes: vec![("collection".to_string(), json!("featured"))],
+            op: MetadataOp::Insert(0),
+        },
+    ];
+    let patch =
+        ia_core::metadata::compute_compound_patch(&source, &groups, None, "test").unwrap();
+
+    // Patch should serialize as a JSON array of RFC 6902 ops
+    let json_output = serde_json::to_value(&patch).unwrap();
+    assert!(json_output.is_array());
+
+    // Each op must have "op" and "path" fields
+    for op in json_output.as_array().unwrap() {
+        assert!(op.get("op").is_some(), "patch op missing 'op' field: {op}");
+        assert!(
+            op.get("path").is_some(),
+            "patch op missing 'path' field: {op}"
+        );
+    }
+
+    // Should have ops for: replace title, remove subject element, add collection element
+    let ops: Vec<&str> = patch.iter().filter_map(|p| p["op"].as_str()).collect();
+    assert!(
+        ops.contains(&"replace") || ops.contains(&"add") || ops.contains(&"remove"),
+        "expected at least one modify op, got: {ops:?}"
+    );
+    assert!(patch.len() >= 3, "expected 3+ ops, got {}", patch.len());
+}

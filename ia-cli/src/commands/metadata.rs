@@ -95,8 +95,8 @@ pub enum MetadataCommand {
     #[command(
         long_about = "Set metadata fields to new values. Replaces existing values. \
             Use -m/--metadata to specify field:value pairs.\n\n\
-            Chain multiple operations with + to apply them in a single request:\n\
-            \x20 ia metadata modify ID -m field:val + remove -m field:val\n\n\
+            Chain multiple operations with + to apply them in a single request:\n  \
+            ia metadata modify ID -m field:val + remove -m field:val\n\n\
             Valid operations after +: modify, append, append-list, insert, remove.\n\
             Shared options (--target, --dry-run, --json, etc.) go before the first +.",
         after_long_help = cstr!(
@@ -252,8 +252,8 @@ pub struct ImportArgs {
 #[command(
     long_about = "Read or modify Internet Archive item metadata. Shows metadata as JSON \
         by default. Use subcommands for write operations, bulk export, or bulk import.\n\n\
-        Chain multiple write operations with + for a single HTTP request:\n\
-        \x20 ia metadata modify ID -m field:val + remove -m field:val",
+        Chain multiple write operations with + for a single HTTP request:\n  \
+        ia metadata modify ID -m field:val + remove -m field:val",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Show item metadata</dim>\n  <bold>$ ia metadata nasa</bold>\
@@ -1189,7 +1189,8 @@ async fn collect_identifiers_from_batch(
 /// Valid operation names for compound continuations.
 const VALID_OPS: &[&str] = &["modify", "append", "append-list", "insert", "remove"];
 
-/// Shared options that must appear only in the first segment.
+/// Shared options that must appear only in the first segment (before any +).
+/// These are write-subcommand options that apply to the entire operation.
 const SHARED_OPTIONS: &[&str] = &[
     "--target",
     "--expect",
@@ -1198,12 +1199,8 @@ const SHARED_OPTIONS: &[&str] = &[
     "--dry-run",
     "--json",
     "--pretty",
-    "--exists",
-    "--formats",
     "--itemlist",
     "--search",
-    "-e",
-    "-F",
 ];
 
 /// Result of splitting compound args: the primary args (for clap) and continuations.
@@ -1262,16 +1259,11 @@ fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
             );
         }
 
-        // Check for shared options that shouldn't be here
-        for arg in &seg[1..] {
-            if SHARED_OPTIONS.contains(&arg.as_str()) {
-                bail!(
-                    "{arg} must appear in the first operation segment (before any +)"
-                );
-            }
-        }
-
-        // Extract -m / --metadata values
+        // Single-pass: extract -m values and validate no shared options.
+        // The shared-options check is interleaved with -m parsing so that
+        // a -m *value* that happens to match a shared option name (e.g.,
+        // `-m "field:--dry-run"`) is correctly consumed as a value rather
+        // than rejected as a misplaced flag.
         let mut changes = Vec::new();
         let mut iter = seg[1..].iter();
         while let Some(arg) = iter.next() {
@@ -1284,6 +1276,10 @@ fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
                 changes.push(value.to_string());
             } else if let Some(value) = arg.strip_prefix("--metadata=") {
                 changes.push(value.to_string());
+            } else if SHARED_OPTIONS.contains(&arg.as_str()) {
+                bail!(
+                    "{arg} must appear in the first operation segment (before any +)"
+                );
             } else {
                 bail!(
                     "unexpected argument {arg:?} in {op_name} continuation \
@@ -1357,24 +1353,16 @@ pub struct CompoundFromArgv {
     pub continuations: Vec<(String, Vec<String>)>,
 }
 
-/// Global flags that consume the next argv element as a value.
-const VALUE_TAKING_FLAGS: &[&str] = &[
-    "-c",
-    "--config-file",
-    "-H",
-    "--host",
-    "--user-agent-suffix",
-    "-j",
-    "--jobs",
-    "--joblog",
-];
-
 /// Find the position of "metadata" when it appears as the CLI subcommand
 /// (first positional arg after the binary name and global flags).
 ///
+/// `value_taking_flags` lists global flags that consume the next argv element
+/// as a value (e.g., `-j`, `--host`). This is derived dynamically from clap's
+/// `Cli::command()` in main.rs so it stays in sync automatically.
+///
 /// Returns `None` if the subcommand is anything other than "metadata",
 /// preventing false positives like `ia download metadata`.
-fn find_metadata_subcommand_pos(args: &[String]) -> Option<usize> {
+fn find_metadata_subcommand_pos(args: &[String], value_taking_flags: &[String]) -> Option<usize> {
     let mut skip_next = false;
     for (i, arg) in args.iter().enumerate().skip(1) {
         if skip_next {
@@ -1382,7 +1370,7 @@ fn find_metadata_subcommand_pos(args: &[String]) -> Option<usize> {
             continue;
         }
         // Flags that consume a value: skip the next arg too
-        if VALUE_TAKING_FLAGS.contains(&arg.as_str()) {
+        if value_taking_flags.iter().any(|f| f == arg) {
             skip_next = true;
             continue;
         }
@@ -1396,8 +1384,11 @@ fn find_metadata_subcommand_pos(args: &[String]) -> Option<usize> {
     None
 }
 
-pub fn extract_compound_from_argv(raw_args: &[String]) -> Result<Option<CompoundFromArgv>> {
-    let Some(meta_pos) = find_metadata_subcommand_pos(raw_args) else {
+pub fn extract_compound_from_argv(
+    raw_args: &[String],
+    value_taking_flags: &[String],
+) -> Result<Option<CompoundFromArgv>> {
+    let Some(meta_pos) = find_metadata_subcommand_pos(raw_args, value_taking_flags) else {
         return Ok(None);
     };
 
@@ -1650,6 +1641,15 @@ mod compound_tests {
     }
 
     #[test]
+    fn split_shared_option_as_metadata_value_is_allowed() {
+        // A metadata *value* that matches a shared option name must not be
+        // rejected — the single-pass parser consumes it as -m's value.
+        let a = args("modify my-item -m title:New + modify -m field:--dry-run");
+        let result = split_compound_args(&a).unwrap().unwrap();
+        assert_eq!(result.continuations[0].1, vec!["field:--dry-run"]);
+    }
+
+    #[test]
     fn split_continuation_with_long_metadata_flag() {
         let a = args("modify my-item -m title:New + append --metadata desc:more");
         let result = split_compound_args(&a).unwrap().unwrap();
@@ -1753,34 +1753,43 @@ mod compound_tests {
 
     // ─── find_metadata_subcommand_pos tests ────────────────────────────────
 
+    /// Test-only flag list — tests exercise the algorithm (skipping flags,
+    /// finding the first positional). Production uses dynamic derivation
+    /// from Cli::command() so this list never needs manual sync.
+    fn test_value_flags() -> Vec<String> {
+        ["-c", "--config-file", "-H", "--host", "--user-agent-suffix",
+         "-j", "--jobs", "--joblog"]
+            .iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn find_subcommand_bare_metadata() {
         let a = args("ia metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a), Some(1));
+        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(1));
     }
 
     #[test]
     fn find_subcommand_with_flags() {
         let a = args("ia -d -j 4 metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a), Some(4));
+        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(4));
     }
 
     #[test]
     fn find_subcommand_download_returns_none() {
         let a = args("ia download test-item");
-        assert_eq!(find_metadata_subcommand_pos(&a), None);
+        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), None);
     }
 
     #[test]
     fn find_subcommand_host_metadata_skips_flag_value() {
         let a = args("ia --host metadata metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a), Some(3));
+        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(3));
     }
 
     #[test]
     fn find_subcommand_config_file_skips_flag_value() {
         let a = args("ia -c /path/to/config metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a), Some(3));
+        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(3));
     }
 
     // ─── extract_compound_from_argv tests ────────────────────────────────
@@ -1788,21 +1797,21 @@ mod compound_tests {
     #[test]
     fn extract_compound_no_metadata_returns_none() {
         let a = args("ia download test-item");
-        let result = extract_compound_from_argv(&a).unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn extract_compound_metadata_no_plus_returns_none() {
         let a = args("ia metadata modify test-item -m title:New");
-        let result = extract_compound_from_argv(&a).unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn extract_compound_metadata_with_plus() {
         let a = args("ia metadata modify test-item -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia metadata modify test-item -m title:New")
@@ -1814,7 +1823,7 @@ mod compound_tests {
     #[test]
     fn extract_compound_download_metadata_not_detected() {
         let a = args("ia download metadata + remove -m x:y");
-        let result = extract_compound_from_argv(&a).unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap();
         assert!(
             result.is_none(),
             "should not detect compound ops for non-metadata subcommand"
@@ -1824,7 +1833,7 @@ mod compound_tests {
     #[test]
     fn extract_compound_host_metadata_not_detected() {
         let a = args("ia --host metadata metadata modify test -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia --host metadata metadata modify test -m title:New")
@@ -1834,7 +1843,7 @@ mod compound_tests {
     #[test]
     fn extract_compound_flags_before_metadata() {
         let a = args("ia -d -j 4 metadata modify test -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia -d -j 4 metadata modify test -m title:New")
@@ -1844,7 +1853,7 @@ mod compound_tests {
     #[test]
     fn extract_compound_list_metadata_not_detected() {
         let a = args("ia list metadata");
-        let result = extract_compound_from_argv(&a).unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap();
         assert!(result.is_none());
     }
 }

@@ -226,7 +226,11 @@ pub fn compute_patch(
     expect: Option<&HashMap<String, serde_json::Value>>,
     identifier: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    compute_compound_patch(source, &[ChangeGroup { changes: changes.to_vec(), op: op.clone() }], expect, identifier)
+    let group = ChangeGroup {
+        changes: changes.to_vec(),
+        op: op.clone(),
+    };
+    compute_compound_patch(source, &[group], expect, identifier)
 }
 
 /// Compute a single JSON Patch from multiple chained operation groups.
