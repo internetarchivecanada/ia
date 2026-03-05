@@ -291,6 +291,16 @@ pub struct MetadataArgs {
     pub command: Option<MetadataCommand>,
 }
 
+// ─── Runtime context ─────────────────────────────────────────────────────────
+
+/// Runtime context for write operations — groups parameters that are
+/// always passed together through the write call chain.
+struct WriteContext {
+    quiet: u8,
+    jobs: usize,
+    joblog_path: Option<PathBuf>,
+}
+
 // ─── Main dispatch ───────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -301,50 +311,42 @@ pub async fn run(
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
+    let ctx = WriteContext {
+        quiet,
+        jobs,
+        joblog_path,
+    };
+
     match args.command {
         Some(MetadataCommand::Export(sub)) => {
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with export");
             }
-            run_export(client, sub, quiet).await
+            run_export(client, sub, ctx.quiet).await
         }
         Some(MetadataCommand::Modify(sub)) => {
-            run_write(
-                client, sub.input, sub.write, MetadataOp::Set, continuations, quiet, jobs,
-                joblog_path,
-            )
-            .await
+            run_write(client, sub.input, sub.write, MetadataOp::Set, continuations, &ctx).await
         }
         Some(MetadataCommand::Append(sub)) => {
-            run_write(
-                client, sub.input, sub.write, MetadataOp::Append, continuations, quiet, jobs,
-                joblog_path,
-            )
-            .await
+            run_write(client, sub.input, sub.write, MetadataOp::Append, continuations, &ctx).await
         }
         Some(MetadataCommand::AppendList(sub)) => {
             run_write(
-                client, sub.input, sub.write, MetadataOp::AppendList, continuations, quiet, jobs,
-                joblog_path,
+                client, sub.input, sub.write, MetadataOp::AppendList, continuations, &ctx,
             )
             .await
         }
         Some(MetadataCommand::Insert(sub)) => {
-            run_write_insert(client, sub.input, sub.write, continuations, quiet, jobs, joblog_path)
-                .await
+            run_write_insert(client, sub.input, sub.write, continuations, &ctx).await
         }
         Some(MetadataCommand::Remove(sub)) => {
-            run_write(
-                client, sub.input, sub.write, MetadataOp::Remove, continuations, quiet, jobs,
-                joblog_path,
-            )
-            .await
+            run_write(client, sub.input, sub.write, MetadataOp::Remove, continuations, &ctx).await
         }
         Some(MetadataCommand::Import(sub)) => {
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with import");
             }
-            run_import(client, sub, quiet, jobs, joblog_path).await
+            run_import(client, sub, &ctx).await
         }
         None => {
             if continuations.is_some() {
@@ -520,16 +522,27 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
 
 // ─── Write ───────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Parse raw continuation segments into ChangeGroups.
+fn build_continuation_groups(
+    continuations: Option<Vec<(String, Vec<String>)>>,
+) -> Result<Vec<ChangeGroup>> {
+    let Some(conts) = continuations else {
+        return Ok(vec![]);
+    };
+    let mut groups = Vec::new();
+    for (op_name, raw_changes) in &conts {
+        groups.extend(parse_continuation_groups(op_name, raw_changes)?);
+    }
+    Ok(groups)
+}
+
 async fn run_write(
     client: &IaClient,
     input: BatchInput,
     write: WriteOpts,
     op: MetadataOp,
     continuations: Option<Vec<(String, Vec<String>)>>,
-    quiet: u8,
-    jobs: usize,
-    joblog_path: Option<PathBuf>,
+    ctx: &WriteContext,
 ) -> Result<()> {
     if write.metadata.is_empty() && continuations.is_none() {
         bail!("no -m/--metadata values specified");
@@ -548,13 +561,9 @@ async fn run_write(
 
     // Build change groups: primary + continuations
     let mut change_groups = vec![ChangeGroup { changes, op }];
-    if let Some(conts) = continuations {
-        for (op_name, raw_changes) in &conts {
-            change_groups.extend(parse_continuation_groups(op_name, raw_changes)?);
-        }
-    }
+    change_groups.extend(build_continuation_groups(continuations)?);
 
-    run_write_inner(client, input, write, change_groups, quiet, jobs, joblog_path).await
+    run_write_inner(client, input, write, change_groups, ctx).await
 }
 
 async fn run_write_insert(
@@ -562,9 +571,7 @@ async fn run_write_insert(
     input: BatchInput,
     write: WriteOpts,
     continuations: Option<Vec<(String, Vec<String>)>>,
-    quiet: u8,
-    jobs: usize,
-    joblog_path: Option<PathBuf>,
+    ctx: &WriteContext,
 ) -> Result<()> {
     if write.metadata.is_empty() && continuations.is_none() {
         bail!("no -m/--metadata values specified");
@@ -586,24 +593,17 @@ async fn run_write_insert(
         .collect::<Result<Vec<_>>>()?;
 
     // Add continuations
-    if let Some(conts) = continuations {
-        for (op_name, raw_changes) in &conts {
-            change_groups.extend(parse_continuation_groups(op_name, raw_changes)?);
-        }
-    }
+    change_groups.extend(build_continuation_groups(continuations)?);
 
-    run_write_inner(client, input, write, change_groups, quiet, jobs, joblog_path).await
+    run_write_inner(client, input, write, change_groups, ctx).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_write_inner(
     client: &IaClient,
     input: BatchInput,
     write: WriteOpts,
     change_groups: Vec<ChangeGroup>,
-    quiet: u8,
-    jobs: usize,
-    joblog_path: Option<PathBuf>,
+    ctx: &WriteContext,
 ) -> Result<()> {
     use ia_core::metadata::write::CompoundModifyRequest;
 
@@ -643,7 +643,8 @@ async fn run_write_inner(
         bail!("no identifiers provided");
     }
 
-    let joblog = joblog_path
+    let joblog = ctx
+        .joblog_path
         .as_ref()
         .map(|p| JoblogWriter::open(p))
         .transpose()
@@ -655,7 +656,7 @@ async fn run_write_inner(
 
     // Dry-run: uses compute_compound_patch for a combined diff
     if write.dry_run {
-        if !json && quiet == 0 {
+        if !json && ctx.quiet == 0 {
             println!("Dry run -- no changes will be applied\n");
         }
         let mut total_dry_run_changes = 0usize;
@@ -666,12 +667,12 @@ async fn run_write_inner(
                 &change_groups,
                 &write.target,
                 expect.as_ref(),
-                quiet,
+                ctx.quiet,
                 json,
             )
             .await?;
         }
-        if !json && quiet == 0 {
+        if !json && ctx.quiet == 0 {
             println!(
                 "\n{} item(s), {} change(s)",
                 identifiers.len(),
@@ -688,7 +689,7 @@ async fn run_write_inner(
     };
 
     // Concurrent batch processing — single POST per item via modify_compound
-    let semaphore = Arc::new(Semaphore::new(jobs));
+    let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let rate_limiter = RateLimiter::new();
     let mut set = JoinSet::new();
     let total_count = identifiers.len();
@@ -743,7 +744,7 @@ async fn run_write_inner(
             &outcome,
             elapsed_ms,
             &file_target,
-            quiet,
+            ctx.quiet,
             joblog.as_ref(),
             json,
         ) {
@@ -844,13 +845,7 @@ fn merge_indexed_columns(
     resolved
 }
 
-async fn run_import(
-    client: &IaClient,
-    args: ImportArgs,
-    quiet: u8,
-    jobs: usize,
-    joblog_path: Option<PathBuf>,
-) -> Result<()> {
+async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> Result<()> {
     let json = args.json;
 
     let records = ia_core::spreadsheet::read_spreadsheet(&args.file).context(format!(
@@ -860,7 +855,8 @@ async fn run_import(
 
     let priority = args.priority.unwrap_or(-5);
 
-    let joblog = joblog_path
+    let joblog = ctx
+        .joblog_path
         .as_ref()
         .map(|p| JoblogWriter::open(p))
         .transpose()
@@ -904,7 +900,7 @@ async fn run_import(
 
     // Dry-run
     if args.dry_run {
-        if !json && quiet == 0 {
+        if !json && ctx.quiet == 0 {
             println!("Dry run -- no changes will be applied\n");
         }
         let mut total_changes = 0usize;
@@ -915,12 +911,12 @@ async fn run_import(
                 groups,
                 &args.target,
                 None,
-                quiet,
+                ctx.quiet,
                 json,
             )
             .await?;
         }
-        if !json && quiet == 0 {
+        if !json && ctx.quiet == 0 {
             println!("\n{} item(s), {} change(s)", item_count, total_changes);
         }
         return Ok(());
@@ -933,7 +929,7 @@ async fn run_import(
     };
 
     // Concurrent batch processing
-    let semaphore = Arc::new(Semaphore::new(jobs));
+    let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let rate_limiter = RateLimiter::new();
     let mut set = JoinSet::new();
 
@@ -987,7 +983,7 @@ async fn run_import(
             &outcome,
             elapsed_ms,
             &file_target,
-            quiet,
+            ctx.quiet,
             joblog.as_ref(),
             json,
         ) {
