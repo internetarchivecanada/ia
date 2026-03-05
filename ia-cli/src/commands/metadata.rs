@@ -13,8 +13,8 @@ use tokio::task::JoinSet;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
-    extract_target_metadata, parse_indexed_key, parse_key_value, MetadataOp, ADMIN_ONLY_FIELDS,
-    IMMUTABLE_FIELDS, REMOVE_TAG,
+    extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup, MetadataOp,
+    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
@@ -547,7 +547,7 @@ async fn run_write(
         .collect::<Result<Vec<_>>>()?;
 
     // Build change groups: primary + continuations
-    let mut change_groups = vec![(changes, op)];
+    let mut change_groups = vec![ChangeGroup { changes, op }];
     if let Some(conts) = continuations {
         for (op_name, raw_changes) in &conts {
             let group = parse_continuation_group(op_name, raw_changes)?;
@@ -572,14 +572,17 @@ async fn run_write_insert(
     }
 
     // Each --metadata arg gets its own group with its own index
-    let mut change_groups: Vec<(Vec<(String, serde_json::Value)>, MetadataOp)> = write
+    let mut change_groups: Vec<ChangeGroup> = write
         .metadata
         .iter()
         .map(|s| {
             let (key, value) =
                 parse_key_value(s).context(format!("invalid key:value format: {s:?}"))?;
             let (field, index) = parse_indexed_key(&key).unwrap_or((key, 0));
-            Ok((vec![(field, json!(value))], MetadataOp::Insert(index)))
+            Ok(ChangeGroup {
+                changes: vec![(field, json!(value))],
+                op: MetadataOp::Insert(index),
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -599,7 +602,7 @@ async fn run_write_inner(
     client: &IaClient,
     input: BatchInput,
     write: WriteOpts,
-    change_groups: Vec<(Vec<(String, serde_json::Value)>, MetadataOp)>,
+    change_groups: Vec<ChangeGroup>,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
@@ -607,8 +610,8 @@ async fn run_write_inner(
     use ia_core::metadata::write::CompoundModifyRequest;
 
     // Warn about immutable/admin-only fields
-    for (changes, _) in &change_groups {
-        for (key, _) in changes {
+    for group in &change_groups {
+        for (key, _) in &group.changes {
             let field = parse_indexed_key(key)
                 .map(|(f, _)| f)
                 .unwrap_or_else(|| key.clone());
@@ -867,7 +870,6 @@ async fn run_import(
 
     // Build (identifier, change_groups) pairs from records.
     // Each record's columns are parsed for operation prefixes.
-    type ChangeGroup = (Vec<(String, serde_json::Value)>, MetadataOp);
     let mut work_items: Vec<(String, Vec<ChangeGroup>)> = Vec::new();
     for (identifier, fields) in &records {
         if fields.is_empty() {
@@ -884,12 +886,15 @@ async fn run_import(
             let (op, field) = parse_column_op(col_name)?;
             // Try to merge with last group if same op
             if let Some(last) = groups.last_mut() {
-                if last.1 == op {
-                    last.0.push((field, value.clone()));
+                if last.op == op {
+                    last.changes.push((field, value.clone()));
                     continue;
                 }
             }
-            groups.push((vec![(field, value.clone())], op));
+            groups.push(ChangeGroup {
+                changes: vec![(field, value.clone())],
+                op,
+            });
         }
 
         if !groups.is_empty() {
@@ -1010,7 +1015,7 @@ async fn run_import(
 async fn run_dry_run_compound(
     client: &IaClient,
     identifier: &str,
-    groups: &[(Vec<(String, serde_json::Value)>, MetadataOp)],
+    groups: &[ChangeGroup],
     target: &str,
     expect: Option<&HashMap<String, serde_json::Value>>,
     quiet: u8,
@@ -1325,7 +1330,10 @@ fn parse_continuation_group(
             last_index = index;
             changes.push((field, json!(value)));
         }
-        Ok((changes, MetadataOp::Insert(last_index)))
+        Ok(ChangeGroup {
+            changes,
+            op: MetadataOp::Insert(last_index),
+        })
     } else {
         let op = match op_name {
             "modify" => MetadataOp::Set,
@@ -1342,7 +1350,7 @@ fn parse_continuation_group(
                 Ok((key, json!(value)))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((changes, op))
+        Ok(ChangeGroup { changes, op })
     }
 }
 
@@ -1620,8 +1628,8 @@ mod compound_tests {
     fn parse_continuation_modify() {
         let group =
             parse_continuation_group("modify", &["title:New".to_string()]).unwrap();
-        assert!(matches!(group.1, MetadataOp::Set));
-        assert_eq!(group.0[0].0, "title");
+        assert!(matches!(group.op, MetadataOp::Set));
+        assert_eq!(group.changes[0].0, "title");
     }
 
     #[test]
@@ -1631,14 +1639,14 @@ mod compound_tests {
             &["collection[0]:featured".to_string()],
         )
         .unwrap();
-        assert!(matches!(group.1, MetadataOp::Insert(0)));
+        assert!(matches!(group.op, MetadataOp::Insert(0)));
     }
 
     #[test]
     fn parse_continuation_remove() {
         let group =
             parse_continuation_group("remove", &["subject:old".to_string()]).unwrap();
-        assert!(matches!(group.1, MetadataOp::Remove));
+        assert!(matches!(group.op, MetadataOp::Remove));
     }
 
     #[test]
@@ -1654,7 +1662,7 @@ mod compound_tests {
             &["subject:physics".to_string()],
         )
         .unwrap();
-        assert!(matches!(group.1, MetadataOp::AppendList));
+        assert!(matches!(group.op, MetadataOp::AppendList));
     }
 
     #[test]

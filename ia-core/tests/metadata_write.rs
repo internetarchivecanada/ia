@@ -4,8 +4,8 @@
 //! All metadata fixtures are FAKE — no real archive.org items.
 
 use ia_core::metadata::write::{
-    compute_patch, modify, modify_compound, prepare_metadata, CompoundModifyRequest, MetadataOp,
-    ModifyRequest, REMOVE_TAG,
+    compute_patch, modify, modify_compound, prepare_metadata, ChangeGroup,
+    CompoundModifyRequest, MetadataOp, ModifyRequest, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::{IaClient, IaConfig, IaError};
@@ -1756,14 +1756,14 @@ async fn modify_compound_set_and_remove_single_post() {
     let req = CompoundModifyRequest {
         identifier: "test-item".to_string(),
         groups: vec![
-            (
-                vec![("title".to_string(), json!("New Title"))],
-                MetadataOp::Set,
-            ),
-            (
-                vec![("subject".to_string(), json!("science"))],
-                MetadataOp::Remove,
-            ),
+            ChangeGroup {
+                changes: vec![("title".to_string(), json!("New Title"))],
+                op: MetadataOp::Set,
+            },
+            ChangeGroup {
+                changes: vec![("subject".to_string(), json!("science"))],
+                op: MetadataOp::Remove,
+            },
         ],
         target: "metadata".to_string(),
         expect: None,
@@ -1789,10 +1789,10 @@ async fn modify_compound_no_net_changes_errors() {
     let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
     let req = CompoundModifyRequest {
         identifier: "test-item".to_string(),
-        groups: vec![(
-            vec![("title".to_string(), json!("Old Title"))],
-            MetadataOp::Set,
-        )],
+        groups: vec![ChangeGroup {
+            changes: vec![("title".to_string(), json!("Old Title"))],
+            op: MetadataOp::Set,
+        }],
         target: "metadata".to_string(),
         expect: None,
         priority: None,
@@ -1808,10 +1808,10 @@ async fn modify_compound_auth_required() {
     let client = IaClient::from_config(config).unwrap();
     let req = CompoundModifyRequest {
         identifier: "test-item".to_string(),
-        groups: vec![(
-            vec![("title".to_string(), json!("New"))],
-            MetadataOp::Set,
-        )],
+        groups: vec![ChangeGroup {
+            changes: vec![("title".to_string(), json!("New"))],
+            op: MetadataOp::Set,
+        }],
         target: "metadata".to_string(),
         expect: None,
         priority: None,
@@ -1874,18 +1874,18 @@ async fn modify_compound_three_groups_single_post() {
     let req = CompoundModifyRequest {
         identifier: "test-item".to_string(),
         groups: vec![
-            (
-                vec![("title".to_string(), json!("New"))],
-                MetadataOp::Set,
-            ),
-            (
-                vec![("subject".to_string(), json!("physics"))],
-                MetadataOp::AppendList,
-            ),
-            (
-                vec![("collection".to_string(), json!("featured"))],
-                MetadataOp::Insert(0),
-            ),
+            ChangeGroup {
+                changes: vec![("title".to_string(), json!("New"))],
+                op: MetadataOp::Set,
+            },
+            ChangeGroup {
+                changes: vec![("subject".to_string(), json!("physics"))],
+                op: MetadataOp::AppendList,
+            },
+            ChangeGroup {
+                changes: vec![("collection".to_string(), json!("featured"))],
+                op: MetadataOp::Insert(0),
+            },
         ],
         target: "metadata".to_string(),
         expect: None,
@@ -1925,14 +1925,14 @@ async fn modify_compound_overlapping_fields_last_wins() {
     let req = CompoundModifyRequest {
         identifier: "test-item".to_string(),
         groups: vec![
-            (
-                vec![("title".to_string(), json!("First"))],
-                MetadataOp::Set,
-            ),
-            (
-                vec![("title".to_string(), json!("Second"))],
-                MetadataOp::Set,
-            ),
+            ChangeGroup {
+                changes: vec![("title".to_string(), json!("First"))],
+                op: MetadataOp::Set,
+            },
+            ChangeGroup {
+                changes: vec![("title".to_string(), json!("Second"))],
+                op: MetadataOp::Set,
+            },
         ],
         target: "metadata".to_string(),
         expect: None,
