@@ -13,8 +13,8 @@ use tokio::task::JoinSet;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
-    extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup, MetadataOp,
-    ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
+    extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup,
+    CompoundModifyRequest, MetadataOp, ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
 };
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
@@ -605,8 +605,6 @@ async fn run_write_inner(
     change_groups: Vec<ChangeGroup>,
     ctx: &WriteContext,
 ) -> Result<()> {
-    use ia_core::metadata::write::CompoundModifyRequest;
-
     // Warn about immutable/admin-only fields
     for group in &change_groups {
         for (key, _) in &group.changes {
@@ -934,8 +932,6 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
     let mut set = JoinSet::new();
 
     for (identifier, groups) in work_items {
-        use ia_core::metadata::write::CompoundModifyRequest;
-
         let client = client.clone();
         let sem = Arc::clone(&semaphore);
         let rl = rate_limiter.clone();
@@ -1203,7 +1199,6 @@ const SHARED_OPTIONS: &[&str] = &[
     "--formats",
     "--itemlist",
     "--search",
-    "--spreadsheet",
     "-e",
     "-F",
     "-s",
