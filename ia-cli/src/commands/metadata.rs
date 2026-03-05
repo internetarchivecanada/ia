@@ -1364,10 +1364,47 @@ pub struct CompoundFromArgv {
     pub continuations: Vec<(String, Vec<String>)>,
 }
 
+/// Global flags that consume the next argv element as a value.
+const VALUE_TAKING_FLAGS: &[&str] = &[
+    "-c",
+    "--config-file",
+    "-H",
+    "--host",
+    "--user-agent-suffix",
+    "-j",
+    "--jobs",
+    "--joblog",
+];
+
+/// Find the position of "metadata" when it appears as the CLI subcommand
+/// (first positional arg after the binary name and global flags).
+///
+/// Returns `None` if the subcommand is anything other than "metadata",
+/// preventing false positives like `ia download metadata`.
+fn find_metadata_subcommand_pos(args: &[String]) -> Option<usize> {
+    let mut skip_next = false;
+    for (i, arg) in args.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        // Flags that consume a value: skip the next arg too
+        if VALUE_TAKING_FLAGS.contains(&arg.as_str()) {
+            skip_next = true;
+            continue;
+        }
+        // Any other flag (boolean flags like -d, -l, -q, --retry-failed)
+        if arg.starts_with('-') {
+            continue;
+        }
+        // First positional arg = subcommand
+        return if arg == "metadata" { Some(i) } else { None };
+    }
+    None
+}
+
 pub fn extract_compound_from_argv(raw_args: &[String]) -> Result<Option<CompoundFromArgv>> {
-    // Find the "metadata" subcommand position
-    let meta_pos = raw_args.iter().position(|a| a == "metadata");
-    let Some(meta_pos) = meta_pos else {
+    let Some(meta_pos) = find_metadata_subcommand_pos(raw_args) else {
         return Ok(None);
     };
 
@@ -1721,6 +1758,40 @@ mod compound_tests {
         assert_eq!(groups[0].changes.len(), 2);
     }
 
+    // ─── find_metadata_subcommand_pos tests ────────────────────────────────
+
+    #[test]
+    fn find_subcommand_bare_metadata() {
+        let a = args("ia metadata modify test -m title:New");
+        assert_eq!(find_metadata_subcommand_pos(&a), Some(1));
+    }
+
+    #[test]
+    fn find_subcommand_with_flags() {
+        let a = args("ia -d -j 4 metadata modify test -m title:New");
+        assert_eq!(find_metadata_subcommand_pos(&a), Some(4));
+    }
+
+    #[test]
+    fn find_subcommand_download_returns_none() {
+        let a = args("ia download test-item");
+        assert_eq!(find_metadata_subcommand_pos(&a), None);
+    }
+
+    #[test]
+    fn find_subcommand_host_metadata_skips_flag_value() {
+        let a = args("ia --host metadata metadata modify test -m title:New");
+        assert_eq!(find_metadata_subcommand_pos(&a), Some(3));
+    }
+
+    #[test]
+    fn find_subcommand_config_file_skips_flag_value() {
+        let a = args("ia -c /path/to/config metadata modify test -m title:New");
+        assert_eq!(find_metadata_subcommand_pos(&a), Some(3));
+    }
+
+    // ─── extract_compound_from_argv tests ────────────────────────────────
+
     #[test]
     fn extract_compound_no_metadata_returns_none() {
         let a = args("ia download test-item");
@@ -1745,5 +1816,42 @@ mod compound_tests {
         );
         assert_eq!(result.continuations.len(), 1);
         assert_eq!(result.continuations[0].0, "remove");
+    }
+
+    #[test]
+    fn extract_compound_download_metadata_not_detected() {
+        let a = args("ia download metadata + remove -m x:y");
+        let result = extract_compound_from_argv(&a).unwrap();
+        assert!(
+            result.is_none(),
+            "should not detect compound ops for non-metadata subcommand"
+        );
+    }
+
+    #[test]
+    fn extract_compound_host_metadata_not_detected() {
+        let a = args("ia --host metadata metadata modify test -m title:New + remove -m x:y");
+        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        assert_eq!(
+            result.filtered_argv,
+            args("ia --host metadata metadata modify test -m title:New")
+        );
+    }
+
+    #[test]
+    fn extract_compound_flags_before_metadata() {
+        let a = args("ia -d -j 4 metadata modify test -m title:New + remove -m x:y");
+        let result = extract_compound_from_argv(&a).unwrap().unwrap();
+        assert_eq!(
+            result.filtered_argv,
+            args("ia -d -j 4 metadata modify test -m title:New")
+        );
+    }
+
+    #[test]
+    fn extract_compound_list_metadata_not_detected() {
+        let a = args("ia list metadata");
+        let result = extract_compound_from_argv(&a).unwrap();
+        assert!(result.is_none());
     }
 }
