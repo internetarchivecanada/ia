@@ -550,8 +550,7 @@ async fn run_write(
     let mut change_groups = vec![ChangeGroup { changes, op }];
     if let Some(conts) = continuations {
         for (op_name, raw_changes) in &conts {
-            let group = parse_continuation_group(op_name, raw_changes)?;
-            change_groups.push(group);
+            change_groups.extend(parse_continuation_groups(op_name, raw_changes)?);
         }
     }
 
@@ -589,8 +588,7 @@ async fn run_write_insert(
     // Add continuations
     if let Some(conts) = continuations {
         for (op_name, raw_changes) in &conts {
-            let group = parse_continuation_group(op_name, raw_changes)?;
-            change_groups.push(group);
+            change_groups.extend(parse_continuation_groups(op_name, raw_changes)?);
         }
     }
 
@@ -1310,30 +1308,34 @@ fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
     }))
 }
 
-/// Parse a continuation segment into a ChangeGroup.
-fn parse_continuation_group(
+/// Parse a continuation segment into one or more ChangeGroups.
+///
+/// For insert operations, each `-m` arg gets its own ChangeGroup with its own
+/// index, matching the behavior of `run_write_insert`. For all other ops, all
+/// changes are collected into a single ChangeGroup.
+fn parse_continuation_groups(
     op_name: &str,
     raw_changes: &[String],
-) -> Result<ia_core::metadata::write::ChangeGroup> {
+) -> Result<Vec<ia_core::metadata::write::ChangeGroup>> {
     if raw_changes.is_empty() {
         bail!("{op_name} continuation has no -m values");
     }
 
     if op_name == "insert" {
-        // Insert: each change may have a different index
-        let mut changes = Vec::new();
-        let mut last_index = 0;
-        for s in raw_changes {
-            let (key, value) =
-                parse_key_value(s).context(format!("invalid key:value format: {s:?}"))?;
-            let (field, index) = parse_indexed_key(&key).unwrap_or((key, 0));
-            last_index = index;
-            changes.push((field, json!(value)));
-        }
-        Ok(ChangeGroup {
-            changes,
-            op: MetadataOp::Insert(last_index),
-        })
+        // Insert: each -m arg gets its own ChangeGroup with its own index
+        // (matching run_write_insert behavior)
+        raw_changes
+            .iter()
+            .map(|s| {
+                let (key, value) =
+                    parse_key_value(s).context(format!("invalid key:value format: {s:?}"))?;
+                let (field, index) = parse_indexed_key(&key).unwrap_or((key, 0));
+                Ok(ChangeGroup {
+                    changes: vec![(field, json!(value))],
+                    op: MetadataOp::Insert(index),
+                })
+            })
+            .collect()
     } else {
         let op = match op_name {
             "modify" => MetadataOp::Set,
@@ -1350,7 +1352,7 @@ fn parse_continuation_group(
                 Ok((key, json!(value)))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(ChangeGroup { changes, op })
+        Ok(vec![ChangeGroup { changes, op }])
     }
 }
 
@@ -1626,43 +1628,97 @@ mod compound_tests {
 
     #[test]
     fn parse_continuation_modify() {
-        let group =
-            parse_continuation_group("modify", &["title:New".to_string()]).unwrap();
-        assert!(matches!(group.op, MetadataOp::Set));
-        assert_eq!(group.changes[0].0, "title");
+        let groups =
+            parse_continuation_groups("modify", &["title:New".to_string()]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].op, MetadataOp::Set));
+        assert_eq!(groups[0].changes[0].0, "title");
     }
 
     #[test]
     fn parse_continuation_insert_with_index() {
-        let group = parse_continuation_group(
+        let groups = parse_continuation_groups(
             "insert",
             &["collection[0]:featured".to_string()],
         )
         .unwrap();
-        assert!(matches!(group.op, MetadataOp::Insert(0)));
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].op, MetadataOp::Insert(0)));
     }
 
     #[test]
     fn parse_continuation_remove() {
-        let group =
-            parse_continuation_group("remove", &["subject:old".to_string()]).unwrap();
-        assert!(matches!(group.op, MetadataOp::Remove));
+        let groups =
+            parse_continuation_groups("remove", &["subject:old".to_string()]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].op, MetadataOp::Remove));
     }
 
     #[test]
     fn parse_continuation_no_changes_errors() {
-        let result = parse_continuation_group("modify", &[]);
+        let result = parse_continuation_groups("modify", &[]);
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_continuation_append_list() {
-        let group = parse_continuation_group(
+        let groups = parse_continuation_groups(
             "append-list",
             &["subject:physics".to_string()],
         )
         .unwrap();
-        assert!(matches!(group.op, MetadataOp::AppendList));
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].op, MetadataOp::AppendList));
+    }
+
+    #[test]
+    fn parse_continuation_insert_multi_index_produces_separate_groups() {
+        let groups = parse_continuation_groups(
+            "insert",
+            &[
+                "collection[0]:featured".to_string(),
+                "subject[2]:physics".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].op, MetadataOp::Insert(0));
+        assert_eq!(groups[0].changes[0].0, "collection");
+        assert_eq!(groups[1].op, MetadataOp::Insert(2));
+        assert_eq!(groups[1].changes[0].0, "subject");
+    }
+
+    #[test]
+    fn parse_continuation_insert_single_still_works() {
+        let groups = parse_continuation_groups(
+            "insert",
+            &["collection[0]:featured".to_string()],
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].op, MetadataOp::Insert(0));
+    }
+
+    #[test]
+    fn parse_continuation_insert_no_index_defaults_zero() {
+        let groups = parse_continuation_groups(
+            "insert",
+            &["collection:featured".to_string()],
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].op, MetadataOp::Insert(0));
+    }
+
+    #[test]
+    fn parse_continuation_non_insert_returns_single_group() {
+        let groups = parse_continuation_groups(
+            "modify",
+            &["title:New".to_string(), "date:2024".to_string()],
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].changes.len(), 2);
     }
 
     #[test]
