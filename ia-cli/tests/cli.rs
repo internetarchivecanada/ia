@@ -770,6 +770,17 @@ fn metadata_compound_empty_continuation_error() {
 }
 
 #[test]
+fn metadata_import_with_compound_errors() {
+    // import uses its own column-prefix system, not compatible with +
+    ia().args([
+        "metadata", "import", "data.csv", "+", "remove", "-m", "x:y",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("compound operations (+) cannot be used with import"));
+}
+
+#[test]
 fn metadata_help_mentions_compound_ops() {
     ia().args(["metadata", "--help"])
         .assert()

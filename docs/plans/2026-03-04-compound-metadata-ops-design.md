@@ -144,12 +144,14 @@ Compound ops work with all bulk input sources:
 
 Same concurrency model: JoinSet + Semaphore + RateLimiter.
 
-### Spreadsheet Incompatibility
+### Import Incompatibility
 
-`--spreadsheet` is **not compatible** with `+`. Spreadsheet mode has its own column-prefix system for mixed operations (e.g., `append:description`, `remove:subject`). If both are used:
+The `import` subcommand is **not compatible** with `+`. Import has its own column-prefix
+system for mixed operations per-row (e.g., `append:description`, `remove:subject`).
+If both are used:
 
 ```
-error: --spreadsheet cannot be combined with + compound operations
+error: compound operations (+) cannot be used with import
 ```
 
 ## JSON Output
