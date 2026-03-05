@@ -217,13 +217,8 @@ pub fn prepare_metadata(
 
 /// Compute a JSON Patch (RFC 6902) from desired metadata changes.
 ///
-/// 1. Applies changes to a copy of source via `prepare_metadata()`
-/// 2. Diffs source vs destination using `json_patch::diff()`
-/// 3. Prepends `test` operations from `expect` for optimistic concurrency
-///
+/// Convenience wrapper around [`compute_compound_patch`] for single-op use.
 /// Returns the patch as a Vec of serde_json::Value operations.
-///
-/// This is a convenience wrapper around `compute_compound_patch` for single-op use.
 pub fn compute_patch(
     source: &serde_json::Value,
     changes: &[(String, serde_json::Value)],

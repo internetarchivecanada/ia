@@ -560,7 +560,11 @@ async fn run_write(
         .collect::<Result<Vec<_>>>()?;
 
     // Build change groups: primary + continuations
-    let mut change_groups = vec![ChangeGroup { changes, op }];
+    let mut change_groups = if changes.is_empty() {
+        vec![]
+    } else {
+        vec![ChangeGroup { changes, op }]
+    };
     change_groups.extend(build_continuation_groups(continuations)?);
 
     run_write_inner(client, input, write, change_groups, ctx).await
@@ -1001,7 +1005,6 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
 
 /// Dry-run: fetch metadata, compute compound patch, display without writing.
 /// Returns the number of non-test patch operations.
-#[allow(clippy::too_many_arguments)]
 async fn run_dry_run_compound(
     client: &IaClient,
     identifier: &str,
@@ -1201,7 +1204,6 @@ const SHARED_OPTIONS: &[&str] = &[
     "--search",
     "-e",
     "-F",
-    "-s",
 ];
 
 /// Result of splitting compound args: the primary args (for clap) and continuations.
@@ -1228,8 +1230,8 @@ fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
     for arg in args {
         if arg == "+" {
             segments.push(vec![]);
-        } else {
-            segments.last_mut().unwrap().push(arg.clone());
+        } else if let Some(last) = segments.last_mut() {
+            last.push(arg.clone());
         }
     }
 
