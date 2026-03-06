@@ -748,8 +748,6 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
     (uploaded, skipped, failed, total_bytes)
 }
 
-/// Parse a list of `KEY:VALUE` strings into `(String, String)` pairs.
-/// Splits on the first `:` — values may contain additional colons.
 /// Load and parse a checksums file (one `MD5  filename` per line).
 fn load_checksums(path: &std::path::Path) -> Result<std::collections::HashMap<String, String>> {
     let content = std::fs::read_to_string(path)
@@ -757,6 +755,9 @@ fn load_checksums(path: &std::path::Path) -> Result<std::collections::HashMap<St
     ia_core::upload::checksum::parse_checksums(&content).context("failed to parse checksums file")
 }
 
+/// Parse a list of `KEY:VALUE` strings into `(String, String)` pairs.
+///
+/// Splits on the first `:` — values may contain additional colons.
 fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
     items
         .iter()
