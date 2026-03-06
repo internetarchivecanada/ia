@@ -69,31 +69,6 @@ fn encode_headers_with_prefix(
     result
 }
 
-/// Parse an S3 XML error response, extracting Code and Message.
-///
-/// Uses basic string matching — no XML crate needed. Returns (Option<Code>, Option<Message>).
-/// Gracefully returns (None, None) on malformed input.
-pub fn parse_s3_error_xml(body: &str) -> (Option<String>, Option<String>) {
-    let code = extract_xml_tag(body, "Code");
-    let message = extract_xml_tag(body, "Message");
-    (code, message)
-}
-
-/// Extract text content from a simple XML tag like `<Tag>content</Tag>`.
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)?;
-    let content_start = start + open.len();
-    let end = xml[content_start..].find(&close)?;
-    let content = &xml[content_start..content_start + end];
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,44 +197,4 @@ mod tests {
         assert_eq!(headers[0].0, "x-archive-filemeta00-title");
     }
 
-    // -- S3 XML error parsing tests --
-
-    #[test]
-    fn parse_s3_error_valid_xml() {
-        let xml = r#"<?xml version='1.0' encoding='UTF-8'?>
-<Error>
-  <Code>SlowDown</Code>
-  <Message>Please reduce your request rate.</Message>
-  <Resource>/my-item/file.pdf</Resource>
-  <RequestId>db1b9e2b-1234</RequestId>
-</Error>"#;
-        let (code, message) = parse_s3_error_xml(xml);
-        assert_eq!(code.as_deref(), Some("SlowDown"));
-        assert_eq!(
-            message.as_deref(),
-            Some("Please reduce your request rate.")
-        );
-    }
-
-    #[test]
-    fn parse_s3_error_missing_message() {
-        let xml = "<Error><Code>AccessDenied</Code></Error>";
-        let (code, message) = parse_s3_error_xml(xml);
-        assert_eq!(code.as_deref(), Some("AccessDenied"));
-        assert!(message.is_none());
-    }
-
-    #[test]
-    fn parse_s3_error_malformed() {
-        let (code, message) = parse_s3_error_xml("not xml at all");
-        assert!(code.is_none());
-        assert!(message.is_none());
-    }
-
-    #[test]
-    fn parse_s3_error_html_error_page() {
-        let html = "<html><body>500 Internal Server Error</body></html>";
-        let (code, _message) = parse_s3_error_xml(html);
-        assert!(code.is_none());
-    }
 }
