@@ -144,9 +144,6 @@ pub async fn upload_file(
         Vec::new()
     };
 
-    // Read file into memory once (before retry loop)
-    let body = tokio::fs::read(file).await?;
-
     // Retry loop
     let mut retries = 0u32;
     loop {
@@ -211,8 +208,12 @@ pub async fn upload_file(
             request = request.header(k.as_str(), v.as_str());
         }
 
-        // Send the request (clone body since reqwest consumes it, needed for retry)
-        let response = request.body(body.clone()).send().await;
+        // Open a fresh file handle per attempt — streams the body instead of
+        // buffering the entire file in memory. Content-Length is already set from
+        // file_size, so IA S3's no-chunked-transfer requirement is satisfied.
+        let file_handle = tokio::fs::File::open(file).await?;
+        let stream_body = reqwest::Body::from(file_handle);
+        let response = request.body(stream_body).send().await;
 
         match response {
             Ok(resp) => {
