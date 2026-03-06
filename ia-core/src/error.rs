@@ -81,6 +81,37 @@ pub enum IaError {
         received: u64,
     },
 
+    #[error("upload failed for {identifier}/{key}: {message}")]
+    UploadFailed {
+        identifier: String,
+        key: String,
+        message: String,
+    },
+
+    #[error("upload blocked: {identifier} appears to be spam")]
+    SpamDetected { identifier: String },
+
+    #[error("collection not found: {collection}")]
+    CollectionNotFound { collection: String },
+
+    #[error("invalid identifier '{identifier}': {reason}")]
+    InvalidIdentifier { identifier: String, reason: String },
+
+    #[error("missing required metadata field: {field}")]
+    MissingRequiredMetadata { field: String },
+
+    #[error("check_limit request failed for {identifier}")]
+    CheckLimitFailed { identifier: String },
+
+    #[error("file too large: {} ({size} bytes)", path.display())]
+    FileTooLarge { path: PathBuf, size: u64 },
+
+    #[error("no files to upload")]
+    EmptyUpload,
+
+    #[error("symlink skipped: {}", path.display())]
+    SymlinkSkipped { path: PathBuf },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -127,6 +158,16 @@ impl IaError {
             // Security — never retry
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
+            // Upload errors
+            IaError::UploadFailed { .. } => true,   // transient network issues
+            IaError::SpamDetected { .. } => false,   // permanent
+            IaError::CollectionNotFound { .. } => false,
+            IaError::InvalidIdentifier { .. } => false,
+            IaError::MissingRequiredMetadata { .. } => false,
+            IaError::CheckLimitFailed { .. } => true, // conservative: treat as overloaded
+            IaError::FileTooLarge { .. } => false,
+            IaError::EmptyUpload => false,
+            IaError::SymlinkSkipped { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -223,6 +264,42 @@ impl IaError {
                 extra.insert("expected".into(), (*expected).into());
                 extra.insert("received".into(), (*received).into());
                 "download_too_large"
+            }
+            IaError::UploadFailed { identifier, key, .. } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                extra.insert("key".into(), key.clone().into());
+                "upload_failed"
+            }
+            IaError::SpamDetected { identifier } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                "spam_detected"
+            }
+            IaError::CollectionNotFound { collection } => {
+                extra.insert("collection".into(), collection.clone().into());
+                "collection_not_found"
+            }
+            IaError::InvalidIdentifier { identifier, reason } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                extra.insert("reason".into(), reason.clone().into());
+                "invalid_identifier"
+            }
+            IaError::MissingRequiredMetadata { field } => {
+                extra.insert("field".into(), field.clone().into());
+                "missing_required_metadata"
+            }
+            IaError::CheckLimitFailed { identifier } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                "check_limit_failed"
+            }
+            IaError::FileTooLarge { path, size } => {
+                extra.insert("path".into(), path.display().to_string().into());
+                extra.insert("size".into(), (*size).into());
+                "file_too_large"
+            }
+            IaError::EmptyUpload => "empty_upload",
+            IaError::SymlinkSkipped { path } => {
+                extra.insert("path".into(), path.display().to_string().into());
+                "symlink_skipped"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -709,5 +786,174 @@ mod tests {
             version: "99.99.99".into(),
         };
         assert!(!err.is_retryable());
+    }
+
+    // -- Upload error tests --
+
+    #[test]
+    fn upload_failed_displays_details() {
+        let err = IaError::UploadFailed {
+            identifier: "my-item".into(),
+            key: "file.pdf".into(),
+            message: "connection reset".into(),
+        };
+        assert!(err.to_string().contains("my-item"));
+        assert!(err.to_string().contains("file.pdf"));
+    }
+
+    #[test]
+    fn spam_detected_is_not_retryable() {
+        let err = IaError::SpamDetected {
+            identifier: "spam-item".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn collection_not_found_is_not_retryable() {
+        let err = IaError::CollectionNotFound {
+            collection: "nonexistent".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn invalid_identifier_is_not_retryable() {
+        let err = IaError::InvalidIdentifier {
+            identifier: "!!!".into(),
+            reason: "invalid characters".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn missing_required_metadata_is_not_retryable() {
+        let err = IaError::MissingRequiredMetadata {
+            field: "mediatype".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn check_limit_failed_is_retryable() {
+        let err = IaError::CheckLimitFailed {
+            identifier: "my-item".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn json_upload_failed() {
+        let err = IaError::UploadFailed {
+            identifier: "my-item".into(),
+            key: "file.pdf".into(),
+            message: "connection reset".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "upload_failed");
+        assert_eq!(v["error"]["identifier"], "my-item");
+        assert_eq!(v["error"]["key"], "file.pdf");
+    }
+
+    #[test]
+    fn json_spam_detected() {
+        let err = IaError::SpamDetected {
+            identifier: "spam-item".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "spam_detected");
+    }
+
+    #[test]
+    fn json_collection_not_found() {
+        let err = IaError::CollectionNotFound {
+            collection: "nonexistent".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "collection_not_found");
+        assert_eq!(v["error"]["collection"], "nonexistent");
+    }
+
+    #[test]
+    fn json_invalid_identifier() {
+        let err = IaError::InvalidIdentifier {
+            identifier: "!!!".into(),
+            reason: "invalid characters".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "invalid_identifier");
+        assert_eq!(v["error"]["identifier"], "!!!");
+    }
+
+    #[test]
+    fn json_missing_required_metadata() {
+        let err = IaError::MissingRequiredMetadata {
+            field: "mediatype".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "missing_required_metadata");
+        assert_eq!(v["error"]["field"], "mediatype");
+    }
+
+    #[test]
+    fn upload_failed_is_retryable() {
+        let err = IaError::UploadFailed {
+            identifier: "my-item".into(),
+            key: "file.pdf".into(),
+            message: "connection reset".into(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn file_too_large_is_not_retryable() {
+        let err = IaError::FileTooLarge {
+            path: PathBuf::from("/tmp/huge.bin"),
+            size: 999_999_999_999,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_file_too_large() {
+        let err = IaError::FileTooLarge {
+            path: PathBuf::from("/tmp/huge.bin"),
+            size: 999_999_999_999,
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "file_too_large");
+        assert_eq!(v["error"]["path"], "/tmp/huge.bin");
+        assert_eq!(v["error"]["size"], 999_999_999_999u64);
+    }
+
+    #[test]
+    fn empty_upload_is_not_retryable() {
+        let err = IaError::EmptyUpload;
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_empty_upload() {
+        let err = IaError::EmptyUpload;
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "empty_upload");
+    }
+
+    #[test]
+    fn symlink_skipped_is_not_retryable() {
+        let err = IaError::SymlinkSkipped {
+            path: PathBuf::from("/tmp/link"),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_symlink_skipped() {
+        let err = IaError::SymlinkSkipped {
+            path: PathBuf::from("/tmp/link"),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "symlink_skipped");
+        assert_eq!(v["error"]["path"], "/tmp/link");
     }
 }
