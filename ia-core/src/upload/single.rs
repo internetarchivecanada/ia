@@ -101,6 +101,9 @@ pub async fn upload_file(
         Vec::new()
     };
 
+    // Read file into memory once (before retry loop)
+    let body = tokio::fs::read(file).await?;
+
     // Retry loop
     let mut retries = 0u32;
     loop {
@@ -119,9 +122,6 @@ pub async fn upload_file(
                 status: UploadProgressStatus::Uploading,
             });
         }
-
-        // Read file bytes (re-read on each retry in case of partial state)
-        let body = tokio::fs::read(file).await?;
 
         // Build request with all required headers
         let mut request = client
@@ -168,8 +168,8 @@ pub async fn upload_file(
             request = request.header(k.as_str(), v.as_str());
         }
 
-        // Send the request
-        let response = request.body(body).send().await;
+        // Send the request (clone body since reqwest consumes it, needed for retry)
+        let response = request.body(body.clone()).send().await;
 
         match response {
             Ok(resp) => {
