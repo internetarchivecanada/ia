@@ -382,7 +382,7 @@ fn base64_encode(data: &[u8]) -> String {
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .filter_map(|i| hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))
         .collect()
 }
 
@@ -436,6 +436,17 @@ mod tests {
     #[test]
     fn hex_to_bytes_known_value() {
         assert_eq!(hex_to_bytes("ff00ab"), vec![0xFF, 0x00, 0xAB]);
+    }
+
+    #[test]
+    fn hex_to_bytes_odd_length_does_not_panic() {
+        let result = hex_to_bytes("abc");
+        assert!(result.len() <= 1);
+    }
+
+    #[test]
+    fn hex_to_bytes_empty() {
+        assert!(hex_to_bytes("").is_empty());
     }
 
     #[test]
