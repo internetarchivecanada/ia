@@ -2,6 +2,7 @@ use crate::error::{IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
 use crate::upload::checksum::compute_file_md5;
 use crate::upload::headers::encode_metadata_headers;
+use crate::upload::s3_error::parse_s3_error;
 use crate::upload::types::*;
 use crate::IaClient;
 use std::path::Path;
@@ -227,25 +228,39 @@ pub async fn upload_file(
                     retries += 1;
                     continue;
                 } else {
-                    // Non-503 error
+                    // Non-503 error — parse S3 XML to classify
                     let body_text = resp.text().await.unwrap_or_default();
-                    let err = IaError::UploadFailed {
-                        identifier: identifier.to_string(),
-                        key: key.to_string(),
-                        message: format!("HTTP {status}: {body_text}"),
+                    let s3_err = parse_s3_error(&body_text);
+
+                    // Build a clean error message from parsed XML or raw body
+                    let err_msg = match &s3_err {
+                        Some(e) => format!("{}: {}", e.code, e.message),
+                        None => format!("HTTP {status}: {body_text}"),
                     };
-                    if err.is_retryable() && retries < opts.retries {
+
+                    // Only retry if the S3 error is classified as retryable
+                    let should_retry = s3_err.as_ref().map_or(
+                        status.is_server_error(), // fallback: retry 5xx
+                        |e| e.is_retryable(),
+                    );
+
+                    if should_retry && retries < opts.retries {
                         tracing::warn!(
                             identifier,
                             key,
                             retry = retries + 1,
                             %status,
-                            "retrying upload"
+                            "retrying upload: {err_msg}"
                         );
                         retries += 1;
                         continue;
                     }
-                    return Err(err);
+
+                    return Err(IaError::UploadFailed {
+                        identifier: identifier.to_string(),
+                        key: key.to_string(),
+                        message: err_msg,
+                    });
                 }
             }
             Err(e) => {

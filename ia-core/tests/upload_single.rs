@@ -705,6 +705,88 @@ async fn upload_content_length_header() {
     assert_eq!(result.bytes, 13);
 }
 
+// -- Non-503 error retry classification --
+
+#[tokio::test]
+async fn upload_403_is_not_retried() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    // 403 should be returned immediately — NOT retried
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
+        .expect(1) // exactly 1 request — no retries
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_sleep: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("AccessDenied"), "expected AccessDenied in error: {err}");
+}
+
+#[tokio::test]
+async fn upload_400_bad_digest_is_not_retried() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match.</Message></Error>",
+        ))
+        .expect(1) // exactly 1 request — no retries
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_sleep: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("BadDigest"));
+}
+
 // -- Dry run with verify computes MD5 --
 
 #[tokio::test]

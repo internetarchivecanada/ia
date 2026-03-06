@@ -159,7 +159,7 @@ impl IaError {
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
             // Upload errors
-            IaError::UploadFailed { .. } => true,   // transient network issues
+            IaError::UploadFailed { .. } => false,  // terminal — retry logic is in single.rs
             IaError::SpamDetected { .. } => false,   // permanent
             IaError::CollectionNotFound { .. } => false,
             IaError::InvalidIdentifier { .. } => false,
@@ -896,13 +896,13 @@ mod tests {
     }
 
     #[test]
-    fn upload_failed_is_retryable() {
+    fn upload_failed_is_not_retryable() {
         let err = IaError::UploadFailed {
             identifier: "my-item".into(),
             key: "file.pdf".into(),
             message: "connection reset".into(),
         };
-        assert!(err.is_retryable());
+        assert!(!err.is_retryable());
     }
 
     #[test]
