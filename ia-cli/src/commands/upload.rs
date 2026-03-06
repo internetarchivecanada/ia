@@ -579,8 +579,47 @@ async fn run_import(
         );
     }
 
-    let progress_fn = move |_p: UploadProgress| {
-        // Batch mode: progress is handled per-item by the result output
+    let quiet_level = quiet;
+    let progress_fn = move |p: UploadProgress| {
+        if json_mode || quiet_level >= 1 {
+            return;
+        }
+        match p.status {
+            UploadProgressStatus::Complete => {
+                eprintln!(
+                    " {} {}/{}",
+                    style("✓").green(),
+                    p.identifier,
+                    p.key,
+                );
+            }
+            UploadProgressStatus::Failed => {
+                eprintln!(
+                    " {} {}/{}",
+                    style("✗").red(),
+                    p.identifier,
+                    p.key,
+                );
+            }
+            UploadProgressStatus::Skipped => {
+                eprintln!(
+                    " {} {}/{} (skipped)",
+                    style("–").dim(),
+                    p.identifier,
+                    p.key,
+                );
+            }
+            UploadProgressStatus::WaitingRateLimit => {
+                eprintln!(
+                    " {} {} rate limited, polling...",
+                    style("⏸").yellow(),
+                    p.identifier,
+                );
+            }
+            UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
+                // Too noisy for batch — skip
+            }
+        }
     };
     let progress_ref: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = if !json_mode && quiet == 0
     {
