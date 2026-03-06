@@ -66,7 +66,10 @@ pub async fn upload_item(
     }
 
     // 4. Expand directories and collect files
-    let expanded = expand_files(files)?;
+    let files_owned = files.to_vec();
+    let expanded = tokio::task::spawn_blocking(move || expand_files(&files_owned))
+        .await
+        .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))??;
 
     // 5. Check for empty
     if expanded.is_empty() {
@@ -85,11 +88,16 @@ pub async fn upload_item(
     let size_hint = if opts.no_size_hint {
         None
     } else {
-        let total: u64 = expanded
-            .iter()
-            .filter_map(|f| std::fs::metadata(f).ok())
-            .map(|m| m.len())
-            .sum();
+        let paths = expanded.clone();
+        let total: u64 = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .filter_map(|f| std::fs::metadata(f).ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .await
+        .unwrap_or(0);
         Some(total)
     };
 

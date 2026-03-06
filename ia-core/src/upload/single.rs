@@ -45,7 +45,7 @@ pub async fn upload_file(
     progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
 ) -> Result<UploadResult> {
     let start = Instant::now();
-    let file_size = std::fs::metadata(file)?.len();
+    let file_size = tokio::fs::metadata(file).await?.len();
 
     // Compute local MD5 if needed for either skip-existing or verify
     let needs_md5 = opts.skip_existing || opts.verify;
@@ -233,7 +233,7 @@ pub async fn upload_file(
 
                     // Delete local file after successful upload if requested
                     if opts.delete_after_upload {
-                        if let Err(e) = std::fs::remove_file(file) {
+                        if let Err(e) = tokio::fs::remove_file(file).await {
                             tracing::warn!(
                                 "failed to delete {} after upload: {e}",
                                 file.display()
