@@ -338,6 +338,15 @@ async fn run_bare_upload(
     // Parse --header as key:value pairs
     let headers = parse_key_values(&args.header)?;
 
+    // --delete-after-upload forces verify — non-negotiable data safety invariant
+    if args.delete_after_upload && args.no_verify {
+        bail!(
+            "--delete-after-upload requires verification (Content-MD5).\n\
+             Cannot combine with --no-verify — refusing to delete local files \
+             without server-side integrity confirmation."
+        );
+    }
+
     // Parse --checksums file
     let checksums = if let Some(ref path) = args.checksums {
         let content = std::fs::read_to_string(path)
@@ -510,6 +519,15 @@ async fn run_import(
     // Parse extra -m metadata and --header
     let extra_metadata = parse_key_values(&args.metadata)?;
     let headers = parse_key_values(&args.header)?;
+
+    // --delete-after-upload forces verify — non-negotiable data safety invariant
+    if args.delete_after_upload && args.no_verify {
+        bail!(
+            "--delete-after-upload requires verification (Content-MD5).\n\
+             Cannot combine with --no-verify — refusing to delete local files \
+             without server-side integrity confirmation."
+        );
+    }
 
     // Parse --checksums file
     let checksums = if let Some(ref path) = args.checksums {

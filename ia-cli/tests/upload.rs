@@ -82,6 +82,28 @@ fn upload_invalid_metadata_format() {
         .stderr(predicate::str::contains("invalid KEY:VALUE format"));
 }
 
+#[test]
+fn delete_after_upload_rejects_no_verify() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.txt");
+    fs::write(&file, "content").unwrap();
+
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args([
+            "-m", "mediatype:texts",
+            "-m", "collection:test_collection",
+            "--delete-after-upload",
+            "--no-verify",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--delete-after-upload requires verification"));
+}
+
 // ─── Dry run ─────────────────────────────────────────────────────────────────
 
 #[test]
