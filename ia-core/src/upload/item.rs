@@ -52,6 +52,19 @@ pub async fn upload_item(
         validate_required_metadata(&opts.metadata)?;
     }
 
+    // 3b. Check that collections actually exist on archive.org
+    if !opts.no_collection_check {
+        let collections: Vec<&str> = opts
+            .metadata
+            .iter()
+            .filter(|(k, _)| k == "collection")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if !collections.is_empty() {
+            crate::upload::validate::check_collections(client, &collections).await?;
+        }
+    }
+
     // 4. Expand directories and collect files
     let expanded = expand_files(files)?;
 

@@ -1,4 +1,5 @@
 use crate::error::IaError;
+use crate::IaClient;
 use std::path::Path;
 
 /// Validate an IA identifier.
@@ -83,6 +84,39 @@ pub fn validate_required_metadata(metadata: &[(String, String)]) -> Result<(), I
     }
 
     Ok(())
+}
+
+/// Check that the named collections exist on archive.org.
+///
+/// Makes GET /metadata/{collection} requests. Returns an error listing
+/// all collections that were not found.
+///
+/// This is a pre-flight validation: better to fail early than to upload
+/// files and discover the collection doesn't exist.
+pub async fn check_collections(
+    client: &IaClient,
+    collections: &[&str],
+) -> Result<(), IaError> {
+    let mut not_found = Vec::new();
+
+    for collection in collections {
+        match client.item_exists(collection).await {
+            Ok(true) => {} // exists
+            Ok(false) => not_found.push((*collection).to_string()),
+            Err(e) => {
+                // Log but don't fail — collection check is best-effort
+                tracing::warn!("failed to check collection {collection}: {e}");
+            }
+        }
+    }
+
+    if not_found.is_empty() {
+        Ok(())
+    } else {
+        Err(IaError::CollectionNotFound {
+            collection: not_found.join(", "),
+        })
+    }
 }
 
 /// Check that a file exists and is not a symlink.

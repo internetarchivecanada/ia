@@ -40,6 +40,7 @@ async fn upload_item_single_file() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         metadata: vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
@@ -95,6 +96,7 @@ async fn upload_item_multiple_files() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         metadata: vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
@@ -133,6 +135,7 @@ async fn upload_item_expands_directory() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         metadata: vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
@@ -161,6 +164,7 @@ async fn upload_item_empty_files_error() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         metadata: vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
@@ -212,6 +216,7 @@ async fn upload_item_test_item_injects_collection() {
     let opts = UploadOpts {
         verify: false,
         test_item: true,
+        no_collection_check: true,
         metadata: vec![("mediatype".into(), "texts".into())],
         ..Default::default()
     };
@@ -245,6 +250,7 @@ async fn upload_item_with_remote_dir() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         remote_dir: Some("scans".into()),
         metadata: vec![
             ("mediatype".into(), "texts".into()),
@@ -275,6 +281,7 @@ async fn upload_item_dry_run() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         dry_run: true,
         metadata: vec![
             ("mediatype".into(), "texts".into()),
@@ -350,6 +357,86 @@ async fn upload_item_no_collection_check_skips_validation() {
             .await
             .unwrap();
 
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].status, UploadStatus::Uploaded));
+}
+
+// -- Collection existence check --
+
+#[tokio::test]
+async fn upload_item_checks_collection_exists() {
+    let server = MockServer::start().await;
+
+    // Mock metadata endpoint — return 200 with empty JSON (item not found → 404-like)
+    Mock::given(method("GET"))
+        .and(path("/metadata/nonexistent-collection"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Item cannot be found"))
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("test.txt");
+    fs::write(&f, "hello").unwrap();
+
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        no_collection_check: false,
+        metadata: vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "nonexistent-collection".into()),
+        ],
+        ..Default::default()
+    };
+
+    let err = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ia_core::IaError::CollectionNotFound { .. }),
+        "expected CollectionNotFound, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn upload_item_collection_check_passes_when_exists() {
+    let server = MockServer::start().await;
+
+    // Mock metadata endpoint — collection exists
+    Mock::given(method("GET"))
+        .and(path("/metadata/test_collection"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test_collection"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+
+    // Accept upload
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("test.txt");
+    fs::write(&f, "hello").unwrap();
+
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        no_collection_check: false,
+        metadata: vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "test_collection".into()),
+        ],
+        ..Default::default()
+    };
+
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
 }
