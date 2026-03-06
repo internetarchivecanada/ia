@@ -19,6 +19,7 @@ pub struct S3Error {
 ///   <RequestId>db1b9e2b-...</RequestId>
 /// </Error>
 /// ```
+#[must_use = "parsed error should be inspected"]
 pub fn parse_s3_error(body: &str) -> Option<S3Error> {
     let code = extract_xml_field(body, "Code")?;
     let message = extract_xml_field(body, "Message").unwrap_or_default();

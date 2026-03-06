@@ -37,11 +37,13 @@ fn encode_key(key: &str) -> String {
 /// Handles multivalue fields (incrementing index per field name),
 /// underscore-to-double-dash key encoding, and uri() value encoding.
 /// Skips empty values.
+#[must_use = "encoded headers must be used"]
 pub fn encode_metadata_headers(metadata: &[(String, String)]) -> Vec<(String, String)> {
     encode_headers_with_prefix(metadata, "meta")
 }
 
 /// Encode file-level metadata into x-archive-filemeta headers.
+#[must_use = "encoded headers must be used"]
 pub fn encode_file_metadata_headers(metadata: &[(String, String)]) -> Vec<(String, String)> {
     encode_headers_with_prefix(metadata, "filemeta")
 }
