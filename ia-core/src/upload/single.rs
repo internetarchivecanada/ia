@@ -274,7 +274,13 @@ pub async fn upload_file(
 /// For production (host == "archive.org"), targets s3.us.archive.org.
 /// For testing (host != "archive.org"), targets the mock server host directly.
 fn build_s3_url(client: &IaClient, identifier: &str, key: &str) -> String {
-    let encoded_key = urlencoding::encode(key);
+    // Encode each path segment individually, preserving `/` separators.
+    // Python uses urllib.parse.quote(key) which also preserves `/`.
+    let encoded_key = key
+        .split('/')
+        .map(|seg| urlencoding::encode(seg))
+        .collect::<Vec<_>>()
+        .join("/");
     let protocol = client.protocol();
     let host = client.host();
 
@@ -371,13 +377,12 @@ fn base64_encode(data: &[u8]) -> String {
 
 /// Convert a hex string to raw bytes.
 ///
-/// Panics if the string length is odd or contains non-hex characters.
-/// Safe to use on output from `compute_file_md5()` which always returns
-/// valid 32-char hex.
+/// Returns an empty vec if the input contains invalid hex.
+/// Input from `compute_file_md5()` is always valid 32-char hex.
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex from compute_file_md5"))
+        .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
 }
 
@@ -456,9 +461,10 @@ mod tests {
         let config = crate::IaConfig::default();
         let client = crate::IaClient::from_config(config).unwrap();
         let url = build_s3_url(&client, "test-item", "path/to/my file.txt");
+        // Slashes preserved, spaces encoded per-segment
         assert_eq!(
             url,
-            "https://s3.us.archive.org/test-item/path%2Fto%2Fmy%20file.txt"
+            "https://s3.us.archive.org/test-item/path/to/my%20file.txt"
         );
     }
 }
