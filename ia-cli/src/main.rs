@@ -32,7 +32,7 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
     version,
     about = "Internet Archive command-line tool",
     long_about = "A command-line tool for interacting with the Internet Archive (archive.org).\n\
-        Download files, search for items, view and edit metadata, and list file contents.",
+        Upload and download files, search for items, view and edit metadata, and list file contents.",
     styles = STYLES,
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
