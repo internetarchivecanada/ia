@@ -63,13 +63,34 @@ pub async fn upload_batch(
         .collect()
         .await;
 
-    // 4. Flatten results — collect successes, return first error if any
+    // 4. Flatten results — collect successes AND failures
     let mut all_results = Vec::new();
+    let mut errors = Vec::new();
     for result in results {
         match result {
             Ok(item_results) => all_results.extend(item_results),
-            Err(e) => return Err(e),
+            Err(e) => errors.push(e),
         }
+    }
+
+    // Convert errors to Failed results so callers see them
+    for err in &errors {
+        all_results.push(UploadResult {
+            identifier: String::new(),
+            key: String::new(),
+            status: crate::upload::types::UploadStatus::Failed(err.to_string()),
+            bytes: 0,
+            md5: None,
+            elapsed_ms: 0,
+            retries: 0,
+        });
+    }
+
+    // If ALL items failed and we have no real results, return the first error
+    if all_results.iter().all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_)))
+        && !errors.is_empty()
+    {
+        return Err(errors.into_iter().next().unwrap());
     }
 
     Ok(all_results)

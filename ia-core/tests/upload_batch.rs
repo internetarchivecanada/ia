@@ -57,6 +57,7 @@ async fn batch_upload_single_item() {
     )];
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         ..Default::default()
     };
 
@@ -100,6 +101,7 @@ async fn batch_upload_multiple_items() {
     ];
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         ..Default::default()
     };
 
@@ -143,6 +145,7 @@ async fn batch_upload_grouped_by_identifier() {
     ];
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         ..Default::default()
     };
 
@@ -262,6 +265,7 @@ async fn batch_upload_merges_metadata_with_opts() {
     // Base opts have some extra header metadata
     let opts = UploadOpts {
         verify: false,
+        no_collection_check: true,
         ..Default::default()
     };
 
@@ -291,6 +295,7 @@ async fn batch_upload_dry_run() {
     let opts = UploadOpts {
         verify: false,
         dry_run: true,
+        no_collection_check: true,
         ..Default::default()
     };
 
