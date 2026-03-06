@@ -76,6 +76,7 @@ impl Default for UploadOpts {
 pub struct UploadResult {
     pub identifier: String,
     pub key: String,
+    #[serde(flatten)]
     pub status: UploadStatus,
     pub bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +87,7 @@ pub struct UploadResult {
 
 /// Upload outcome for a single file.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
 pub enum UploadStatus {
     Uploaded,
     Skipped,
@@ -142,9 +143,30 @@ mod tests {
             elapsed_ms: 500,
             retries: 0,
         };
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("test-item"));
-        assert!(json.contains("uploaded"));
+        let val: serde_json::Value = serde_json::to_value(&result).unwrap();
+        // Adjacently-tagged + flatten: "status" appears at top level
+        assert_eq!(val["identifier"], "test-item");
+        assert_eq!(val["status"], "uploaded");
+        assert_eq!(val["bytes"], 1024);
+        // Unit variants have no "detail" key
+        assert!(val.get("detail").is_none());
+    }
+
+    #[test]
+    fn upload_result_failed_includes_detail() {
+        let result = UploadResult {
+            identifier: "test-item".into(),
+            key: "file.pdf".into(),
+            status: UploadStatus::Failed("connection reset".into()),
+            bytes: 0,
+            md5: None,
+            elapsed_ms: 100,
+            retries: 3,
+        };
+        let val: serde_json::Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["status"], "failed");
+        assert_eq!(val["detail"], "connection reset");
+        assert_eq!(val["retries"], 3);
     }
 
     #[test]
@@ -160,5 +182,37 @@ mod tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(!json.contains("md5"));
+    }
+
+    #[test]
+    fn upload_result_dry_run_json_shape() {
+        let result = UploadResult {
+            identifier: "test-item".into(),
+            key: "file.pdf".into(),
+            status: UploadStatus::DryRun,
+            bytes: 4096,
+            md5: None,
+            elapsed_ms: 0,
+            retries: 0,
+        };
+        let val: serde_json::Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["status"], "dry_run");
+        assert!(val.get("detail").is_none());
+    }
+
+    #[test]
+    fn upload_result_skipped_json_shape() {
+        let result = UploadResult {
+            identifier: "test-item".into(),
+            key: "file.pdf".into(),
+            status: UploadStatus::Skipped,
+            bytes: 0,
+            md5: None,
+            elapsed_ms: 0,
+            retries: 0,
+        };
+        let val: serde_json::Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["status"], "skipped");
+        assert!(val.get("detail").is_none());
     }
 }
