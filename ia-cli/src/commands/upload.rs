@@ -352,17 +352,11 @@ async fn run_bare_upload(
         );
     }
 
-    // Parse --checksums file
-    let checksums = if let Some(ref path) = args.checksums {
-        let content = std::fs::read_to_string(path)
-            .context(format!("failed to read checksums file: {}", path.display()))?;
-        Some(
-            ia_core::upload::checksum::parse_checksums(&content)
-                .context("failed to parse checksums file")?,
-        )
-    } else {
-        None
-    };
+    let checksums = args
+        .checksums
+        .as_ref()
+        .map(|p| load_checksums(p))
+        .transpose()?;
 
     // Handle stdin ('-' as file arg)
     let (files, _temp_file) = handle_stdin_files(&args.files, args.remote_name.as_deref())?;
@@ -489,17 +483,11 @@ async fn run_import(
         );
     }
 
-    // Parse --checksums file
-    let checksums = if let Some(ref path) = args.checksums {
-        let content = std::fs::read_to_string(path)
-            .context(format!("failed to read checksums file: {}", path.display()))?;
-        Some(
-            ia_core::upload::checksum::parse_checksums(&content)
-                .context("failed to parse checksums file")?,
-        )
-    } else {
-        None
-    };
+    let checksums = args
+        .checksums
+        .as_ref()
+        .map(|p| load_checksums(p))
+        .transpose()?;
 
     let opts = UploadOpts {
         metadata: extra_metadata,
@@ -762,6 +750,13 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
 
 /// Parse a list of `KEY:VALUE` strings into `(String, String)` pairs.
 /// Splits on the first `:` — values may contain additional colons.
+/// Load and parse a checksums file (one `MD5  filename` per line).
+fn load_checksums(path: &std::path::Path) -> Result<std::collections::HashMap<String, String>> {
+    let content = std::fs::read_to_string(path)
+        .context(format!("failed to read checksums file: {}", path.display()))?;
+    ia_core::upload::checksum::parse_checksums(&content).context("failed to parse checksums file")
+}
+
 fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
     items
         .iter()
