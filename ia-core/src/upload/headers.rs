@@ -59,11 +59,11 @@ fn encode_headers_with_prefix(
         }
 
         let idx = index_counters.entry(key.clone()).or_insert(0);
-        let header_key = format!("x-archive-{}{:02}-{}", prefix, idx, encode_key(key));
+        let header_key = format!("x-archive-{}{:02}-{}", prefix, *idx, encode_key(key));
         let header_value = encode_value(value);
 
         result.push((header_key, header_value));
-        *index_counters.get_mut(key).unwrap() += 1;
+        *idx += 1;
     }
 
     result

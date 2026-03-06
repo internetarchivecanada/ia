@@ -29,7 +29,10 @@ pub fn validate_identifier(id: &str) -> Result<(), IaError> {
         });
     }
 
-    let first = id.chars().next().unwrap();
+    // Safe: id is at least 3 chars (checked above), so .next() always yields Some
+    let Some(first) = id.chars().next() else {
+        unreachable!("id is non-empty after length check");
+    };
     if !first.is_ascii_alphanumeric() && first != '@' {
         return Err(IaError::InvalidIdentifier {
             identifier: id.to_string(),

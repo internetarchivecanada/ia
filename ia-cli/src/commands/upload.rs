@@ -459,35 +459,11 @@ async fn run_bare_upload(
         .context(format!("failed to upload to {identifier}"))?;
 
     // Output results
-    let mut had_failure = false;
-    for r in &results {
-        if matches!(r.status, UploadStatus::Failed(_)) {
-            had_failure = true;
-        }
-
-        if args.json {
-            let json = serde_json::to_string(r).context("failed to serialize upload result")?;
-            println!("{json}");
-        } else if quiet == 0 {
-            print_result_line(r);
-        }
-
-        // Write to joblog
-        if let Some(ref jl) = joblog {
-            write_upload_result(jl, r);
-        }
-    }
+    let had_failure = output_results(&results, args.json, quiet, joblog.as_ref())?;
 
     // Summary for quiet == 1
     if !args.json && quiet == 1 {
-        let uploaded = results.iter().filter(|r| matches!(r.status, UploadStatus::Uploaded)).count();
-        let skipped = results.iter().filter(|r| matches!(r.status, UploadStatus::Skipped)).count();
-        let failed = results.iter().filter(|r| matches!(r.status, UploadStatus::Failed(_))).count();
-        let total_bytes: u64 = results
-            .iter()
-            .filter(|r| matches!(r.status, UploadStatus::Uploaded))
-            .map(|r| r.bytes)
-            .sum();
+        let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
         let total_ms: u64 = results.iter().map(|r| r.elapsed_ms).max().unwrap_or(0);
         eprintln!(
             "{}  {} uploaded, {} skipped, {} failed ({}) in {:.1}s",
@@ -600,34 +576,11 @@ async fn run_import(
         .context("batch upload failed")?;
 
     // Output results
-    let mut had_failure = false;
-    for r in &results {
-        if matches!(r.status, UploadStatus::Failed(_)) {
-            had_failure = true;
-        }
-
-        if json_mode {
-            let json = serde_json::to_string(r).context("failed to serialize upload result")?;
-            println!("{json}");
-        } else if quiet == 0 {
-            print_result_line(r);
-        }
-
-        if let Some(ref jl) = joblog {
-            write_upload_result(jl, r);
-        }
-    }
+    let had_failure = output_results(&results, json_mode, quiet, joblog.as_ref())?;
 
     // Summary
     if !json_mode && quiet < 2 {
-        let uploaded = results.iter().filter(|r| matches!(r.status, UploadStatus::Uploaded)).count();
-        let skipped = results.iter().filter(|r| matches!(r.status, UploadStatus::Skipped)).count();
-        let failed = results.iter().filter(|r| matches!(r.status, UploadStatus::Failed(_))).count();
-        let total_bytes: u64 = results
-            .iter()
-            .filter(|r| matches!(r.status, UploadStatus::Uploaded))
-            .map(|r| r.bytes)
-            .sum();
+        let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
         eprintln!(
             "\n{} {} uploaded, {} skipped, {} failed ({})",
             if had_failure {
@@ -721,6 +674,56 @@ fn run_cleanup(_args: CleanupArgs) -> Result<()> {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Output upload results: print per-line (JSON or human), write to joblog.
+/// Returns whether any file failed.
+fn output_results(
+    results: &[UploadResult],
+    json_mode: bool,
+    quiet: u8,
+    joblog: Option<&JoblogWriter>,
+) -> Result<bool> {
+    let mut had_failure = false;
+    for r in results {
+        if matches!(r.status, UploadStatus::Failed(_)) {
+            had_failure = true;
+        }
+
+        if json_mode {
+            let json = serde_json::to_string(r).context("failed to serialize upload result")?;
+            println!("{json}");
+        } else if quiet == 0 {
+            print_result_line(r);
+        }
+
+        if let Some(jl) = joblog {
+            write_upload_result(jl, r);
+        }
+    }
+    Ok(had_failure)
+}
+
+/// Compute summary counts from upload results.
+fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
+    let uploaded = results
+        .iter()
+        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| matches!(r.status, UploadStatus::Skipped))
+        .count();
+    let failed = results
+        .iter()
+        .filter(|r| matches!(r.status, UploadStatus::Failed(_)))
+        .count();
+    let total_bytes: u64 = results
+        .iter()
+        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
+        .map(|r| r.bytes)
+        .sum();
+    (uploaded, skipped, failed, total_bytes)
+}
 
 /// Parse a list of `KEY:VALUE` strings into `(String, String)` pairs.
 /// Splits on the first `:` — values may contain additional colons.
