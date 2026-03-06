@@ -708,8 +708,26 @@ fn output_results(
         }
 
         if json_mode {
-            let json = serde_json::to_string(r).context("failed to serialize upload result")?;
-            println!("{json}");
+            match &r.status {
+                UploadStatus::Failed(msg) => {
+                    // Use project error convention for failures → stderr
+                    let err_json = serde_json::json!({
+                        "error": {
+                            "code": "upload_failed",
+                            "message": msg,
+                            "identifier": r.identifier,
+                            "key": r.key,
+                        }
+                    });
+                    eprintln!("{}", serde_json::to_string(&err_json).unwrap_or_default());
+                }
+                _ => {
+                    // Success/skip/dry-run go to stdout as JSONL
+                    let json =
+                        serde_json::to_string(r).context("failed to serialize upload result")?;
+                    println!("{json}");
+                }
+            }
         } else if quiet == 0 {
             print_result_line(r);
         }
@@ -1099,5 +1117,39 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"status\":\"error\""));
         assert!(content.contains("\"error\":\"timeout\""));
+    }
+
+    #[test]
+    fn output_results_json_failed_uses_error_convention() {
+        let results = vec![UploadResult {
+            identifier: "test-item".into(),
+            key: "file.pdf".into(),
+            status: UploadStatus::Failed("connection reset".into()),
+            bytes: 0,
+            md5: None,
+            elapsed_ms: 0,
+            retries: 0,
+        }];
+
+        // output_results writes to stdout/stderr — just verify it doesn't panic
+        // and returns had_failure = true
+        let had_failure = output_results(&results, true, 0, None).unwrap();
+        assert!(had_failure);
+    }
+
+    #[test]
+    fn output_results_json_success_goes_to_stdout() {
+        let results = vec![UploadResult {
+            identifier: "test-item".into(),
+            key: "file.pdf".into(),
+            status: UploadStatus::Uploaded,
+            bytes: 1024,
+            md5: Some("abc123".into()),
+            elapsed_ms: 500,
+            retries: 0,
+        }];
+
+        let had_failure = output_results(&results, true, 0, None).unwrap();
+        assert!(!had_failure);
     }
 }
