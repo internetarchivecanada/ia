@@ -70,7 +70,9 @@ pub async fn upload_file(
 
     // Skip-existing: compare local MD5 with remote, skip if match
     if opts.skip_existing {
-        let local_md5 = md5_hex.as_ref().expect("md5 computed when skip_existing=true");
+        let local_md5 = md5_hex.as_deref().ok_or_else(|| IaError::Config(
+            "internal error: MD5 not computed for skip_existing check".into()
+        ))?;
         match client.get_item(identifier).await {
             Ok(item) => {
                 let remote_md5 = item
@@ -79,7 +81,7 @@ pub async fn upload_file(
                     .find(|f| f.name == key)
                     .and_then(|f| f.md5.as_deref());
 
-                if remote_md5 == Some(local_md5.as_str()) {
+                if remote_md5 == Some(local_md5) {
                     if let Some(cb) = progress {
                         cb(UploadProgress {
                             identifier: identifier.to_string(),
@@ -94,7 +96,7 @@ pub async fn upload_file(
                         key: key.to_string(),
                         status: UploadStatus::Skipped,
                         bytes: file_size,
-                        md5: Some(local_md5.clone()),
+                        md5: Some(local_md5.to_string()),
                         elapsed_ms: start.elapsed().as_millis() as u64,
                         retries: 0,
                     });
