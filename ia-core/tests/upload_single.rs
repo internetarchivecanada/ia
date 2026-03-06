@@ -815,7 +815,7 @@ async fn upload_checksum_skip_when_md5_matches() {
     let f = temp_file(b"hello"); // MD5 = 5d41402abc4b2a76b9719d911017c592
     let client = test_client(&server);
     let opts = UploadOpts {
-        checksum: true,
+        skip_existing: true,
         verify: true,
         ..Default::default()
     };
@@ -852,7 +852,7 @@ async fn upload_checksum_no_skip_when_md5_differs() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        checksum: true,
+        skip_existing: true,
         verify: false,
         ..Default::default()
     };
@@ -889,7 +889,7 @@ async fn upload_checksum_no_skip_when_file_not_on_remote() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        checksum: true,
+        skip_existing: true,
         verify: false,
         ..Default::default()
     };
@@ -926,7 +926,7 @@ async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        checksum: true,
+        skip_existing: true,
         verify: false, // no Content-MD5 header, but still compute for skip
         ..Default::default()
     };

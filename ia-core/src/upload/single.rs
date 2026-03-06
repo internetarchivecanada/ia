@@ -47,8 +47,8 @@ pub async fn upload_file(
     let start = Instant::now();
     let file_size = std::fs::metadata(file)?.len();
 
-    // Compute local MD5 if needed for either checksum skip or verify
-    let needs_md5 = opts.checksum || opts.verify;
+    // Compute local MD5 if needed for either skip-existing or verify
+    let needs_md5 = opts.skip_existing || opts.verify;
     let md5_hex = if needs_md5 {
         if let Some(md5) = opts.checksums.as_ref().and_then(|cs| cs.get(key)) {
             Some(md5.clone())
@@ -68,9 +68,9 @@ pub async fn upload_file(
         None
     };
 
-    // Checksum skip: compare local MD5 with remote, skip if match
-    if opts.checksum {
-        let local_md5 = md5_hex.as_ref().expect("md5 computed when checksum=true");
+    // Skip-existing: compare local MD5 with remote, skip if match
+    if opts.skip_existing {
+        let local_md5 = md5_hex.as_ref().expect("md5 computed when skip_existing=true");
         match client.get_item(identifier).await {
             Ok(item) => {
                 let remote_md5 = item

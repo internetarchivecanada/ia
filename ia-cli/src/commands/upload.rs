@@ -98,7 +98,7 @@ pub struct UploadArgs {
 
     /// Skip files already uploaded (MD5 match)
     #[arg(long)]
-    pub checksum: bool,
+    pub skip_existing: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -224,7 +224,7 @@ pub struct ImportArgs {
 
     /// Skip files already uploaded (MD5 match)
     #[arg(long)]
-    pub checksum: bool,
+    pub skip_existing: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -374,7 +374,7 @@ async fn run_bare_upload(
         remote_dir: args.remote_dir.clone(),
         keep_directories: args.keep_directories,
         verify: !args.no_verify,
-        checksum: args.checksum,
+        skip_existing: args.skip_existing,
         checksums,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
@@ -506,7 +506,7 @@ async fn run_import(
         headers,
         checksums,
         verify: !args.no_verify,
-        checksum: args.checksum,
+        skip_existing: args.skip_existing,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
         no_backup: args.no_backup,
