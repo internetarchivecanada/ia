@@ -108,6 +108,9 @@ fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
                 "record for identifier '{identifier}' is missing required 'file' field"
             )))?;
 
+        // Strip REMOTE_NAME from metadata — it's a template column, not an IA metadata field
+        fields.remove("REMOTE_NAME");
+
         let metadata: Vec<(String, String)> = fields.into_iter().collect();
 
         let group = map

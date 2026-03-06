@@ -877,6 +877,7 @@ fn write_template_tsv<W: std::io::Write>(
     let columns = [
         "identifier",
         "file",
+        "REMOTE_NAME",
         "mediatype",
         "collection",
         "title",
@@ -890,9 +891,10 @@ fn write_template_tsv<W: std::io::Write>(
     for row in rows {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row.identifier,
             row.file,
+            row.remote_name,
             row.mediatype,
             row.collection,
             row.title,
@@ -920,6 +922,7 @@ fn write_template_xlsx(
     let columns = [
         "identifier",
         "file",
+        "REMOTE_NAME",
         "mediatype",
         "collection",
         "title",
@@ -941,6 +944,7 @@ fn write_template_xlsx(
         let fields = [
             &row.identifier,
             &row.file,
+            &row.remote_name,
             &row.mediatype,
             &row.collection,
             &row.title,

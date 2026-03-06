@@ -17,6 +17,7 @@ pub struct TemplateOpts {
 pub struct TemplateRow {
     pub identifier: String,
     pub file: String,
+    pub remote_name: String,
     pub mediatype: String,
     pub collection: String,
     pub title: String,
@@ -74,6 +75,7 @@ pub fn generate_template(dir: &Path, opts: &TemplateOpts) -> Result<Vec<Template
             TemplateRow {
                 identifier,
                 file: path.to_string_lossy().into_owned(),
+                remote_name: String::new(),
                 mediatype: String::new(),
                 collection: String::new(),
                 title: String::new(),
@@ -159,6 +161,7 @@ pub fn write_template_csv<W: std::io::Write>(rows: &[TemplateRow], writer: &mut 
         .write_record([
             "identifier",
             "file",
+            "REMOTE_NAME",
             "mediatype",
             "collection",
             "title",
@@ -176,6 +179,7 @@ pub fn write_template_csv<W: std::io::Write>(rows: &[TemplateRow], writer: &mut 
             .write_record([
                 &row.identifier,
                 &row.file,
+                &row.remote_name,
                 &row.mediatype,
                 &row.collection,
                 &row.title,
@@ -356,6 +360,7 @@ mod tests {
         let rows = vec![TemplateRow {
             identifier: "test-item".into(),
             file: "/tmp/file.txt".into(),
+            remote_name: String::new(),
             mediatype: "texts".into(),
             collection: String::new(),
             title: String::new(),
@@ -392,6 +397,7 @@ mod tests {
         let rows = vec![TemplateRow {
             identifier: "id".into(),
             file: "/path".into(),
+            remote_name: String::new(),
             mediatype: String::new(),
             collection: String::new(),
             title: String::new(),
@@ -408,6 +414,7 @@ mod tests {
         for col in [
             "identifier",
             "file",
+            "REMOTE_NAME",
             "mediatype",
             "collection",
             "title",

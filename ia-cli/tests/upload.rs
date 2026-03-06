@@ -246,7 +246,7 @@ fn upload_template_generates_csv_to_stdout() {
 
     let stdout = String::from_utf8(output).unwrap();
     // Header row
-    assert!(stdout.starts_with("identifier,file,mediatype,"));
+    assert!(stdout.starts_with("identifier,file,REMOTE_NAME,mediatype,"));
     // Data rows (one per file)
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(lines.len(), 3); // header + 2 files
