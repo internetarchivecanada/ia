@@ -488,7 +488,19 @@ async fn run_bare_upload(
     // Open in browser if requested
     if args.open_after_upload && !had_failure {
         let url = format!("https://archive.org/details/{identifier}");
-        if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
+        let result = if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg(&url).spawn()
+        } else if cfg!(target_os = "linux") {
+            std::process::Command::new("xdg-open").arg(&url).spawn()
+        } else if cfg!(target_os = "windows") {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", &url])
+                .spawn()
+        } else {
+            eprintln!("--open-after-upload is not supported on this platform");
+            Ok(std::process::Command::new("true").spawn().unwrap())
+        };
+        if let Err(e) = result {
             eprintln!("failed to open browser: {e}");
         }
     }
