@@ -339,7 +339,7 @@ fn upload_cleanup_not_implemented() {
     ia_with_config(&cfg)
         .args(["upload", "cleanup", "my-item"])
         .assert()
-        .success()
+        .failure()
         .stderr(predicate::str::contains("not yet implemented"));
 }
 

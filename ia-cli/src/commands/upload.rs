@@ -674,8 +674,7 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 fn run_cleanup(_args: CleanupArgs) -> Result<()> {
-    eprintln!("Multipart cleanup is not yet implemented (Phase 2)");
-    Ok(())
+    bail!("multipart cleanup is not yet implemented (Phase 2)")
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
