@@ -74,14 +74,21 @@ impl Default for UploadOpts {
 /// Result of a single file upload.
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadResult {
+    /// Item identifier on archive.org.
     pub identifier: String,
+    /// Remote filename (S3 key).
     pub key: String,
+    /// Upload outcome.
     #[serde(flatten)]
     pub status: UploadStatus,
+    /// File size in bytes.
     pub bytes: u64,
+    /// MD5 hex digest (if computed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub md5: Option<String>,
+    /// Wall-clock time in milliseconds.
     pub elapsed_ms: u64,
+    /// Number of retry attempts.
     pub retries: u32,
 }
 
@@ -98,10 +105,15 @@ pub enum UploadStatus {
 /// Progress update during an upload.
 #[derive(Debug, Clone)]
 pub struct UploadProgress {
+    /// Item identifier.
     pub identifier: String,
+    /// Remote filename (S3 key).
     pub key: String,
+    /// Bytes sent so far.
     pub bytes_sent: u64,
+    /// Total file size in bytes.
     pub total_bytes: u64,
+    /// Current upload phase.
     pub status: UploadProgressStatus,
 }
 

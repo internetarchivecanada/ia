@@ -1,7 +1,9 @@
 /// Parsed S3 error response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Error {
+    /// S3 error code (e.g. "AccessDenied", "SlowDown").
     pub code: String,
+    /// Human-readable error message from S3.
     pub message: String,
 }
 
