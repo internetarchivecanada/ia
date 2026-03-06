@@ -1,6 +1,6 @@
 use crate::error::{IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
-use crate::upload::checksum::compute_file_md5;
+use crate::upload::checksum::compute_file_md5_async;
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::parse_s3_error;
 use crate::upload::types::*;
@@ -62,7 +62,7 @@ pub async fn upload_file(
                     status: UploadProgressStatus::Verifying,
                 });
             }
-            Some(compute_file_md5(file)?)
+            Some(compute_file_md5_async(file).await?)
         }
     } else {
         None

@@ -79,6 +79,17 @@ fn try_parse_bsd(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// Async wrapper for compute_file_md5 that runs on a blocking thread.
+///
+/// MD5 computation is CPU + I/O intensive. Running it on tokio's async
+/// runtime blocks the executor. This spawns it on the blocking thread pool.
+pub async fn compute_file_md5_async(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || compute_file_md5(&path))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +145,17 @@ mod tests {
         let md5 = compute_file_md5(f.path()).unwrap();
         // MD5 of empty string
         assert_eq!(md5, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[tokio::test]
+    async fn compute_md5_async_matches_sync() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello async").unwrap();
+        f.flush().unwrap();
+
+        let sync_result = compute_file_md5(f.path()).unwrap();
+        let async_result = compute_file_md5_async(f.path()).await.unwrap();
+        assert_eq!(sync_result, async_result);
     }
 
     #[test]
