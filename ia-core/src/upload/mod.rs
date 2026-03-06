@@ -3,6 +3,7 @@ pub mod check_limit;
 pub mod checksum;
 pub mod headers;
 mod item;
+pub mod s3_error;
 mod single;
 pub mod template;
 mod types;
