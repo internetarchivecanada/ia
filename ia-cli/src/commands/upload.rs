@@ -253,6 +253,13 @@ pub struct ImportArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum TemplateFormat {
+    Csv,
+    Tsv,
+    Xlsx,
+}
+
 #[derive(Debug, Args)]
 pub struct TemplateArgs {
     /// Directory to scan for files
@@ -263,9 +270,9 @@ pub struct TemplateArgs {
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
 
-    /// Output format: csv, tsv, xlsx (default: csv)
-    #[arg(long, default_value = "csv")]
-    pub format: String,
+    /// Output format
+    #[arg(long, default_value = "csv", value_enum)]
+    pub format: TemplateFormat,
 
     /// Prefix to prepend to generated identifiers
     #[arg(long)]
@@ -687,13 +694,14 @@ fn run_template(args: TemplateArgs) -> Result<()> {
         bail!("no files found in {}", args.dir.display());
     }
 
-    match args.format.as_str() {
-        "csv" | "tsv" => {
+    match args.format {
+        TemplateFormat::Csv | TemplateFormat::Tsv => {
+            let is_tsv = matches!(args.format, TemplateFormat::Tsv);
             if let Some(ref output_path) = args.output {
                 let file = std::fs::File::create(output_path)
                     .context(format!("failed to create {}", output_path.display()))?;
                 let mut writer = std::io::BufWriter::new(file);
-                if args.format == "tsv" {
+                if is_tsv {
                     write_template_tsv(&rows, &mut writer)?;
                 } else {
                     write_template_csv(&rows, &mut writer)
@@ -708,7 +716,7 @@ fn run_template(args: TemplateArgs) -> Result<()> {
             } else {
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::new(stdout.lock());
-                if args.format == "tsv" {
+                if is_tsv {
                     write_template_tsv(&rows, &mut writer)?;
                 } else {
                     write_template_csv(&rows, &mut writer)
@@ -716,7 +724,7 @@ fn run_template(args: TemplateArgs) -> Result<()> {
                 }
             }
         }
-        "xlsx" => {
+        TemplateFormat::Xlsx => {
             let output_path = args
                 .output
                 .as_ref()
@@ -729,7 +737,6 @@ fn run_template(args: TemplateArgs) -> Result<()> {
                 output_path.display(),
             );
         }
-        other => bail!("unsupported format: {other} (expected: csv, tsv, xlsx)"),
     }
 
     Ok(())
