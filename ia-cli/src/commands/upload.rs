@@ -440,7 +440,7 @@ async fn run_bare_upload(
                 .spawn()
         } else {
             eprintln!("--open-after-upload is not supported on this platform");
-            Ok(std::process::Command::new("true").spawn().unwrap())
+            return Ok(());
         };
         if let Err(e) = result {
             eprintln!("failed to open browser: {e}");
