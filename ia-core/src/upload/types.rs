@@ -71,6 +71,154 @@ impl Default for UploadOpts {
     }
 }
 
+/// Builder for [`UploadOpts`].
+///
+/// All fields default to the same values as `UploadOpts::default()`.
+///
+/// # Example
+///
+/// ```
+/// use ia_core::upload::UploadOptsBuilder;
+///
+/// let opts = UploadOptsBuilder::new()
+///     .verify(true)
+///     .dry_run(true)
+///     .metadata(vec![("mediatype".into(), "texts".into())])
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct UploadOptsBuilder {
+    opts: UploadOpts,
+}
+
+impl UploadOptsBuilder {
+    /// Create a new builder with default values.
+    pub fn new() -> Self {
+        Self {
+            opts: UploadOpts::default(),
+        }
+    }
+
+    /// Set metadata key-value pairs.
+    pub fn metadata(mut self, metadata: Vec<(String, String)>) -> Self {
+        self.opts.metadata = metadata;
+        self
+    }
+
+    /// Set the explicit remote filename.
+    pub fn remote_name(mut self, name: impl Into<String>) -> Self {
+        self.opts.remote_name = Some(name.into());
+        self
+    }
+
+    /// Set the remote directory prefix.
+    pub fn remote_dir(mut self, dir: impl Into<String>) -> Self {
+        self.opts.remote_dir = Some(dir.into());
+        self
+    }
+
+    /// Set whether to preserve directory structure.
+    pub fn keep_directories(mut self, keep: bool) -> Self {
+        self.opts.keep_directories = keep;
+        self
+    }
+
+    /// Set whether to send Content-MD5 for verification.
+    pub fn verify(mut self, verify: bool) -> Self {
+        self.opts.verify = verify;
+        self
+    }
+
+    /// Set whether to skip already-uploaded files.
+    pub fn skip_existing(mut self, skip: bool) -> Self {
+        self.opts.skip_existing = skip;
+        self
+    }
+
+    /// Set pre-computed MD5 checksums.
+    pub fn checksums(mut self, checksums: HashMap<String, String>) -> Self {
+        self.opts.checksums = Some(checksums);
+        self
+    }
+
+    /// Set whether to delete local files after upload.
+    pub fn delete_after_upload(mut self, delete: bool) -> Self {
+        self.opts.delete_after_upload = delete;
+        self
+    }
+
+    /// Set whether to skip derivative generation.
+    pub fn no_derive(mut self, no_derive: bool) -> Self {
+        self.opts.no_derive = no_derive;
+        self
+    }
+
+    /// Set whether to skip keeping old file versions.
+    pub fn no_backup(mut self, no_backup: bool) -> Self {
+        self.opts.no_backup = no_backup;
+        self
+    }
+
+    /// Set whether to error if item doesn't exist.
+    pub fn no_auto_make_bucket(mut self, no_auto: bool) -> Self {
+        self.opts.no_auto_make_bucket = no_auto;
+        self
+    }
+
+    /// Set whether to skip the size hint header.
+    pub fn no_size_hint(mut self, no_hint: bool) -> Self {
+        self.opts.no_size_hint = no_hint;
+        self
+    }
+
+    /// Set whether to skip collection existence check.
+    pub fn no_collection_check(mut self, no_check: bool) -> Self {
+        self.opts.no_collection_check = no_check;
+        self
+    }
+
+    /// Set whether to upload to test_collection.
+    pub fn test_item(mut self, test: bool) -> Self {
+        self.opts.test_item = test;
+        self
+    }
+
+    /// Set maximum retry attempts.
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.opts.retries = retries;
+        self
+    }
+
+    /// Set sleep duration between retries.
+    pub fn retry_sleep(mut self, duration: Duration) -> Self {
+        self.opts.retry_sleep = duration;
+        self
+    }
+
+    /// Set additional HTTP headers.
+    pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.opts.headers = headers;
+        self
+    }
+
+    /// Set whether to validate without uploading.
+    pub fn dry_run(mut self, dry_run: bool) -> Self {
+        self.opts.dry_run = dry_run;
+        self
+    }
+
+    /// Consume the builder and return the configured [`UploadOpts`].
+    pub fn build(self) -> UploadOpts {
+        self.opts
+    }
+}
+
+impl Default for UploadOptsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Result of a single file upload.
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadResult {
@@ -226,5 +374,29 @@ mod tests {
         let val: serde_json::Value = serde_json::to_value(&result).unwrap();
         assert_eq!(val["status"], "skipped");
         assert!(val.get("detail").is_none());
+    }
+
+    #[test]
+    fn builder_defaults_match_direct_default() {
+        let from_builder = UploadOptsBuilder::new().build();
+        let from_default = UploadOpts::default();
+        assert_eq!(from_builder.verify, from_default.verify);
+        assert_eq!(from_builder.retries, from_default.retries);
+        assert_eq!(from_builder.dry_run, from_default.dry_run);
+        assert!(from_builder.metadata.is_empty());
+    }
+
+    #[test]
+    fn builder_chained_setters() {
+        let opts = UploadOptsBuilder::new()
+            .verify(false)
+            .dry_run(true)
+            .retries(5)
+            .metadata(vec![("key".into(), "val".into())])
+            .build();
+        assert!(!opts.verify);
+        assert!(opts.dry_run);
+        assert_eq!(opts.retries, 5);
+        assert_eq!(opts.metadata.len(), 1);
     }
 }

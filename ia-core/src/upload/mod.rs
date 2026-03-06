@@ -14,4 +14,7 @@ pub use check_limit::RateLimitStatus;
 pub use item::upload_item;
 pub use single::upload_file;
 pub use template::{generate_template, write_template_csv, TemplateOpts, TemplateRow};
-pub use types::{UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus};
+pub use types::{
+    UploadOpts, UploadOptsBuilder, UploadProgress, UploadProgressStatus, UploadResult,
+    UploadStatus,
+};
