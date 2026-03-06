@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,7 +6,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use color_print::cstr;
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
@@ -400,66 +398,9 @@ async fn run_bare_upload(
         .context("failed to open joblog")?;
 
     // Set up progress display
-    let multi = MultiProgress::new();
-    let progress_bars: std::sync::Arc<std::sync::Mutex<HashMap<String, ProgressBar>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-    let pb_style = ProgressStyle::with_template(
-        "{spinner:.green} {prefix:.bold} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("=> ");
-
-    // Build progress callback
-    let json_mode = args.json;
-    let pb_clone = progress_bars.clone();
-    let multi_clone = multi.clone();
-    let style_clone = pb_style.clone();
-    let progress_fn = move |p: UploadProgress| {
-        if json_mode || quiet >= 1 {
-            return;
-        }
-        let mut bars = pb_clone.lock().unwrap_or_else(|e| e.into_inner());
-        match p.status {
-            UploadProgressStatus::Uploading => {
-                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
-                    let pb = multi_clone.add(ProgressBar::new(p.total_bytes));
-                    pb.set_style(style_clone.clone());
-                    pb.set_prefix(p.key.clone());
-                    pb
-                });
-                pb.set_position(p.bytes_sent);
-            }
-            UploadProgressStatus::Verifying => {
-                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
-                    let pb = multi_clone.add(ProgressBar::new(p.total_bytes));
-                    pb.set_style(style_clone.clone());
-                    pb.set_prefix(p.key.clone());
-                    pb
-                });
-                pb.set_message("verifying...");
-            }
-            UploadProgressStatus::Complete => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.finish_and_clear();
-                }
-            }
-            UploadProgressStatus::Skipped => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.finish_and_clear();
-                }
-            }
-            UploadProgressStatus::Failed => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.abandon();
-                }
-            }
-            UploadProgressStatus::WaitingRateLimit => {
-                if let Some(pb) = bars.get(&p.key) {
-                    pb.set_message("rate limited, waiting...");
-                }
-            }
-        }
+    let display = crate::output::UploadDisplay::new();
+    let progress_fn = |p: UploadProgress| {
+        display.update(p);
     };
 
     // Decide whether to use progress callback
