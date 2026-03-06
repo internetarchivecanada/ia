@@ -87,10 +87,10 @@ pub async fn upload_batch(
     }
 
     // If ALL items failed and we have no real results, return the first error
-    if all_results.iter().all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_)))
-        && !errors.is_empty()
-    {
-        return Err(errors.into_iter().next().unwrap());
+    if all_results.iter().all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_))) {
+        if let Some(first_err) = errors.into_iter().next() {
+            return Err(first_err);
+        }
     }
 
     Ok(all_results)
