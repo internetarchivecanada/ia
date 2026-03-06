@@ -787,6 +787,158 @@ async fn upload_400_bad_digest_is_not_retried() {
     assert!(result.unwrap_err().to_string().contains("BadDigest"));
 }
 
+// -- Checksum skip --
+
+#[tokio::test]
+async fn upload_checksum_skip_when_md5_matches() {
+    let server = MockServer::start().await;
+
+    // Mock metadata endpoint — file exists with matching MD5
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [
+                {"name": "test.txt", "md5": "5d41402abc4b2a76b9719d911017c592", "size": "5"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // No PUT request should be made
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello"); // MD5 = 5d41402abc4b2a76b9719d911017c592
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        checksum: true,
+        verify: true,
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Skipped));
+}
+
+#[tokio::test]
+async fn upload_checksum_no_skip_when_md5_differs() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [
+                {"name": "test.txt", "md5": "0000000000000000000000000000000", "size": "5"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        checksum: true,
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn upload_checksum_no_skip_when_file_not_on_remote() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [
+                {"name": "other.txt", "md5": "abc123", "size": "10"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        checksum: true,
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [
+                {"name": "test.txt", "md5": "5d41402abc4b2a76b9719d911017c592", "size": "5"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        checksum: true,
+        verify: false, // no Content-MD5 header, but still compute for skip
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Skipped));
+}
+
 // -- Dry run with verify computes MD5 --
 
 #[tokio::test]

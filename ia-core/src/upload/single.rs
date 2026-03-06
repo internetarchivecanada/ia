@@ -47,9 +47,9 @@ pub async fn upload_file(
     let start = Instant::now();
     let file_size = std::fs::metadata(file)?.len();
 
-    // Compute MD5 if verify is enabled
-    let md5_hex = if opts.verify {
-        // Check pre-computed checksums first
+    // Compute local MD5 if needed for either checksum skip or verify
+    let needs_md5 = opts.checksum || opts.verify;
+    let md5_hex = if needs_md5 {
         if let Some(md5) = opts.checksums.as_ref().and_then(|cs| cs.get(key)) {
             Some(md5.clone())
         } else {
@@ -67,6 +67,45 @@ pub async fn upload_file(
     } else {
         None
     };
+
+    // Checksum skip: compare local MD5 with remote, skip if match
+    if opts.checksum {
+        let local_md5 = md5_hex.as_ref().expect("md5 computed when checksum=true");
+        match client.get_item(identifier).await {
+            Ok(item) => {
+                let remote_md5 = item
+                    .files
+                    .iter()
+                    .find(|f| f.name == key)
+                    .and_then(|f| f.md5.as_deref());
+
+                if remote_md5 == Some(local_md5.as_str()) {
+                    if let Some(cb) = progress {
+                        cb(UploadProgress {
+                            identifier: identifier.to_string(),
+                            key: key.to_string(),
+                            bytes_sent: file_size,
+                            total_bytes: file_size,
+                            status: UploadProgressStatus::Skipped,
+                        });
+                    }
+                    return Ok(UploadResult {
+                        identifier: identifier.to_string(),
+                        key: key.to_string(),
+                        status: UploadStatus::Skipped,
+                        bytes: file_size,
+                        md5: Some(local_md5.clone()),
+                        elapsed_ms: start.elapsed().as_millis() as u64,
+                        retries: 0,
+                    });
+                }
+            }
+            Err(e) => {
+                // Item doesn't exist yet or metadata fetch failed — upload normally
+                tracing::debug!("checksum skip: metadata fetch failed for {identifier}: {e}");
+            }
+        }
+    }
 
     // Dry run: validate everything but don't upload
     if opts.dry_run {
@@ -88,11 +127,15 @@ pub async fn upload_file(
     let (access, secret) = client.require_auth()?;
     let auth_header = format!("LOW {access}:{secret}");
 
-    // Build Content-MD5 header (base64 of raw MD5 bytes)
-    let content_md5_b64 = md5_hex.as_ref().map(|hex| {
-        let raw_bytes = hex_to_bytes(hex);
-        base64_encode(&raw_bytes)
-    });
+    // Build Content-MD5 header only if verify is on
+    let content_md5_b64 = if opts.verify {
+        md5_hex.as_ref().map(|hex| {
+            let raw_bytes = hex_to_bytes(hex);
+            base64_encode(&raw_bytes)
+        })
+    } else {
+        None
+    };
 
     // Pre-compute metadata headers (only used on first file)
     let metadata_headers = if is_first_file && !opts.metadata.is_empty() {
