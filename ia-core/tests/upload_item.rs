@@ -472,3 +472,41 @@ async fn upload_item_empty_metadata_skips_validation() {
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
 }
+
+// -- test_item replaces existing collection metadata --
+
+#[tokio::test]
+async fn upload_item_test_item_replaces_existing_collection() {
+    let server = MockServer::start().await;
+
+    // Expect the metadata header to contain test_collection, NOT my-real-collection
+    Mock::given(method("PUT"))
+        .and(header("x-archive-meta00-collection", "test_collection"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("test.txt");
+    fs::write(&f, "content").unwrap();
+
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        test_item: true,
+        no_collection_check: true,
+        metadata: vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "my-real-collection".into()),
+        ],
+        ..Default::default()
+    };
+
+    let results =
+        upload::upload_item(&client, "test-item", &[f], &opts, None)
+            .await
+            .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].status, UploadStatus::Uploaded));
+}

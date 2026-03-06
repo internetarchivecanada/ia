@@ -939,6 +939,69 @@ async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
     assert!(matches!(result.status, UploadStatus::Skipped));
 }
 
+// -- Empty file upload --
+
+#[tokio::test]
+async fn upload_empty_file() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(header("Content-Length", "0"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("empty.txt");
+    std::fs::write(&file, "").unwrap();
+
+    let opts = UploadOpts::default();
+    let result = upload::upload_file(
+        &client, "test-item", &file, "empty.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 0);
+}
+
+// -- Pre-computed checksums used for Content-MD5 --
+
+#[tokio::test]
+async fn upload_precomputed_checksum_used_for_content_md5() {
+    let server = MockServer::start().await;
+
+    // MD5 of "hello" = 5d41402abc4b2a76b9719d911017c592
+    // Base64 of those 16 bytes = XUFAKrxLKna5cZ2REBfFkg==
+    Mock::given(method("PUT"))
+        .and(header("Content-MD5", "XUFAKrxLKna5cZ2REBfFkg=="))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+
+    let mut checksums = std::collections::HashMap::new();
+    checksums.insert("test.txt".into(), "5d41402abc4b2a76b9719d911017c592".into());
+
+    let opts = UploadOpts {
+        verify: true,
+        checksums: Some(checksums),
+        ..UploadOpts::default()
+    };
+
+    let result = upload::upload_file(
+        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
 // -- Dry run with verify computes MD5 --
 
 #[tokio::test]
