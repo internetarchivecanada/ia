@@ -141,6 +141,13 @@ fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             errors.push(e.to_string());
         }
 
+        // Validate required metadata per group
+        if !group.metadata.is_empty() {
+            if let Err(e) = crate::upload::validate::validate_required_metadata(&group.metadata) {
+                errors.push(format!("{}: {e}", group.identifier));
+            }
+        }
+
         for file in &group.files {
             if let Err(e) = validate_file(file) {
                 errors.push(format!("{}: {e}", file.display()));
@@ -237,5 +244,52 @@ mod tests {
         let groups = group_records(records).unwrap();
         assert_eq!(groups[0].identifier, "aaa");
         assert_eq!(groups[1].identifier, "zzz");
+    }
+
+    #[test]
+    fn validate_groups_checks_required_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let groups = vec![ItemGroup {
+            identifier: "test-item".into(),
+            metadata: vec![("title".into(), "My Item".into())], // missing mediatype + collection
+            files: vec![file],
+        }];
+        let err = validate_groups(&groups).unwrap_err();
+        assert!(err.to_string().contains("mediatype"));
+    }
+
+    #[test]
+    fn validate_groups_passes_with_valid_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let groups = vec![ItemGroup {
+            identifier: "test-item".into(),
+            metadata: vec![
+                ("mediatype".into(), "texts".into()),
+                ("collection".into(), "test_collection".into()),
+            ],
+            files: vec![file],
+        }];
+        validate_groups(&groups).unwrap();
+    }
+
+    #[test]
+    fn validate_groups_skips_empty_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        // No metadata — should pass (no validation triggered)
+        let groups = vec![ItemGroup {
+            identifier: "test-item".into(),
+            metadata: vec![],
+            files: vec![file],
+        }];
+        validate_groups(&groups).unwrap();
     }
 }
