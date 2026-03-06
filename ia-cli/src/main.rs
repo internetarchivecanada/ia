@@ -101,6 +101,8 @@ enum Commands {
     Search(commands::search::SearchArgs),
     /// Show job log summary and failed operations
     Status(commands::status::StatusArgs),
+    /// Upload files to the Internet Archive
+    Upload(commands::upload::UploadArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
     /// Configure credentials and settings
@@ -224,6 +226,9 @@ async fn main() -> Result<()> {
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
+        Commands::Upload(args) => {
+            commands::upload::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
+        }
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]
