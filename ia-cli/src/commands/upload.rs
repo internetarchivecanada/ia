@@ -283,6 +283,10 @@ pub struct TemplateArgs {
     /// Generate identifiers from parent directory names
     #[arg(long)]
     pub identifier_from_dirname: bool,
+
+    /// Output template as JSONL
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -621,6 +625,13 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 
     if rows.is_empty() {
         bail!("no files found in {}", args.dir.display());
+    }
+
+    if args.json {
+        for row in &rows {
+            println!("{}", serde_json::to_string(row).context("failed to serialize template row")?);
+        }
+        return Ok(());
     }
 
     match args.format {

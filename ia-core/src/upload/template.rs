@@ -13,7 +13,7 @@ pub struct TemplateOpts {
 }
 
 /// A single row in the upload template.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TemplateRow {
     pub identifier: String,
     pub file: String,
