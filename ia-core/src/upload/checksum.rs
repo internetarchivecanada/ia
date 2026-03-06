@@ -87,7 +87,7 @@ pub async fn compute_file_md5_async(path: &std::path::Path) -> std::result::Resu
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || compute_file_md5(&path))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
 }
 
 #[cfg(test)]
