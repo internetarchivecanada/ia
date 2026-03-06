@@ -230,7 +230,12 @@ pub async fn upload_file(
 
                     // Delete local file after successful upload if requested
                     if opts.delete_after_upload {
-                        let _ = std::fs::remove_file(file);
+                        if let Err(e) = std::fs::remove_file(file) {
+                            tracing::warn!(
+                                "failed to delete {} after upload: {e}",
+                                file.display()
+                            );
+                        }
                     }
 
                     return Ok(UploadResult {
