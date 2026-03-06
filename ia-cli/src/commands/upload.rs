@@ -192,6 +192,14 @@ pub struct ImportArgs {
     #[arg(short = 'm', long = "metadata")]
     pub metadata: Vec<String>,
 
+    /// Additional HTTP header (repeatable, KEY:VALUE)
+    #[arg(long = "header")]
+    pub header: Vec<String>,
+
+    /// Path to pre-computed MD5 checksums file
+    #[arg(long)]
+    pub checksums: Option<PathBuf>,
+
     /// Skip derivative generation
     #[arg(long)]
     pub no_derive: bool,
@@ -294,6 +302,9 @@ pub async fn run(
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
+    }
+    if args.dashboard {
+        bail!("upload dashboard is not yet implemented (Phase 3)");
     }
 
     match args.command {
@@ -520,11 +531,26 @@ async fn run_import(
         bail!("spreadsheet is empty — no records to upload");
     }
 
-    // Parse extra -m metadata
+    // Parse extra -m metadata and --header
     let extra_metadata = parse_key_values(&args.metadata)?;
+    let headers = parse_key_values(&args.header)?;
+
+    // Parse --checksums file
+    let checksums = if let Some(ref path) = args.checksums {
+        let content = std::fs::read_to_string(path)
+            .context(format!("failed to read checksums file: {}", path.display()))?;
+        Some(
+            ia_core::upload::checksum::parse_checksums(&content)
+                .context("failed to parse checksums file")?,
+        )
+    } else {
+        None
+    };
 
     let opts = UploadOpts {
         metadata: extra_metadata,
+        headers,
+        checksums,
         verify: !args.no_verify,
         checksum: args.checksum,
         delete_after_upload: args.delete_after_upload,
