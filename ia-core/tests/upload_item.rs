@@ -473,6 +473,108 @@ async fn upload_item_empty_metadata_skips_validation() {
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
 }
 
+// -- keep_directories preserves path in PUT URL --
+
+#[tokio::test]
+async fn upload_item_keep_directories_preserves_path() {
+    let server = MockServer::start().await;
+
+    // Accept any PUT
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("subdir");
+    fs::create_dir(&sub).unwrap();
+    let f = sub.join("deep_file.txt");
+    fs::write(&f, "deep content").unwrap();
+
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        no_collection_check: true,
+        keep_directories: true,
+        metadata: vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "test_collection".into()),
+        ],
+        ..Default::default()
+    };
+
+    // Pass the directory so expand_files walks it; keep_directories uses the full path
+    let results = upload::upload_item(
+        &client,
+        "test-item",
+        &[dir.path().to_path_buf()],
+        &opts,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].status, UploadStatus::Uploaded));
+
+    // Verify the PUT path includes the subdirectory component
+    let requests = server.received_requests().await.unwrap();
+    let put_req = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .unwrap();
+    let req_path = put_req.url.path();
+    assert!(
+        req_path.contains("subdir") && req_path.contains("deep_file.txt"),
+        "keep_directories should preserve subdir in PUT path, got: {req_path}"
+    );
+}
+
+// -- remote_name changes PUT path --
+
+#[tokio::test]
+async fn upload_item_remote_name_changes_put_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/custom.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("original.txt");
+    fs::write(&f, "renamed content").unwrap();
+
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        no_collection_check: true,
+        remote_name: Some("custom.txt".into()),
+        metadata: vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "test_collection".into()),
+        ],
+        ..Default::default()
+    };
+
+    let results = upload::upload_item(
+        &client,
+        "test-item",
+        &[f],
+        &opts,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].status, UploadStatus::Uploaded));
+    assert_eq!(results[0].key, "custom.txt");
+}
+
 // -- test_item replaces existing collection metadata --
 
 #[tokio::test]

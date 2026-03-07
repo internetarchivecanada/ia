@@ -1004,6 +1004,176 @@ async fn upload_precomputed_checksum_used_for_content_md5() {
 
 // -- Dry run with verify computes MD5 --
 
+// -- Network error retry --
+
+#[tokio::test]
+async fn upload_retries_on_server_error() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    // First attempt: 500 with retryable S3 error
+    Mock::given(method("PUT"))
+        .and(path("/test-item/retry.txt"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(
+            "<Error><Code>InternalError</Code><Message>Temporary</Message></Error>",
+        ))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Second attempt: success
+    Mock::given(method("PUT"))
+        .and(path("/test-item/retry.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // check_limit returns not-over-limit (called before retry attempt)
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"retry content");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_sleep: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "retry.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+}
+
+// -- 503 retries exhausted --
+
+#[tokio::test]
+async fn upload_503_retries_exhausted() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    // check_limit returns not-over-limit so poll_check_limit clears quickly
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"over_limit": 0, "detail": {"rationing_level": 0}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    // Always return 503 (non-spam) — retries will be exhausted
+    Mock::given(method("PUT"))
+        .and(path("/test-item/exhaust.txt"))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("Please reduce your request rate."),
+        )
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"exhaust");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 2,
+        retry_sleep: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let err = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "exhaust.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("503"),
+        "expected error to contain '503', got: {err}"
+    );
+}
+
+// -- no_auto_make_bucket omits header --
+
+#[tokio::test]
+async fn upload_no_auto_make_bucket_omits_header() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"bucket test");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        no_auto_make_bucket: true,
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+
+    let requests = server.received_requests().await.unwrap();
+    let put_req = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .unwrap();
+    assert!(
+        put_req.headers.get("x-archive-auto-make-bucket").is_none(),
+        "header should not be set when no_auto_make_bucket=true"
+    );
+}
+
+// -- Dry run with verify computes MD5 --
+
 #[tokio::test]
 async fn dry_run_with_verify_computes_md5() {
     let server = MockServer::start().await;
