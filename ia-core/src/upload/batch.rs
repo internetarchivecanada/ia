@@ -51,13 +51,23 @@ pub async fn upload_batch(
     validate_groups(&groups)?;
 
     // 3. Upload items concurrently
-    let results: Vec<Result<Vec<UploadResult>>> = stream::iter(groups)
+    // Return (identifier, Result) so we can attribute failures to specific items.
+    let results: Vec<(String, Result<Vec<UploadResult>>)> = stream::iter(groups)
         .map(|group| async move {
-            // Build per-item opts by merging spreadsheet metadata with base opts
+            let id = group.identifier.clone();
+            // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
             let mut item_opts = opts.clone();
-            item_opts.metadata.extend(group.metadata);
+            for (key, value) in group.metadata {
+                if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
+                    existing.1 = value;
+                } else {
+                    item_opts.metadata.push((key, value));
+                }
+            }
 
-            upload_item(client, &group.identifier, &group.files, &item_opts, progress).await
+            let result =
+                upload_item(client, &group.identifier, &group.files, &item_opts, progress).await;
+            (id, result)
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -65,18 +75,18 @@ pub async fn upload_batch(
 
     // 4. Flatten results — collect successes AND failures
     let mut all_results = Vec::new();
-    let mut errors = Vec::new();
-    for result in results {
+    let mut errors: Vec<(String, IaError)> = Vec::new();
+    for (identifier, result) in results {
         match result {
             Ok(item_results) => all_results.extend(item_results),
-            Err(e) => errors.push(e),
+            Err(e) => errors.push((identifier, e)),
         }
     }
 
-    // Convert errors to Failed results so callers see them
-    for err in &errors {
+    // Convert errors to Failed results so callers can attribute them
+    for (identifier, err) in &errors {
         all_results.push(UploadResult {
-            identifier: String::new(),
+            identifier: identifier.clone(),
             key: String::new(),
             status: crate::upload::types::UploadStatus::Failed(err.to_string()),
             bytes: 0,
@@ -88,7 +98,7 @@ pub async fn upload_batch(
 
     // If ALL items failed and we have no real results, return the first error
     if all_results.iter().all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_))) {
-        if let Some(first_err) = errors.into_iter().next() {
+        if let Some((_, first_err)) = errors.into_iter().next() {
             return Err(first_err);
         }
     }

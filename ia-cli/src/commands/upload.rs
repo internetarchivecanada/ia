@@ -762,7 +762,7 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
 fn load_checksums(path: &std::path::Path) -> Result<std::collections::HashMap<String, String>> {
     let content = std::fs::read_to_string(path)
         .context(format!("failed to read checksums file: {}", path.display()))?;
-    ia_core::upload::checksum::parse_checksums(&content).context("failed to parse checksums file")
+    Ok(ia_core::upload::checksum::parse_checksums(&content))
 }
 
 /// Parse a list of `KEY:VALUE` strings into `(String, String)` pairs.

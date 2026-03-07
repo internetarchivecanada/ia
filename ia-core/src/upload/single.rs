@@ -44,6 +44,12 @@ pub async fn upload_file(
     size_hint: Option<u64>,
     progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
 ) -> Result<UploadResult> {
+    if opts.multipart {
+        return Err(IaError::Config(
+            "multipart upload is not yet implemented (Phase 2)".into(),
+        ));
+    }
+
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
@@ -399,8 +405,11 @@ async fn poll_check_limit(
                     return Ok(());
                 }
             }
-            Err(e) => {
-                tracing::warn!("check_limit request failed: {e}");
+            Err(_) => {
+                // Don't log the error — the check_limit URL contains the
+                // access key as a query parameter, and reqwest may include
+                // the URL in error messages.
+                tracing::warn!(identifier, "check_limit request failed");
             }
         }
 

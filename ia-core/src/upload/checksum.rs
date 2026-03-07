@@ -23,7 +23,7 @@ pub fn compute_file_md5(path: &Path) -> Result<String, std::io::Error> {
 ///
 /// Returns a map of filename to hex MD5 digest.
 /// Skips blank lines and unrecognized formats with a warning.
-pub fn parse_checksums(content: &str) -> Result<HashMap<String, String>, std::io::Error> {
+pub fn parse_checksums(content: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
     for line in content.lines() {
@@ -48,7 +48,7 @@ pub fn parse_checksums(content: &str) -> Result<HashMap<String, String>, std::io
         tracing::warn!("unrecognized checksums line: {}", line);
     }
 
-    Ok(map)
+    map
 }
 
 fn try_parse_gnu(line: &str) -> Option<(String, String)> {
@@ -100,7 +100,7 @@ mod tests {
     fn parse_gnu_md5sum_format() {
         let input = "d41d8cd98f00b204e9800998ecf8427e  file.txt\n\
                       abc123def456abc123def456abc123de  other.pdf\n";
-        let map = parse_checksums(input).unwrap();
+        let map = parse_checksums(input);
         assert_eq!(
             map.get("file.txt").unwrap(),
             "d41d8cd98f00b204e9800998ecf8427e"
@@ -115,7 +115,7 @@ mod tests {
     fn parse_bsd_md5_format() {
         let input = "MD5 (file.txt) = d41d8cd98f00b204e9800998ecf8427e\n\
                       MD5 (other.pdf) = abc123def456abc123def456abc123de\n";
-        let map = parse_checksums(input).unwrap();
+        let map = parse_checksums(input);
         assert_eq!(
             map.get("file.txt").unwrap(),
             "d41d8cd98f00b204e9800998ecf8427e"
@@ -126,14 +126,14 @@ mod tests {
     fn parse_mixed_formats() {
         let input = "d41d8cd98f00b204e9800998ecf8427e  file.txt\n\
                       MD5 (other.pdf) = abc123def456abc123def456abc123de\n";
-        let map = parse_checksums(input).unwrap();
+        let map = parse_checksums(input);
         assert_eq!(map.len(), 2);
     }
 
     #[test]
     fn parse_skips_blank_lines() {
         let input = "d41d8cd98f00b204e9800998ecf8427e  file.txt\n\n\n";
-        let map = parse_checksums(input).unwrap();
+        let map = parse_checksums(input);
         assert_eq!(map.len(), 1);
     }
 
