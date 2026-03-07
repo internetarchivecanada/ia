@@ -343,6 +343,57 @@ fn upload_cleanup_not_implemented() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
+// ─── Import dry-run ──────────────────────────────────────────────────────────
+
+#[test]
+fn upload_import_csv_dry_run() {
+    let dir = TempDir::new().unwrap();
+    let data_file = dir.path().join("hello.txt");
+    fs::write(&data_file, "hello world").unwrap();
+
+    let csv_path = dir.path().join("batch.csv");
+    fs::write(
+        &csv_path,
+        format!(
+            "identifier,file,mediatype,collection\ntest-item-dry,{},texts,test_collection\n",
+            data_file.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "import",
+            csv_path.to_str().unwrap(),
+            "--dry-run",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+}
+
+// ─── Flag acceptance ─────────────────────────────────────────────────────────
+
+#[test]
+fn upload_skip_existing_flag_accepted() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--skip-existing"));
+}
+
+#[test]
+fn upload_checksums_flag_accepted() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--checksums"));
+}
+
 // ─── Help text ───────────────────────────────────────────────────────────────
 
 #[test]
