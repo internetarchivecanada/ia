@@ -1035,6 +1035,7 @@ dependencies = [
  "predicates",
  "ratatui",
  "rpassword",
+ "rust_xlsxwriter",
  "serde_json",
  "tempfile",
  "tokio",

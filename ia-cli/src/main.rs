@@ -32,7 +32,7 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
     version,
     about = "Internet Archive command-line tool",
     long_about = "A command-line tool for interacting with the Internet Archive (archive.org).\n\
-        Download files, search for items, view and edit metadata, and list file contents.",
+        Upload and download files, search for items, view and edit metadata, and list file contents.",
     styles = STYLES,
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
@@ -101,6 +101,8 @@ enum Commands {
     Search(commands::search::SearchArgs),
     /// Show job log summary and failed operations
     Status(commands::status::StatusArgs),
+    /// Upload files to the Internet Archive
+    Upload(commands::upload::UploadArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
     /// Configure credentials and settings
@@ -224,6 +226,9 @@ async fn main() -> Result<()> {
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
+        Commands::Upload(args) => {
+            commands::upload::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
+        }
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]

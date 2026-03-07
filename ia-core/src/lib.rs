@@ -13,6 +13,7 @@ pub mod search;
 pub mod spreadsheet;
 pub mod types;
 pub mod update;
+pub mod upload;
 pub mod user_agent;
 
 pub use client::IaClient;

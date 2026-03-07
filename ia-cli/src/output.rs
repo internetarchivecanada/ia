@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ia_core::download::{DownloadProgress, DownloadStatus, ItemDownloadResult};
+use ia_core::upload::{UploadProgress, UploadProgressStatus};
 
 pub struct DownloadDisplay {
     identifier: String,
@@ -378,6 +379,77 @@ impl BatchDisplay {
         }
 
         eprintln!("{:.1}s elapsed", elapsed);
+    }
+}
+
+/// Progress display for file uploads.
+///
+/// Manages per-file progress bars via `MultiProgress`. Create once, then
+/// pass `update` as the progress callback to `upload_item`.
+pub struct UploadDisplay {
+    multi: MultiProgress,
+    bars: Mutex<HashMap<String, ProgressBar>>,
+    style: ProgressStyle,
+}
+
+impl UploadDisplay {
+    pub fn new() -> Self {
+        let style = ProgressStyle::with_template(
+            "{spinner:.green} {prefix:.bold} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> ");
+
+        Self {
+            multi: MultiProgress::new(),
+            bars: Mutex::new(HashMap::new()),
+            style,
+        }
+    }
+
+    /// Handle an upload progress event — create/update/remove progress bars.
+    pub fn update(&self, p: UploadProgress) {
+        let mut bars = self.bars.lock().unwrap_or_else(|e| e.into_inner());
+        match p.status {
+            UploadProgressStatus::Uploading => {
+                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
+                    let pb = self.multi.add(ProgressBar::new(p.total_bytes));
+                    pb.set_style(self.style.clone());
+                    pb.set_prefix(p.key.clone());
+                    pb
+                });
+                pb.set_position(p.bytes_sent);
+            }
+            UploadProgressStatus::Verifying => {
+                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
+                    let pb = self.multi.add(ProgressBar::new(p.total_bytes));
+                    pb.set_style(self.style.clone());
+                    pb.set_prefix(p.key.clone());
+                    pb
+                });
+                pb.set_message("verifying...");
+            }
+            UploadProgressStatus::Complete => {
+                if let Some(pb) = bars.remove(&p.key) {
+                    pb.finish_and_clear();
+                }
+            }
+            UploadProgressStatus::Skipped => {
+                if let Some(pb) = bars.remove(&p.key) {
+                    pb.finish_and_clear();
+                }
+            }
+            UploadProgressStatus::Failed => {
+                if let Some(pb) = bars.remove(&p.key) {
+                    pb.abandon();
+                }
+            }
+            UploadProgressStatus::WaitingRateLimit => {
+                if let Some(pb) = bars.get(&p.key) {
+                    pb.set_message("rate limited, waiting...");
+                }
+            }
+        }
     }
 }
 
