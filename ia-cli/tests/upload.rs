@@ -248,6 +248,23 @@ fn upload_dashboard_on_cleanup_errors() {
         .stderr(predicate::str::contains("only supported for"));
 }
 
+#[test]
+fn upload_dashboard_accepted_on_import() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--dashboard",
+            "import",
+            "/tmp/nonexistent-test-file.csv",
+        ])
+        .assert()
+        .failure()
+        // Should fail for a reason OTHER than dashboard restriction —
+        // verifies import is recognized as a valid dashboard target.
+        .stderr(predicate::str::contains("only supported for").not());
+}
+
 // ─── Template subcommand ─────────────────────────────────────────────────────
 
 #[test]
