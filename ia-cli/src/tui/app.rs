@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,7 +62,7 @@ pub struct TuiState {
     /// Active file downloads, keyed by "{identifier}/{file_name}" to avoid
     /// collisions when multiple items have files with the same name.
     pub active_files: HashMap<String, FileProgress>,
-    pub completed_files: Vec<String>,
+    pub completed_files: VecDeque<String>,
     pub failed_files: Vec<(String, String)>,
     pub throughput: ThroughputTracker,
     pub disk_statuses: Vec<(String, u64)>,
@@ -120,7 +120,7 @@ impl TuiState {
             bytes_downloaded: 0,
             bytes_total: 0,
             active_files: HashMap::new(),
-            completed_files: Vec::new(),
+            completed_files: VecDeque::new(),
             failed_files: Vec::new(),
             throughput: ThroughputTracker::new(),
             disk_statuses: Vec::new(),
@@ -167,6 +167,12 @@ impl TuiState {
     /// have files with the same name (e.g. `_meta.xml`).
     fn file_key(identifier: &str, file_name: &str) -> String {
         format!("{identifier}\0{file_name}")
+    }
+
+    /// Clamp scroll_offset so it doesn't scroll past the active file list.
+    pub fn clamp_scroll(&mut self) {
+        let max = self.active_files.len().saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.min(max);
     }
 
     fn update(&mut self, progress: DownloadProgress) {
@@ -248,7 +254,10 @@ impl TuiState {
                     self.bytes_downloaded += progress.bytes_downloaded;
                 }
                 self.files_completed += 1;
-                self.completed_files.push(progress.file_name);
+                self.completed_files.push_back(progress.file_name);
+                if self.completed_files.len() > 10 {
+                    self.completed_files.pop_front();
+                }
             }
             DownloadStatus::Skipped(_) => {
                 self.active_files.remove(&file_key);
@@ -318,6 +327,7 @@ impl Dashboard for DownloadDashboard {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 s.scroll_offset = s.scroll_offset.saturating_add(1);
+                s.clamp_scroll();
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {

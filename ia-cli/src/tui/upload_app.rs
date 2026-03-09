@@ -4,7 +4,7 @@
 //! rate limit status, throughput sampling, and S3 task counts. Implements the
 //! [`Dashboard`](super::framework::Dashboard) trait via [`UploadDashboard`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -100,7 +100,7 @@ pub struct UploadTuiState {
     pub bytes_total: u64,
     /// Active file uploads, keyed by `file_key(identifier, key)`.
     pub active_files: HashMap<String, UploadFileProgress>,
-    pub completed_files: Vec<String>,
+    pub completed_files: VecDeque<String>,
     pub failed_files: Vec<(String, String)>,
     pub throughput: ThroughputTracker,
     pub scroll_offset: usize,
@@ -146,7 +146,7 @@ impl UploadTuiState {
             bytes_uploaded: 0,
             bytes_total: 0,
             active_files: HashMap::new(),
-            completed_files: Vec::new(),
+            completed_files: VecDeque::new(),
             failed_files: Vec::new(),
             throughput: ThroughputTracker::new(),
             scroll_offset: 0,
@@ -283,7 +283,10 @@ impl UploadTuiState {
                     self.bytes_uploaded += p.bytes_sent;
                 }
                 self.files_completed += 1;
-                self.completed_files.push(p.key);
+                self.completed_files.push_back(p.key);
+                if self.completed_files.len() > 10 {
+                    self.completed_files.pop_front();
+                }
             }
             UploadProgressStatus::Skipped => {
                 self.active_files.remove(&fk);
@@ -311,6 +314,12 @@ impl UploadTuiState {
             return 0.0;
         }
         (self.bytes_uploaded as f64 / self.bytes_total as f64).min(1.0)
+    }
+
+    /// Clamp scroll_offset so it doesn't scroll past the active file list.
+    pub fn clamp_scroll(&mut self) {
+        let max = self.active_files.len().saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.min(max);
     }
 }
 
@@ -342,6 +351,7 @@ impl Dashboard for UploadDashboard {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 s.scroll_offset = s.scroll_offset.saturating_add(1);
+                s.clamp_scroll();
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -855,7 +865,7 @@ mod tests {
         assert_eq!(state.bytes_uploaded, 1000);
         assert_eq!(state.files_completed, 1);
         assert!(state.active_files.is_empty());
-        assert_eq!(state.completed_files, vec!["file.txt"]);
+        assert_eq!(state.completed_files, VecDeque::from(vec!["file.txt".to_string()]));
         assert_eq!(state.items[0].status, UploadItemStatus::Complete);
         assert_eq!(state.items[0].bytes_uploaded, 1000);
     }
@@ -1228,6 +1238,20 @@ mod tests {
             state: Arc::clone(&state),
         };
 
+        // Add active files so scroll has room to move
+        {
+            let mut s = state.lock().unwrap();
+            for i in 0..5 {
+                s.update(progress(
+                    "x",
+                    &format!("file-{i}.txt"),
+                    0,
+                    100,
+                    UploadProgressStatus::Verifying,
+                ));
+            }
+        }
+
         dash.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(state.lock().unwrap().scroll_offset, 1);
         dash.handle_key(KeyCode::Down, KeyModifiers::NONE);
@@ -1281,5 +1305,52 @@ mod tests {
             state: Arc::clone(&state),
         };
         assert!(!dash.handle_key(KeyCode::Char('z'), KeyModifiers::NONE));
+    }
+
+    // --- Bounded completed_files and scroll clamping ---
+
+    #[test]
+    fn completed_files_bounded() {
+        let mut state = UploadTuiState::new(&["item-1".into()]);
+        for i in 0..20 {
+            state.update(progress(
+                "item-1",
+                &format!("file-{i}.txt"),
+                0,
+                100,
+                UploadProgressStatus::Verifying,
+            ));
+            state.update(progress(
+                "item-1",
+                &format!("file-{i}.txt"),
+                100,
+                100,
+                UploadProgressStatus::Complete,
+            ));
+        }
+        assert!(state.completed_files.len() <= 10);
+        assert_eq!(state.completed_files.back().unwrap(), "file-19.txt");
+    }
+
+    #[test]
+    fn scroll_offset_clamped() {
+        let mut state = UploadTuiState::new(&["item-1".into()]);
+        state.update(progress(
+            "item-1",
+            "a.txt",
+            0,
+            100,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-1",
+            "b.txt",
+            0,
+            100,
+            UploadProgressStatus::Verifying,
+        ));
+        state.scroll_offset = 100;
+        state.clamp_scroll();
+        assert!(state.scroll_offset <= 1);
     }
 }
