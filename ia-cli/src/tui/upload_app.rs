@@ -572,7 +572,7 @@ pub async fn run_upload_tui(
     );
 
     if total_failed > 0 {
-        std::process::exit(1);
+        anyhow::bail!("{total_failed} file(s) failed to upload");
     }
 
     Ok(())
@@ -786,7 +786,7 @@ pub async fn run_upload_batch_tui(
     );
 
     if total_failed > 0 {
-        std::process::exit(1);
+        anyhow::bail!("{total_failed} file(s) failed to upload");
     }
 
     Ok(())

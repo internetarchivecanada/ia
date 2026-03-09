@@ -925,7 +925,7 @@ pub async fn run_tui(
     );
 
     if total_failed > 0 {
-        std::process::exit(1);
+        anyhow::bail!("{total_failed} file(s) failed to download");
     }
 
     Ok(())
