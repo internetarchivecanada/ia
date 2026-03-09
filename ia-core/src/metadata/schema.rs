@@ -12,7 +12,7 @@ use crate::error::IaError;
 /// The JSON keys from the API use spaces (e.g. "internal use only"),
 /// which are renamed to snake_case for Rust. Serialization outputs
 /// snake_case keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaField {
     /// Machine name (e.g. "title", "creator")
     pub field: String,
