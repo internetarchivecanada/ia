@@ -183,6 +183,12 @@ impl UploadOptsBuilder {
         self
     }
 
+    /// Set whether to use multipart upload.
+    pub fn multipart(mut self, multipart: bool) -> Self {
+        self.opts.multipart = multipart;
+        self
+    }
+
     /// Set maximum retry attempts.
     pub fn retries(mut self, retries: u32) -> Self {
         self.opts.retries = retries;
@@ -274,6 +280,28 @@ pub enum UploadProgressStatus {
     Complete,
     Skipped,
     Failed,
+}
+
+/// Information about an in-progress multipart upload (from S3 list-uploads).
+#[derive(Debug, Clone, Serialize)]
+pub struct MultipartUploadInfo {
+    /// Remote filename (S3 key).
+    pub key: String,
+    /// Server-assigned upload ID.
+    pub upload_id: String,
+    /// ISO 8601 timestamp when the upload was initiated.
+    pub initiated: String,
+}
+
+/// Information about a completed part (from S3 list-parts).
+#[derive(Debug, Clone)]
+pub struct PartInfo {
+    /// 1-based part number.
+    pub part_number: u32,
+    /// ETag returned by S3 for this part (includes quotes).
+    pub etag: String,
+    /// Size in bytes.
+    pub size: u64,
 }
 
 #[cfg(test)]
@@ -398,5 +426,42 @@ mod tests {
         assert!(opts.dry_run);
         assert_eq!(opts.retries, 5);
         assert_eq!(opts.metadata.len(), 1);
+    }
+
+    #[test]
+    fn multipart_upload_info_debug() {
+        let info = MultipartUploadInfo {
+            key: "file.zip".into(),
+            upload_id: "abc123".into(),
+            initiated: "2026-03-06T12:00:00Z".into(),
+        };
+        assert_eq!(info.key, "file.zip");
+        assert_eq!(info.upload_id, "abc123");
+        let dbg = format!("{info:?}");
+        assert!(dbg.contains("file.zip"));
+    }
+
+    #[test]
+    fn part_info_debug() {
+        let part = PartInfo {
+            part_number: 1,
+            etag: "\"abc123\"".into(),
+            size: 104857600,
+        };
+        assert_eq!(part.part_number, 1);
+        assert_eq!(part.size, 104857600);
+    }
+
+    #[test]
+    fn multipart_upload_info_serializes() {
+        let info = MultipartUploadInfo {
+            key: "file.zip".into(),
+            upload_id: "abc123".into(),
+            initiated: "2026-03-06T12:00:00Z".into(),
+        };
+        let val: serde_json::Value = serde_json::to_value(&info).unwrap();
+        assert_eq!(val["key"], "file.zip");
+        assert_eq!(val["upload_id"], "abc123");
+        assert_eq!(val["initiated"], "2026-03-06T12:00:00Z");
     }
 }

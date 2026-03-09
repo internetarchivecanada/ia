@@ -1205,3 +1205,72 @@ async fn dry_run_with_verify_computes_md5() {
         Some("5d41402abc4b2a76b9719d911017c592")
     );
 }
+
+// -- Multipart dispatch --
+
+#[tokio::test]
+async fn upload_file_multipart_flag_dispatches() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let content = b"test multipart dispatch";
+    let f = temp_file(content);
+
+    // List uploads (resume check): empty
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(wiremock::matchers::query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Initiate
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.bin"))
+        .and(wiremock::matchers::query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>dispatch-test</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Part 1
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.bin"))
+        .and(wiremock::matchers::query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e1\""))
+        .mount(&server)
+        .await;
+
+    // Complete
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.bin"))
+        .and(wiremock::matchers::query_param("uploadId", "dispatch-test"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        multipart: true,
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}

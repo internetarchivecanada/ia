@@ -128,6 +128,10 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Use multipart upload (recommended for files >5 GB)
+    #[arg(long)]
+    pub multipart: bool,
+
     /// Full-screen TUI dashboard (not yet implemented)
     #[arg(long)]
     pub dashboard: bool,
@@ -175,8 +179,20 @@ pub enum UploadCommand {
     )]
     Template(TemplateArgs),
 
-    /// Clean up incomplete multipart uploads (not yet implemented)
-    #[command(hide = true)]
+    /// Clean up incomplete multipart uploads
+    #[command(
+        long_about = "List or abort incomplete multipart uploads for an item. \
+            Use this to clean up uploads that were interrupted or abandoned.",
+        after_long_help = cstr!(
+            "<bold><underline>Examples:</underline></bold>\n\
+             \n  <dim># List all incomplete uploads for an item</dim>\
+             \n  <bold>$ ia upload cleanup my-item</bold>\
+             \n\n  <dim># Abort a specific file's upload</dim>\
+             \n  <bold>$ ia upload cleanup my-item file.zip</bold>\
+             \n\n  <dim># Abort all incomplete uploads</dim>\
+             \n  <bold>$ ia upload cleanup my-item --abort-all</bold>\n"
+        ),
+    )]
     Cleanup(CleanupArgs),
 }
 
@@ -233,6 +249,10 @@ pub struct ImportArgs {
     /// Upload to test_collection (auto-removed after 30 days)
     #[arg(long)]
     pub test_item: bool,
+
+    /// Use multipart upload (recommended for files >5 GB)
+    #[arg(long)]
+    pub multipart: bool,
 
     /// Validate everything, upload nothing
     #[arg(long)]
@@ -295,9 +315,17 @@ pub struct CleanupArgs {
     #[arg()]
     pub identifier: String,
 
-    /// Specific file to clean up (default: all incomplete uploads)
+    /// Specific file to clean up
     #[arg()]
     pub file: Option<String>,
+
+    /// Abort all incomplete uploads without confirmation
+    #[arg(long)]
+    pub abort_all: bool,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -319,7 +347,7 @@ pub async fn run(
     match args.command {
         Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path).await,
         Some(UploadCommand::Template(sub)) => run_template(sub),
-        Some(UploadCommand::Cleanup(sub)) => run_cleanup(sub),
+        Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         None => run_bare_upload(client, args, quiet, joblog_path).await,
     }
 }
@@ -381,7 +409,7 @@ async fn run_bare_upload(
         no_size_hint: args.no_size_hint,
         no_collection_check: args.no_collection_check,
         test_item: args.test_item,
-        multipart: false,
+        multipart: args.multipart,
         retries: args.retries,
         retry_sleep: Duration::from_secs(args.retry_sleep),
         headers,
@@ -506,6 +534,7 @@ async fn run_import(
         no_size_hint: args.no_size_hint,
         no_collection_check: args.no_collection_check,
         test_item: args.test_item,
+        multipart: args.multipart,
         retries: args.retries,
         retry_sleep: Duration::from_secs(args.retry_sleep),
         dry_run: args.dry_run,
@@ -684,8 +713,91 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
-fn run_cleanup(_args: CleanupArgs) -> Result<()> {
-    bail!("multipart cleanup is not yet implemented (Phase 2)")
+async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
+    let uploads = ia_core::upload::multipart::list_uploads(client, &args.identifier).await?;
+
+    if uploads.is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            eprintln!(
+                "{} No incomplete multipart uploads for {}",
+                style("✓").green(),
+                args.identifier,
+            );
+        }
+        return Ok(());
+    }
+
+    // Filter by file if specified
+    let targets: Vec<_> = if let Some(ref file) = args.file {
+        uploads.into_iter().filter(|u| u.key == *file).collect()
+    } else {
+        uploads
+    };
+
+    if targets.is_empty() {
+        if args.json {
+            println!("[]");
+        } else {
+            eprintln!(
+                "{} No incomplete uploads matching '{}' for {}",
+                style("✓").green(),
+                args.file.as_deref().unwrap_or(""),
+                args.identifier,
+            );
+        }
+        return Ok(());
+    }
+
+    // List mode: no file and no --abort-all → just list
+    if args.file.is_none() && !args.abort_all {
+        if args.json {
+            let json = serde_json::to_string(&targets)?;
+            println!("{json}");
+        } else {
+            eprintln!(
+                "{} {} incomplete multipart upload(s) for {}:",
+                style("▸").cyan(),
+                targets.len(),
+                args.identifier,
+            );
+            for u in &targets {
+                eprintln!(
+                    "  {} {} (initiated: {})",
+                    u.upload_id, u.key, u.initiated,
+                );
+            }
+            eprintln!(
+                "\nUse --abort-all or specify a file to abort."
+            );
+        }
+        return Ok(());
+    }
+
+    // Abort mode
+    for u in &targets {
+        ia_core::upload::multipart::abort_upload(client, &args.identifier, &u.key, &u.upload_id)
+            .await?;
+        if args.json {
+            let json = serde_json::json!({
+                "action": "aborted",
+                "identifier": args.identifier,
+                "key": u.key,
+                "upload_id": u.upload_id,
+            });
+            println!("{}", serde_json::to_string(&json)?);
+        } else {
+            eprintln!(
+                " {} aborted {}/{}",
+                style("✓").green(),
+                args.identifier,
+                u.key,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
