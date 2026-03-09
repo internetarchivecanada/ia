@@ -1049,6 +1049,7 @@ name = "ia-core"
 version = "0.7.0"
 dependencies = [
  "async-stream",
+ "bytes",
  "calamine",
  "chrono",
  "configparser",

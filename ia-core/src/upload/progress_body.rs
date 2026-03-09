@@ -2,6 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use futures::Stream;
 use tokio::io::{AsyncRead, ReadBuf};
 
@@ -45,7 +46,7 @@ where
     R: AsyncRead + Unpin,
     F: Fn(u64) + Unpin,
 {
-    type Item = Result<Vec<u8>, io::Error>;
+    type Item = Result<Bytes, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -58,7 +59,7 @@ where
                 }
                 this.bytes_sent += n as u64;
                 (this.callback)(this.bytes_sent);
-                Poll::Ready(Some(Ok(this.buf[..n].to_vec())))
+                Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.buf[..n]))))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
             Poll::Pending => Poll::Pending,
