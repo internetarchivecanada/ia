@@ -388,7 +388,7 @@ pub async fn run_upload_tui(
     identifiers: Vec<String>,
     files_per_item: Vec<Vec<std::path::PathBuf>>,
     opts: ia_core::upload::UploadOpts,
-    _concurrency: usize,
+    concurrency: usize,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -397,6 +397,9 @@ pub async fn run_upload_tui(
 
     let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
 
+    // Semaphore to limit how many items upload concurrently
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
     // Spawn upload tasks (one per item)
     let mut handles = Vec::new();
     for (id, files) in identifiers.iter().zip(files_per_item.iter()) {
@@ -404,10 +407,12 @@ pub async fn run_upload_tui(
         let id = id.clone();
         let files = files.clone();
         let opts = opts.clone();
+        let sem = Arc::clone(&semaphore);
         let progress_state = Arc::clone(&state);
         let cleanup_state = Arc::clone(&state);
 
         handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
             let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
                 Arc::new(move |p: UploadProgress| {
                     if let Ok(mut s) = progress_state.lock() {
