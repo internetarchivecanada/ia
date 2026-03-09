@@ -563,6 +563,219 @@ pub async fn run_upload_tui(
 }
 
 // ---------------------------------------------------------------------------
+// Batch (import) entry point
+// ---------------------------------------------------------------------------
+
+/// Entry point for `ia upload import --dashboard`.
+///
+/// Groups spreadsheet records by identifier (reusing `batch::group_records`),
+/// validates them, then runs the upload dashboard with per-item concurrency
+/// controlled by a semaphore matching the `--jobs` parameter.
+pub async fn run_upload_batch_tui(
+    client: &ia_core::IaClient,
+    records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
+    opts: ia_core::upload::UploadOpts,
+    jobs: usize,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // 1. Group and validate (reuse batch.rs logic)
+    let groups = ia_core::upload::batch::group_records(records)?;
+    ia_core::upload::batch::validate_groups(&groups)?;
+
+    // 2. Extract identifiers for TUI state initialization
+    let identifiers: Vec<String> = groups.iter().map(|g| g.identifier.clone()).collect();
+
+    // 3. Set up terminal — the guard ensures cleanup even on panic.
+    let (mut terminal, _guard) = super::framework::setup_terminal()?;
+    let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
+
+    // 4. Spawn upload tasks (one per item group, with concurrency semaphore)
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(jobs));
+    let mut handles = Vec::new();
+
+    for group in groups {
+        let client = client.clone();
+        let mut item_opts = opts.clone();
+        // Merge spreadsheet metadata — same logic as batch.rs lines 58-66:
+        // spreadsheet metadata overrides CLI metadata for same keys.
+        for (key, value) in group.metadata {
+            if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
+                existing.1 = value;
+            } else {
+                item_opts.metadata.push((key, value));
+            }
+        }
+
+        let sem = Arc::clone(&semaphore);
+        let progress_state = Arc::clone(&state);
+        let cleanup_state = Arc::clone(&state);
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            let id = group.identifier.clone();
+            let files = group.files;
+
+            let progress_fn = move |p: UploadProgress| {
+                if let Ok(mut s) = progress_state.lock() {
+                    s.update(p);
+                }
+            };
+            let progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = Some(&progress_fn);
+            let result =
+                ia_core::upload::upload_item(&client, &id, &files, &item_opts, progress).await;
+
+            // Clean up lingering active files and mark item status
+            if let Ok(mut s) = cleanup_state.lock() {
+                let prefix = format!("{id}\0");
+                s.active_files.retain(|k, _| !k.starts_with(&prefix));
+
+                if let Some(&idx) = s.item_index.get(&id) {
+                    match &result {
+                        Ok(_) => {
+                            let item = &mut s.items[idx];
+                            if !matches!(
+                                item.status,
+                                UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                            ) {
+                                if item.files_failed > 0 {
+                                    item.status = UploadItemStatus::Failed(format!(
+                                        "{} file(s) failed",
+                                        item.files_failed
+                                    ));
+                                } else {
+                                    item.status = UploadItemStatus::Complete;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            s.items[idx].status = UploadItemStatus::Failed(e.to_string());
+                        }
+                    }
+                }
+
+                // Check if all items are done
+                if s.items.iter().all(|i| {
+                    matches!(
+                        i.status,
+                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                    )
+                }) {
+                    s.done = true;
+                }
+            }
+
+            result
+        }));
+    }
+
+    // 5. Spawn S3 tasks polling loop (every 60s).
+    let tasks_state = Arc::clone(&state);
+    let tasks_client = client.clone();
+    let tasks_ids = identifiers.clone();
+    let tasks_handle = tokio::spawn(async move {
+        loop {
+            let mut total_queued = 0u32;
+            let mut total_running = 0u32;
+            let mut total_error = 0u32;
+
+            for id in &tasks_ids {
+                if let Ok(value) = ia_core::tasks::get_tasks(
+                    &tasks_client,
+                    &ia_core::tasks::TasksQuery {
+                        identifier: Some(id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    total_queued += value.summary.queued;
+                    total_running += value.summary.running;
+                    total_error += value.summary.error;
+                }
+            }
+
+            if let Ok(mut s) = tasks_state.lock() {
+                s.tasks_queued = total_queued;
+                s.tasks_running = total_running;
+                s.tasks_error = total_error;
+            }
+
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+
+    // 6. Run the dashboard event loop on a blocking thread.
+    let dashboard_state = Arc::clone(&state);
+    let tick_rate = Duration::from_millis(100);
+    tokio::task::spawn_blocking(move || {
+        let mut dashboard = UploadDashboard {
+            state: dashboard_state,
+        };
+        super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
+    })
+    .await??;
+
+    // 7. Dashboard exited — clean up
+    tasks_handle.abort();
+    drop(_guard);
+
+    // Collect results and print summary
+    let mut total_uploaded = 0usize;
+    let mut total_skipped = 0usize;
+    let mut total_failed = 0usize;
+    let mut total_bytes = 0u64;
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(results)) => {
+                for r in &results {
+                    match &r.status {
+                        ia_core::upload::UploadStatus::Uploaded => {
+                            total_uploaded += 1;
+                            total_bytes += r.bytes;
+                        }
+                        ia_core::upload::UploadStatus::Skipped => {
+                            total_skipped += 1;
+                        }
+                        ia_core::upload::UploadStatus::Failed(_) => {
+                            total_failed += 1;
+                        }
+                        ia_core::upload::UploadStatus::DryRun => {
+                            total_skipped += 1;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Error: {e}");
+                total_failed += 1;
+            }
+            Err(e) => {
+                eprintln!("Task panicked: {e}");
+                total_failed += 1;
+            }
+        }
+    }
+
+    let elapsed = state.lock().unwrap().throughput.elapsed();
+    eprintln!(
+        "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
+        total_uploaded,
+        total_skipped,
+        total_failed,
+        crate::output::format_bytes(total_bytes),
+        elapsed.as_secs_f64(),
+    );
+
+    if total_failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-mod batch;
+pub mod batch;
 pub mod check_limit;
 pub mod checksum;
 pub mod headers;

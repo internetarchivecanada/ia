@@ -350,8 +350,7 @@ pub async fn run(
                 bail!("--dashboard is only supported for bare upload and import");
             }
             Some(UploadCommand::Import(_)) => {
-                // Dashboard supported for import — Task 9
-                bail!("--dashboard for import is not yet implemented");
+                // Dashboard supported for import — handled in run_import
             }
         }
     }
@@ -362,7 +361,7 @@ pub async fn run(
     }
 
     match args.command {
-        Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path).await,
+        Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path, args.dashboard).await,
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         None => run_bare_upload(client, args, quiet, joblog_path).await,
@@ -524,6 +523,7 @@ async fn run_import(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    dashboard: bool,
 ) -> Result<()> {
     let records = read_spreadsheet(&args.spreadsheet)
         .context(format!("failed to read spreadsheet: {}", args.spreadsheet.display()))?;
@@ -570,6 +570,20 @@ async fn run_import(
         dry_run: args.dry_run,
         ..UploadOpts::default()
     };
+
+    // Dashboard mode — hand off to the TUI and return early
+    #[cfg(feature = "tui")]
+    if dashboard {
+        return crate::tui::run_upload_batch_tui(
+            client,
+            records,
+            opts,
+            jobs,
+        )
+        .await;
+    }
+    #[cfg(not(feature = "tui"))]
+    let _ = dashboard;
 
     // Open joblog writer if path provided
     let joblog = joblog_path

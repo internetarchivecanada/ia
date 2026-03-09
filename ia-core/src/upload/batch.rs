@@ -12,10 +12,10 @@ use crate::IaClient;
 
 /// A group of files and metadata for a single IA item.
 #[derive(Debug)]
-struct ItemGroup {
-    identifier: String,
-    metadata: Vec<(String, String)>,
-    files: Vec<PathBuf>,
+pub struct ItemGroup {
+    pub identifier: String,
+    pub metadata: Vec<(String, String)>,
+    pub files: Vec<PathBuf>,
 }
 
 /// Batch upload items from spreadsheet records.
@@ -107,7 +107,7 @@ pub async fn upload_batch(
 }
 
 /// Group spreadsheet records by identifier, extracting file paths and metadata.
-fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
+pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
     // Use BTreeMap for deterministic ordering by identifier
     let mut map: BTreeMap<String, ItemGroup> = BTreeMap::new();
 
@@ -146,7 +146,7 @@ fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
 ///
 /// Checks identifiers and file existence/type. Collects all errors
 /// and reports them together.
-fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
+pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     for group in groups {
