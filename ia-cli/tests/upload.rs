@@ -209,7 +209,7 @@ fn upload_json_and_dashboard_mutually_exclusive() {
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
 #[test]
-fn upload_dashboard_not_implemented() {
+fn upload_dashboard_requires_tty() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.txt");
     fs::write(&file, "content").unwrap();
@@ -222,7 +222,7 @@ fn upload_dashboard_not_implemented() {
         .arg("--dashboard")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not yet implemented (Phase 3)"));
+        .stderr(predicate::str::contains("requires an interactive terminal"));
 }
 
 // ─── Template subcommand ─────────────────────────────────────────────────────

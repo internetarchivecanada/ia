@@ -51,6 +51,7 @@ pub struct UploadItemState {
 impl UploadItemState {
     /// Per-item throughput in bytes/sec.
     #[must_use]
+    #[allow(dead_code)] // Will be used by batch dashboard (Task 9)
     pub fn throughput(&self) -> f64 {
         let secs = self.started_at.elapsed().as_secs_f64();
         if secs > 0.0 {
@@ -69,10 +70,12 @@ impl UploadItemState {
 #[derive(Debug, Clone)]
 pub struct UploadFileProgress {
     pub name: String,
+    #[allow(dead_code)] // Used by batch dashboard (Task 9)
     pub identifier: String,
     pub bytes_sent: u64,
     pub total_bytes: u64,
     pub status: UploadProgressStatus,
+    #[allow(dead_code)] // Will be used for per-file ETA display
     pub started_at: Instant,
 }
 
@@ -358,6 +361,205 @@ impl Dashboard for UploadDashboard {
         let s = self.state.lock().unwrap();
         s.quit_requested
     }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Entry point for `ia upload --dashboard`.
+///
+/// Sets up the terminal, spawns upload tasks with progress callbacks that
+/// update shared TUI state, optionally polls the S3 tasks API, and runs
+/// the dashboard event loop on a blocking thread. Prints a summary line
+/// after the dashboard exits.
+pub async fn run_upload_tui(
+    client: &ia_core::IaClient,
+    identifiers: Vec<String>,
+    files_per_item: Vec<Vec<std::path::PathBuf>>,
+    opts: ia_core::upload::UploadOpts,
+    _concurrency: usize,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // Set up terminal — the guard ensures cleanup even on panic.
+    let (mut terminal, _guard) = super::framework::setup_terminal()?;
+
+    let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
+
+    // Spawn upload tasks (one per item)
+    let mut handles = Vec::new();
+    for (id, files) in identifiers.iter().zip(files_per_item.iter()) {
+        let client = client.clone();
+        let id = id.clone();
+        let files = files.clone();
+        let opts = opts.clone();
+        let progress_state = Arc::clone(&state);
+        let cleanup_state = Arc::clone(&state);
+
+        handles.push(tokio::spawn(async move {
+            let progress_fn = move |p: UploadProgress| {
+                if let Ok(mut s) = progress_state.lock() {
+                    s.update(p);
+                }
+            };
+            let progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = Some(&progress_fn);
+            let result = ia_core::upload::upload_item(&client, &id, &files, &opts, progress).await;
+
+            // Clean up any lingering active files for this item
+            if let Ok(mut s) = cleanup_state.lock() {
+                let prefix = format!("{id}\0");
+                s.active_files.retain(|k, _| !k.starts_with(&prefix));
+
+                // Mark item status based on result
+                if let Some(&idx) = s.item_index.get(&id) {
+                    match &result {
+                        Ok(_) => {
+                            // upload_item's progress events handle per-file status,
+                            // but ensure the item is marked complete/failed.
+                            let item = &mut s.items[idx];
+                            if !matches!(
+                                item.status,
+                                UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                            ) {
+                                if item.files_failed > 0 {
+                                    item.status = UploadItemStatus::Failed(format!(
+                                        "{} file(s) failed",
+                                        item.files_failed
+                                    ));
+                                } else {
+                                    item.status = UploadItemStatus::Complete;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            s.items[idx].status =
+                                UploadItemStatus::Failed(e.to_string());
+                        }
+                    }
+                }
+
+                // Check if all items are done
+                if s.items.iter().all(|i| {
+                    matches!(
+                        i.status,
+                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                    )
+                }) {
+                    s.done = true;
+                }
+            }
+
+            result
+        }));
+    }
+
+    // Spawn S3 tasks polling loop (every 60s).
+    // Failures are silently ignored — auth might not be configured.
+    let tasks_state = Arc::clone(&state);
+    let tasks_client = client.clone();
+    let tasks_ids = identifiers.clone();
+    let tasks_handle = tokio::spawn(async move {
+        loop {
+            let mut total_queued = 0u32;
+            let mut total_running = 0u32;
+            let mut total_error = 0u32;
+
+            for id in &tasks_ids {
+                if let Ok(value) = ia_core::tasks::get_tasks(
+                    &tasks_client,
+                    &ia_core::tasks::TasksQuery {
+                        identifier: Some(id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                {
+                    total_queued += value.summary.queued;
+                    total_running += value.summary.running;
+                    total_error += value.summary.error;
+                }
+            }
+
+            if let Ok(mut s) = tasks_state.lock() {
+                s.tasks_queued = total_queued;
+                s.tasks_running = total_running;
+                s.tasks_error = total_error;
+            }
+
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+
+    // Run the dashboard event loop on a blocking thread so the async
+    // upload tasks keep running on the tokio runtime.
+    let dashboard_state = Arc::clone(&state);
+    let tick_rate = Duration::from_millis(100);
+    tokio::task::spawn_blocking(move || {
+        let mut dashboard = UploadDashboard {
+            state: dashboard_state,
+        };
+        super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
+    })
+    .await??;
+
+    // Dashboard exited — clean up
+    tasks_handle.abort();
+    drop(_guard);
+
+    // Collect results and print summary
+    let mut total_uploaded = 0usize;
+    let mut total_skipped = 0usize;
+    let mut total_failed = 0usize;
+    let mut total_bytes = 0u64;
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(results)) => {
+                for r in &results {
+                    match &r.status {
+                        ia_core::upload::UploadStatus::Uploaded => {
+                            total_uploaded += 1;
+                            total_bytes += r.bytes;
+                        }
+                        ia_core::upload::UploadStatus::Skipped => {
+                            total_skipped += 1;
+                        }
+                        ia_core::upload::UploadStatus::Failed(_) => {
+                            total_failed += 1;
+                        }
+                        ia_core::upload::UploadStatus::DryRun => {
+                            total_skipped += 1;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Error: {e}");
+                total_failed += 1;
+            }
+            Err(e) => {
+                eprintln!("Task panicked: {e}");
+                total_failed += 1;
+            }
+        }
+    }
+
+    let elapsed = state.lock().unwrap().throughput.elapsed();
+    eprintln!(
+        "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
+        total_uploaded,
+        total_skipped,
+        total_failed,
+        crate::output::format_bytes(total_bytes),
+        elapsed.as_secs_f64(),
+    );
+
+    if total_failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

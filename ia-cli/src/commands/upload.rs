@@ -132,7 +132,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub multipart: bool,
 
-    /// Full-screen TUI dashboard (not yet implemented)
+    /// Full-screen TUI dashboard for monitoring upload progress
     #[arg(long)]
     pub dashboard: bool,
 
@@ -340,8 +340,25 @@ pub async fn run(
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
     }
+    #[cfg(feature = "tui")]
     if args.dashboard {
-        bail!("upload dashboard is not yet implemented (Phase 3)");
+        match &args.command {
+            None => {
+                // Dashboard supported for bare upload — handled in run_bare_upload
+            }
+            Some(UploadCommand::Template(_) | UploadCommand::Cleanup(_)) => {
+                bail!("--dashboard is only supported for bare upload and import");
+            }
+            Some(UploadCommand::Import(_)) => {
+                // Dashboard supported for import — Task 9
+                bail!("--dashboard for import is not yet implemented");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if args.dashboard {
+        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
     }
 
     match args.command {
@@ -415,6 +432,19 @@ async fn run_bare_upload(
         headers,
         dry_run: args.dry_run,
     };
+
+    // Dashboard mode — hand off to the TUI and return early
+    #[cfg(feature = "tui")]
+    if args.dashboard {
+        return crate::tui::run_upload_tui(
+            client,
+            vec![identifier.to_string()],
+            vec![files.clone()],
+            opts,
+            1,
+        )
+        .await;
+    }
 
     // Open joblog writer if path provided
     let joblog = joblog_path
