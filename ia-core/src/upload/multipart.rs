@@ -451,6 +451,224 @@ pub async fn list_parts(
     Ok(parse_list_parts_response(&body))
 }
 
+// ── Full multipart upload ───────────────────────────────────────────────
+
+use crate::upload::types::{
+    UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
+};
+use std::path::Path;
+use std::time::Instant;
+
+/// Upload a file using the S3 multipart protocol.
+///
+/// Flow: check for resume → initiate (if fresh) → split into parts → upload
+/// each part with retry → complete.
+/// On permanent part failure, aborts the upload (best-effort cleanup).
+/// Retries individual parts on transient errors.
+///
+/// `part_size` controls the split size. Use [`DEFAULT_PART_SIZE`] for production.
+/// A smaller value can be passed for testing.
+pub async fn upload_file_multipart(
+    client: &IaClient,
+    identifier: &str,
+    file: &Path,
+    key: &str,
+    opts: &UploadOpts,
+    part_size: u64,
+    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+) -> Result<UploadResult> {
+    let start = Instant::now();
+    let file_size = tokio::fs::metadata(file).await?.len();
+
+    // Report verifying phase
+    if let Some(cb) = progress {
+        cb(UploadProgress {
+            identifier: identifier.into(),
+            key: key.into(),
+            bytes_sent: 0,
+            total_bytes: file_size,
+            status: UploadProgressStatus::Verifying,
+        });
+    }
+
+    // Try to resume an existing upload
+    let (upload_id, existing_parts) = try_resume(client, identifier, key).await?;
+
+    let (upload_id, mut completed_parts) = match upload_id {
+        Some(id) => {
+            tracing::info!(
+                identifier,
+                key,
+                upload_id = %id,
+                existing_parts = existing_parts.len(),
+                "resuming multipart upload"
+            );
+            let parts: Vec<(u32, String)> = existing_parts
+                .into_iter()
+                .map(|p| (p.part_number, p.etag))
+                .collect();
+            (id, parts)
+        }
+        None => {
+            let id = initiate_upload(client, identifier, key).await?;
+            (id, Vec::new())
+        }
+    };
+
+    // Compute part boundaries
+    let part_count = file_size.div_ceil(part_size).max(1) as u32;
+    let mut total_retries = 0u32;
+
+    // Upload each part
+    for part_num in 1..=part_count {
+        // Skip already-completed parts (resume)
+        if completed_parts.iter().any(|(n, _)| *n == part_num) {
+            continue;
+        }
+
+        let offset = (part_num as u64 - 1) * part_size;
+        let this_part_size = std::cmp::min(part_size, file_size - offset) as usize;
+
+        // Read part data from file
+        let data = read_file_range(file, offset, this_part_size).await?;
+
+        // Report progress
+        if let Some(cb) = progress {
+            cb(UploadProgress {
+                identifier: identifier.into(),
+                key: key.into(),
+                bytes_sent: offset,
+                total_bytes: file_size,
+                status: UploadProgressStatus::Uploading,
+            });
+        }
+
+        // Per-part retry loop
+        let mut part_retries = 0u32;
+        let etag = loop {
+            match upload_part(client, identifier, key, &upload_id, part_num, data.clone())
+                .await
+            {
+                Ok(etag) => break etag,
+                Err(e) => {
+                    // Check if retryable (503, SlowDown, InternalError, ServiceUnavailable)
+                    let is_retryable = matches!(
+                        &e,
+                        IaError::UploadFailed { message, .. }
+                            if message.contains("503")
+                                || message.contains("SlowDown")
+                                || message.contains("InternalError")
+                                || message.contains("ServiceUnavailable")
+                    );
+
+                    if is_retryable && part_retries < opts.retries {
+                        part_retries += 1;
+                        total_retries += 1;
+
+                        if let Some(cb) = progress {
+                            cb(UploadProgress {
+                                identifier: identifier.into(),
+                                key: key.into(),
+                                bytes_sent: offset,
+                                total_bytes: file_size,
+                                status: UploadProgressStatus::WaitingRateLimit,
+                            });
+                        }
+
+                        tokio::time::sleep(opts.retry_sleep).await;
+                        continue;
+                    }
+
+                    // Non-retryable or retries exhausted: abort the upload
+                    tracing::warn!(
+                        identifier,
+                        key,
+                        part_num,
+                        "multipart part failed, aborting upload"
+                    );
+                    let _ = abort_upload(client, identifier, key, &upload_id).await;
+                    return Err(e);
+                }
+            }
+        };
+
+        completed_parts.push((part_num, etag));
+    }
+
+    // Complete the multipart upload
+    let keep_old_version = !opts.no_backup;
+    complete_upload(
+        client,
+        identifier,
+        key,
+        &upload_id,
+        &completed_parts,
+        keep_old_version,
+    )
+    .await?;
+
+    // Report completion
+    if let Some(cb) = progress {
+        cb(UploadProgress {
+            identifier: identifier.into(),
+            key: key.into(),
+            bytes_sent: file_size,
+            total_bytes: file_size,
+            status: UploadProgressStatus::Complete,
+        });
+    }
+
+    // Delete local file if requested
+    if opts.delete_after_upload {
+        if let Err(e) = tokio::fs::remove_file(file).await {
+            tracing::warn!("failed to delete {} after upload: {e}", file.display());
+        }
+    }
+
+    Ok(UploadResult {
+        identifier: identifier.into(),
+        key: key.into(),
+        status: UploadStatus::Uploaded,
+        bytes: file_size,
+        md5: None,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        retries: total_retries,
+    })
+}
+
+/// Read a range of bytes from a file.
+async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(file).await?;
+    f.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Check for an existing in-progress upload for this key and return it.
+///
+/// If multiple uploads exist for the same key, returns the most recent one.
+async fn try_resume(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+) -> Result<(Option<String>, Vec<PartInfo>)> {
+    let uploads = list_uploads(client, identifier).await?;
+
+    // Find uploads matching this key, take the most recent
+    // Take the last matching upload (most recent, S3 returns chronological order)
+    let matching = uploads.iter().rfind(|u| u.key == key);
+
+    match matching {
+        Some(info) => {
+            let parts = list_parts(client, identifier, key, &info.upload_id).await?;
+            Ok((Some(info.upload_id.clone()), parts))
+        }
+        None => Ok((None, Vec::new())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

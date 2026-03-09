@@ -1,9 +1,20 @@
 //! Integration tests for multipart upload operations.
 
 use ia_core::upload::multipart;
+use ia_core::upload::{UploadOpts, UploadStatus};
 use ia_core::{IaClient, IaConfig};
+use std::io::Write;
+use tempfile::NamedTempFile;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Helper to create a temp file with given content.
+fn temp_file(content: &[u8]) -> NamedTempFile {
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(content).unwrap();
+    f.flush().unwrap();
+    f
+}
 
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
 fn test_client(server: &MockServer) -> IaClient {
@@ -274,4 +285,230 @@ async fn list_parts_success() {
     assert_eq!(parts[0].part_number, 1);
     assert_eq!(parts[0].etag, "\"etag1\"");
     assert_eq!(parts[1].size, 52428800);
+}
+
+// ── Full multipart flow ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upload_file_multipart_success() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    // File: 15 bytes, part size 10 → 2 parts (10 + 5)
+    let content = b"hello world!!!!";
+    let f = temp_file(content);
+
+    // 0. List uploads (resume check): empty
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // 1. Initiate
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-123</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 2. Part 1
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .and(query_param("uploadId", "mp-123"))
+        .and(header("content-length", "10"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 3. Part 2
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .and(query_param("uploadId", "mp-123"))
+        .and(header("content-length", "5"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 4. Complete
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10, // part_size override for testing
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 15);
+    assert_eq!(result.identifier, "test-item");
+    assert_eq!(result.key, "data.bin");
+}
+
+#[tokio::test]
+async fn upload_file_multipart_part_retry_on_503() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let content = b"hello world"; // 11 bytes, 1 part with size >= 11
+    let f = temp_file(content);
+
+    // List uploads (resume check): empty
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Initiate
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-456</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Part 1: first attempt 503, second attempt success
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("SlowDown"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    // Complete
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-456"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_sleep: std::time::Duration::from_millis(1), // fast for tests
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024, // single part
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert!(result.retries >= 1);
+}
+
+#[tokio::test]
+async fn upload_file_multipart_aborts_on_permanent_error() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let f = temp_file(b"data");
+
+    // List uploads (resume check): empty
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Initiate
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-789</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Part 1: permanent 403
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Abort (should be called on permanent failure)
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-789"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        None,
+    )
+    .await;
+
+    assert!(result.is_err());
 }
