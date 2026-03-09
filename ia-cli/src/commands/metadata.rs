@@ -11,11 +11,14 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use comfy_table::{Cell, Color, Table};
+
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup,
     CompoundModifyRequest, MetadataOp, ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
 };
+use ia_core::metadata::{fetch_schema, SchemaField};
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
@@ -34,6 +37,17 @@ pub enum DefinedByFilter {
     UserAdmin,
 }
 
+impl DefinedByFilter {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Uploader => value == "uploader",
+            Self::IaAdmin => value == "IA admin",
+            Self::IaSoftware => value == "IA software",
+            Self::UserAdmin => value == "user admin",
+        }
+    }
+}
+
 /// Filter values for --edit-access flag
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum EditAccessFilter {
@@ -46,6 +60,18 @@ pub enum EditAccessFilter {
     UserAdmin,
     #[value(name = "not-editable")]
     NotEditable,
+}
+
+impl EditAccessFilter {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Uploader => value == "uploader",
+            Self::IaAdmin => value == "IA admin",
+            Self::IaSoftware => value == "IA software",
+            Self::UserAdmin => value == "user admin",
+            Self::NotEditable => value == "not editable",
+        }
+    }
 }
 
 // ─── Shared arg structs ──────────────────────────────────────────────────────
@@ -511,9 +537,64 @@ async fn run_read(
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
+fn filter_schema_fields<'a>(fields: &'a [SchemaField], args: &SchemaArgs) -> Vec<&'a SchemaField> {
+    fields
+        .iter()
+        .filter(|f| args.internal || f.internal_use_only != "Yes")
+        .filter(|f| !args.required || f.required == "Yes" || f.required == "Recommended")
+        .filter(|f| !args.repeatable || f.repeatable == "Yes")
+        .filter(|f| {
+            args.defined_by
+                .as_ref()
+                .map_or(true, |db| db.matches(&f.defined_by))
+        })
+        .filter(|f| {
+            args.edit_access
+                .as_ref()
+                .map_or(true, |ea| ea.matches(&f.edit_access))
+        })
+        .collect()
+}
+
+fn print_schema_table(fields: &[&SchemaField]) {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    table.set_header(vec![
+        Cell::new("FIELD").fg(Color::Cyan),
+        Cell::new("LABEL").fg(Color::Cyan),
+        Cell::new("REQUIRED").fg(Color::Cyan),
+        Cell::new("REPEATABLE").fg(Color::Cyan),
+    ]);
+    for f in fields {
+        table.add_row(vec![&f.field, &f.label, &f.required, &f.repeatable]);
+    }
+    println!("{table}");
+}
+
 async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
-    let _ = (client, args);
-    bail!("schema command not yet implemented")
+    let data = fetch_schema(client).await?;
+    let source = if args.files {
+        &data.files_schema
+    } else {
+        &data.metadata_schema
+    };
+
+    // Single-field detail mode (Task 5)
+    if let Some(ref field_name) = args.field {
+        let _ = field_name;
+        bail!("single-field lookup not yet implemented");
+    }
+
+    let filtered = filter_schema_fields(source, &args);
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&filtered)?;
+        println!("{json}");
+    } else {
+        print_schema_table(&filtered);
+    }
+
+    Ok(())
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
