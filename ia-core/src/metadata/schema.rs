@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::client::IaClient;
+use crate::error::IaError;
+
 /// A single field definition from the IA metadata schema.
 ///
 /// The Internet Archive stores metadata field definitions in the
@@ -63,6 +66,29 @@ pub struct SchemaData {
     pub metadata_schema: Vec<SchemaField>,
     /// File-level metadata field definitions
     pub files_schema: Vec<SchemaField>,
+}
+
+/// Fetch the metadata schema from the ia-metadata item on archive.org.
+///
+/// Downloads and parses `ia-metadata_schema.json` which contains both
+/// item-level (`metadata_schema`) and file-level (`files_schema`) field
+/// definitions.
+pub async fn fetch_schema(client: &IaClient) -> crate::Result<SchemaData> {
+    let url = client.url("/download/ia-metadata/ia-metadata_schema.json");
+    let resp = client.http().get(&url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message: format!("failed to fetch metadata schema: {status}"),
+        });
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(reqwest_middleware::Error::from)?;
+    let data: SchemaData = serde_json::from_str(&body)?;
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -156,5 +182,59 @@ mod tests {
         assert_eq!(json["edit_access"], "uploader");
         assert_eq!(json["accepted_values"], "String, plain text");
         assert_eq!(json["usage_notes"], "All alphabets supported");
+    }
+
+    // -- fetch_schema integration tests --
+
+    fn mock_config(server_uri: &str) -> crate::config::IaConfig {
+        let mut config = crate::config::IaConfig::default();
+        let host = server_uri
+            .strip_prefix("http://")
+            .or_else(|| server_uri.strip_prefix("https://"))
+            .unwrap_or(server_uri);
+        config.general.host = host.to_string();
+        config.general.secure = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn fetch_schema_returns_both_schemas() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(sample_schema_json()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let data = fetch_schema(&client).await.unwrap();
+        assert_eq!(data.metadata_schema.len(), 2);
+        assert_eq!(data.files_schema.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_schema_returns_error_on_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client =
+            crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = fetch_schema(&client).await;
+        assert!(result.is_err());
     }
 }
