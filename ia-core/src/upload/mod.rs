@@ -19,3 +19,40 @@ pub use types::{
     MultipartUploadInfo, PartInfo, UploadOpts, UploadOptsBuilder, UploadProgress,
     UploadProgressStatus, UploadResult, UploadStatus,
 };
+
+use crate::IaClient;
+
+// ── Shared S3 URL helpers ───────────────────────────────────────────────
+
+/// Build the S3 URL for a file within an item.
+///
+/// For production (host == "archive.org"), targets s3.us.archive.org.
+/// For testing (host != "archive.org"), targets the mock server host directly.
+pub(crate) fn build_s3_url(client: &IaClient, identifier: &str, key: &str) -> String {
+    // Encode each path segment individually, preserving `/` separators.
+    // Python uses urllib.parse.quote(key) which also preserves `/`.
+    let encoded_key = key
+        .split('/')
+        .map(|seg| urlencoding::encode(seg))
+        .collect::<Vec<_>>()
+        .join("/");
+    let protocol = client.protocol();
+    let host = client.host();
+
+    if host == "archive.org" {
+        format!("{protocol}://s3.us.archive.org/{identifier}/{encoded_key}")
+    } else {
+        format!("{protocol}://{host}/{identifier}/{encoded_key}")
+    }
+}
+
+/// Build the S3 URL for item-level operations (e.g. list uploads).
+pub(crate) fn build_s3_item_url(client: &IaClient, identifier: &str) -> String {
+    let protocol = client.protocol();
+    let host = client.host();
+    if host == "archive.org" {
+        format!("{protocol}://s3.us.archive.org/{identifier}")
+    } else {
+        format!("{protocol}://{host}/{identifier}")
+    }
+}

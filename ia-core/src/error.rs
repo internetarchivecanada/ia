@@ -86,6 +86,8 @@ pub enum IaError {
         identifier: String,
         key: String,
         message: String,
+        /// HTTP status code, if the error came from an HTTP response.
+        status: Option<u16>,
     },
 
     #[error("upload blocked: {identifier} appears to be spam")]
@@ -273,9 +275,12 @@ impl IaError {
                 extra.insert("received".into(), (*received).into());
                 "download_too_large"
             }
-            IaError::UploadFailed { identifier, key, .. } => {
+            IaError::UploadFailed { identifier, key, status, .. } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("key".into(), key.clone().into());
+                if let Some(code) = status {
+                    extra.insert("status".into(), (*code).into());
+                }
                 "upload_failed"
             }
             IaError::SpamDetected { identifier } => {
@@ -815,6 +820,7 @@ mod tests {
             identifier: "my-item".into(),
             key: "file.pdf".into(),
             message: "connection reset".into(),
+            status: None,
         };
         assert!(err.to_string().contains("my-item"));
         assert!(err.to_string().contains("file.pdf"));
@@ -867,6 +873,7 @@ mod tests {
             identifier: "my-item".into(),
             key: "file.pdf".into(),
             message: "connection reset".into(),
+            status: None,
         };
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "upload_failed");
@@ -920,6 +927,7 @@ mod tests {
             identifier: "my-item".into(),
             key: "file.pdf".into(),
             message: "connection reset".into(),
+            status: None,
         };
         assert!(!err.is_retryable());
     }

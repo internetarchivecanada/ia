@@ -16,9 +16,6 @@ use crate::IaClient;
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Minimum part size per S3 spec: 5 MiB (except last part).
-pub const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
-
 // ── XML parsing helpers ─────────────────────────────────────────────────────
 //
 // S3 returns XML for multipart operations. We use simple string matching
@@ -145,34 +142,7 @@ pub fn build_complete_manifest(parts: &[(u32, String)]) -> String {
     xml
 }
 
-// ── S3 URL helpers ──────────────────────────────────────────────────────
-
-/// Build the S3 URL for multipart operations on a specific file.
-fn build_s3_url(client: &IaClient, identifier: &str, key: &str) -> String {
-    let encoded_key = key
-        .split('/')
-        .map(|seg| urlencoding::encode(seg))
-        .collect::<Vec<_>>()
-        .join("/");
-    let protocol = client.protocol();
-    let host = client.host();
-    if host == "archive.org" {
-        format!("{protocol}://s3.us.archive.org/{identifier}/{encoded_key}")
-    } else {
-        format!("{protocol}://{host}/{identifier}/{encoded_key}")
-    }
-}
-
-/// Build the S3 URL for item-level operations (list uploads).
-fn build_s3_item_url(client: &IaClient, identifier: &str) -> String {
-    let protocol = client.protocol();
-    let host = client.host();
-    if host == "archive.org" {
-        format!("{protocol}://s3.us.archive.org/{identifier}")
-    } else {
-        format!("{protocol}://{host}/{identifier}")
-    }
-}
+use super::{build_s3_item_url, build_s3_url};
 
 // ── S3 operations ───────────────────────────────────────────────────────
 
@@ -198,6 +168,7 @@ pub async fn initiate_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("initiate multipart: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -211,6 +182,7 @@ pub async fn initiate_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("initiate multipart failed: {msg}"),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -218,6 +190,7 @@ pub async fn initiate_upload(
         identifier: identifier.into(),
         key: key.into(),
         message: "initiate response missing UploadId".into(),
+        status: None,
     })
 }
 
@@ -253,6 +226,7 @@ pub async fn upload_part(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("upload part {part_number}: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -265,6 +239,7 @@ pub async fn upload_part(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("upload part {part_number} failed: {msg}"),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -277,6 +252,7 @@ pub async fn upload_part(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("upload part {part_number}: missing ETag in response"),
+            status: None,
         })
 }
 
@@ -318,6 +294,7 @@ pub async fn complete_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("complete multipart: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -330,6 +307,7 @@ pub async fn complete_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("complete multipart failed: {msg}"),
+            status: Some(status.as_u16()),
         });
     }
     Ok(())
@@ -361,6 +339,7 @@ pub async fn abort_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("abort multipart: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -370,6 +349,7 @@ pub async fn abort_upload(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("abort multipart failed: HTTP {status}: {body}"),
+            status: Some(status.as_u16()),
         });
     }
     Ok(())
@@ -395,6 +375,7 @@ pub async fn list_uploads(
             identifier: identifier.into(),
             key: String::new(),
             message: format!("list multipart uploads: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -404,6 +385,7 @@ pub async fn list_uploads(
             identifier: identifier.into(),
             key: String::new(),
             message: format!("list multipart uploads: HTTP {status}: {body}"),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -436,6 +418,7 @@ pub async fn list_parts(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("list parts: {e}"),
+            status: None,
         })?;
 
     let status = resp.status();
@@ -445,6 +428,7 @@ pub async fn list_parts(
             identifier: identifier.into(),
             key: key.into(),
             message: format!("list parts: HTTP {status}: {body}"),
+            status: Some(status.as_u16()),
         });
     }
 
@@ -561,14 +545,11 @@ pub async fn upload_file_multipart(
             match upload_part(client, identifier, key, &upload_id, part_num, data).await {
                 Ok(etag) => break etag,
                 Err(e) => {
-                    // Check if retryable (503, SlowDown, InternalError, ServiceUnavailable)
+                    // Check if retryable: 5xx status codes are transient
                     let is_retryable = matches!(
                         &e,
-                        IaError::UploadFailed { message, .. }
-                            if message.contains("503")
-                                || message.contains("SlowDown")
-                                || message.contains("InternalError")
-                                || message.contains("ServiceUnavailable")
+                        IaError::UploadFailed { status: Some(code), .. }
+                            if *code >= 500
                     );
 
                     if is_retryable && part_retries < opts.retries {
@@ -849,10 +830,5 @@ mod tests {
     #[test]
     fn default_part_size_is_100mib() {
         assert_eq!(DEFAULT_PART_SIZE, 100 * 1024 * 1024);
-    }
-
-    #[test]
-    fn min_part_size_is_5mib() {
-        assert_eq!(MIN_PART_SIZE, 5 * 1024 * 1024);
     }
 }

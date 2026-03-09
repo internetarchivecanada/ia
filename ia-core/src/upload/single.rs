@@ -281,6 +281,7 @@ pub async fn upload_file(
                             message: format!(
                                 "503 after {retries} retries: {body_text}"
                             ),
+                            status: Some(503),
                         });
                     }
                     tracing::warn!(
@@ -324,6 +325,7 @@ pub async fn upload_file(
                         identifier: identifier.to_string(),
                         key: key.to_string(),
                         message: err_msg,
+                        status: Some(status.as_u16()),
                     });
                 }
             }
@@ -342,33 +344,14 @@ pub async fn upload_file(
                     identifier: identifier.to_string(),
                     key: key.to_string(),
                     message: e.to_string(),
+                    status: None,
                 });
             }
         }
     }
 }
 
-/// Build the S3 PUT URL for an upload.
-///
-/// For production (host == "archive.org"), targets s3.us.archive.org.
-/// For testing (host != "archive.org"), targets the mock server host directly.
-fn build_s3_url(client: &IaClient, identifier: &str, key: &str) -> String {
-    // Encode each path segment individually, preserving `/` separators.
-    // Python uses urllib.parse.quote(key) which also preserves `/`.
-    let encoded_key = key
-        .split('/')
-        .map(|seg| urlencoding::encode(seg))
-        .collect::<Vec<_>>()
-        .join("/");
-    let protocol = client.protocol();
-    let host = client.host();
-
-    if host == "archive.org" {
-        format!("{protocol}://s3.us.archive.org/{identifier}/{encoded_key}")
-    } else {
-        format!("{protocol}://{host}/{identifier}/{encoded_key}")
-    }
-}
+use super::build_s3_url;
 
 /// Poll the check_limit endpoint until the rate limit clears.
 ///
