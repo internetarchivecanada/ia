@@ -139,15 +139,6 @@ impl TuiState {
         self.throughput.throughput()
     }
 
-    pub fn eta_seconds(&self) -> Option<f64> {
-        let speed = self.throughput.throughput();
-        if speed > 0.0 && self.bytes_total > self.bytes_downloaded {
-            Some((self.bytes_total - self.bytes_downloaded) as f64 / speed)
-        } else {
-            None
-        }
-    }
-
     pub fn overall_progress(&self) -> f64 {
         let items_total = self.items.len();
         if items_total == 0 {

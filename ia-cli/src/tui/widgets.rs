@@ -113,7 +113,6 @@ pub fn format_elapsed(d: Duration) -> String {
 /// Compute an ETA string from remaining bytes and current throughput.
 ///
 /// Returns an empty string when `bytes_per_sec` is zero or negative.
-#[allow(dead_code)] // Used by the upload dashboard (Task 7+)
 #[must_use]
 pub fn format_eta(remaining_bytes: u64, bytes_per_sec: f64) -> String {
     if bytes_per_sec <= 0.0 || remaining_bytes == 0 {
@@ -187,7 +186,6 @@ pub fn draw_errors_panel(frame: &mut Frame, area: Rect, errors: &[(String, Strin
 ///
 /// Each hint is `(key, label)` — for example `("[q]", "uit")`. Keys are
 /// rendered in cyan brackets, labels in the default (gray) style.
-#[allow(dead_code)] // Used by the upload dashboard (Task 7+)
 pub fn draw_key_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, label)) in hints.iter().enumerate() {

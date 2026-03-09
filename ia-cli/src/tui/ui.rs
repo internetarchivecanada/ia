@@ -76,19 +76,15 @@ fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
     let progress = state.overall_progress();
     let throughput = state.throughput();
 
-    let eta_str = state
-        .eta_seconds()
-        .map(|s| {
-            let secs = s as u64;
-            if secs >= 3600 {
-                format!("  ETA {}h {:02}m", secs / 3600, (secs % 3600) / 60)
-            } else if secs >= 60 {
-                format!("  ETA {}m {:02}s", secs / 60, secs % 60)
-            } else {
-                format!("  ETA {}s", secs)
-            }
-        })
-        .unwrap_or_default();
+    let remaining = state.bytes_total.saturating_sub(state.bytes_downloaded);
+    let eta_str = {
+        let s = widgets::format_eta(remaining, throughput);
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!("  {s}")
+        }
+    };
 
     let label = format!(
         " {} — {:.0}% ({})  {}/s{} ",
@@ -404,14 +400,6 @@ fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
         ])
     };
 
-    let keys = Line::from(vec![
-        Span::raw(" "),
-        Span::styled("[j/k]", Style::default().fg(Color::Cyan)),
-        Span::raw(" scroll  "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw("uit"),
-    ]);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -425,6 +413,6 @@ fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
         .split(inner);
 
     f.render_widget(Paragraph::new(status), layout[0]);
-    f.render_widget(Paragraph::new(keys), layout[1]);
+    widgets::draw_key_hints(f, layout[1], &[("j/k", " scroll  "), ("q", "uit")]);
 }
 
