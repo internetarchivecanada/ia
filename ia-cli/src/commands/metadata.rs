@@ -367,7 +367,9 @@ pub struct SchemaArgs {
          \n\n  <dim># Compound operations (single request)</dim>\
          \n  <bold>$ ia metadata modify nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
          \n\n  <dim># Bulk export</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-         \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\n"
+         \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\
+         \n\n  <dim># Browse metadata field definitions</dim>\n  <bold>$ ia metadata schema</bold>\
+         \n  <bold>$ ia metadata schema title</bold>\n"
     ),
     subcommand_required = false,
 )]
