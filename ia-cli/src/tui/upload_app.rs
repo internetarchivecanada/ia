@@ -374,6 +374,128 @@ impl Dashboard for UploadDashboard {
 }
 
 // ---------------------------------------------------------------------------
+// Shared dashboard lifecycle
+// ---------------------------------------------------------------------------
+
+/// Shared dashboard lifecycle: poll S3 tasks, run the event loop, collect
+/// results, and print a summary. Used by both [`run_upload_tui`] and
+/// [`run_upload_batch_tui`].
+async fn run_dashboard_and_summarize(
+    client: &ia_core::IaClient,
+    state: Arc<Mutex<UploadTuiState>>,
+    mut terminal: super::framework::Term,
+    _guard: super::framework::TerminalGuard,
+    handles: Vec<
+        tokio::task::JoinHandle<
+            std::result::Result<Vec<ia_core::upload::UploadResult>, ia_core::error::IaError>,
+        >,
+    >,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    // 1. Spawn S3 tasks polling loop (every 60s, single aggregate query).
+    //    Uses `args=*s3-put*&submitter={email}` instead of per-identifier
+    //    queries — for a 500-item batch this reduces polling from 500
+    //    requests/minute to 1.
+    let tasks_state = Arc::clone(&state);
+    let tasks_client = client.clone();
+    // Get submitter email from config cookies (no network call needed).
+    let submitter = client.config().cookies.get("logged-in-user").cloned();
+    let tasks_handle = tokio::spawn(async move {
+        loop {
+            if let Ok(value) = ia_core::tasks::get_tasks(
+                &tasks_client,
+                &ia_core::tasks::TasksQuery {
+                    args: Some("*s3-put*".to_string()),
+                    submitter: submitter.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                if let Ok(mut s) = tasks_state.lock() {
+                    s.tasks_queued = value.summary.queued;
+                    s.tasks_running = value.summary.running;
+                    s.tasks_error = value.summary.error;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+
+    // 2. Run the dashboard event loop on a blocking thread so the async
+    //    upload tasks keep running on the tokio runtime.
+    let dashboard_state = Arc::clone(&state);
+    let tick_rate = Duration::from_millis(100);
+    tokio::task::spawn_blocking(move || {
+        let mut dashboard = UploadDashboard {
+            state: dashboard_state,
+        };
+        super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
+    })
+    .await??;
+
+    // 3. Clean up
+    tasks_handle.abort();
+    drop(_guard);
+
+    // 4. Collect results and print summary
+    let mut total_uploaded = 0usize;
+    let mut total_skipped = 0usize;
+    let mut total_failed = 0usize;
+    let mut total_bytes = 0u64;
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(results)) => {
+                for r in &results {
+                    match &r.status {
+                        ia_core::upload::UploadStatus::Uploaded => {
+                            total_uploaded += 1;
+                            total_bytes += r.bytes;
+                        }
+                        ia_core::upload::UploadStatus::Skipped => {
+                            total_skipped += 1;
+                        }
+                        ia_core::upload::UploadStatus::Failed(_) => {
+                            total_failed += 1;
+                        }
+                        ia_core::upload::UploadStatus::DryRun => {
+                            total_skipped += 1;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Error: {e}");
+                total_failed += 1;
+            }
+            Err(e) => {
+                eprintln!("Task panicked: {e}");
+                total_failed += 1;
+            }
+        }
+    }
+
+    let elapsed = state.lock().unwrap().throughput.elapsed();
+    eprintln!(
+        "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
+        total_uploaded,
+        total_skipped,
+        total_failed,
+        crate::output::format_bytes(total_bytes),
+        elapsed.as_secs_f64(),
+    );
+
+    if total_failed > 0 {
+        anyhow::bail!("{total_failed} file(s) failed to upload");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -390,10 +512,8 @@ pub async fn run_upload_tui(
     opts: ia_core::upload::UploadOpts,
     concurrency: usize,
 ) -> anyhow::Result<()> {
-    use std::time::Duration;
-
     // Set up terminal — the guard ensures cleanup even on panic.
-    let (mut terminal, _guard) = super::framework::setup_terminal()?;
+    let (terminal, _guard) = super::framework::setup_terminal()?;
 
     let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
 
@@ -470,112 +590,7 @@ pub async fn run_upload_tui(
         }));
     }
 
-    // Spawn S3 tasks polling loop (every 60s).
-    // Failures are silently ignored — auth might not be configured.
-    let tasks_state = Arc::clone(&state);
-    let tasks_client = client.clone();
-    let tasks_ids = identifiers.clone();
-    let tasks_handle = tokio::spawn(async move {
-        loop {
-            let mut total_queued = 0u32;
-            let mut total_running = 0u32;
-            let mut total_error = 0u32;
-
-            for id in &tasks_ids {
-                if let Ok(value) = ia_core::tasks::get_tasks(
-                    &tasks_client,
-                    &ia_core::tasks::TasksQuery {
-                        identifier: Some(id.clone()),
-                        ..Default::default()
-                    },
-                )
-                .await
-                {
-                    total_queued += value.summary.queued;
-                    total_running += value.summary.running;
-                    total_error += value.summary.error;
-                }
-            }
-
-            if let Ok(mut s) = tasks_state.lock() {
-                s.tasks_queued = total_queued;
-                s.tasks_running = total_running;
-                s.tasks_error = total_error;
-            }
-
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    });
-
-    // Run the dashboard event loop on a blocking thread so the async
-    // upload tasks keep running on the tokio runtime.
-    let dashboard_state = Arc::clone(&state);
-    let tick_rate = Duration::from_millis(100);
-    tokio::task::spawn_blocking(move || {
-        let mut dashboard = UploadDashboard {
-            state: dashboard_state,
-        };
-        super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
-    })
-    .await??;
-
-    // Dashboard exited — clean up
-    tasks_handle.abort();
-    drop(_guard);
-
-    // Collect results and print summary
-    let mut total_uploaded = 0usize;
-    let mut total_skipped = 0usize;
-    let mut total_failed = 0usize;
-    let mut total_bytes = 0u64;
-
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(results)) => {
-                for r in &results {
-                    match &r.status {
-                        ia_core::upload::UploadStatus::Uploaded => {
-                            total_uploaded += 1;
-                            total_bytes += r.bytes;
-                        }
-                        ia_core::upload::UploadStatus::Skipped => {
-                            total_skipped += 1;
-                        }
-                        ia_core::upload::UploadStatus::Failed(_) => {
-                            total_failed += 1;
-                        }
-                        ia_core::upload::UploadStatus::DryRun => {
-                            total_skipped += 1;
-                        }
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("Error: {e}");
-                total_failed += 1;
-            }
-            Err(e) => {
-                eprintln!("Task panicked: {e}");
-                total_failed += 1;
-            }
-        }
-    }
-
-    let elapsed = state.lock().unwrap().throughput.elapsed();
-    eprintln!(
-        "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
-        total_uploaded,
-        total_skipped,
-        total_failed,
-        crate::output::format_bytes(total_bytes),
-        elapsed.as_secs_f64(),
-    );
-
-    if total_failed > 0 {
-        anyhow::bail!("{total_failed} file(s) failed to upload");
-    }
-
-    Ok(())
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
 }
 
 // ---------------------------------------------------------------------------
@@ -593,8 +608,6 @@ pub async fn run_upload_batch_tui(
     opts: ia_core::upload::UploadOpts,
     jobs: usize,
 ) -> anyhow::Result<()> {
-    use std::time::Duration;
-
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
     ia_core::upload::batch::validate_groups(&groups)?;
@@ -603,7 +616,7 @@ pub async fn run_upload_batch_tui(
     let identifiers: Vec<String> = groups.iter().map(|g| g.identifier.clone()).collect();
 
     // 3. Set up terminal — the guard ensures cleanup even on panic.
-    let (mut terminal, _guard) = super::framework::setup_terminal()?;
+    let (terminal, _guard) = super::framework::setup_terminal()?;
     let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
 
     // 4. Spawn upload tasks (one per item group, with concurrency semaphore)
@@ -686,110 +699,8 @@ pub async fn run_upload_batch_tui(
         }));
     }
 
-    // 5. Spawn S3 tasks polling loop (every 60s).
-    let tasks_state = Arc::clone(&state);
-    let tasks_client = client.clone();
-    let tasks_ids = identifiers.clone();
-    let tasks_handle = tokio::spawn(async move {
-        loop {
-            let mut total_queued = 0u32;
-            let mut total_running = 0u32;
-            let mut total_error = 0u32;
-
-            for id in &tasks_ids {
-                if let Ok(value) = ia_core::tasks::get_tasks(
-                    &tasks_client,
-                    &ia_core::tasks::TasksQuery {
-                        identifier: Some(id.clone()),
-                        ..Default::default()
-                    },
-                )
-                .await
-                {
-                    total_queued += value.summary.queued;
-                    total_running += value.summary.running;
-                    total_error += value.summary.error;
-                }
-            }
-
-            if let Ok(mut s) = tasks_state.lock() {
-                s.tasks_queued = total_queued;
-                s.tasks_running = total_running;
-                s.tasks_error = total_error;
-            }
-
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    });
-
-    // 6. Run the dashboard event loop on a blocking thread.
-    let dashboard_state = Arc::clone(&state);
-    let tick_rate = Duration::from_millis(100);
-    tokio::task::spawn_blocking(move || {
-        let mut dashboard = UploadDashboard {
-            state: dashboard_state,
-        };
-        super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
-    })
-    .await??;
-
-    // 7. Dashboard exited — clean up
-    tasks_handle.abort();
-    drop(_guard);
-
-    // Collect results and print summary
-    let mut total_uploaded = 0usize;
-    let mut total_skipped = 0usize;
-    let mut total_failed = 0usize;
-    let mut total_bytes = 0u64;
-
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(results)) => {
-                for r in &results {
-                    match &r.status {
-                        ia_core::upload::UploadStatus::Uploaded => {
-                            total_uploaded += 1;
-                            total_bytes += r.bytes;
-                        }
-                        ia_core::upload::UploadStatus::Skipped => {
-                            total_skipped += 1;
-                        }
-                        ia_core::upload::UploadStatus::Failed(_) => {
-                            total_failed += 1;
-                        }
-                        ia_core::upload::UploadStatus::DryRun => {
-                            total_skipped += 1;
-                        }
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                eprintln!("Error: {e}");
-                total_failed += 1;
-            }
-            Err(e) => {
-                eprintln!("Task panicked: {e}");
-                total_failed += 1;
-            }
-        }
-    }
-
-    let elapsed = state.lock().unwrap().throughput.elapsed();
-    eprintln!(
-        "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
-        total_uploaded,
-        total_skipped,
-        total_failed,
-        crate::output::format_bytes(total_bytes),
-        elapsed.as_secs_f64(),
-    );
-
-    if total_failed > 0 {
-        anyhow::bail!("{total_failed} file(s) failed to upload");
-    }
-
-    Ok(())
+    // 5-7. Run dashboard lifecycle (tasks polling, event loop, summary).
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
 }
 
 // ---------------------------------------------------------------------------
