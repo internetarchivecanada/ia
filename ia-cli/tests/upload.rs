@@ -334,13 +334,13 @@ fn upload_import_nonexistent_file() {
 // ─── Cleanup subcommand ──────────────────────────────────────────────────────
 
 #[test]
-fn upload_cleanup_not_implemented() {
+fn upload_cleanup_requires_credentials() {
     let cfg = empty_config();
     ia_with_config(&cfg)
         .args(["upload", "cleanup", "my-item"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("credentials required"));
 }
 
 // ─── Import dry-run ──────────────────────────────────────────────────────────
