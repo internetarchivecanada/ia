@@ -454,14 +454,11 @@ async fn run_bare_upload(
 
     // Set up progress display
     let display = crate::output::UploadDisplay::new();
-    let progress_fn = |p: UploadProgress| {
-        display.update(p);
-    };
-
-    // Decide whether to use progress callback
-    let progress_ref: Option<&(dyn Fn(UploadProgress) + Send + Sync)> =
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         if !args.json && quiet == 0 {
-            Some(&progress_fn)
+            Some(std::sync::Arc::new(move |p: UploadProgress| {
+                display.update(p);
+            }))
         } else {
             None
         };
@@ -605,53 +602,52 @@ async fn run_import(
     }
 
     let quiet_level = quiet;
-    let progress_fn = move |p: UploadProgress| {
-        if json_mode || quiet_level >= 1 {
-            return;
-        }
-        match p.status {
-            UploadProgressStatus::Complete => {
-                eprintln!(
-                    " {} {}/{}",
-                    style("✓").green(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::Failed => {
-                eprintln!(
-                    " {} {}/{}",
-                    style("✗").red(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::Skipped => {
-                eprintln!(
-                    " {} {}/{} (skipped)",
-                    style("–").dim(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::WaitingRateLimit => {
-                eprintln!(
-                    " {} {} rate limited, polling...",
-                    style("⏸").yellow(),
-                    p.identifier,
-                );
-            }
-            UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
-                // Too noisy for batch — skip
-            }
-        }
-    };
-    let progress_ref: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = if !json_mode && quiet == 0
-    {
-        Some(&progress_fn)
-    } else {
-        None
-    };
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+        if !json_mode && quiet == 0 {
+            Some(std::sync::Arc::new(move |p: UploadProgress| {
+                if json_mode || quiet_level >= 1 {
+                    return;
+                }
+                match p.status {
+                    UploadProgressStatus::Complete => {
+                        eprintln!(
+                            " {} {}/{}",
+                            style("\u{2713}").green(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::Failed => {
+                        eprintln!(
+                            " {} {}/{}",
+                            style("\u{2717}").red(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::Skipped => {
+                        eprintln!(
+                            " {} {}/{} (skipped)",
+                            style("\u{2013}").dim(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::WaitingRateLimit => {
+                        eprintln!(
+                            " {} {} rate limited, polling...",
+                            style("\u{23F8}").yellow(),
+                            p.identifier,
+                        );
+                    }
+                    UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
+                        // Too noisy for batch — skip
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
     let results = upload_batch(client, records, &opts, jobs, progress_ref)
         .await

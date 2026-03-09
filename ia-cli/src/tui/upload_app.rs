@@ -398,13 +398,14 @@ pub async fn run_upload_tui(
         let cleanup_state = Arc::clone(&state);
 
         handles.push(tokio::spawn(async move {
-            let progress_fn = move |p: UploadProgress| {
-                if let Ok(mut s) = progress_state.lock() {
-                    s.update(p);
-                }
-            };
-            let progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = Some(&progress_fn);
-            let result = ia_core::upload::upload_item(&client, &id, &files, &opts, progress).await;
+            let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
+                Arc::new(move |p: UploadProgress| {
+                    if let Ok(mut s) = progress_state.lock() {
+                        s.update(p);
+                    }
+                });
+            let result =
+                ia_core::upload::upload_item(&client, &id, &files, &opts, Some(progress_fn)).await;
 
             // Clean up any lingering active files for this item
             if let Ok(mut s) = cleanup_state.lock() {
@@ -616,14 +617,15 @@ pub async fn run_upload_batch_tui(
             let id = group.identifier.clone();
             let files = group.files;
 
-            let progress_fn = move |p: UploadProgress| {
-                if let Ok(mut s) = progress_state.lock() {
-                    s.update(p);
-                }
-            };
-            let progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = Some(&progress_fn);
+            let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
+                Arc::new(move |p: UploadProgress| {
+                    if let Ok(mut s) = progress_state.lock() {
+                        s.update(p);
+                    }
+                });
             let result =
-                ia_core::upload::upload_item(&client, &id, &files, &item_opts, progress).await;
+                ia_core::upload::upload_item(&client, &id, &files, &item_opts, Some(progress_fn))
+                    .await;
 
             // Clean up lingering active files and mark item status
             if let Ok(mut s) = cleanup_state.lock() {

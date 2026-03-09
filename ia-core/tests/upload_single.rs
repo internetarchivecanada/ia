@@ -572,9 +572,10 @@ async fn upload_progress_callback_fires() {
         Arc::new(Mutex::new(Vec::new()));
     let statuses_clone = statuses.clone();
 
-    let cb = move |p: ia_core::upload::UploadProgress| {
-        statuses_clone.lock().unwrap().push(p.status);
-    };
+    let cb: std::sync::Arc<dyn Fn(ia_core::upload::UploadProgress) + Send + Sync> =
+        std::sync::Arc::new(move |p: ia_core::upload::UploadProgress| {
+            statuses_clone.lock().unwrap().push(p.status);
+        });
 
     let result = upload::upload_file(
         &client,
@@ -585,7 +586,7 @@ async fn upload_progress_callback_fires() {
         true,
         true,
         None,
-        Some(&cb),
+        Some(cb),
     )
     .await
     .unwrap();

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{IaError, Result};
 use crate::upload::single::upload_file;
@@ -30,7 +31,7 @@ pub async fn upload_item(
     identifier: &str,
     files: &[PathBuf],
     opts: &UploadOpts,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<Vec<UploadResult>> {
     // 1. Validate identifier
     validate_identifier(identifier)?;
@@ -113,7 +114,7 @@ pub async fn upload_item(
         let hint = if is_first { size_hint } else { None };
 
         let result = upload_file(
-            client, identifier, file, key, &opts, is_first, is_last, hint, progress,
+            client, identifier, file, key, &opts, is_first, is_last, hint, progress.clone(),
         )
         .await?;
 

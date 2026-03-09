@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Options for upload operations.
@@ -281,6 +282,13 @@ pub enum UploadProgressStatus {
     Skipped,
     Failed,
 }
+
+/// Progress callback type for upload operations.
+///
+/// Wrapping in `Arc` allows the callback to be shared across async tasks
+/// and to satisfy the `'static` bound required by `reqwest::Body::wrap_stream()`
+/// without resorting to `unsafe` lifetime transmutes.
+pub type ProgressCallback = Arc<dyn Fn(UploadProgress) + Send + Sync>;
 
 /// Information about an in-progress multipart upload (from S3 list-uploads).
 #[derive(Debug, Clone, Serialize)]

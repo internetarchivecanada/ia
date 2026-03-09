@@ -441,6 +441,7 @@ use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Upload a file using the S3 multipart protocol.
@@ -459,7 +460,7 @@ pub async fn upload_file_multipart(
     key: &str,
     opts: &UploadOpts,
     part_size: u64,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<UploadResult> {
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
@@ -478,7 +479,7 @@ pub async fn upload_file_multipart(
     }
 
     // Report verifying phase
-    if let Some(cb) = progress {
+    if let Some(ref cb) = progress {
         cb(UploadProgress {
             identifier: identifier.into(),
             key: key.into(),
@@ -527,7 +528,7 @@ pub async fn upload_file_multipart(
         let this_part_size = std::cmp::min(part_size, file_size - offset) as usize;
 
         // Report progress
-        if let Some(cb) = progress {
+        if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.into(),
                 key: key.into(),
@@ -556,7 +557,7 @@ pub async fn upload_file_multipart(
                         part_retries += 1;
                         total_retries += 1;
 
-                        if let Some(cb) = progress {
+                        if let Some(ref cb) = progress {
                             cb(UploadProgress {
                                 identifier: identifier.into(),
                                 key: key.into(),
@@ -604,7 +605,7 @@ pub async fn upload_file_multipart(
     .await?;
 
     // Report completion
-    if let Some(cb) = progress {
+    if let Some(ref cb) = progress {
         cb(UploadProgress {
             identifier: identifier.into(),
             key: key.into(),

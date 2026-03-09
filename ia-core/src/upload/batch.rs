@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
@@ -38,7 +39,7 @@ pub async fn upload_batch(
     records: Vec<SpreadsheetRecord>,
     opts: &UploadOpts,
     concurrency: usize,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<Vec<UploadResult>> {
     if records.is_empty() {
         return Err(IaError::EmptyUpload);
@@ -53,21 +54,25 @@ pub async fn upload_batch(
     // 3. Upload items concurrently
     // Return (identifier, Result) so we can attribute failures to specific items.
     let results: Vec<(String, Result<Vec<UploadResult>>)> = stream::iter(groups)
-        .map(|group| async move {
-            let id = group.identifier.clone();
-            // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
-            let mut item_opts = opts.clone();
-            for (key, value) in group.metadata {
-                if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
-                    existing.1 = value;
-                } else {
-                    item_opts.metadata.push((key, value));
+        .map(|group| {
+            let progress = progress.clone();
+            async move {
+                let id = group.identifier.clone();
+                // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
+                let mut item_opts = opts.clone();
+                for (key, value) in group.metadata {
+                    if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
+                        existing.1 = value;
+                    } else {
+                        item_opts.metadata.push((key, value));
+                    }
                 }
-            }
 
-            let result =
-                upload_item(client, &group.identifier, &group.files, &item_opts, progress).await;
-            (id, result)
+                let result =
+                    upload_item(client, &group.identifier, &group.files, &item_opts, progress)
+                        .await;
+                (id, result)
+            }
         })
         .buffer_unordered(concurrency)
         .collect()

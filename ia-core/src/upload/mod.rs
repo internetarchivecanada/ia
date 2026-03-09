@@ -17,7 +17,7 @@ pub use item::upload_item;
 pub use single::upload_file;
 pub use template::{generate_template, write_template_csv, TemplateOpts, TemplateRow};
 pub use types::{
-    MultipartUploadInfo, PartInfo, UploadOpts, UploadOptsBuilder, UploadProgress,
+    MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts, UploadOptsBuilder, UploadProgress,
     UploadProgressStatus, UploadResult, UploadStatus,
 };
 
