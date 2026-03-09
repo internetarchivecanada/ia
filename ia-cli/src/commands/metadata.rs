@@ -20,6 +20,34 @@ use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
 
+// ─── Filter enums ────────────────────────────────────────────────────────────
+
+/// Filter values for --defined-by flag
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum DefinedByFilter {
+    Uploader,
+    #[value(name = "ia-admin")]
+    IaAdmin,
+    #[value(name = "ia-software")]
+    IaSoftware,
+    #[value(name = "user-admin")]
+    UserAdmin,
+}
+
+/// Filter values for --edit-access flag
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum EditAccessFilter {
+    Uploader,
+    #[value(name = "ia-admin")]
+    IaAdmin,
+    #[value(name = "ia-software")]
+    IaSoftware,
+    #[value(name = "user-admin")]
+    UserAdmin,
+    #[value(name = "not-editable")]
+    NotEditable,
+}
+
 // ─── Shared arg structs ──────────────────────────────────────────────────────
 
 /// Shared write options for all metadata write subcommands.
@@ -184,6 +212,23 @@ pub enum MetadataCommand {
         ),
     )]
     Import(ImportArgs),
+
+    /// Look up Internet Archive metadata field definitions
+    #[command(
+        long_about = "Look up Internet Archive metadata field definitions. Shows a table of \
+            all user-facing fields by default, or detailed info for a specific field.\n\n\
+            The schema is fetched live from the ia-metadata item on archive.org.",
+        after_long_help = cstr!(
+            "<bold><underline>Examples:</underline></bold>\n\
+             \n  <dim># List all user-facing metadata fields</dim>\n  <bold>$ ia metadata schema</bold>\
+             \n\n  <dim># Look up a specific field</dim>\n  <bold>$ ia metadata schema title</bold>\
+             \n\n  <dim># Show file-level schema</dim>\n  <bold>$ ia metadata schema --files</bold>\
+             \n\n  <dim># Show required fields only</dim>\n  <bold>$ ia metadata schema --required</bold>\
+             \n\n  <dim># Include internal fields</dim>\n  <bold>$ ia metadata schema --internal</bold>\
+             \n\n  <dim># Machine-readable output</dim>\n  <bold>$ ia metadata schema --json</bold>\n"
+        ),
+    )]
+    Schema(SchemaArgs),
 }
 
 // ─── Per-subcommand arg structs ──────────────────────────────────────────────
@@ -242,6 +287,40 @@ pub struct ImportArgs {
     pub dry_run: bool,
 
     /// Output results as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SchemaArgs {
+    /// Field name to look up (shows detailed view)
+    pub field: Option<String>,
+
+    /// Show file-level schema instead of item-level
+    #[arg(short = 'f', long)]
+    pub files: bool,
+
+    /// Include internal-use-only fields (hidden by default)
+    #[arg(long)]
+    pub internal: bool,
+
+    /// Only show required or recommended fields
+    #[arg(long)]
+    pub required: bool,
+
+    /// Only show repeatable fields
+    #[arg(long)]
+    pub repeatable: bool,
+
+    /// Filter by who defines the field
+    #[arg(long)]
+    pub defined_by: Option<DefinedByFilter>,
+
+    /// Filter by who can edit the field
+    #[arg(long)]
+    pub edit_access: Option<EditAccessFilter>,
+
+    /// Output as JSON
     #[arg(long)]
     pub json: bool,
 }
@@ -348,6 +427,12 @@ pub async fn run(
             }
             run_import(client, sub, &ctx).await
         }
+        Some(MetadataCommand::Schema(sub)) => {
+            if continuations.is_some() {
+                bail!("compound operations (+) cannot be used with schema");
+            }
+            run_schema(client, sub).await
+        }
         None => {
             if continuations.is_some() {
                 bail!("compound operations (+) require a write subcommand (modify, append, etc.)");
@@ -422,6 +507,13 @@ async fn run_read(
     println!("{output}");
 
     Ok(())
+}
+
+// ─── Schema ──────────────────────────────────────────────────────────────────
+
+async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
+    let _ = (client, args);
+    bail!("schema command not yet implemented")
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
