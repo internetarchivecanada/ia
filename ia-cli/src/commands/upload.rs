@@ -128,6 +128,10 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Use multipart upload (recommended for files >5 GB)
+    #[arg(long)]
+    pub multipart: bool,
+
     /// Full-screen TUI dashboard (not yet implemented)
     #[arg(long)]
     pub dashboard: bool,
@@ -233,6 +237,10 @@ pub struct ImportArgs {
     /// Upload to test_collection (auto-removed after 30 days)
     #[arg(long)]
     pub test_item: bool,
+
+    /// Use multipart upload (recommended for files >5 GB)
+    #[arg(long)]
+    pub multipart: bool,
 
     /// Validate everything, upload nothing
     #[arg(long)]
@@ -381,7 +389,7 @@ async fn run_bare_upload(
         no_size_hint: args.no_size_hint,
         no_collection_check: args.no_collection_check,
         test_item: args.test_item,
-        multipart: false,
+        multipart: args.multipart,
         retries: args.retries,
         retry_sleep: Duration::from_secs(args.retry_sleep),
         headers,
@@ -506,6 +514,7 @@ async fn run_import(
         no_size_hint: args.no_size_hint,
         no_collection_check: args.no_collection_check,
         test_item: args.test_item,
+        multipart: args.multipart,
         retries: args.retries,
         retry_sleep: Duration::from_secs(args.retry_sleep),
         dry_run: args.dry_run,
