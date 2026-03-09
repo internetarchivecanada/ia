@@ -1,10 +1,11 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
 use super::app::{ItemStatus, TuiState};
+use super::widgets;
 
 pub fn draw(f: &mut Frame, state: &TuiState) {
     let mut constraints = vec![Constraint::Length(3)]; // Header always
@@ -26,7 +27,7 @@ pub fn draw(f: &mut Frame, state: &TuiState) {
         constraints.push(Constraint::Length(5));
     }
 
-    let show_throughput = !state.throughput_history.is_empty();
+    let show_throughput = !state.throughput.history().is_empty();
     if show_throughput {
         constraints.push(Constraint::Length(4)); // Throughput sparkline
     }
@@ -58,12 +59,12 @@ pub fn draw(f: &mut Frame, state: &TuiState) {
     }
 
     if show_errors {
-        draw_errors_panel(f, chunks[idx], state);
+        widgets::draw_errors_panel(f, chunks[idx], &state.failed_files);
         idx += 1;
     }
 
     if show_throughput {
-        draw_throughput_panel(f, chunks[idx], state);
+        widgets::draw_throughput_panel(f, chunks[idx], state.throughput.history());
         idx += 1;
     }
 
@@ -332,71 +333,8 @@ fn draw_disks_panel(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(para, inner);
 }
 
-fn draw_errors_panel(f: &mut Frame, area: Rect, state: &TuiState) {
-    let block = Block::default()
-        .title(format!(" Errors ({}) ", state.failed_files.len()))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for (name, err) in state.failed_files.iter().rev().take(inner.height as usize) {
-        lines.push(Line::from(vec![
-            Span::styled(
-                " \u{2717} ",
-                Style::default().fg(Color::Red),
-            ),
-            Span::styled(name, Style::default().fg(Color::White)),
-            Span::raw(" "),
-            Span::styled(err, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
-}
-
-fn draw_throughput_panel(f: &mut Frame, area: Rect, state: &TuiState) {
-    let block = Block::default()
-        .title(" Throughput (last 60s) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    // Convert f64 throughput to u64 for sparkline
-    let data: Vec<u64> = state
-        .throughput_history
-        .iter()
-        .map(|v| *v as u64)
-        .collect();
-
-    let sparkline = Sparkline::default()
-        .block(block)
-        .data(&data)
-        .style(Style::default().fg(Color::Cyan));
-
-    f.render_widget(sparkline, area);
-}
-
 fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
-    let elapsed = state.elapsed();
-    let elapsed_str = if elapsed.as_secs() >= 3600 {
-        format!(
-            "{}h {:02}m {:02}s",
-            elapsed.as_secs() / 3600,
-            (elapsed.as_secs() % 3600) / 60,
-            elapsed.as_secs() % 60
-        )
-    } else if elapsed.as_secs() >= 60 {
-        format!(
-            "{}m {:02}s",
-            elapsed.as_secs() / 60,
-            elapsed.as_secs() % 60
-        )
-    } else {
-        format!("{}s", elapsed.as_secs())
-    };
+    let elapsed_str = widgets::format_elapsed(state.elapsed());
 
     let is_batch = state.items.len() > 1;
 

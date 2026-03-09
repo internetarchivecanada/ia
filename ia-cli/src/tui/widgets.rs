@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Shared TUI widgets and formatting helpers.
 //!
 //! These are reusable components extracted from the download dashboard so that
@@ -95,6 +93,7 @@ impl Default for ThroughputTracker {
 /// Format a byte count as a human-readable string using binary prefixes.
 ///
 /// Examples: `"512 B"`, `"1.5 KiB"`, `"23.4 MiB"`, `"1.20 GiB"`, `"2.50 TiB"`.
+#[allow(dead_code)] // Used by the upload dashboard (Task 7+)
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
@@ -136,6 +135,7 @@ pub fn format_elapsed(d: Duration) -> String {
 /// Compute an ETA string from remaining bytes and current throughput.
 ///
 /// Returns an empty string when `bytes_per_sec` is zero or negative.
+#[allow(dead_code)] // Used by the upload dashboard (Task 7+)
 #[must_use]
 pub fn format_eta(remaining_bytes: u64, bytes_per_sec: f64) -> String {
     if bytes_per_sec <= 0.0 || remaining_bytes == 0 {
@@ -209,6 +209,7 @@ pub fn draw_errors_panel(frame: &mut Frame, area: Rect, errors: &[(String, Strin
 ///
 /// Each hint is `(key, label)` — for example `("[q]", "uit")`. Keys are
 /// rendered in cyan brackets, labels in the default (gray) style.
+#[allow(dead_code)] // Used by the upload dashboard (Task 7+)
 pub fn draw_key_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, label)) in hints.iter().enumerate() {

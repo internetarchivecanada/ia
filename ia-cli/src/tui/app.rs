@@ -1,34 +1,17 @@
 use std::collections::HashMap;
-use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use tokio::sync::Semaphore;
 
 use ia_core::download::{DownloadOpts, DownloadProgress, DownloadStatus};
 use ia_core::IaClient;
 
+use super::framework::{self, Dashboard};
 use super::ui;
-
-/// Guard that restores the terminal on drop (even during panic).
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
-        let _ = std::io::stdout().execute(Show);
-    }
-}
+use super::widgets::ThroughputTracker;
 
 /// Per-item download state for batch tracking.
 #[derive(Debug, Clone)]
@@ -81,9 +64,7 @@ pub struct TuiState {
     pub active_files: HashMap<String, FileProgress>,
     pub completed_files: Vec<String>,
     pub failed_files: Vec<(String, String)>,
-    pub started_at: Instant,
-    pub throughput_history: Vec<f64>,
-    pub last_throughput_sample: Instant,
+    pub throughput: ThroughputTracker,
     pub disk_statuses: Vec<(String, u64)>,
     #[allow(dead_code)]
     pub paused: bool,
@@ -141,9 +122,7 @@ impl TuiState {
             active_files: HashMap::new(),
             completed_files: Vec::new(),
             failed_files: Vec::new(),
-            started_at: Instant::now(),
-            throughput_history: Vec::new(),
-            last_throughput_sample: Instant::now(),
+            throughput: ThroughputTracker::new(),
             disk_statuses: Vec::new(),
             paused: false,
             scroll_offset: 0,
@@ -153,20 +132,15 @@ impl TuiState {
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
+        self.throughput.elapsed()
     }
 
     pub fn throughput(&self) -> f64 {
-        let secs = self.elapsed().as_secs_f64();
-        if secs > 0.0 {
-            self.bytes_downloaded as f64 / secs
-        } else {
-            0.0
-        }
+        self.throughput.throughput()
     }
 
     pub fn eta_seconds(&self) -> Option<f64> {
-        let speed = self.throughput();
+        let speed = self.throughput.throughput();
         if speed > 0.0 && self.bytes_total > self.bytes_downloaded {
             Some((self.bytes_total - self.bytes_downloaded) as f64 / speed)
         } else {
@@ -298,13 +272,8 @@ impl TuiState {
         }
 
         // Sample throughput every second
-        if self.last_throughput_sample.elapsed() >= Duration::from_secs(1) {
-            self.throughput_history.push(self.throughput());
-            if self.throughput_history.len() > 60 {
-                self.throughput_history.remove(0);
-            }
-            self.last_throughput_sample = Instant::now();
-        }
+        self.throughput.set_bytes(self.bytes_downloaded);
+        self.throughput.maybe_sample();
     }
 
     /// Number of items that have finished successfully.
@@ -330,6 +299,52 @@ impl TuiState {
             .iter()
             .filter(|i| matches!(i.status, ItemStatus::Downloading))
             .count()
+    }
+}
+
+/// Wrapper that implements [`Dashboard`] for the download TUI, delegating
+/// rendering to `ui::draw` and key handling to the existing j/k/q logic.
+struct DownloadDashboard {
+    state: Arc<Mutex<TuiState>>,
+}
+
+impl Dashboard for DownloadDashboard {
+    fn draw(&self, frame: &mut ratatui::Frame) {
+        let s = self.state.lock().unwrap();
+        ui::draw(frame, &s);
+    }
+
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        let mut s = self.state.lock().unwrap();
+        match code {
+            KeyCode::Char('q') => {
+                s.quit_requested = true;
+                true
+            }
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                s.quit_requested = true;
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                s.scroll_offset = s.scroll_offset.saturating_add(1);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                s.scroll_offset = s.scroll_offset.saturating_sub(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.done && s.active_files.is_empty()
+    }
+
+    fn quit_requested(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.quit_requested
     }
 }
 
@@ -804,23 +819,11 @@ pub async fn run_tui(
     semaphore: Arc<Semaphore>,
     items_concurrency: usize,
 ) -> anyhow::Result<()> {
-    // Check if stdout is a TTY — raw mode requires an interactive terminal
-    if !std::io::stdout().is_terminal() {
-        anyhow::bail!(
-            "Dashboard mode requires an interactive terminal.\n\
-             Hint: remove --dashboard when piping output or running without a TTY."
-        );
-    }
+    // Set up terminal — the guard ensures cleanup even on panic.
+    // `setup_terminal` also checks for an interactive TTY.
+    let (mut terminal, _guard) = framework::setup_terminal()?;
 
     let state = Arc::new(Mutex::new(TuiState::new(identifiers)));
-
-    // Set up terminal — the guard ensures cleanup even on panic
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
 
     // Semaphore to limit how many items download concurrently
     let item_sem = Arc::new(Semaphore::new(items_concurrency));
@@ -875,62 +878,17 @@ pub async fn run_tui(
         handles.push(handle);
     }
 
-    // Main UI loop
+    // Run the dashboard event loop on a blocking thread so the async
+    // download tasks keep running on the tokio runtime.
+    let dashboard_state = Arc::clone(&state);
     let tick_rate = Duration::from_millis(100);
-    let mut input_disabled = false;
-
-    loop {
-        // Draw
-        {
-            let s = state.lock().unwrap();
-            terminal.draw(|f| ui::draw(f, &s))?;
-
-            if s.quit_requested || (s.done && s.active_files.is_empty()) {
-                break;
-            }
-        }
-
-        // Handle input — if event system fails, continue without input
-        if !input_disabled {
-            match event::poll(tick_rate) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) => {
-                        let mut s = state.lock().unwrap();
-                        match key.code {
-                            KeyCode::Char('q') => {
-                                s.quit_requested = true;
-                            }
-                            KeyCode::Char('c')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                s.quit_requested = true;
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                s.scroll_offset = s.scroll_offset.saturating_add(1);
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                s.scroll_offset = s.scroll_offset.saturating_sub(1);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        input_disabled = true;
-                    }
-                },
-                Ok(false) => {}
-                Err(_) => {
-                    // Input reader failed — continue rendering without input.
-                    // Downloads will run to completion; the TUI exits automatically.
-                    input_disabled = true;
-                    tokio::time::sleep(tick_rate).await;
-                }
-            }
-        } else {
-            tokio::time::sleep(tick_rate).await;
-        }
-    }
+    tokio::task::spawn_blocking(move || {
+        let mut dashboard = DownloadDashboard {
+            state: dashboard_state,
+        };
+        framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
+    })
+    .await??;
 
     // Guard handles terminal cleanup (disable_raw_mode + LeaveAlternateScreen) on drop.
     drop(_guard);

@@ -3,9 +3,6 @@
 //! Provides a [`Dashboard`] trait, terminal lifecycle management ([`TerminalGuard`]),
 //! and a generic event loop ([`run_dashboard_sync`]) that any dashboard can reuse.
 
-// TODO: Remove once the download dashboard migrates to this framework (Task 3).
-#![allow(dead_code)]
-
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
