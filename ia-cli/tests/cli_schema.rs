@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -90,4 +91,87 @@ async fn schema_table_shows_internal_with_flag() {
         .success()
         .stdout(predicate::str::contains("title"))
         .stdout(predicate::str::contains("scanner"));
+}
+
+#[tokio::test]
+async fn schema_detail_shows_all_properties() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args(["--host", &host, "--insecure", "metadata", "schema", "title"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("title"));
+    assert!(stdout.contains("Label:"));
+    assert!(stdout.contains("Title"));
+    assert!(stdout.contains("Required:"));
+    assert!(stdout.contains("Recommended"));
+    assert!(stdout.contains("Definition:"));
+    assert!(stdout.contains("Example:"));
+}
+
+#[tokio::test]
+async fn schema_detail_unknown_field_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "nonexistent",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[tokio::test]
+async fn schema_detail_json_outputs_single_object() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "title",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["field"], "title");
+    assert!(v.is_object(), "single field should be an object, not array");
 }

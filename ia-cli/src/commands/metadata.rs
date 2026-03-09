@@ -556,6 +556,28 @@ fn filter_schema_fields<'a>(fields: &'a [SchemaField], args: &SchemaArgs) -> Vec
         .collect()
 }
 
+fn print_schema_detail(field: &SchemaField) {
+    println!("{}", field.field);
+    println!("  Label:           {}", field.label);
+    println!("  Required:        {}", field.required);
+    println!("  Repeatable:      {}", field.repeatable);
+    println!("  Internal:        {}", field.internal_use_only);
+    println!("  Defined by:      {}", field.defined_by);
+    println!("  Edit access:     {}", field.edit_access);
+    if !field.definition.is_empty() {
+        println!("  Definition:      {}", field.definition);
+    }
+    if !field.accepted_values.is_empty() {
+        println!("  Accepted values: {}", field.accepted_values);
+    }
+    if !field.usage_notes.is_empty() {
+        println!("  Usage notes:     {}", field.usage_notes);
+    }
+    if !field.example.is_empty() {
+        println!("  Example:         {}", field.example.join(", "));
+    }
+}
+
 fn print_schema_table(fields: &[&SchemaField]) {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::NOTHING);
@@ -579,10 +601,39 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
         &data.metadata_schema
     };
 
-    // Single-field detail mode (Task 5)
+    // Single-field detail mode
     if let Some(ref field_name) = args.field {
-        let _ = field_name;
-        bail!("single-field lookup not yet implemented");
+        let found = source.iter().find(|f| f.field == *field_name);
+        match found {
+            Some(field) => {
+                if args.json {
+                    let json = serde_json::to_string_pretty(field)?;
+                    println!("{json}");
+                } else {
+                    print_schema_detail(field);
+                }
+            }
+            None => {
+                let suggestions: Vec<&str> = source
+                    .iter()
+                    .filter(|f| {
+                        f.field.contains(field_name.as_str())
+                            || field_name.contains(&f.field)
+                    })
+                    .map(|f| f.field.as_str())
+                    .take(5)
+                    .collect();
+                let mut msg = format!("field '{}' not found in schema", field_name);
+                if !suggestions.is_empty() {
+                    msg.push_str(&format!(
+                        ". Did you mean: {}?",
+                        suggestions.join(", ")
+                    ));
+                }
+                bail!("{msg}");
+            }
+        }
+        return Ok(());
     }
 
     let filtered = filter_schema_fields(source, &args);
