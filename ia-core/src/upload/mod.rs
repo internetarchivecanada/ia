@@ -3,6 +3,7 @@ pub mod check_limit;
 pub mod checksum;
 pub mod headers;
 mod item;
+pub(crate) mod progress_body;
 pub mod s3_error;
 pub mod multipart;
 mod single;

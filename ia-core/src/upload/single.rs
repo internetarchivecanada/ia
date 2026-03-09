@@ -227,8 +227,44 @@ pub async fn upload_file(
         // buffering the entire file in memory. Content-Length is already set from
         // file_size, so IA S3's no-chunked-transfer requirement is satisfied.
         let file_handle = tokio::fs::File::open(file).await?;
-        let stream_body = reqwest::Body::from(file_handle);
-        let response = request.body(stream_body).send().await;
+
+        let response = if let Some(cb) = progress {
+            // Wrap with ProgressBody for byte-level progress callbacks.
+            //
+            // Safety: `wrap_stream` requires `'static`, but `cb` is a borrowed
+            // reference. The stream is fully consumed within the `.send().await`
+            // below — it never escapes this function. We extend the lifetime via
+            // transmute. The `progress` reference is valid for the entire
+            // duration of `upload_file`, which encompasses the `.send().await`
+            // call that polls the stream to completion.
+            let cb: &'static (dyn Fn(UploadProgress) + Send + Sync) = unsafe {
+                std::mem::transmute::<
+                    &(dyn Fn(UploadProgress) + Send + Sync),
+                    &'static (dyn Fn(UploadProgress) + Send + Sync),
+                >(cb)
+            };
+            let id = identifier.to_string();
+            let k = key.to_string();
+            let fs = file_size;
+            let stream = super::progress_body::ProgressBody::new(
+                file_handle,
+                move |bytes_sent| {
+                    cb(UploadProgress {
+                        identifier: id.clone(),
+                        key: k.clone(),
+                        bytes_sent,
+                        total_bytes: fs,
+                        status: UploadProgressStatus::Uploading,
+                    });
+                },
+            );
+            request
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await
+        } else {
+            request.body(reqwest::Body::from(file_handle)).send().await
+        };
 
         match response {
             Ok(resp) => {
