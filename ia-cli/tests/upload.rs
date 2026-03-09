@@ -225,6 +225,29 @@ fn upload_dashboard_requires_tty() {
         .stderr(predicate::str::contains("requires an interactive terminal"));
 }
 
+#[test]
+fn upload_dashboard_on_template_errors() {
+    let dir = TempDir::new().unwrap();
+
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "--dashboard", "template"])
+        .arg(dir.path().as_os_str())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported for"));
+}
+
+#[test]
+fn upload_dashboard_on_cleanup_errors() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "--dashboard", "cleanup", "test-item"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only supported for"));
+}
+
 // ─── Template subcommand ─────────────────────────────────────────────────────
 
 #[test]
