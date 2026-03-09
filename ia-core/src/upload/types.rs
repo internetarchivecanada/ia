@@ -183,6 +183,12 @@ impl UploadOptsBuilder {
         self
     }
 
+    /// Set whether to use multipart upload.
+    pub fn multipart(mut self, multipart: bool) -> Self {
+        self.opts.multipart = multipart;
+        self
+    }
+
     /// Set maximum retry attempts.
     pub fn retries(mut self, retries: u32) -> Self {
         self.opts.retries = retries;

@@ -45,9 +45,16 @@ pub async fn upload_file(
     progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
 ) -> Result<UploadResult> {
     if opts.multipart {
-        return Err(IaError::Config(
-            "multipart upload is not yet implemented (Phase 2)".into(),
-        ));
+        return crate::upload::multipart::upload_file_multipart(
+            client,
+            identifier,
+            file,
+            key,
+            opts,
+            crate::upload::multipart::DEFAULT_PART_SIZE,
+            progress,
+        )
+        .await;
     }
 
     let start = Instant::now();
