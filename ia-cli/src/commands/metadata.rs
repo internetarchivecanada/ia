@@ -11,14 +11,68 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use comfy_table::{Cell, Color, Table};
+
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup,
     CompoundModifyRequest, MetadataOp, ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS, REMOVE_TAG,
 };
+use ia_core::metadata::{fetch_schema, SchemaField};
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
+
+// ─── Filter enums ────────────────────────────────────────────────────────────
+
+/// Filter values for --defined-by flag
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum DefinedByFilter {
+    Uploader,
+    #[value(name = "ia-admin")]
+    IaAdmin,
+    #[value(name = "ia-software")]
+    IaSoftware,
+    #[value(name = "user-admin")]
+    UserAdmin,
+}
+
+impl DefinedByFilter {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Uploader => value == "uploader",
+            Self::IaAdmin => value == "IA admin",
+            Self::IaSoftware => value == "IA software",
+            Self::UserAdmin => value == "user admin",
+        }
+    }
+}
+
+/// Filter values for --edit-access flag
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum EditAccessFilter {
+    Uploader,
+    #[value(name = "ia-admin")]
+    IaAdmin,
+    #[value(name = "ia-software")]
+    IaSoftware,
+    #[value(name = "user-admin")]
+    UserAdmin,
+    #[value(name = "not-editable")]
+    NotEditable,
+}
+
+impl EditAccessFilter {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Uploader => value == "uploader",
+            Self::IaAdmin => value == "IA admin",
+            Self::IaSoftware => value == "IA software",
+            Self::UserAdmin => value == "user admin",
+            Self::NotEditable => value == "not editable",
+        }
+    }
+}
 
 // ─── Shared arg structs ──────────────────────────────────────────────────────
 
@@ -184,6 +238,23 @@ pub enum MetadataCommand {
         ),
     )]
     Import(ImportArgs),
+
+    /// Look up Internet Archive metadata field definitions
+    #[command(
+        long_about = "Look up Internet Archive metadata field definitions. Shows a table of \
+            all user-facing fields by default, or detailed info for a specific field.\n\n\
+            The schema is fetched live from the ia-metadata item on archive.org.",
+        after_long_help = cstr!(
+            "<bold><underline>Examples:</underline></bold>\n\
+             \n  <dim># List all user-facing metadata fields</dim>\n  <bold>$ ia metadata schema</bold>\
+             \n\n  <dim># Look up a specific field</dim>\n  <bold>$ ia metadata schema title</bold>\
+             \n\n  <dim># Show file-level schema</dim>\n  <bold>$ ia metadata schema --files</bold>\
+             \n\n  <dim># Show required fields only</dim>\n  <bold>$ ia metadata schema --required</bold>\
+             \n\n  <dim># Include internal fields</dim>\n  <bold>$ ia metadata schema --internal</bold>\
+             \n\n  <dim># Machine-readable output</dim>\n  <bold>$ ia metadata schema --json</bold>\n"
+        ),
+    )]
+    Schema(SchemaArgs),
 }
 
 // ─── Per-subcommand arg structs ──────────────────────────────────────────────
@@ -246,6 +317,40 @@ pub struct ImportArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct SchemaArgs {
+    /// Field name to look up (shows detailed view)
+    pub field: Option<String>,
+
+    /// Show file-level schema instead of item-level
+    #[arg(short = 'f', long)]
+    pub files: bool,
+
+    /// Include internal-use-only fields (hidden by default)
+    #[arg(long)]
+    pub internal: bool,
+
+    /// Only show required or recommended fields
+    #[arg(long)]
+    pub required: bool,
+
+    /// Only show repeatable fields
+    #[arg(long)]
+    pub repeatable: bool,
+
+    /// Filter by who defines the field
+    #[arg(long)]
+    pub defined_by: Option<DefinedByFilter>,
+
+    /// Filter by who can edit the field
+    #[arg(long)]
+    pub edit_access: Option<EditAccessFilter>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
 // ─── Top-level struct ────────────────────────────────────────────────────────
 
 #[derive(Args)]
@@ -262,7 +367,9 @@ pub struct ImportArgs {
          \n\n  <dim># Compound operations (single request)</dim>\
          \n  <bold>$ ia metadata modify nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
          \n\n  <dim># Bulk export</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-         \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\n"
+         \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\
+         \n\n  <dim># Browse metadata field definitions</dim>\n  <bold>$ ia metadata schema</bold>\
+         \n  <bold>$ ia metadata schema title</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -348,6 +455,12 @@ pub async fn run(
             }
             run_import(client, sub, &ctx).await
         }
+        Some(MetadataCommand::Schema(sub)) => {
+            if continuations.is_some() {
+                bail!("compound operations (+) cannot be used with schema");
+            }
+            run_schema(client, sub).await
+        }
         None => {
             if continuations.is_some() {
                 bail!("compound operations (+) require a write subcommand (modify, append, etc.)");
@@ -420,6 +533,140 @@ async fn run_read(
         serde_json::to_string(&item)?
     };
     println!("{output}");
+
+    Ok(())
+}
+
+// ─── Schema ──────────────────────────────────────────────────────────────────
+
+fn filter_schema_fields<'a>(fields: &'a [SchemaField], args: &SchemaArgs) -> Vec<&'a SchemaField> {
+    fields
+        .iter()
+        .filter(|f| args.internal || f.internal_use_only != "Yes")
+        .filter(|f| !args.required || f.required == "Yes" || f.required == "Recommended")
+        .filter(|f| !args.repeatable || f.repeatable == "Yes")
+        .filter(|f| {
+            args.defined_by
+                .as_ref()
+                .map_or(true, |db| db.matches(&f.defined_by))
+        })
+        .filter(|f| {
+            args.edit_access
+                .as_ref()
+                .map_or(true, |ea| ea.matches(&f.edit_access))
+        })
+        .collect()
+}
+
+fn print_schema_detail(field: &SchemaField) {
+    println!("{}", field.field);
+    println!("  Label:           {}", field.label);
+    println!("  Required:        {}", field.required);
+    println!("  Repeatable:      {}", field.repeatable);
+    println!("  Internal:        {}", field.internal_use_only);
+    println!("  Defined by:      {}", field.defined_by);
+    println!("  Edit access:     {}", field.edit_access);
+    if !field.definition.is_empty() {
+        println!("  Definition:      {}", field.definition);
+    }
+    if !field.accepted_values.is_empty() {
+        println!("  Accepted values: {}", field.accepted_values);
+    }
+    if !field.usage_notes.is_empty() {
+        println!("  Usage notes:     {}", field.usage_notes);
+    }
+    if !field.example.is_empty() {
+        println!("  Example:         {}", field.example.join(", "));
+    }
+}
+
+fn print_schema_table(fields: &[&SchemaField]) {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    table.set_header(vec![
+        Cell::new("FIELD").fg(Color::Cyan),
+        Cell::new("LABEL").fg(Color::Cyan),
+        Cell::new("REQUIRED").fg(Color::Cyan),
+        Cell::new("REPEATABLE").fg(Color::Cyan),
+    ]);
+    for f in fields {
+        table.add_row(vec![&f.field, &f.label, &f.required, &f.repeatable]);
+    }
+    println!("{table}");
+    eprintln!(
+        "\nRun 'ia metadata schema <field>' for full details including usage notes and examples."
+    );
+}
+
+async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
+    let data = match fetch_schema(client).await {
+        Ok(data) => data,
+        Err(e) => {
+            if args.json {
+                ia_core::write_json_error(&e);
+                std::process::exit(1);
+            }
+            return Err(e).context("failed to fetch metadata schema");
+        }
+    };
+    let source = if args.files {
+        &data.files_schema
+    } else {
+        &data.metadata_schema
+    };
+
+    // Single-field detail mode (case-insensitive lookup)
+    if let Some(ref field_name) = args.field {
+        let lower_name = field_name.to_lowercase();
+        let found = source
+            .iter()
+            .find(|f| f.field.eq_ignore_ascii_case(&lower_name));
+        match found {
+            Some(field) => {
+                if args.json {
+                    let json = serde_json::to_string_pretty(field)?;
+                    println!("{json}");
+                } else {
+                    print_schema_detail(field);
+                }
+            }
+            None => {
+                let suggestions: Vec<&str> = source
+                    .iter()
+                    .filter(|f| f.field.starts_with(&lower_name))
+                    .map(|f| f.field.as_str())
+                    .take(5)
+                    .collect();
+                let err = IaError::SchemaFieldNotFound {
+                    field: field_name.clone(),
+                };
+                if args.json {
+                    ia_core::write_json_error(&err);
+                    std::process::exit(1);
+                }
+                let mut msg = format!("field '{}' not found in schema", field_name);
+                if !suggestions.is_empty() {
+                    msg.push_str(&format!(
+                        ". Did you mean: {}?",
+                        suggestions.join(", ")
+                    ));
+                }
+                bail!("{msg}");
+            }
+        }
+        return Ok(());
+    }
+
+    let filtered = filter_schema_fields(source, &args);
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&filtered)?;
+        println!("{json}");
+    } else if filtered.is_empty() {
+        eprintln!("no fields match the given filters");
+    } else {
+        print_schema_table(&filtered);
+    }
 
     Ok(())
 }
