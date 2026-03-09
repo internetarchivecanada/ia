@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod rate_limit;
 pub mod search;
 pub mod spreadsheet;
+pub mod tasks;
 pub mod types;
 pub mod update;
 pub mod upload;
