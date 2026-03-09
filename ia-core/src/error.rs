@@ -112,6 +112,12 @@ pub enum IaError {
     #[error("symlink skipped: {}", path.display())]
     SymlinkSkipped { path: PathBuf },
 
+    #[error("multipart upload aborted for {identifier}/{key}")]
+    MultipartAborted { identifier: String, key: String },
+
+    #[error("multipart upload incomplete for {identifier}/{key} (upload_id: {upload_id})")]
+    MultipartIncomplete { identifier: String, key: String, upload_id: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -168,6 +174,8 @@ impl IaError {
             IaError::FileTooLarge { .. } => false,
             IaError::EmptyUpload => false,
             IaError::SymlinkSkipped { .. } => false,
+            IaError::MultipartAborted { .. } => false,
+            IaError::MultipartIncomplete { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -300,6 +308,17 @@ impl IaError {
             IaError::SymlinkSkipped { path } => {
                 extra.insert("path".into(), path.display().to_string().into());
                 "symlink_skipped"
+            }
+            IaError::MultipartAborted { identifier, key } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                extra.insert("key".into(), key.clone().into());
+                "multipart_aborted"
+            }
+            IaError::MultipartIncomplete { identifier, key, upload_id } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                extra.insert("key".into(), key.clone().into());
+                extra.insert("upload_id".into(), upload_id.clone().into());
+                "multipart_incomplete"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -955,5 +974,53 @@ mod tests {
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "symlink_skipped");
         assert_eq!(v["error"]["path"], "/tmp/link");
+    }
+
+    #[test]
+    fn multipart_aborted_displays_details() {
+        let err = IaError::MultipartAborted {
+            identifier: "my-item".into(),
+            key: "file.zip".into(),
+        };
+        assert!(err.to_string().contains("my-item"));
+        assert!(err.to_string().contains("file.zip"));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn multipart_incomplete_displays_details() {
+        let err = IaError::MultipartIncomplete {
+            identifier: "my-item".into(),
+            key: "file.zip".into(),
+            upload_id: "abc123".into(),
+        };
+        assert!(err.to_string().contains("my-item"));
+        assert!(err.to_string().contains("file.zip"));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_multipart_aborted() {
+        let err = IaError::MultipartAborted {
+            identifier: "my-item".into(),
+            key: "file.zip".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "multipart_aborted");
+        assert_eq!(v["error"]["identifier"], "my-item");
+        assert_eq!(v["error"]["key"], "file.zip");
+    }
+
+    #[test]
+    fn json_multipart_incomplete() {
+        let err = IaError::MultipartIncomplete {
+            identifier: "my-item".into(),
+            key: "file.zip".into(),
+            upload_id: "abc123".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "multipart_incomplete");
+        assert_eq!(v["error"]["identifier"], "my-item");
+        assert_eq!(v["error"]["upload_id"], "abc123");
     }
 }
