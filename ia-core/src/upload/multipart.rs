@@ -8,7 +8,10 @@
 //! - Abort: DELETE /{id}/{key}?uploadId={ID}
 //! - Cleanup: GET /{id}?uploads (list all), then abort
 
+use crate::error::{IaError, Result};
+use crate::upload::s3_error::parse_s3_error;
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
+use crate::IaClient;
 
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
@@ -140,6 +143,312 @@ pub fn build_complete_manifest(parts: &[(u32, String)]) -> String {
     }
     xml.push_str("</CompleteMultipartUpload>");
     xml
+}
+
+// ── S3 URL helpers ──────────────────────────────────────────────────────
+
+/// Build the S3 URL for multipart operations on a specific file.
+fn build_s3_url(client: &IaClient, identifier: &str, key: &str) -> String {
+    let encoded_key = key
+        .split('/')
+        .map(|seg| urlencoding::encode(seg))
+        .collect::<Vec<_>>()
+        .join("/");
+    let protocol = client.protocol();
+    let host = client.host();
+    if host == "archive.org" {
+        format!("{protocol}://s3.us.archive.org/{identifier}/{encoded_key}")
+    } else {
+        format!("{protocol}://{host}/{identifier}/{encoded_key}")
+    }
+}
+
+/// Build the S3 URL for item-level operations (list uploads).
+fn build_s3_item_url(client: &IaClient, identifier: &str) -> String {
+    let protocol = client.protocol();
+    let host = client.host();
+    if host == "archive.org" {
+        format!("{protocol}://s3.us.archive.org/{identifier}")
+    } else {
+        format!("{protocol}://{host}/{identifier}")
+    }
+}
+
+// ── S3 operations ───────────────────────────────────────────────────────
+
+/// Initiate a multipart upload. Returns the server-assigned upload ID.
+///
+/// `POST /{identifier}/{key}?uploads`
+pub async fn initiate_upload(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+) -> Result<String> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!("{}?uploads=", build_s3_url(client, identifier, key));
+
+    let resp = client
+        .http()
+        .post(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("initiate multipart: {e}"),
+        })?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let msg = parse_s3_error(&body)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("initiate multipart failed: {msg}"),
+        });
+    }
+
+    parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
+        identifier: identifier.into(),
+        key: key.into(),
+        message: "initiate response missing UploadId".into(),
+    })
+}
+
+/// Upload a single part. Returns the ETag from the response.
+///
+/// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
+pub async fn upload_part(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    body: Vec<u8>,
+) -> Result<String> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!(
+        "{}?partNumber={}&uploadId={}",
+        build_s3_url(client, identifier, key),
+        part_number,
+        upload_id,
+    );
+    let content_length = body.len();
+
+    let resp = client
+        .http()
+        .put(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .header("Content-Length", content_length.to_string())
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("upload part {part_number}: {e}"),
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        let msg = parse_s3_error(&body_text)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {body_text}"));
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("upload part {part_number} failed: {msg}"),
+        });
+    }
+
+    // Extract ETag from response headers
+    resp.headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("upload part {part_number}: missing ETag in response"),
+        })
+}
+
+/// Complete a multipart upload by sending the manifest.
+///
+/// `POST /{identifier}/{key}?uploadId={ID}` with XML body
+pub async fn complete_upload(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[(u32, String)],
+    keep_old_version: bool,
+) -> Result<()> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!(
+        "{}?uploadId={}",
+        build_s3_url(client, identifier, key),
+        upload_id,
+    );
+
+    let manifest = build_complete_manifest(parts);
+    let mut req = client
+        .http()
+        .post(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .header("Content-Type", "application/xml")
+        .header("Content-Length", manifest.len().to_string());
+
+    if keep_old_version {
+        req = req.header("x-archive-keep-old-version", "1");
+    }
+
+    let resp = req
+        .body(manifest)
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("complete multipart: {e}"),
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let msg = parse_s3_error(&body)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("complete multipart failed: {msg}"),
+        });
+    }
+    Ok(())
+}
+
+/// Abort a multipart upload.
+///
+/// `DELETE /{identifier}/{key}?uploadId={ID}`
+pub async fn abort_upload(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<()> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!(
+        "{}?uploadId={}",
+        build_s3_url(client, identifier, key),
+        upload_id,
+    );
+
+    let resp = client
+        .http()
+        .delete(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("abort multipart: {e}"),
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("abort multipart failed: HTTP {status}: {body}"),
+        });
+    }
+    Ok(())
+}
+
+/// List all in-progress multipart uploads for an item.
+///
+/// `GET /{identifier}?uploads`
+pub async fn list_uploads(
+    client: &IaClient,
+    identifier: &str,
+) -> Result<Vec<MultipartUploadInfo>> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!("{}?uploads=", build_s3_item_url(client, identifier));
+
+    let resp = client
+        .http()
+        .get(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: String::new(),
+            message: format!("list multipart uploads: {e}"),
+        })?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: String::new(),
+            message: format!("list multipart uploads: HTTP {status}: {body}"),
+        });
+    }
+
+    Ok(parse_list_uploads_response(&body))
+}
+
+/// List completed parts for a multipart upload.
+///
+/// `GET /{identifier}/{key}?uploadId={ID}`
+pub async fn list_parts(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<Vec<PartInfo>> {
+    let (access, secret) = client.require_auth()?;
+    let url = format!(
+        "{}?uploadId={}",
+        build_s3_url(client, identifier, key),
+        upload_id,
+    );
+
+    let resp = client
+        .http()
+        .get(&url)
+        .header("Authorization", format!("LOW {access}:{secret}"))
+        .send()
+        .await
+        .map_err(|e| IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("list parts: {e}"),
+        })?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: format!("list parts: HTTP {status}: {body}"),
+        });
+    }
+
+    Ok(parse_list_parts_response(&body))
 }
 
 #[cfg(test)]
