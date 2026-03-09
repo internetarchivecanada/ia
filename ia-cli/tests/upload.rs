@@ -394,6 +394,48 @@ fn upload_checksums_flag_accepted() {
         .stdout(predicate::str::contains("--checksums"));
 }
 
+#[test]
+fn upload_multipart_flag_accepted() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--multipart"));
+}
+
+#[test]
+fn upload_import_multipart_flag_accepted() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "import", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--multipart"));
+}
+
+#[test]
+fn upload_multipart_dry_run_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("hello.txt");
+    fs::write(&file, "hello world").unwrap();
+
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args([
+            "-m",
+            "mediatype:texts",
+            "-m",
+            "collection:test_collection",
+            "--multipart",
+            "--dry-run",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+}
+
 // ─── Help text ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -436,4 +478,25 @@ fn upload_template_help_shows_options() {
         .stdout(predicate::str::contains("--identifier-from-filename"))
         .stdout(predicate::str::contains("--identifier-from-dirname"))
         .stdout(predicate::str::contains("--identifier-prefix"));
+}
+
+#[test]
+fn upload_cleanup_help_shows_options() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("IDENTIFIER"))
+        .stdout(predicate::str::contains("--abort-all"))
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("incomplete multipart"));
+}
+
+#[test]
+fn upload_help_shows_cleanup_subcommand() {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    cmd.args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleanup"));
 }

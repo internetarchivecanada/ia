@@ -480,6 +480,19 @@ pub async fn upload_file_multipart(
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
+    // Dry run: report what would happen without contacting the server
+    if opts.dry_run {
+        return Ok(UploadResult {
+            identifier: identifier.into(),
+            key: key.into(),
+            status: UploadStatus::DryRun,
+            bytes: file_size,
+            md5: None,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            retries: 0,
+        });
+    }
+
     // Report verifying phase
     if let Some(cb) = progress {
         cb(UploadProgress {
