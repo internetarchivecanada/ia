@@ -529,9 +529,6 @@ pub async fn upload_file_multipart(
         let offset = (part_num as u64 - 1) * part_size;
         let this_part_size = std::cmp::min(part_size, file_size - offset) as usize;
 
-        // Read part data from file
-        let data = read_file_range(file, offset, this_part_size).await?;
-
         // Report progress
         if let Some(cb) = progress {
             cb(UploadProgress {
@@ -543,12 +540,12 @@ pub async fn upload_file_multipart(
             });
         }
 
-        // Per-part retry loop
+        // Per-part retry loop — re-read from file on each attempt to avoid
+        // holding a 100 MiB clone in memory across retries.
         let mut part_retries = 0u32;
         let etag = loop {
-            match upload_part(client, identifier, key, &upload_id, part_num, data.clone())
-                .await
-            {
+            let data = read_file_range(file, offset, this_part_size).await?;
+            match upload_part(client, identifier, key, &upload_id, part_num, data).await {
                 Ok(etag) => break etag,
                 Err(e) => {
                     // Check if retryable (503, SlowDown, InternalError, ServiceUnavailable)
@@ -594,6 +591,11 @@ pub async fn upload_file_multipart(
 
         completed_parts.push((part_num, etag));
     }
+
+    // Sort parts by number — required by S3 CompleteMultipartUpload.
+    // When resuming, existing parts may be non-contiguous (e.g. parts 1,3
+    // done, part 2 uploaded now) leaving completed_parts out of order.
+    completed_parts.sort_by_key(|(num, _)| *num);
 
     // Complete the multipart upload
     let keep_old_version = !opts.no_backup;

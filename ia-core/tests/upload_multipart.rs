@@ -669,3 +669,81 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
 }
+
+#[tokio::test]
+async fn upload_file_multipart_resume_non_contiguous_parts() {
+    // Regression: if parts 1 and 3 are done but 2 is missing, the manifest
+    // must still be sorted by part number for S3 CompleteMultipartUpload.
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    // File: 30 bytes, part size 10 → 3 parts
+    let f = temp_file(b"aaaaabbbbbcccccdddddeeeeefffff");
+
+    // List uploads: existing upload
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult>
+  <Upload>
+    <Key>data.bin</Key>
+    <UploadId>gap-resume</UploadId>
+    <Initiated>2026-03-06T12:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // List parts: parts 1 and 3 done, part 2 missing
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "gap-resume"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult>
+  <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part>
+  <Part><PartNumber>3</PartNumber><ETag>"e3"</ETag><Size>10</Size></Part>
+</ListPartsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // Only part 2 should be uploaded
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .and(query_param("uploadId", "gap-resume"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Complete — verify it's called (manifest must be sorted)
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "gap-resume"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
