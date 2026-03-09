@@ -175,3 +175,123 @@ async fn schema_detail_json_outputs_single_object() {
     assert_eq!(v["field"], "title");
     assert!(v.is_object(), "single field should be an object, not array");
 }
+
+#[tokio::test]
+async fn schema_required_filter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "--required",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("title")); // Recommended counts as required
+    // scanner is "No" required AND internal — should not appear
+}
+
+#[tokio::test]
+async fn schema_files_flag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "--files",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("name"));
+    assert!(stdout.contains("File Name"));
+    // Should not contain metadata-only fields
+    assert!(!stdout.contains("title"));
+}
+
+#[tokio::test]
+async fn schema_json_outputs_array() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(v.is_array(), "listing mode should output JSON array");
+}
+
+#[tokio::test]
+async fn schema_defined_by_filter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .mount(&server)
+        .await;
+
+    let host = server.uri().replace("http://", "");
+    let output = Command::cargo_bin("ia")
+        .unwrap()
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "schema",
+            "--internal",
+            "--defined-by",
+            "ia-software",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert!(stdout.contains("scanner")); // defined by IA software
+    assert!(!stdout.contains("title")); // defined by uploader
+}
