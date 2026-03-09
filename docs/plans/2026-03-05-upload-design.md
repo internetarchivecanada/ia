@@ -576,24 +576,48 @@ Uploading 42 items (156 files, 12.4 GiB)
 
 ### `--dashboard` (Ratatui TUI)
 
-Shared infrastructure with download dashboard. Panels:
+Shared infrastructure with download dashboard. Panels ordered by priority
+(lower-priority panels hidden first when terminal is small):
 
-| Panel | Content |
-|-------|---------|
-| **Items** | Item list with per-item file progress, status, speed |
-| **Files** | Current file transfers with progress bars |
-| **S3 Tasks** | Live s3-put task count from tasks API (refreshes ~60s) |
-| **Rate Limit** | Per-item rate limit status, check_limit poll results |
-| **Throughput** | Aggregate upload speed graph |
-| **Errors** | Recent errors with context |
+| Priority | Panel | Content |
+|----------|-------|---------|
+| 1 | **Files** | Current file transfers with animated progress bars |
+| 2 | **Items** | Item list with per-item file progress, status, speed |
+| 3 | **Errors** | Recent errors with context |
+| 4 | **Throughput** | Aggregate upload speed sparkline |
+| 5 | **Rate Limit** | Per-item rate limit status, check_limit poll results |
+| 6 | **S3 Tasks** | Live s3-put task count from tasks API (refreshes ~60s) |
 
-### Shared Code with Download
+### Shared TUI Framework (Trait-Based)
 
-- Progress bar rendering (indicatif for default, ratatui widgets for dashboard)
-- Throughput tracking
-- Error panel
-- Item list panel
-- TUI event loop and layout
+Refactor the download dashboard into a trait-based framework that both download
+and upload dashboards implement. The framework provides:
+
+- `Dashboard` trait with `update()`, `draw()`, `handle_input()` methods
+- Terminal lifecycle management (setup, teardown, panic guard)
+- Event loop skeleton (tick rate, input polling, render cycle)
+- Throughput tracker (sampling, history, sparkline rendering)
+- Common panel widgets (error panel, item list, progress bars)
+- Keyboard handling (q/Ctrl-C quit, j/k scroll)
+
+The download dashboard is migrated onto this framework first, proving the
+abstraction before the upload dashboard is built on top of it.
+
+### Byte-Level Upload Progress
+
+`single.rs` wraps the request body in an async progress-reporting stream that
+fires the `UploadProgress` callback as bytes are written, enabling smooth
+animated progress bars. Without this, bars would jump from 0% to 100%.
+Similar to how the download dashboard tracks bytes via reqwest's streaming
+response, but applied to the outgoing request body.
+
+### S3 Tasks Panel — Minimal Tasks API
+
+A minimal read-only `tasks` module in `ia-core` provides just enough to power
+the S3 Tasks panel: a single GET to `/services/tasks.php` filtered by
+identifier/cmd, returning task counts and statuses. This module will be expanded
+into a full `ia tasks` CLI command later. No throwaway work — the types and
+client methods are reusable.
 
 ### Upload-Specific Additions
 
