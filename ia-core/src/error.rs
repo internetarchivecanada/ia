@@ -120,6 +120,9 @@ pub enum IaError {
     #[error("multipart upload incomplete for {identifier}/{key} (upload_id: {upload_id})")]
     MultipartIncomplete { identifier: String, key: String, upload_id: String },
 
+    #[error("schema field not found: {field}")]
+    SchemaFieldNotFound { field: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -178,6 +181,7 @@ impl IaError {
             IaError::SymlinkSkipped { .. } => false,
             IaError::MultipartAborted { .. } => false,
             IaError::MultipartIncomplete { .. } => false,
+            IaError::SchemaFieldNotFound { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -324,6 +328,10 @@ impl IaError {
                 extra.insert("key".into(), key.clone().into());
                 extra.insert("upload_id".into(), upload_id.clone().into());
                 "multipart_incomplete"
+            }
+            IaError::SchemaFieldNotFound { field } => {
+                extra.insert("field".into(), field.clone().into());
+                "schema_field_not_found"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -972,6 +980,24 @@ mod tests {
             path: PathBuf::from("/tmp/link"),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn schema_field_not_found_is_not_retryable() {
+        let err = IaError::SchemaFieldNotFound {
+            field: "nonexistent".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_schema_field_not_found() {
+        let err = IaError::SchemaFieldNotFound {
+            field: "nonexistent".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "schema_field_not_found");
+        assert_eq!(v["error"]["field"], "nonexistent");
     }
 
     #[test]

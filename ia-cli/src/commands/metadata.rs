@@ -593,19 +593,34 @@ fn print_schema_table(fields: &[&SchemaField]) {
         table.add_row(vec![&f.field, &f.label, &f.required, &f.repeatable]);
     }
     println!("{table}");
+    eprintln!(
+        "\nRun 'ia metadata schema <field>' for full details including usage notes and examples."
+    );
 }
 
 async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
-    let data = fetch_schema(client).await?;
+    let data = match fetch_schema(client).await {
+        Ok(data) => data,
+        Err(e) => {
+            if args.json {
+                ia_core::write_json_error(&e);
+                std::process::exit(1);
+            }
+            return Err(e).context("failed to fetch metadata schema");
+        }
+    };
     let source = if args.files {
         &data.files_schema
     } else {
         &data.metadata_schema
     };
 
-    // Single-field detail mode
+    // Single-field detail mode (case-insensitive lookup)
     if let Some(ref field_name) = args.field {
-        let found = source.iter().find(|f| f.field == *field_name);
+        let lower_name = field_name.to_lowercase();
+        let found = source
+            .iter()
+            .find(|f| f.field.eq_ignore_ascii_case(&lower_name));
         match found {
             Some(field) => {
                 if args.json {
@@ -618,13 +633,17 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
             None => {
                 let suggestions: Vec<&str> = source
                     .iter()
-                    .filter(|f| {
-                        f.field.contains(field_name.as_str())
-                            || field_name.contains(&f.field)
-                    })
+                    .filter(|f| f.field.starts_with(&lower_name))
                     .map(|f| f.field.as_str())
                     .take(5)
                     .collect();
+                let err = IaError::SchemaFieldNotFound {
+                    field: field_name.clone(),
+                };
+                if args.json {
+                    ia_core::write_json_error(&err);
+                    std::process::exit(1);
+                }
                 let mut msg = format!("field '{}' not found in schema", field_name);
                 if !suggestions.is_empty() {
                     msg.push_str(&format!(
@@ -643,6 +662,8 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
     if args.json {
         let json = serde_json::to_string_pretty(&filtered)?;
         println!("{json}");
+    } else if filtered.is_empty() {
+        eprintln!("no fields match the given filters");
     } else {
         print_schema_table(&filtered);
     }
