@@ -512,3 +512,160 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
 
     assert!(result.is_err());
 }
+
+// ── Resume ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upload_file_multipart_resumes_from_existing() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    // File: 30 bytes, part size 10 → 3 parts
+    let content = b"aaaaabbbbbcccccdddddeeeeefffff";
+    assert_eq!(content.len(), 30);
+    let f = temp_file(content);
+
+    // 1. List uploads: finds existing upload for this key
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult>
+  <Upload>
+    <Key>data.bin</Key>
+    <UploadId>resume-123</UploadId>
+    <Initiated>2026-03-06T12:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // 2. List parts: part 1 already uploaded
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult>
+  <Part>
+    <PartNumber>1</PartNumber>
+    <ETag>"existing-etag1"</ETag>
+    <Size>10</Size>
+  </Part>
+</ListPartsResult>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // 3. Should NOT initiate a new upload (no POST ?uploads mock)
+
+    // 4. Parts 2 and 3 uploaded (part 1 skipped)
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "3"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag3\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 5. Complete
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10, // small parts for testing
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 30);
+}
+
+#[tokio::test]
+async fn upload_file_multipart_no_resume_starts_fresh() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let f = temp_file(b"hello");
+
+    // List uploads: empty (no existing uploads)
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Falls through to fresh initiate
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>fresh-123</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "fresh-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
