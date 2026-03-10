@@ -91,21 +91,26 @@ enum Commands {
     /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
     /// Download files from one or more items
+    #[command(visible_alias = "do")]
     Download(commands::download::DownloadArgs),
     /// List files in an item with filtering and formatting
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List(commands::list::ListArgs),
     /// Read or modify item metadata
+    #[command(visible_alias = "md")]
     Metadata(commands::metadata::MetadataArgs),
     /// Search the Internet Archive
+    #[command(visible_alias = "se")]
     Search(commands::search::SearchArgs),
     /// Show job log summary and failed operations
     Status(commands::status::StatusArgs),
     /// Upload files to the Internet Archive
+    #[command(visible_alias = "up")]
     Upload(commands::upload::UploadArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
     /// Configure credentials and settings
+    #[command(visible_alias = "co")]
     Config(commands::config::ConfigArgs),
     /// Update ia to a specific or latest version
     #[cfg(feature = "self-update")]
