@@ -62,7 +62,9 @@ fn upload_nonexistent_file_errors() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("No such file or directory"));
+        .stderr(predicate::str::contains("No such file or directory").or(
+            predicate::str::contains("The system cannot find the path specified"),
+        ));
 }
 
 #[test]
