@@ -28,35 +28,33 @@ ia/
 
 ## Workflow
 
-All work happens on feature branches in git worktrees. Main is protected — a pre-commit hook
-rejects direct commits, and branch protection blocks pushes.
+Work happens on feature branches — main is protected by a pre-commit hook and branch protection.
 
-### 1. Plan
+### Plan
 
-For non-trivial work, start with a design doc or implementation plan in `docs/plans/`. This is
-where you think through the approach before writing code. Commit it to your feature branch as the
-first commit.
+For non-trivial work, consider starting with a design doc or implementation plan in `docs/plans/`.
 
-- **Design docs** (`*-design.md`) — architectural decisions, trade-offs, and rationale. These are
-  durable reference material.
-- **Implementation plans** (`*-implementation-plan.md`) — step-by-step breakdown of complex
-  changes. Useful during development and for debugging later.
+- **Design docs** (`*-design.md`) — architectural decisions, trade-offs, and rationale.
+- **Implementation plans** (`*-implementation-plan.md`) — step-by-step breakdown of complex changes.
 
 Small bug fixes and trivial changes don't need docs — use judgment.
 
-### 2. Create a Worktree
+### Branch
+
+Create a feature branch however you like. There are helper scripts for git worktrees if you
+prefer that workflow:
 
 ```sh
-scripts/ia-worktree feat my-feature     # creates feat/my-feature branch
-scripts/ia-worktree fix search-count    # creates fix/search-count branch
+scripts/ia-worktree feat my-feature     # creates feat/my-feature branch in a worktree
+scripts/ia-worktree fix search-count    # creates fix/search-count branch in a worktree
 ```
 
 Types: `fix`, `feat`, `refactor`, `docs`, `chore`
 
-This creates a worktree at `../worktrees/<slug>` with a branch `<type>/<slug>` from main.
-Then `cd` into it and start working.
+After merge, `scripts/ia-cleanup <slug>` removes the worktree and local branch.
+`scripts/ia-status` shows active worktrees.
 
-### 3. Implement
+### Implement
 
 - Write tests alongside your code.
 - Commit in logical chunks, not one giant commit at the end.
@@ -68,7 +66,7 @@ Then `cd` into it and start working.
   cargo clippy -p ia-core -p ia-cli -- -D warnings
   ```
 
-### 4. Open a PR
+### Open a PR
 
 ```sh
 git push -u origin <branch>
@@ -76,22 +74,6 @@ gh pr create
 ```
 
 Link any related issues with `Closes #N` in the PR body.
-
-### 5. After Merge
-
-From outside the worktree (e.g., the main checkout):
-
-```sh
-scripts/ia-cleanup <slug>
-```
-
-This removes the worktree, deletes the local branch, and prunes stale references.
-
-To see all active worktrees:
-
-```sh
-scripts/ia-status
-```
 
 ## Code Conventions
 
@@ -117,6 +99,6 @@ These apply to all contributors — human or AI:
 
 - **Never send write requests to live archive.org** in automated tests. Use mocks.
 - **Never commit secrets.**
-- **Never commit to main.** Use a worktree.
+- **Never commit to main.** Use a feature branch.
 
 See the full safety rules in [`AGENTS.md`](./AGENTS.md#safety-rules).

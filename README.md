@@ -66,6 +66,10 @@ See the [usage guide](docs/usage.md) for quick start examples, configuration, an
 
 Run `ia --help` or `ia <command> --help` for built-in documentation.
 
+## Contributing
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup, workflow, and code conventions.
+
 ## License
 
 [AGPL-3.0](LICENSE)
