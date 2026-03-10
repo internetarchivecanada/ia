@@ -1,4 +1,4 @@
-use console::style;
+use console::{style, Color};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,18 +59,10 @@ fn format_speed(bytes: u64, elapsed_secs: f64) -> String {
     }
 }
 
-/// Format a count: colored if non-zero, plain "0" otherwise.
-fn colored_count_yellow(count: usize) -> String {
+/// Format a count: colored with `color` if non-zero, plain "0" otherwise.
+fn colored_count(count: usize, color: Color) -> String {
     if count > 0 {
-        style(count.to_string()).yellow().to_string()
-    } else {
-        "0".to_string()
-    }
-}
-
-fn colored_count_red(count: usize) -> String {
-    if count > 0 {
-        style(count.to_string()).red().to_string()
+        style(count.to_string()).fg(color).to_string()
     } else {
         "0".to_string()
     }
@@ -100,8 +92,8 @@ fn print_item_finish(
         style(ICON_SUCCESS).green(),
         files_done,
         verb,
-        colored_count_yellow(files_skipped),
-        colored_count_red(files_failed),
+        colored_count(files_skipped, Color::Yellow),
+        colored_count(files_failed, Color::Red),
     );
 }
 
@@ -133,8 +125,8 @@ pub fn print_batch_summary(
         summary.items_succeeded,
         summary.items_total,
         style(summary.items_succeeded).green(),
-        colored_count_yellow(summary.files_skipped),
-        colored_count_red(summary.files_failed + summary.items_failed),
+        colored_count(summary.files_skipped, Color::Yellow),
+        colored_count(summary.files_failed + summary.items_failed, Color::Red),
     );
     eprintln!(
         "{} {}{}",
@@ -328,18 +320,7 @@ impl BatchDisplay {
             style(identifier).bold(),
         ));
 
-        let bar = self.multi.insert_before(
-            &self.bottom_sentinel,
-            ProgressBar::new(0),
-        );
-        bar.set_style(
-            ProgressStyle::with_template(&format!(
-                "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
-            ))
-            .unwrap()
-            .progress_chars(PROGRESS_CHARS),
-        );
-        bar.set_message("starting...");
+        let bar = self.multi.insert_before(&self.bottom_sentinel, make_progress_bar(0));
 
         let mut items = self.active_item_bars.lock().unwrap();
         items.insert(
@@ -556,10 +537,11 @@ impl UploadDisplay {
         for err in errors.iter() {
             eprintln!("{err}");
         }
+        let files_failed = errors.len();
+        drop(errors);
 
         let elapsed = self.started_at.elapsed().as_secs_f64();
         let files_done = *self.files_done.lock().unwrap();
-        let files_failed = errors.len();
         let files_uploaded = files_done.saturating_sub(files_failed);
         let bytes_total = *self.bytes_total.lock().unwrap();
 
