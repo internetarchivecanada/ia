@@ -85,12 +85,12 @@ pub async fn upload_item(
     // 7. Compute remote keys
     let keys = compute_keys(&expanded, &opts)?;
 
-    // 8. Compute size hint (unless disabled)
-    let size_hint = if opts.no_size_hint {
-        None
-    } else {
+    // 8. Compute total bytes (always needed for progress display).
+    //    Do a single stat pass here; conditionally set size_hint based on no_size_hint.
+    let file_count = expanded.len();
+    let total_bytes: u64 = {
         let paths = expanded.clone();
-        let total: u64 = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> u64 {
             paths
                 .iter()
                 .filter_map(|f| std::fs::metadata(f).ok())
@@ -98,29 +98,12 @@ pub async fn upload_item(
                 .sum()
         })
         .await
-        .unwrap_or(0);
-        Some(total)
+        .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?
     };
+    let size_hint = if opts.no_size_hint { None } else { Some(total_bytes) };
 
     // 9. Emit Enumerated event so consumers know the file list and total size.
-    //    bytes_total uses size_hint when available; when no_size_hint is set we
-    //    stat the files here so the progress display still gets a useful total.
-    let file_count = expanded.len();
     if let Some(ref cb) = progress {
-        let bytes_total = if let Some(hint) = size_hint {
-            hint
-        } else {
-            let paths = expanded.clone();
-            tokio::task::spawn_blocking(move || -> u64 {
-                paths
-                    .iter()
-                    .filter_map(|f| std::fs::metadata(f).ok())
-                    .map(|m| m.len())
-                    .sum()
-            })
-            .await
-            .unwrap_or(0)
-        };
         cb(UploadProgress {
             identifier: identifier.to_string(),
             key: String::new(),
@@ -128,7 +111,7 @@ pub async fn upload_item(
             total_bytes: 0,
             status: UploadProgressStatus::Enumerated {
                 files_count: file_count,
-                bytes_total,
+                bytes_total: total_bytes,
             },
         });
     }
