@@ -581,6 +581,7 @@ struct UploadItemBars {
     bar: ProgressBar,
     per_file_bytes: HashMap<String, u64>,
     files_done: usize,
+    files_skipped: usize,
     files_total: usize,
     bytes_total: u64,
     errors: Vec<String>,
@@ -645,6 +646,7 @@ impl UploadBatchDisplay {
                         bar,
                         per_file_bytes: HashMap::new(),
                         files_done: 0,
+                        files_skipped: 0,
                         files_total: files_count,
                         bytes_total,
                         errors: Vec::new(),
@@ -685,6 +687,7 @@ impl UploadBatchDisplay {
                 let should_finish = {
                     let mut items = self.active_items.lock().unwrap();
                     if let Some(item) = items.get_mut(identifier) {
+                        item.files_skipped += 1;
                         item.files_done += 1;
                         item.bar.set_message(format!(
                             "{}/{} files",
@@ -707,7 +710,7 @@ impl UploadBatchDisplay {
                             "  {} {} {}",
                             style(ICON_ERROR).red(),
                             style(&p.key).dim(),
-                            style("-- upload failed").red(),
+                            style("— upload failed").red(),
                         ));
                         item.files_done += 1;
                         item.bar.set_message(format!(
@@ -748,25 +751,39 @@ impl UploadBatchDisplay {
 
             let elapsed = item.started_at.elapsed().as_secs_f64();
             let speed = format_speed(item.bytes_total, elapsed);
+            let files_uploaded = item
+                .files_done
+                .saturating_sub(item.errors.len())
+                .saturating_sub(item.files_skipped);
             let error_info = if !item.errors.is_empty() {
                 format!(
                     "\n  {} {} errors",
-                    style("--").dim(),
+                    style("─").dim(),
                     style(item.errors.len()).red()
+                )
+            } else {
+                String::new()
+            };
+            let skipped_info = if item.files_skipped > 0 {
+                format!(
+                    "\n  {} {} skipped",
+                    style("─").dim(),
+                    style(item.files_skipped).yellow()
                 )
             } else {
                 String::new()
             };
 
             item.header.set_message(format!(
-                "{} {}       {} files ({}) {:.0}s{}{}",
+                "{} {}       {} files ({}) {:.0}s{}{}{}",
                 style(ICON_SUCCESS).green(),
                 style(identifier).bold(),
-                item.files_done,
+                files_uploaded,
                 format_bytes(item.bytes_total),
                 elapsed,
                 style(&speed).dim(),
                 error_info,
+                skipped_info,
             ));
             item.header.finish();
         }
