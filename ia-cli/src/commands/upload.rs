@@ -456,7 +456,7 @@ async fn run_bare_upload(
     let display: Option<std::sync::Arc<crate::output::UploadDisplay>> =
         if !args.json && quiet == 0 {
             Some(std::sync::Arc::new(
-                crate::output::UploadDisplay::new(identifier),
+                crate::output::UploadDisplay::new(identifier, opts.dry_run),
             ))
         } else {
             None

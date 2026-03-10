@@ -98,6 +98,8 @@ pub async fn upload_item(
                 .sum()
         })
         .await
+        // JoinError only fires on panic or runtime shutdown — propagate rather
+        // than silently defaulting to 0 so callers notice catastrophic failures.
         .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?
     };
     let size_hint = if opts.no_size_hint { None } else { Some(total_bytes) };

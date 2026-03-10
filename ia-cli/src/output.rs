@@ -20,9 +20,7 @@ const BAR_WIDTH: usize = 40;
 const ICON_HEADER: &str = "▸";
 const ICON_SUCCESS: &str = "✓";
 const ICON_ERROR: &str = "✗";
-#[allow(dead_code)]
 const ICON_SKIPPED: &str = "–";
-#[allow(dead_code)]
 const ICON_DRY_RUN: &str = "⊘";
 
 /// Create a progress bar with the shared style.
@@ -69,32 +67,45 @@ fn colored_count(count: usize, color: Color) -> String {
     }
 }
 
-/// Print the standard item completion block to stderr.
-fn print_item_finish(
-    identifier: &str,
-    verb: &str,
+/// Stats for a completed single-item operation.
+struct ItemFinish<'a> {
+    identifier: &'a str,
+    verb: &'a str,
     files_done: usize,
     files_skipped: usize,
     files_failed: usize,
     bytes_total: u64,
     elapsed_secs: f64,
-) {
-    let speed = format_speed(bytes_total, elapsed_secs);
+    dry_run: bool,
+}
+
+/// Print the standard item completion block to stderr.
+fn print_item_finish(f: &ItemFinish<'_>) {
+    let speed = format_speed(f.bytes_total, f.elapsed_secs);
+    let icon = if f.dry_run {
+        style(ICON_DRY_RUN).dim()
+    } else if f.files_failed > 0 {
+        style(ICON_ERROR).red()
+    } else if f.files_done == 0 && f.files_skipped > 0 {
+        style(ICON_SKIPPED).dim()
+    } else {
+        style(ICON_SUCCESS).green()
+    };
     eprintln!(
         "{}  {} files ({}) in {:.1}s{}",
-        style(identifier).bold(),
-        files_done,
-        format_bytes(bytes_total),
-        elapsed_secs,
+        style(f.identifier).bold(),
+        f.files_done,
+        format_bytes(f.bytes_total),
+        f.elapsed_secs,
         style(&speed).dim(),
     );
     eprintln!(
         "  {} {} {} · {} skipped · {} errors",
-        style(ICON_SUCCESS).green(),
-        files_done,
-        verb,
-        colored_count(files_skipped, Color::Yellow),
-        colored_count(files_failed, Color::Red),
+        icon,
+        f.files_done,
+        f.verb,
+        colored_count(f.files_skipped, Color::Yellow),
+        colored_count(f.files_failed, Color::Red),
     );
 }
 
@@ -121,13 +132,14 @@ pub fn print_batch_summary(
         "{}",
         style("────────────────────────────────────────────────────").dim()
     );
+    let errors_total = summary.files_failed + summary.items_failed;
     eprintln!(
-        "{}/{} items ({} done · {} skipped · {} errors)",
+        "{}/{} items ({} done) · {} files skipped · {} file errors",
         summary.items_succeeded,
         summary.items_total,
         style(summary.items_succeeded).green(),
         colored_count(summary.files_skipped, Color::Yellow),
-        colored_count(summary.files_failed + summary.items_failed, Color::Red),
+        colored_count(errors_total, Color::Red),
     );
     eprintln!(
         "{} {}{}",
@@ -164,7 +176,7 @@ pub struct DownloadDisplay {
     identifier: String,
     bar: ProgressBar,
     per_file_bytes: Mutex<HashMap<String, u64>>,
-    files_done: Mutex<usize>,
+    files_processed: Mutex<usize>,
     files_total: Mutex<usize>,
     errors: Mutex<Vec<String>>,
 }
@@ -178,7 +190,7 @@ impl DownloadDisplay {
             identifier: identifier.to_string(),
             bar,
             per_file_bytes: Mutex::new(HashMap::new()),
-            files_done: Mutex::new(0),
+            files_processed: Mutex::new(0),
             files_total: Mutex::new(0),
             errors: Mutex::new(Vec::new()),
         }
@@ -207,16 +219,16 @@ impl DownloadDisplay {
                     let total: u64 = map.values().sum();
                     self.bar.set_position(total);
                 }
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{total} files"));
+                self.bar.set_message(format!("{processed}/{total} files"));
             }
             DownloadStatus::Skipped(_) => {
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{total} files"));
+                self.bar.set_message(format!("{processed}/{total} files"));
             }
             DownloadStatus::Failed(err) => {
                 self.errors.lock().unwrap().push(format!(
@@ -225,10 +237,10 @@ impl DownloadDisplay {
                     style(&progress.file_name).dim(),
                     style(format!("— {err}")).red(),
                 ));
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{total} files"));
+                self.bar.set_message(format!("{processed}/{total} files"));
             }
             DownloadStatus::Verifying => {}
         }
@@ -243,15 +255,16 @@ impl DownloadDisplay {
             eprintln!("{err}");
         }
 
-        print_item_finish(
-            &self.identifier,
-            "downloaded",
-            result.files_downloaded,
-            result.files_skipped,
-            result.files_failed,
-            result.bytes_total,
-            result.elapsed.as_secs_f64(),
-        );
+        print_item_finish(&ItemFinish {
+            identifier: &self.identifier,
+            verb: "downloaded",
+            files_done: result.files_downloaded,
+            files_skipped: result.files_skipped,
+            files_failed: result.files_failed,
+            bytes_total: result.bytes_total,
+            elapsed_secs: result.elapsed.as_secs_f64(),
+            dry_run: false,
+        });
 
         if let Some(free) = disk_space_free(destdir) {
             eprintln!(
@@ -278,7 +291,7 @@ struct ItemBars {
     header: ProgressBar,
     bar: ProgressBar,
     per_file_bytes: HashMap<String, u64>,
-    files_done: usize,
+    files_processed: usize,
     files_total: usize,
 }
 
@@ -330,7 +343,7 @@ impl BatchDisplay {
                 header: item_header,
                 bar,
                 per_file_bytes: HashMap::new(),
-                files_done: 0,
+                files_processed: 0,
                 files_total: 0,
             },
         );
@@ -364,19 +377,19 @@ impl BatchDisplay {
                     let total: u64 = item.per_file_bytes.values().sum();
                     item.bar.set_position(total);
                 }
-                item.files_done += 1;
+                item.files_processed += 1;
                 item.bar
-                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
+                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
             }
             DownloadStatus::Skipped(_) => {
-                item.files_done += 1;
+                item.files_processed += 1;
                 item.bar
-                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
+                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
             }
             DownloadStatus::Failed(_) => {
-                item.files_done += 1;
+                item.files_processed += 1;
                 item.bar
-                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
+                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
             }
             DownloadStatus::Verifying => {}
         }
@@ -394,7 +407,7 @@ impl BatchDisplay {
             let skipped_info = if result.files_skipped > 0 {
                 format!(
                     "\n  {} {} skipped",
-                    style("─").dim(),
+                    style(ICON_SKIPPED).dim(),
                     style(result.files_skipped).yellow()
                 )
             } else {
@@ -446,16 +459,17 @@ pub struct UploadDisplay {
     identifier: String,
     bar: ProgressBar,
     per_file_bytes: Mutex<HashMap<String, u64>>,
-    files_done: Mutex<usize>,
+    files_processed: Mutex<usize>,
     files_skipped: Mutex<usize>,
     files_total: Mutex<usize>,
     bytes_total: Mutex<u64>,
     errors: Mutex<Vec<String>>,
+    dry_run: Mutex<bool>,
     started_at: Instant,
 }
 
 impl UploadDisplay {
-    pub fn new(identifier: &str) -> Self {
+    pub fn new(identifier: &str, dry_run: bool) -> Self {
         print_item_header(identifier);
         let bar = make_progress_bar(0);
 
@@ -463,11 +477,12 @@ impl UploadDisplay {
             identifier: identifier.to_string(),
             bar,
             per_file_bytes: Mutex::new(HashMap::new()),
-            files_done: Mutex::new(0),
+            files_processed: Mutex::new(0),
             files_skipped: Mutex::new(0),
             files_total: Mutex::new(0),
             bytes_total: Mutex::new(0),
             errors: Mutex::new(Vec::new()),
+            dry_run: Mutex::new(dry_run),
             started_at: Instant::now(),
         }
     }
@@ -500,17 +515,17 @@ impl UploadDisplay {
                 self.bar.set_position(total);
                 drop(map);
 
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{files_total} files"));
+                self.bar.set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::Skipped => {
                 *self.files_skipped.lock().unwrap() += 1;
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{files_total} files"));
+                self.bar.set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::Failed => {
                 self.errors.lock().unwrap().push(format!(
@@ -519,10 +534,10 @@ impl UploadDisplay {
                     style(&p.key).dim(),
                     style("— upload failed").red(),
                 ));
-                let mut done = self.files_done.lock().unwrap();
-                *done += 1;
+                let mut processed = self.files_processed.lock().unwrap();
+                *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{done}/{files_total} files"));
+                self.bar.set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::WaitingRateLimit => {
                 self.bar.set_message("rate limited, waiting...");
@@ -542,22 +557,24 @@ impl UploadDisplay {
         drop(errors);
 
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        let files_done = *self.files_done.lock().unwrap();
+        let files_processed = *self.files_processed.lock().unwrap();
         let files_skipped = *self.files_skipped.lock().unwrap();
-        let files_uploaded = files_done
+        let files_uploaded = files_processed
             .saturating_sub(files_failed)
             .saturating_sub(files_skipped);
         let bytes_total = *self.bytes_total.lock().unwrap();
+        let dry_run = *self.dry_run.lock().unwrap();
 
-        print_item_finish(
-            &self.identifier,
-            "uploaded",
-            files_uploaded,
+        print_item_finish(&ItemFinish {
+            identifier: &self.identifier,
+            verb: "uploaded",
+            files_done: files_uploaded,
             files_skipped,
             files_failed,
             bytes_total,
-            elapsed,
-        );
+            elapsed_secs: elapsed,
+            dry_run,
+        });
     }
 }
 
@@ -580,7 +597,7 @@ struct UploadItemBars {
     header: ProgressBar,
     bar: ProgressBar,
     per_file_bytes: HashMap<String, u64>,
-    files_done: usize,
+    files_processed: usize,
     files_skipped: usize,
     files_total: usize,
     bytes_total: u64,
@@ -623,6 +640,12 @@ impl UploadBatchDisplay {
                 files_count,
                 bytes_total,
             } => {
+                // Guard: only create bars once per item (ignore duplicate Enumerated events)
+                let mut items = self.active_items.lock().unwrap();
+                if items.contains_key(identifier) {
+                    return;
+                }
+
                 let item_header = self.multi.insert_before(
                     &self.bottom_sentinel,
                     ProgressBar::new_spinner(),
@@ -638,14 +661,13 @@ impl UploadBatchDisplay {
                 let bar = self.multi.insert_before(&self.bottom_sentinel, bar);
                 bar.set_message(format!("0/{files_count} files"));
 
-                let mut items = self.active_items.lock().unwrap();
                 items.insert(
                     identifier.to_string(),
                     UploadItemBars {
                         header: item_header,
                         bar,
                         per_file_bytes: HashMap::new(),
-                        files_done: 0,
+                        files_processed: 0,
                         files_skipped: 0,
                         files_total: files_count,
                         bytes_total,
@@ -669,12 +691,12 @@ impl UploadBatchDisplay {
                         item.per_file_bytes.insert(p.key.clone(), p.total_bytes);
                         let total: u64 = item.per_file_bytes.values().sum();
                         item.bar.set_position(total);
-                        item.files_done += 1;
+                        item.files_processed += 1;
                         item.bar.set_message(format!(
                             "{}/{} files",
-                            item.files_done, item.files_total
+                            item.files_processed, item.files_total
                         ));
-                        item.files_done >= item.files_total
+                        item.files_processed >= item.files_total
                     } else {
                         false
                     }
@@ -688,12 +710,12 @@ impl UploadBatchDisplay {
                     let mut items = self.active_items.lock().unwrap();
                     if let Some(item) = items.get_mut(identifier) {
                         item.files_skipped += 1;
-                        item.files_done += 1;
+                        item.files_processed += 1;
                         item.bar.set_message(format!(
                             "{}/{} files",
-                            item.files_done, item.files_total
+                            item.files_processed, item.files_total
                         ));
-                        item.files_done >= item.files_total
+                        item.files_processed >= item.files_total
                     } else {
                         false
                     }
@@ -712,12 +734,12 @@ impl UploadBatchDisplay {
                             style(&p.key).dim(),
                             style("— upload failed").red(),
                         ));
-                        item.files_done += 1;
+                        item.files_processed += 1;
                         item.bar.set_message(format!(
                             "{}/{} files",
-                            item.files_done, item.files_total
+                            item.files_processed, item.files_total
                         ));
-                        item.files_done >= item.files_total
+                        item.files_processed >= item.files_total
                     } else {
                         false
                     }
@@ -752,13 +774,13 @@ impl UploadBatchDisplay {
             let elapsed = item.started_at.elapsed().as_secs_f64();
             let speed = format_speed(item.bytes_total, elapsed);
             let files_uploaded = item
-                .files_done
+                .files_processed
                 .saturating_sub(item.errors.len())
                 .saturating_sub(item.files_skipped);
             let error_info = if !item.errors.is_empty() {
                 format!(
                     "\n  {} {} errors",
-                    style("─").dim(),
+                    style(ICON_ERROR).red(),
                     style(item.errors.len()).red()
                 )
             } else {
@@ -767,16 +789,25 @@ impl UploadBatchDisplay {
             let skipped_info = if item.files_skipped > 0 {
                 format!(
                     "\n  {} {} skipped",
-                    style("─").dim(),
+                    style(ICON_SKIPPED).dim(),
                     style(item.files_skipped).yellow()
                 )
             } else {
                 String::new()
             };
 
+            // Choose icon: errors → red ✗, all skipped → dim –, otherwise → green ✓
+            let icon = if !item.errors.is_empty() {
+                style(ICON_ERROR).red()
+            } else if files_uploaded == 0 && item.files_skipped > 0 {
+                style(ICON_SKIPPED).dim()
+            } else {
+                style(ICON_SUCCESS).green()
+            };
+
             item.header.set_message(format!(
                 "{} {}       {} files ({}) {:.0}s{}{}{}",
-                style(ICON_SUCCESS).green(),
+                icon,
                 style(identifier).bold(),
                 files_uploaded,
                 format_bytes(item.bytes_total),
