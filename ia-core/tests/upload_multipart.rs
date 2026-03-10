@@ -49,7 +49,7 @@ async fn initiate_upload_success() {
         .await;
 
     let client = test_client(&server);
-    let upload_id = multipart::initiate_upload(&client, "test-item", "large-file.zip")
+    let upload_id = multipart::initiate_upload(&client, "test-item", "large-file.zip", &[])
         .await
         .unwrap();
     assert_eq!(upload_id, "upload-id-123");
@@ -71,7 +71,7 @@ async fn initiate_upload_403_fails() {
         .await;
 
     let client = test_client(&server);
-    let result = multipart::initiate_upload(&client, "test-item", "file.zip").await;
+    let result = multipart::initiate_upload(&client, "test-item", "file.zip", &[]).await;
     assert!(result.is_err());
 }
 
@@ -362,6 +362,9 @@ async fn upload_file_multipart_success() {
         "data.bin",
         &opts,
         10, // part_size override for testing
+        true,
+        true,
+        None,
         None,
     )
     .await
@@ -439,6 +442,9 @@ async fn upload_file_multipart_part_retry_on_503() {
         "data.bin",
         &opts,
         1024, // single part
+        true,
+        true,
+        None,
         None,
     )
     .await
@@ -506,6 +512,9 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
         "data.bin",
         &opts,
         1024,
+        true,
+        true,
+        None,
         None,
     )
     .await;
@@ -599,6 +608,9 @@ async fn upload_file_multipart_resumes_from_existing() {
         "data.bin",
         &opts,
         10, // small parts for testing
+        true,
+        true,
+        None,
         None,
     )
     .await
@@ -662,6 +674,9 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
         "data.bin",
         &opts,
         1024,
+        true,
+        true,
+        None,
         None,
     )
     .await
@@ -740,6 +755,9 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
         "data.bin",
         &opts,
         10,
+        true,
+        true,
+        None,
         None,
     )
     .await

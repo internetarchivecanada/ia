@@ -1,31 +1,46 @@
+//! Upload dashboard panel rendering.
+//!
+//! Draws all panels for the upload TUI dashboard. Layout mirrors the download
+//! dashboard (`tui/ui.rs`) with upload-specific panels: S3 tasks, rate limits,
+//! and verification status.
+
+use ia_core::upload::UploadProgressStatus;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::Frame;
 
-use super::app::{ItemStatus, TuiState};
+use super::upload_app::{UploadItemStatus, UploadTuiState};
 use super::widgets;
-use super::widgets::format_bytes;
 
-pub fn draw(f: &mut Frame, state: &TuiState) {
-    let mut constraints = vec![Constraint::Length(3)]; // Header always
+/// Draw the complete upload dashboard UI.
+pub fn draw(f: &mut Frame, state: &UploadTuiState) {
+    let mut constraints = vec![Constraint::Length(3)]; // Header (always)
+
+    constraints.push(Constraint::Min(5)); // Workers panel (always)
 
     let show_items = state.items.len() > 1;
     if show_items {
         constraints.push(Constraint::Min(5)); // Items panel
     }
 
-    constraints.push(Constraint::Min(5)); // Workers panel (always)
+    let show_s3_tasks = state.tasks_queued > 0 || state.tasks_running > 0 || state.tasks_error > 0;
+    if show_s3_tasks {
+        constraints.push(Constraint::Length(3)); // S3 Tasks
+    }
 
-    let show_disks = !state.disk_statuses.is_empty();
-    if show_disks {
-        constraints.push(Constraint::Length(3));
+    let has_rate_limited = state
+        .items
+        .iter()
+        .any(|i| i.status == UploadItemStatus::RateLimited);
+    if has_rate_limited {
+        constraints.push(Constraint::Length(3)); // Rate Limit
     }
 
     let show_errors = !state.failed_files.is_empty();
     if show_errors {
-        constraints.push(Constraint::Length(5));
+        constraints.push(Constraint::Length(5)); // Errors
     }
 
     let show_throughput = !state.throughput.history().is_empty();
@@ -33,7 +48,7 @@ pub fn draw(f: &mut Frame, state: &TuiState) {
         constraints.push(Constraint::Length(4)); // Throughput sparkline
     }
 
-    constraints.push(Constraint::Length(3)); // Status bar
+    constraints.push(Constraint::Length(3)); // Status bar (always)
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -46,16 +61,21 @@ pub fn draw(f: &mut Frame, state: &TuiState) {
     draw_header(f, chunks[idx], state);
     idx += 1;
 
+    draw_active_files(f, chunks[idx], state);
+    idx += 1;
+
     if show_items {
         draw_items_panel(f, chunks[idx], state);
         idx += 1;
     }
 
-    draw_active_files(f, chunks[idx], state);
-    idx += 1;
+    if show_s3_tasks {
+        draw_s3_tasks_panel(f, chunks[idx], state);
+        idx += 1;
+    }
 
-    if show_disks {
-        draw_disks_panel(f, chunks[idx], state);
+    if has_rate_limited {
+        draw_rate_limit_panel(f, chunks[idx], state);
         idx += 1;
     }
 
@@ -72,33 +92,41 @@ pub fn draw(f: &mut Frame, state: &TuiState) {
     draw_status_bar(f, chunks[idx], state);
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
-    let progress = state.overall_progress();
-    let throughput = state.throughput();
+// ---------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------
 
-    let remaining = state.bytes_total.saturating_sub(state.bytes_downloaded);
-    let eta_str = {
-        let s = widgets::format_eta(remaining, throughput);
-        if s.is_empty() {
-            String::new()
-        } else {
-            format!("  {s}")
-        }
+fn draw_header(f: &mut Frame, area: Rect, state: &UploadTuiState) {
+    let progress = state.overall_progress();
+    let throughput = state.throughput.throughput();
+    let remaining = state.bytes_total.saturating_sub(state.bytes_uploaded);
+    let eta_str = widgets::format_eta(remaining, throughput);
+    let eta_display = if eta_str.is_empty() {
+        String::new()
+    } else {
+        format!("  {eta_str}")
+    };
+
+    // Title: single-item shows identifier, batch shows count.
+    let title_ident = if state.items.len() == 1 {
+        state.items[0].identifier.clone()
+    } else {
+        format!("{} items", state.items.len())
     };
 
     let label = format!(
-        " {} — {:.0}% ({})  {}/s{} ",
-        state.identifier,
+        " {} \u{2014} {:.0}% ({})  {}/s{} ",
+        title_ident,
         progress * 100.0,
-        format_bytes(state.bytes_downloaded),
-        format_bytes(throughput as u64),
-        eta_str,
+        widgets::format_bytes(state.bytes_uploaded),
+        widgets::format_bytes(throughput as u64),
+        eta_display,
     );
 
     let gauge = Gauge::default()
         .block(
             Block::default()
-                .title(format!(" ia download — {} ", state.identifier))
+                .title(" ia upload ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -109,7 +137,11 @@ fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(gauge, area);
 }
 
-fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
+// ---------------------------------------------------------------------------
+// Items panel
+// ---------------------------------------------------------------------------
+
+fn draw_items_panel(f: &mut Frame, area: Rect, state: &UploadTuiState) {
     let block = Block::default()
         .title(" Items ")
         .borders(Borders::ALL)
@@ -121,32 +153,38 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
     let mut lines: Vec<Line> = Vec::new();
     for item in &state.items {
         let status_icon = match &item.status {
-            ItemStatus::Pending => Span::styled("  ", Style::default().fg(Color::DarkGray)),
-            ItemStatus::Downloading => Span::styled(" \u{25b8}", Style::default().fg(Color::Cyan)),
-            ItemStatus::Complete => {
+            UploadItemStatus::Pending => {
+                Span::styled("  ", Style::default().fg(Color::DarkGray))
+            }
+            UploadItemStatus::Verifying => {
+                Span::styled(" \u{25c7}", Style::default().fg(Color::Yellow))
+            }
+            UploadItemStatus::Uploading => {
+                Span::styled(" \u{25b8}", Style::default().fg(Color::Cyan))
+            }
+            UploadItemStatus::RateLimited => {
+                Span::styled(" \u{23f8}", Style::default().fg(Color::Yellow))
+            }
+            UploadItemStatus::Complete => {
                 Span::styled(" \u{2713}", Style::default().fg(Color::Green))
             }
-            ItemStatus::Failed(_) => Span::styled(" \u{2717}", Style::default().fg(Color::Red)),
+            UploadItemStatus::Failed(_) => {
+                Span::styled(" \u{2717}", Style::default().fg(Color::Red))
+            }
         };
 
         let files_info = if item.files_total > 0 {
             format!(
                 "{}/{}",
                 item.files_completed + item.files_skipped + item.files_failed,
-                item.files_total
+                item.files_total,
             )
         } else {
             "\u{2014}".to_string()
         };
 
-        let bytes_info = if item.bytes_downloaded > 0 {
-            format_bytes(item.bytes_downloaded)
-        } else {
-            "\u{2014}".to_string()
-        };
-
-        let speed_info = if matches!(item.status, ItemStatus::Downloading) {
-            format!("{}/s", format_bytes(item.throughput() as u64))
+        let bytes_info = if item.bytes_uploaded > 0 {
+            widgets::format_bytes(item.bytes_uploaded)
         } else {
             "\u{2014}".to_string()
         };
@@ -167,11 +205,6 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
                 format!("{:>10}", bytes_info),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>10}", speed_info),
-                Style::default().fg(Color::DarkGray),
-            ),
         ]));
 
         if lines.len() >= inner.height as usize {
@@ -183,7 +216,11 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(para, inner);
 }
 
-fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
+// ---------------------------------------------------------------------------
+// Active files (Workers) panel
+// ---------------------------------------------------------------------------
+
+fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
     let block = Block::default()
         .title(format!(" Workers ({}) ", state.active_files.len()))
         .borders(Borders::ALL)
@@ -194,21 +231,25 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Active files with progress
+    // Active files sorted by name.
     let mut active: Vec<_> = state.active_files.values().collect();
     active.sort_by(|a, b| a.name.cmp(&b.name));
 
     for fp in active.iter().skip(state.scroll_offset) {
-        let progress = fp
-            .total_bytes
-            .map(|total| {
-                if total > 0 {
-                    fp.bytes_downloaded as f64 / total as f64
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
+        let (icon, icon_color) = match fp.status {
+            UploadProgressStatus::Verifying => ("\u{25c7}", Color::Yellow),
+            UploadProgressStatus::Uploading => ("\u{2191}", Color::Cyan),
+            UploadProgressStatus::WaitingRateLimit => ("\u{23f8}", Color::Yellow),
+            UploadProgressStatus::Complete => ("\u{2713}", Color::Green),
+            UploadProgressStatus::Skipped => ("\u{2013}", Color::DarkGray),
+            UploadProgressStatus::Failed => ("\u{2717}", Color::Red),
+        };
+
+        let progress = if fp.total_bytes > 0 {
+            fp.bytes_sent as f64 / fp.total_bytes as f64
+        } else {
+            0.0
+        };
 
         let bar_width = 20;
         let filled = (progress * bar_width as f64) as usize;
@@ -216,30 +257,16 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
         let bar = format!(
             "{}{}",
             "\u{2588}".repeat(filled),
-            "\u{2591}".repeat(empty)
+            "\u{2591}".repeat(empty),
         );
-
-        let speed = {
-            let secs = fp.started_at.elapsed().as_secs_f64();
-            if secs > 0.0 {
-                format!(
-                    "{}/s",
-                    format_bytes((fp.bytes_downloaded as f64 / secs) as u64)
-                )
-            } else {
-                "\u{2014}".to_string()
-            }
-        };
 
         let name = widgets::truncate_tail(&fp.name, 30);
 
         lines.push(Line::from(vec![
-            Span::styled(" \u{25b8} ", Style::default().fg(Color::Green)),
-            Span::styled(name, Style::default().fg(Color::White)),
-            Span::raw(" "),
+            Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
             Span::styled(bar, Style::default().fg(Color::Cyan)),
-            Span::raw(format!(" {:>5.1}%  ", progress * 100.0)),
-            Span::styled(speed, Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {:>5.1}% ", progress * 100.0)),
+            Span::styled(name, Style::default().fg(Color::White)),
         ]));
 
         if lines.len() >= inner.height as usize {
@@ -247,7 +274,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
         }
     }
 
-    // Recent completions
+    // Show recent completions if space permits.
     if lines.len() < inner.height as usize && !state.completed_files.is_empty() {
         let remaining = inner.height as usize - lines.len();
         let recent = state
@@ -259,10 +286,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
         for name in recent {
             let display_name = widgets::truncate_tail(name, 30);
             lines.push(Line::from(vec![
-                Span::styled(
-                    " \u{2713} ",
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled(" \u{2713} ", Style::default().fg(Color::Green)),
                 Span::styled(display_name, Style::default().fg(Color::DarkGray)),
                 Span::styled(" done", Style::default().fg(Color::DarkGray)),
             ]));
@@ -272,14 +296,14 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
     if lines.is_empty() {
         if state.done {
             lines.push(Line::from(Span::styled(
-                " All downloads complete.",
+                " All uploads complete.",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
             lines.push(Line::from(Span::styled(
-                " Waiting for downloads to start...",
+                " Waiting for uploads to start...",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -289,40 +313,99 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(para, inner);
 }
 
-fn draw_disks_panel(f: &mut Frame, area: Rect, state: &TuiState) {
+// ---------------------------------------------------------------------------
+// S3 Tasks panel
+// ---------------------------------------------------------------------------
+
+fn draw_s3_tasks_panel(f: &mut Frame, area: Rect, state: &UploadTuiState) {
     let block = Block::default()
-        .title(" Disks ")
+        .title(" S3 Tasks ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::White));
+        .border_style(Style::default().fg(Color::DarkGray));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (path, free) in &state.disk_statuses {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(path, Style::default().fg(Color::White)),
-            Span::raw(": "),
-            Span::styled(
-                format!("{} free", format_bytes(*free)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
+    let line = Line::from(vec![
+        Span::styled(" Queued: ", Style::default().fg(Color::White)),
+        Span::styled(
+            state.tasks_queued.to_string(),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("  "),
+        Span::styled("Running: ", Style::default().fg(Color::White)),
+        Span::styled(
+            state.tasks_running.to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled("Errors: ", Style::default().fg(Color::White)),
+        Span::styled(
+            state.tasks_error.to_string(),
+            if state.tasks_error > 0 {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+    ]);
 
-    let para = Paragraph::new(lines);
-    f.render_widget(para, inner);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
-fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
-    let elapsed_str = widgets::format_elapsed(state.elapsed());
+// ---------------------------------------------------------------------------
+// Rate Limit panel
+// ---------------------------------------------------------------------------
+
+fn draw_rate_limit_panel(f: &mut Frame, area: Rect, state: &UploadTuiState) {
+    let block = Block::default()
+        .title(" Rate Limited ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = state
+        .items
+        .iter()
+        .filter(|i| i.status == UploadItemStatus::RateLimited)
+        .take(inner.height as usize)
+        .map(|item| {
+            Line::from(vec![
+                Span::styled(" \u{23f8} ", Style::default().fg(Color::Yellow)),
+                Span::styled(&*item.identifier, Style::default().fg(Color::White)),
+                Span::styled(
+                    "  polling check_limit...",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+fn draw_status_bar(f: &mut Frame, area: Rect, state: &UploadTuiState) {
+    let elapsed_str = widgets::format_elapsed(state.throughput.elapsed());
 
     let is_batch = state.items.len() > 1;
 
     let status = if is_batch {
-        let items_done = state.items_completed();
-        let items_failed = state.items_failed();
+        let items_done = state
+            .items
+            .iter()
+            .filter(|i| matches!(i.status, UploadItemStatus::Complete))
+            .count();
+        let items_failed = state
+            .items
+            .iter()
+            .filter(|i| matches!(i.status, UploadItemStatus::Failed(_)))
+            .count();
         let items_total = state.items.len();
 
         let mut parts = vec![
@@ -400,4 +483,3 @@ fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(status), layout[0]);
     widgets::draw_key_hints(f, layout[1], &[("j/k", " scroll  "), ("q", "uit")]);
 }
-

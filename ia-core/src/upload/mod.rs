@@ -1,8 +1,9 @@
-mod batch;
+pub mod batch;
 pub mod check_limit;
 pub mod checksum;
 pub mod headers;
 mod item;
+pub(crate) mod progress_body;
 pub mod s3_error;
 pub mod multipart;
 mod single;
@@ -16,7 +17,7 @@ pub use item::upload_item;
 pub use single::upload_file;
 pub use template::{generate_template, write_template_csv, TemplateOpts, TemplateRow};
 pub use types::{
-    MultipartUploadInfo, PartInfo, UploadOpts, UploadOptsBuilder, UploadProgress,
+    MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts, UploadOptsBuilder, UploadProgress,
     UploadProgressStatus, UploadResult, UploadStatus,
 };
 

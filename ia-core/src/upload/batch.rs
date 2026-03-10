@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
@@ -12,10 +13,10 @@ use crate::IaClient;
 
 /// A group of files and metadata for a single IA item.
 #[derive(Debug)]
-struct ItemGroup {
-    identifier: String,
-    metadata: Vec<(String, String)>,
-    files: Vec<PathBuf>,
+pub struct ItemGroup {
+    pub identifier: String,
+    pub metadata: Vec<(String, String)>,
+    pub files: Vec<PathBuf>,
 }
 
 /// Batch upload items from spreadsheet records.
@@ -38,7 +39,7 @@ pub async fn upload_batch(
     records: Vec<SpreadsheetRecord>,
     opts: &UploadOpts,
     concurrency: usize,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<Vec<UploadResult>> {
     if records.is_empty() {
         return Err(IaError::EmptyUpload);
@@ -53,21 +54,25 @@ pub async fn upload_batch(
     // 3. Upload items concurrently
     // Return (identifier, Result) so we can attribute failures to specific items.
     let results: Vec<(String, Result<Vec<UploadResult>>)> = stream::iter(groups)
-        .map(|group| async move {
-            let id = group.identifier.clone();
-            // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
-            let mut item_opts = opts.clone();
-            for (key, value) in group.metadata {
-                if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
-                    existing.1 = value;
-                } else {
-                    item_opts.metadata.push((key, value));
+        .map(|group| {
+            let progress = progress.clone();
+            async move {
+                let id = group.identifier.clone();
+                // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
+                let mut item_opts = opts.clone();
+                for (key, value) in group.metadata {
+                    if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
+                        existing.1 = value;
+                    } else {
+                        item_opts.metadata.push((key, value));
+                    }
                 }
-            }
 
-            let result =
-                upload_item(client, &group.identifier, &group.files, &item_opts, progress).await;
-            (id, result)
+                let result =
+                    upload_item(client, &group.identifier, &group.files, &item_opts, progress)
+                        .await;
+                (id, result)
+            }
         })
         .buffer_unordered(concurrency)
         .collect()
@@ -107,7 +112,7 @@ pub async fn upload_batch(
 }
 
 /// Group spreadsheet records by identifier, extracting file paths and metadata.
-fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
+pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
     // Use BTreeMap for deterministic ordering by identifier
     let mut map: BTreeMap<String, ItemGroup> = BTreeMap::new();
 
@@ -146,7 +151,7 @@ fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> {
 ///
 /// Checks identifiers and file existence/type. Collects all errors
 /// and reports them together.
-fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
+pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     for group in groups {

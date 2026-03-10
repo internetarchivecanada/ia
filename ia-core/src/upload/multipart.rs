@@ -134,8 +134,14 @@ pub fn parse_list_parts_response(body: &str) -> Vec<PartInfo> {
 pub fn build_complete_manifest(parts: &[(u32, String)]) -> String {
     let mut xml = String::from("<CompleteMultipartUpload>");
     for (num, etag) in parts {
+        // Minimal XML escaping for ETags (defense-in-depth; S3 ETags are
+        // always hex strings, but we guard against unexpected characters).
+        let safe_etag = etag
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         xml.push_str(&format!(
-            "<Part><PartNumber>{num}</PartNumber><ETag>{etag}</ETag></Part>"
+            "<Part><PartNumber>{num}</PartNumber><ETag>{safe_etag}</ETag></Part>"
         ));
     }
     xml.push_str("</CompleteMultipartUpload>");
@@ -149,19 +155,31 @@ use super::{build_s3_item_url, build_s3_url};
 /// Initiate a multipart upload. Returns the server-assigned upload ID.
 ///
 /// `POST /{identifier}/{key}?uploads`
+///
+/// `extra_headers` allows callers to attach metadata (`x-archive-meta*`),
+/// `x-archive-auto-make-bucket`, `x-archive-queue-derive`, and other
+/// item-creation headers to the initiate request. IA S3 only accepts
+/// metadata at item creation time, so these headers must be sent here.
 pub async fn initiate_upload(
     client: &IaClient,
     identifier: &str,
     key: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<String> {
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads=", build_s3_url(client, identifier, key));
 
-    let resp = client
+    let mut req = client
         .http()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
-        .header("Content-Length", "0")
+        .header("Content-Length", "0");
+
+    for (k, v) in extra_headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| IaError::UploadFailed {
@@ -441,6 +459,7 @@ use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Upload a file using the S3 multipart protocol.
@@ -452,6 +471,12 @@ use std::time::Instant;
 ///
 /// `part_size` controls the split size. Use [`DEFAULT_PART_SIZE`] for production.
 /// A smaller value can be passed for testing.
+///
+/// `is_first_file` / `is_last_file` / `size_hint` control the same IA S3
+/// headers as the single-PUT path (`x-archive-auto-make-bucket`,
+/// `x-archive-queue-derive`, `x-archive-size-hint`), plus metadata headers
+/// on the initiate POST.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_file_multipart(
     client: &IaClient,
     identifier: &str,
@@ -459,7 +484,10 @@ pub async fn upload_file_multipart(
     key: &str,
     opts: &UploadOpts,
     part_size: u64,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    is_first_file: bool,
+    is_last_file: bool,
+    size_hint: Option<u64>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<UploadResult> {
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
@@ -478,7 +506,7 @@ pub async fn upload_file_multipart(
     }
 
     // Report verifying phase
-    if let Some(cb) = progress {
+    if let Some(ref cb) = progress {
         cb(UploadProgress {
             identifier: identifier.into(),
             key: key.into(),
@@ -490,6 +518,39 @@ pub async fn upload_file_multipart(
 
     // Try to resume an existing upload
     let (upload_id, existing_parts) = try_resume(client, identifier, key).await?;
+
+    // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
+    let extra_headers = {
+        use crate::upload::headers::encode_metadata_headers;
+        let mut hdrs = Vec::new();
+
+        // Metadata headers (first file only, same as single-PUT path)
+        if is_first_file && !opts.metadata.is_empty() {
+            hdrs.extend(encode_metadata_headers(&opts.metadata));
+        }
+
+        // x-archive-auto-make-bucket (first file only)
+        if is_first_file && !opts.no_auto_make_bucket {
+            hdrs.push(("x-archive-auto-make-bucket".to_string(), "1".to_string()));
+        }
+
+        // x-archive-size-hint (first file only)
+        if let Some(hint) = size_hint {
+            hdrs.push(("x-archive-size-hint".to_string(), hint.to_string()));
+        }
+
+        // x-archive-queue-derive
+        if opts.no_derive || !is_last_file {
+            hdrs.push(("x-archive-queue-derive".to_string(), "0".to_string()));
+        } else {
+            hdrs.push(("x-archive-queue-derive".to_string(), "1".to_string()));
+        }
+
+        // Custom headers from opts
+        hdrs.extend(opts.headers.iter().cloned());
+
+        hdrs
+    };
 
     let (upload_id, mut completed_parts) = match upload_id {
         Some(id) => {
@@ -507,7 +568,7 @@ pub async fn upload_file_multipart(
             (id, parts)
         }
         None => {
-            let id = initiate_upload(client, identifier, key).await?;
+            let id = initiate_upload(client, identifier, key, &extra_headers).await?;
             (id, Vec::new())
         }
     };
@@ -527,7 +588,7 @@ pub async fn upload_file_multipart(
         let this_part_size = std::cmp::min(part_size, file_size - offset) as usize;
 
         // Report progress
-        if let Some(cb) = progress {
+        if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.into(),
                 key: key.into(),
@@ -556,7 +617,7 @@ pub async fn upload_file_multipart(
                         part_retries += 1;
                         total_retries += 1;
 
-                        if let Some(cb) = progress {
+                        if let Some(ref cb) = progress {
                             cb(UploadProgress {
                                 identifier: identifier.into(),
                                 key: key.into(),
@@ -604,7 +665,7 @@ pub async fn upload_file_multipart(
     .await?;
 
     // Report completion
-    if let Some(cb) = progress {
+    if let Some(ref cb) = progress {
         cb(UploadProgress {
             identifier: identifier.into(),
             key: key.into(),

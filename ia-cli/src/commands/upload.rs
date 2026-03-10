@@ -132,7 +132,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub multipart: bool,
 
-    /// Full-screen TUI dashboard (not yet implemented)
+    /// Full-screen TUI dashboard for monitoring upload progress
     #[arg(long)]
     pub dashboard: bool,
 
@@ -340,12 +340,28 @@ pub async fn run(
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
     }
+    #[cfg(feature = "tui")]
     if args.dashboard {
-        bail!("upload dashboard is not yet implemented (Phase 3)");
+        match &args.command {
+            None => {
+                // Dashboard supported for bare upload — handled in run_bare_upload
+            }
+            Some(UploadCommand::Template(_) | UploadCommand::Cleanup(_)) => {
+                bail!("--dashboard is only supported for bare upload and import");
+            }
+            Some(UploadCommand::Import(_)) => {
+                // Dashboard supported for import — handled in run_import
+            }
+        }
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if args.dashboard {
+        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
     }
 
     match args.command {
-        Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path).await,
+        Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path, args.dashboard).await,
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         None => run_bare_upload(client, args, quiet, joblog_path).await,
@@ -416,6 +432,19 @@ async fn run_bare_upload(
         dry_run: args.dry_run,
     };
 
+    // Dashboard mode — hand off to the TUI and return early
+    #[cfg(feature = "tui")]
+    if args.dashboard {
+        return crate::tui::run_upload_tui(
+            client,
+            vec![identifier.to_string()],
+            vec![files.clone()],
+            opts,
+            1,
+        )
+        .await;
+    }
+
     // Open joblog writer if path provided
     let joblog = joblog_path
         .as_ref()
@@ -425,14 +454,11 @@ async fn run_bare_upload(
 
     // Set up progress display
     let display = crate::output::UploadDisplay::new();
-    let progress_fn = |p: UploadProgress| {
-        display.update(p);
-    };
-
-    // Decide whether to use progress callback
-    let progress_ref: Option<&(dyn Fn(UploadProgress) + Send + Sync)> =
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         if !args.json && quiet == 0 {
-            Some(&progress_fn)
+            Some(std::sync::Arc::new(move |p: UploadProgress| {
+                display.update(p);
+            }))
         } else {
             None
         };
@@ -494,6 +520,7 @@ async fn run_import(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    dashboard: bool,
 ) -> Result<()> {
     let records = read_spreadsheet(&args.spreadsheet)
         .context(format!("failed to read spreadsheet: {}", args.spreadsheet.display()))?;
@@ -541,6 +568,20 @@ async fn run_import(
         ..UploadOpts::default()
     };
 
+    // Dashboard mode — hand off to the TUI and return early
+    #[cfg(feature = "tui")]
+    if dashboard {
+        return crate::tui::run_upload_batch_tui(
+            client,
+            records,
+            opts,
+            jobs,
+        )
+        .await;
+    }
+    #[cfg(not(feature = "tui"))]
+    let _ = dashboard;
+
     // Open joblog writer if path provided
     let joblog = joblog_path
         .as_ref()
@@ -560,54 +601,49 @@ async fn run_import(
         );
     }
 
-    let quiet_level = quiet;
-    let progress_fn = move |p: UploadProgress| {
-        if json_mode || quiet_level >= 1 {
-            return;
-        }
-        match p.status {
-            UploadProgressStatus::Complete => {
-                eprintln!(
-                    " {} {}/{}",
-                    style("✓").green(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::Failed => {
-                eprintln!(
-                    " {} {}/{}",
-                    style("✗").red(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::Skipped => {
-                eprintln!(
-                    " {} {}/{} (skipped)",
-                    style("–").dim(),
-                    p.identifier,
-                    p.key,
-                );
-            }
-            UploadProgressStatus::WaitingRateLimit => {
-                eprintln!(
-                    " {} {} rate limited, polling...",
-                    style("⏸").yellow(),
-                    p.identifier,
-                );
-            }
-            UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
-                // Too noisy for batch — skip
-            }
-        }
-    };
-    let progress_ref: Option<&(dyn Fn(UploadProgress) + Send + Sync)> = if !json_mode && quiet == 0
-    {
-        Some(&progress_fn)
-    } else {
-        None
-    };
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+        if !json_mode && quiet == 0 {
+            Some(std::sync::Arc::new(move |p: UploadProgress| {
+                match p.status {
+                    UploadProgressStatus::Complete => {
+                        eprintln!(
+                            " {} {}/{}",
+                            style("\u{2713}").green(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::Failed => {
+                        eprintln!(
+                            " {} {}/{}",
+                            style("\u{2717}").red(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::Skipped => {
+                        eprintln!(
+                            " {} {}/{} (skipped)",
+                            style("\u{2013}").dim(),
+                            p.identifier,
+                            p.key,
+                        );
+                    }
+                    UploadProgressStatus::WaitingRateLimit => {
+                        eprintln!(
+                            " {} {} rate limited, polling...",
+                            style("\u{23F8}").yellow(),
+                            p.identifier,
+                        );
+                    }
+                    UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
+                        // Too noisy for batch — skip
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
     let results = upload_batch(client, records, &opts, jobs, progress_ref)
         .await

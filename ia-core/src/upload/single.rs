@@ -6,6 +6,7 @@ use crate::upload::s3_error::parse_s3_error;
 use crate::upload::types::*;
 use crate::IaClient;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Upload a single file to an IA S3 bucket.
@@ -42,7 +43,7 @@ pub async fn upload_file(
     is_first_file: bool,
     is_last_file: bool,
     size_hint: Option<u64>,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<UploadResult> {
     if opts.multipart {
         return crate::upload::multipart::upload_file_multipart(
@@ -52,6 +53,9 @@ pub async fn upload_file(
             key,
             opts,
             crate::upload::multipart::DEFAULT_PART_SIZE,
+            is_first_file,
+            is_last_file,
+            size_hint,
             progress,
         )
         .await;
@@ -66,7 +70,7 @@ pub async fn upload_file(
         if let Some(md5) = opts.checksums.as_ref().and_then(|cs| cs.get(key)) {
             Some(md5.clone())
         } else {
-            if let Some(cb) = progress {
+            if let Some(ref cb) = progress {
                 cb(UploadProgress {
                     identifier: identifier.to_string(),
                     key: key.to_string(),
@@ -95,7 +99,7 @@ pub async fn upload_file(
                     .and_then(|f| f.md5.as_deref());
 
                 if remote_md5 == Some(local_md5) {
-                    if let Some(cb) = progress {
+                    if let Some(ref cb) = progress {
                         cb(UploadProgress {
                             identifier: identifier.to_string(),
                             key: key.to_string(),
@@ -164,11 +168,11 @@ pub async fn upload_file(
     loop {
         // On retry, poll check_limit before re-uploading
         if retries > 0 {
-            poll_check_limit(client, identifier, opts, progress).await?;
+            poll_check_limit(client, identifier, opts, progress.clone()).await?;
         }
 
         // Report progress: uploading
-        if let Some(cb) = progress {
+        if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.to_string(),
                 key: key.to_string(),
@@ -227,14 +231,39 @@ pub async fn upload_file(
         // buffering the entire file in memory. Content-Length is already set from
         // file_size, so IA S3's no-chunked-transfer requirement is satisfied.
         let file_handle = tokio::fs::File::open(file).await?;
-        let stream_body = reqwest::Body::from(file_handle);
-        let response = request.body(stream_body).send().await;
+
+        let response = if let Some(cb) = progress.clone() {
+            // Wrap with ProgressBody for byte-level progress callbacks.
+            // The Arc<dyn Fn> is cloned into the move closure, satisfying
+            // the 'static bound required by reqwest::Body::wrap_stream().
+            let id = identifier.to_string();
+            let k = key.to_string();
+            let fs = file_size;
+            let stream = super::progress_body::ProgressBody::new(
+                file_handle,
+                move |bytes_sent| {
+                    cb(UploadProgress {
+                        identifier: id.clone(),
+                        key: k.clone(),
+                        bytes_sent,
+                        total_bytes: fs,
+                        status: UploadProgressStatus::Uploading,
+                    });
+                },
+            );
+            request
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await
+        } else {
+            request.body(reqwest::Body::from(file_handle)).send().await
+        };
 
         match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    if let Some(cb) = progress {
+                    if let Some(ref cb) = progress {
                         cb(UploadProgress {
                             identifier: identifier.to_string(),
                             key: key.to_string(),
@@ -362,7 +391,7 @@ async fn poll_check_limit(
     client: &IaClient,
     identifier: &str,
     opts: &UploadOpts,
-    progress: Option<&(dyn Fn(UploadProgress) + Send + Sync)>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<()> {
     let (access, _) = client.require_auth()?;
     let protocol = client.protocol();
@@ -377,7 +406,7 @@ async fn poll_check_limit(
     };
 
     for _attempt in 0..opts.retries {
-        if let Some(cb) = progress {
+        if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.to_string(),
                 key: String::new(),
