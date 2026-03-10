@@ -3,9 +3,10 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ia_core::download::{DownloadProgress, DownloadStatus, ItemDownloadResult};
-use ia_core::upload::{UploadProgress, UploadProgressStatus};
+use ia_core::upload::{UploadProgress, UploadProgressStatus, UploadResult, UploadStatus};
 
 // ─── Shared progress style ──────────────────────────────────────────────────
 
@@ -270,7 +271,7 @@ pub struct BatchDisplay {
     bottom_sentinel: ProgressBar,
     active_item_bars: Mutex<HashMap<String, ItemBars>>,
     #[allow(dead_code)]
-    started_at: std::time::Instant,
+    started_at: Instant,
 }
 
 struct ItemBars {
@@ -304,7 +305,7 @@ impl BatchDisplay {
             batch_header,
             bottom_sentinel,
             active_item_bars: Mutex::new(HashMap::new()),
-            started_at: std::time::Instant::now(),
+            started_at: Instant::now(),
         }
     }
 
@@ -442,7 +443,6 @@ impl BatchDisplay {
 /// Matches `DownloadDisplay` pattern: header on creation, aggregate byte
 /// bar during transfer, summary block on finish.
 pub struct UploadDisplay {
-    #[allow(dead_code)] // used by finish(), wired up in a later task
     identifier: String,
     bar: ProgressBar,
     per_file_bytes: Mutex<HashMap<String, u64>>,
@@ -450,8 +450,7 @@ pub struct UploadDisplay {
     files_total: Mutex<usize>,
     bytes_total: Mutex<u64>,
     errors: Mutex<Vec<String>>,
-    #[allow(dead_code)] // used by finish(), wired up in a later task
-    started_at: std::time::Instant,
+    started_at: Instant,
 }
 
 impl UploadDisplay {
@@ -467,7 +466,7 @@ impl UploadDisplay {
             files_total: Mutex::new(0),
             bytes_total: Mutex::new(0),
             errors: Mutex::new(Vec::new()),
-            started_at: std::time::Instant::now(),
+            started_at: Instant::now(),
         }
     }
 
@@ -529,7 +528,6 @@ impl UploadDisplay {
     }
 
     /// Finish the display: clear the bar and print summary.
-    #[allow(dead_code)] // wired up in a later task
     pub fn finish(&self) {
         self.bar.finish_and_clear();
 
@@ -554,6 +552,279 @@ impl UploadDisplay {
             bytes_total,
             elapsed,
         );
+    }
+}
+
+// ─── UploadBatchDisplay ─────────────────────────────────────────────────────
+
+/// Multi-item upload progress display.
+///
+/// Driven entirely by `UploadProgress` events: creates aggregate bars on
+/// `Enumerated`, tracks bytes on `Uploading`, auto-detects item completion
+/// when the file counter reaches the expected count.
+pub struct UploadBatchDisplay {
+    multi: MultiProgress,
+    batch_header: ProgressBar,
+    bottom_sentinel: ProgressBar,
+    active_items: Mutex<HashMap<String, UploadItemBars>>,
+    completed_items: Mutex<usize>,
+    items_total: usize,
+}
+
+struct UploadItemBars {
+    header: ProgressBar,
+    bar: ProgressBar,
+    per_file_bytes: HashMap<String, u64>,
+    files_done: usize,
+    files_total: usize,
+    bytes_total: u64,
+    errors: Vec<String>,
+    started_at: Instant,
+}
+
+impl UploadBatchDisplay {
+    pub fn new(items_total: usize, jobs: usize) -> Self {
+        let multi = MultiProgress::new();
+
+        let batch_header = multi.add(ProgressBar::new_spinner());
+        batch_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
+        batch_header.set_message(format!(
+            "Uploading {} items ({} workers)...",
+            style(items_total).bold(),
+            jobs,
+        ));
+
+        let bottom_sentinel = multi.add(ProgressBar::new_spinner());
+        bottom_sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
+        bottom_sentinel.set_message("");
+        bottom_sentinel.finish();
+
+        Self {
+            multi,
+            batch_header,
+            bottom_sentinel,
+            active_items: Mutex::new(HashMap::new()),
+            completed_items: Mutex::new(0),
+            items_total,
+        }
+    }
+
+    /// Handle an upload progress event.
+    pub fn update(&self, p: UploadProgress) {
+        let identifier = &p.identifier;
+
+        match p.status {
+            UploadProgressStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                let item_header = self.multi.insert_before(
+                    &self.bottom_sentinel,
+                    ProgressBar::new_spinner(),
+                );
+                item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
+                item_header.set_message(format!(
+                    "{} {}",
+                    style(ICON_HEADER).cyan(),
+                    style(identifier).bold(),
+                ));
+
+                let bar = make_progress_bar(bytes_total);
+                let bar = self.multi.insert_before(&self.bottom_sentinel, bar);
+                bar.set_message(format!("0/{files_count} files"));
+
+                let mut items = self.active_items.lock().unwrap();
+                items.insert(
+                    identifier.to_string(),
+                    UploadItemBars {
+                        header: item_header,
+                        bar,
+                        per_file_bytes: HashMap::new(),
+                        files_done: 0,
+                        files_total: files_count,
+                        bytes_total,
+                        errors: Vec::new(),
+                        started_at: Instant::now(),
+                    },
+                );
+            }
+            UploadProgressStatus::Uploading => {
+                let mut items = self.active_items.lock().unwrap();
+                if let Some(item) = items.get_mut(identifier) {
+                    item.per_file_bytes.insert(p.key.clone(), p.bytes_sent);
+                    let total: u64 = item.per_file_bytes.values().sum();
+                    item.bar.set_position(total);
+                }
+            }
+            UploadProgressStatus::Complete => {
+                let should_finish = {
+                    let mut items = self.active_items.lock().unwrap();
+                    if let Some(item) = items.get_mut(identifier) {
+                        item.per_file_bytes.insert(p.key.clone(), p.total_bytes);
+                        let total: u64 = item.per_file_bytes.values().sum();
+                        item.bar.set_position(total);
+                        item.files_done += 1;
+                        item.bar.set_message(format!(
+                            "{}/{} files",
+                            item.files_done, item.files_total
+                        ));
+                        item.files_done >= item.files_total
+                    } else {
+                        false
+                    }
+                };
+                if should_finish {
+                    self.maybe_finish_item(identifier);
+                }
+            }
+            UploadProgressStatus::Skipped => {
+                let should_finish = {
+                    let mut items = self.active_items.lock().unwrap();
+                    if let Some(item) = items.get_mut(identifier) {
+                        item.files_done += 1;
+                        item.bar.set_message(format!(
+                            "{}/{} files",
+                            item.files_done, item.files_total
+                        ));
+                        item.files_done >= item.files_total
+                    } else {
+                        false
+                    }
+                };
+                if should_finish {
+                    self.maybe_finish_item(identifier);
+                }
+            }
+            UploadProgressStatus::Failed => {
+                let should_finish = {
+                    let mut items = self.active_items.lock().unwrap();
+                    if let Some(item) = items.get_mut(identifier) {
+                        item.errors.push(format!(
+                            "  {} {} {}",
+                            style(ICON_ERROR).red(),
+                            style(&p.key).dim(),
+                            style("-- upload failed").red(),
+                        ));
+                        item.files_done += 1;
+                        item.bar.set_message(format!(
+                            "{}/{} files",
+                            item.files_done, item.files_total
+                        ));
+                        item.files_done >= item.files_total
+                    } else {
+                        false
+                    }
+                };
+                if should_finish {
+                    self.maybe_finish_item(identifier);
+                }
+            }
+            UploadProgressStatus::WaitingRateLimit => {
+                let mut items = self.active_items.lock().unwrap();
+                if let Some(item) = items.get_mut(identifier) {
+                    item.bar.set_message("rate limited, waiting...");
+                }
+            }
+            UploadProgressStatus::Verifying => {
+                // No visual update needed
+            }
+        }
+    }
+
+    /// Finalize an item when all its files are done.
+    fn maybe_finish_item(&self, identifier: &str) {
+        let mut items = self.active_items.lock().unwrap();
+        if let Some(item) = items.remove(identifier) {
+            item.bar.finish_and_clear();
+
+            // Print collected errors
+            for err in &item.errors {
+                eprintln!("{err}");
+            }
+
+            let elapsed = item.started_at.elapsed().as_secs_f64();
+            let speed = format_speed(item.bytes_total, elapsed);
+            let error_info = if !item.errors.is_empty() {
+                format!(
+                    "\n  {} {} errors",
+                    style("--").dim(),
+                    style(item.errors.len()).red()
+                )
+            } else {
+                String::new()
+            };
+
+            item.header.set_message(format!(
+                "{} {}       {} files ({}) {:.0}s{}{}",
+                style(ICON_SUCCESS).green(),
+                style(identifier).bold(),
+                item.files_done,
+                format_bytes(item.bytes_total),
+                elapsed,
+                style(&speed).dim(),
+                error_info,
+            ));
+            item.header.finish();
+
+            *self.completed_items.lock().unwrap() += 1;
+        }
+    }
+
+    /// Finish the batch display and print a summary.
+    pub fn finish(&self, results: &[UploadResult], elapsed: Duration) {
+        self.batch_header.finish_and_clear();
+        self.bottom_sentinel.finish_and_clear();
+
+        let mut items_succeeded = 0usize;
+        let mut items_failed = 0usize;
+        let mut files_skipped = 0usize;
+        let mut files_failed = 0usize;
+        let mut bytes_total = 0u64;
+
+        // Group results by identifier to compute per-item stats
+        let mut item_had_failure: HashMap<String, bool> = HashMap::new();
+        for r in results {
+            match &r.status {
+                UploadStatus::Uploaded => {
+                    bytes_total += r.bytes;
+                }
+                UploadStatus::Skipped => {
+                    files_skipped += 1;
+                }
+                UploadStatus::Failed(_) => {
+                    files_failed += 1;
+                    item_had_failure.insert(r.identifier.clone(), true);
+                }
+                UploadStatus::DryRun => {
+                    bytes_total += r.bytes;
+                }
+            }
+        }
+
+        // Count items that succeeded vs failed
+        let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for r in results {
+            seen_ids.insert(&r.identifier);
+        }
+
+        for id in &seen_ids {
+            if item_had_failure.contains_key(*id) {
+                items_failed += 1;
+            } else {
+                items_succeeded += 1;
+            }
+        }
+
+        let summary = BatchSummary {
+            items_total: self.items_total,
+            items_succeeded,
+            items_failed,
+            files_skipped,
+            files_failed,
+            bytes_total,
+            elapsed_secs: elapsed.as_secs_f64(),
+        };
+        print_batch_summary(&summary, "uploaded", None);
     }
 }
 

@@ -131,7 +131,8 @@ fn upload_dry_run_succeeds_without_credentials() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("dry run"));
+        // Aggregate display shows item name and summary instead of per-file "dry run" lines
+        .stderr(predicate::str::contains("my-item"));
 }
 
 #[test]
@@ -150,7 +151,8 @@ fn upload_dry_run_with_test_item() {
         .args(["-m", "mediatype:texts", "--test-item", "--dry-run", "--no-verify"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("dry run"));
+        // Aggregate display shows item name and summary instead of per-file "dry run" lines
+        .stderr(predicate::str::contains("my-item"));
 }
 
 // ─── JSON output ─────────────────────────────────────────────────────────────
