@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Create a git worktree with a typed branch for feature work.
+# Usage: ia-worktree <type> <slug>
+#   type: fix, feat, refactor, docs, chore
+#   slug: short kebab-case description (e.g., search-pagination)
+#
+# Examples:
+#   ia-worktree fix search-count
+#   ia-worktree feat upload-multipart
+#   ia-worktree docs api-quirks
+
+set -euo pipefail
+
+VALID_TYPES="fix feat refactor docs chore"
+
+if [[ $# -lt 2 ]]; then
+    echo "Usage: ia-worktree <type> <slug>" >&2
+    echo "Types: $VALID_TYPES" >&2
+    exit 1
+fi
+
+TYPE="$1"
+SLUG="$2"
+
+# Validate type
+if ! echo "$VALID_TYPES" | grep -qw "$TYPE"; then
+    echo "ERROR: Invalid type '$TYPE'. Must be one of: $VALID_TYPES" >&2
+    exit 1
+fi
+
+BRANCH="$TYPE/$SLUG"
+REPO_ROOT=$(git worktree list | head -1 | awk '{print $1}')
+WORKTREE_PATH="$(dirname "$REPO_ROOT")/worktrees/$SLUG"
+
+# Safety checks
+if git branch --list "$BRANCH" | grep -q .; then
+    echo "ERROR: Local branch '$BRANCH' already exists." >&2
+    exit 1
+fi
+
+if git ls-remote --heads origin "$BRANCH" 2>/dev/null | grep -q .; then
+    echo "ERROR: Remote branch '$BRANCH' already exists on origin." >&2
+    exit 1
+fi
+
+if [[ -d "$WORKTREE_PATH" ]]; then
+    echo "ERROR: Worktree path already exists: $WORKTREE_PATH" >&2
+    exit 1
+fi
+
+# Create
+mkdir -p "$(dirname "$WORKTREE_PATH")"
+git worktree add -b "$BRANCH" "$WORKTREE_PATH" main
+
+echo ""
+echo "Worktree: $WORKTREE_PATH"
+echo "Branch:   $BRANCH"
+echo ""
+echo "Next: cd $WORKTREE_PATH"

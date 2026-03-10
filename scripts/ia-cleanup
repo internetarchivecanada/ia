@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Remove a worktree and its branch after a PR has been merged.
+# Must be run from OUTSIDE the worktree being cleaned up.
+# Usage: ia-cleanup <slug>
+#
+# Example:
+#   ia-cleanup search-count
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: ia-cleanup <slug>" >&2
+    exit 1
+fi
+
+SLUG="$1"
+REPO_ROOT=$(git worktree list | head -1 | awk '{print $1}')
+WORKTREE_PATH="$(dirname "$REPO_ROOT")/worktrees/$SLUG"
+
+# Find the branch associated with this worktree
+if [[ -d "$WORKTREE_PATH" ]]; then
+    BRANCH=$(git -C "$WORKTREE_PATH" branch --show-current 2>/dev/null || echo "")
+else
+    echo "ERROR: Worktree not found at $WORKTREE_PATH" >&2
+    echo "Active worktrees:" >&2
+    git worktree list >&2
+    exit 1
+fi
+
+# Safety: don't delete from inside the worktree
+CURRENT_DIR=$(pwd -P)
+RESOLVED_WT=$(cd "$WORKTREE_PATH" && pwd -P)
+if [[ "$CURRENT_DIR" == "$RESOLVED_WT" || "$CURRENT_DIR" == "$RESOLVED_WT/"* ]]; then
+    echo "ERROR: You are inside the worktree you are trying to delete." >&2
+    echo "Exit the worktree first (e.g., cd $REPO_ROOT)." >&2
+    exit 1
+fi
+
+# Verify the PR is merged
+if [[ -n "$BRANCH" ]]; then
+    MERGED=$(gh pr list --head "$BRANCH" --state merged --limit 1 --json number -q '.[0].number' 2>/dev/null || echo "")
+    if [[ -z "$MERGED" ]]; then
+        echo "WARNING: No merged PR found for branch '$BRANCH'." >&2
+        echo "Proceeding anyway — make sure the work is merged or no longer needed." >&2
+    else
+        echo "Merged PR: #$MERGED"
+    fi
+fi
+
+# Remove worktree
+echo "Removing worktree: $WORKTREE_PATH"
+git worktree remove --force "$WORKTREE_PATH"
+
+# Delete local branch
+if [[ -n "$BRANCH" ]]; then
+    echo "Deleting branch: $BRANCH"
+    if ! git branch -d "$BRANCH" 2>/dev/null; then
+        echo "WARNING: 'git branch -d $BRANCH' failed."
+        echo "To force-delete: git branch -D $BRANCH"
+    fi
+fi
+
+# Tidy
+git remote prune origin 2>/dev/null || true
+git worktree prune 2>/dev/null || true
+
+echo "Done."
