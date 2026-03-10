@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{IaError, Result};
 use crate::upload::single::upload_file;
-use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
+use crate::upload::types::{UploadOpts, UploadProgress, UploadProgressStatus, UploadResult};
 use crate::upload::validate::{validate_file, validate_identifier, validate_required_metadata};
 use crate::IaClient;
 
@@ -102,8 +102,38 @@ pub async fn upload_item(
         Some(total)
     };
 
-    // 9. Upload sequentially
+    // 9. Emit Enumerated event so consumers know the file list and total size.
+    //    bytes_total uses size_hint when available; when no_size_hint is set we
+    //    stat the files here so the progress display still gets a useful total.
     let file_count = expanded.len();
+    if let Some(ref cb) = progress {
+        let bytes_total = if let Some(hint) = size_hint {
+            hint
+        } else {
+            let paths = expanded.clone();
+            tokio::task::spawn_blocking(move || -> u64 {
+                paths
+                    .iter()
+                    .filter_map(|f| std::fs::metadata(f).ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .await
+            .unwrap_or(0)
+        };
+        cb(UploadProgress {
+            identifier: identifier.to_string(),
+            key: String::new(),
+            bytes_sent: 0,
+            total_bytes: 0,
+            status: UploadProgressStatus::Enumerated {
+                files_count: file_count,
+                bytes_total,
+            },
+        });
+    }
+
+    // 10. Upload sequentially
     let mut results = Vec::with_capacity(file_count);
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {

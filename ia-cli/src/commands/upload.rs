@@ -636,7 +636,9 @@ async fn run_import(
                             p.identifier,
                         );
                     }
-                    UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
+                    UploadProgressStatus::Enumerated { .. }
+                    | UploadProgressStatus::Uploading
+                    | UploadProgressStatus::Verifying => {
                         // Too noisy for batch — skip
                     }
                 }

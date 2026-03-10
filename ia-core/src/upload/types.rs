@@ -275,6 +275,16 @@ pub struct UploadProgress {
 /// Current phase of an individual file upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadProgressStatus {
+    /// File list and total size are now known for the item.
+    ///
+    /// Emitted once per item after directory expansion and size computation,
+    /// before any file uploads begin. Mirrors `DownloadStatus::Enumerated`.
+    Enumerated {
+        /// Number of files that will be uploaded.
+        files_count: usize,
+        /// Total bytes across all files (0 when size is unknown).
+        bytes_total: u64,
+    },
     Verifying,
     Uploading,
     WaitingRateLimit,

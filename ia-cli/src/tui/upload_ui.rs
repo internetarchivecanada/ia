@@ -237,6 +237,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
 
     for fp in active.iter().skip(state.scroll_offset) {
         let (icon, icon_color) = match fp.status {
+            UploadProgressStatus::Enumerated { .. } => ("\u{25cb}", Color::DarkGray),
             UploadProgressStatus::Verifying => ("\u{25c7}", Color::Yellow),
             UploadProgressStatus::Uploading => ("\u{2191}", Color::Cyan),
             UploadProgressStatus::WaitingRateLimit => ("\u{23f8}", Color::Yellow),

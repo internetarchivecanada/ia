@@ -418,6 +418,10 @@ impl UploadDisplay {
     pub fn update(&self, p: UploadProgress) {
         let mut bars = self.bars.lock().unwrap_or_else(|e| e.into_inner());
         match p.status {
+            UploadProgressStatus::Enumerated { .. } => {
+                // Nothing to do here yet — future tasks will use this to set
+                // the aggregate bar length.
+            }
             UploadProgressStatus::Uploading => {
                 let pb = bars.entry(p.key.clone()).or_insert_with(|| {
                     let pb = self.multi.add(ProgressBar::new(p.total_bytes));
