@@ -53,6 +53,9 @@ pub async fn upload_file(
             key,
             opts,
             crate::upload::multipart::DEFAULT_PART_SIZE,
+            is_first_file,
+            is_last_file,
+            size_hint,
             progress,
         )
         .await;

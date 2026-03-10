@@ -310,12 +310,15 @@ struct DownloadDashboard {
 
 impl Dashboard for DownloadDashboard {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let s = self.state.lock().unwrap();
-        ui::draw(frame, &s);
+        if let Ok(s) = self.state.lock() {
+            ui::draw(frame, &s);
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        let mut s = self.state.lock().unwrap();
+        let Ok(mut s) = self.state.lock() else {
+            return false;
+        };
         match code {
             KeyCode::Char('q') => {
                 s.quit_requested = true;
@@ -339,13 +342,13 @@ impl Dashboard for DownloadDashboard {
     }
 
     fn is_done(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        s.done && s.active_files.is_empty()
+        self.state
+            .lock()
+            .map_or(true, |s| s.done && s.active_files.is_empty())
     }
 
     fn quit_requested(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        s.quit_requested
+        self.state.lock().map_or(true, |s| s.quit_requested)
     }
 }
 
@@ -915,7 +918,7 @@ pub async fn run_tui(
         }
     }
 
-    let elapsed = state.lock().unwrap().elapsed();
+    let elapsed = state.lock().map_or(Duration::ZERO, |s| s.elapsed());
     eprintln!(
         "Downloaded {}/{} files ({} bytes) in {:.1}s",
         total_downloaded,

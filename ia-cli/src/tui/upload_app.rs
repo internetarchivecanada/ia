@@ -178,7 +178,10 @@ impl UploadTuiState {
                         item.status = UploadItemStatus::Verifying;
                         item.started_at = Instant::now();
                     }
-                    item.files_total += 1;
+                    // Guard: only count a file once (prevents double-count on retry).
+                    if !self.active_files.contains_key(&fk) {
+                        item.files_total += 1;
+                    }
                 }
                 UploadProgressStatus::Uploading => {
                     if matches!(
@@ -248,6 +251,10 @@ impl UploadTuiState {
         // ── Global state ────────────────────────────────────────────
         match p.status {
             UploadProgressStatus::Verifying => {
+                // Guard: only count a file once (prevents double-count on retry).
+                if self.active_files.contains_key(&fk) {
+                    return;
+                }
                 self.files_total += 1;
                 self.bytes_total += p.total_bytes;
                 self.active_files.insert(
@@ -334,12 +341,15 @@ pub struct UploadDashboard {
 
 impl Dashboard for UploadDashboard {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let s = self.state.lock().unwrap();
-        upload_ui::draw(frame, &s);
+        if let Ok(s) = self.state.lock() {
+            upload_ui::draw(frame, &s);
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        let mut s = self.state.lock().unwrap();
+        let Ok(mut s) = self.state.lock() else {
+            return false;
+        };
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 s.quit_requested = true;
@@ -363,13 +373,13 @@ impl Dashboard for UploadDashboard {
     }
 
     fn is_done(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        s.done && s.active_files.is_empty()
+        self.state
+            .lock()
+            .map_or(true, |s| s.done && s.active_files.is_empty())
     }
 
     fn quit_requested(&self) -> bool {
-        let s = self.state.lock().unwrap();
-        s.quit_requested
+        self.state.lock().map_or(true, |s| s.quit_requested)
     }
 }
 
@@ -440,6 +450,17 @@ async fn run_dashboard_and_summarize(
     tasks_handle.abort();
     drop(_guard);
 
+    // Let the user know if uploads are still in-flight.
+    let in_flight = handles
+        .iter()
+        .filter(|h| !h.is_finished())
+        .count();
+    if in_flight > 0 {
+        eprintln!(
+            "Waiting for {in_flight} in-flight upload(s) to finish (Ctrl-C to abort)..."
+        );
+    }
+
     // 4. Collect results and print summary
     let mut total_uploaded = 0usize;
     let mut total_skipped = 0usize;
@@ -478,7 +499,9 @@ async fn run_dashboard_and_summarize(
         }
     }
 
-    let elapsed = state.lock().unwrap().throughput.elapsed();
+    let elapsed = state
+        .lock()
+        .map_or(Duration::ZERO, |s| s.throughput.elapsed());
     eprintln!(
         "Uploaded {} files, {} skipped, {} failed ({}) in {:.1}s",
         total_uploaded,
@@ -493,6 +516,53 @@ async fn run_dashboard_and_summarize(
     }
 
     Ok(())
+}
+
+/// Post-upload cleanup: remove lingering active files, mark item status, and
+/// check if all items are done. Shared by both `run_upload_tui` and
+/// `run_upload_batch_tui` task closures.
+fn finalize_item(
+    state: &Mutex<UploadTuiState>,
+    id: &str,
+    result: &std::result::Result<Vec<ia_core::upload::UploadResult>, ia_core::error::IaError>,
+) {
+    if let Ok(mut s) = state.lock() {
+        let prefix = format!("{id}\0");
+        s.active_files.retain(|k, _| !k.starts_with(&prefix));
+
+        if let Some(&idx) = s.item_index.get(id) {
+            match result {
+                Ok(_) => {
+                    let item = &mut s.items[idx];
+                    if !matches!(
+                        item.status,
+                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                    ) {
+                        if item.files_failed > 0 {
+                            item.status = UploadItemStatus::Failed(format!(
+                                "{} file(s) failed",
+                                item.files_failed
+                            ));
+                        } else {
+                            item.status = UploadItemStatus::Complete;
+                        }
+                    }
+                }
+                Err(e) => {
+                    s.items[idx].status = UploadItemStatus::Failed(e.to_string());
+                }
+            }
+        }
+
+        if s.items.iter().all(|i| {
+            matches!(
+                i.status,
+                UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+            )
+        }) {
+            s.done = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,50 +612,7 @@ pub async fn run_upload_tui(
             let result =
                 ia_core::upload::upload_item(&client, &id, &files, &opts, Some(progress_fn)).await;
 
-            // Clean up any lingering active files for this item
-            if let Ok(mut s) = cleanup_state.lock() {
-                let prefix = format!("{id}\0");
-                s.active_files.retain(|k, _| !k.starts_with(&prefix));
-
-                // Mark item status based on result
-                if let Some(&idx) = s.item_index.get(&id) {
-                    match &result {
-                        Ok(_) => {
-                            // upload_item's progress events handle per-file status,
-                            // but ensure the item is marked complete/failed.
-                            let item = &mut s.items[idx];
-                            if !matches!(
-                                item.status,
-                                UploadItemStatus::Complete | UploadItemStatus::Failed(_)
-                            ) {
-                                if item.files_failed > 0 {
-                                    item.status = UploadItemStatus::Failed(format!(
-                                        "{} file(s) failed",
-                                        item.files_failed
-                                    ));
-                                } else {
-                                    item.status = UploadItemStatus::Complete;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            s.items[idx].status =
-                                UploadItemStatus::Failed(e.to_string());
-                        }
-                    }
-                }
-
-                // Check if all items are done
-                if s.items.iter().all(|i| {
-                    matches!(
-                        i.status,
-                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
-                    )
-                }) {
-                    s.done = true;
-                }
-            }
-
+            finalize_item(&cleanup_state, &id, &result);
             result
         }));
     }
@@ -655,46 +682,7 @@ pub async fn run_upload_batch_tui(
                 ia_core::upload::upload_item(&client, &id, &files, &item_opts, Some(progress_fn))
                     .await;
 
-            // Clean up lingering active files and mark item status
-            if let Ok(mut s) = cleanup_state.lock() {
-                let prefix = format!("{id}\0");
-                s.active_files.retain(|k, _| !k.starts_with(&prefix));
-
-                if let Some(&idx) = s.item_index.get(&id) {
-                    match &result {
-                        Ok(_) => {
-                            let item = &mut s.items[idx];
-                            if !matches!(
-                                item.status,
-                                UploadItemStatus::Complete | UploadItemStatus::Failed(_)
-                            ) {
-                                if item.files_failed > 0 {
-                                    item.status = UploadItemStatus::Failed(format!(
-                                        "{} file(s) failed",
-                                        item.files_failed
-                                    ));
-                                } else {
-                                    item.status = UploadItemStatus::Complete;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            s.items[idx].status = UploadItemStatus::Failed(e.to_string());
-                        }
-                    }
-                }
-
-                // Check if all items are done
-                if s.items.iter().all(|i| {
-                    matches!(
-                        i.status,
-                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
-                    )
-                }) {
-                    s.done = true;
-                }
-            }
-
+            finalize_item(&cleanup_state, &id, &result);
             result
         }));
     }

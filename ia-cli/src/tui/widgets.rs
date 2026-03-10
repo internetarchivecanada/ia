@@ -3,6 +3,7 @@
 //! These are reusable components extracted from the download dashboard so that
 //! both the download and upload dashboards can share the same look and feel.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -15,16 +16,26 @@ use ratatui::Frame;
 // ThroughputTracker
 // ---------------------------------------------------------------------------
 
-/// Tracks bytes transferred over time and maintains a rolling 60-sample history
-/// suitable for rendering as a sparkline.
+/// Rolling-window throughput tracker.
+///
+/// Maintains a 5-second sliding window of `(timestamp, cumulative_bytes)` samples
+/// to compute *current* throughput, plus a 60-entry sparkline history of those
+/// instantaneous readings. The speed display reflects what's happening *now*,
+/// not a lifetime average.
 #[derive(Debug, Clone)]
 pub struct ThroughputTracker {
     started_at: Instant,
     last_sample: Instant,
     total_bytes: u64,
-    /// Rolling throughput history (bytes/sec), most recent last. Max 60 entries.
-    history: Vec<f64>,
+    /// Sliding window of `(timestamp, cumulative_bytes)` samples, kept for the
+    /// last [`WINDOW`] seconds. Used to compute rolling throughput.
+    samples: VecDeque<(Instant, u64)>,
+    /// Sparkline history (bytes/sec), most recent last. Max 60 entries.
+    history: VecDeque<f64>,
 }
+
+/// Rolling window size for throughput calculation.
+const WINDOW: Duration = Duration::from_secs(5);
 
 impl ThroughputTracker {
     /// Create a new tracker, starting the clock now.
@@ -35,7 +46,8 @@ impl ThroughputTracker {
             started_at: now,
             last_sample: now,
             total_bytes: 0,
-            history: Vec::with_capacity(60),
+            samples: VecDeque::with_capacity(8),
+            history: VecDeque::with_capacity(60),
         }
     }
 
@@ -44,21 +56,45 @@ impl ThroughputTracker {
         self.total_bytes = total;
     }
 
-    /// If at least one second has elapsed since the last sample, push the
-    /// current throughput onto the history ring (keeping at most 60 entries).
+    /// If at least one second has elapsed since the last sample, record the
+    /// current cumulative bytes and push the rolling throughput onto the
+    /// sparkline history (keeping at most 60 entries).
     pub fn maybe_sample(&mut self) {
         if self.last_sample.elapsed() >= Duration::from_secs(1) {
-            self.history.push(self.throughput());
-            if self.history.len() > 60 {
-                self.history.remove(0);
+            let now = Instant::now();
+            self.samples.push_back((now, self.total_bytes));
+
+            // Evict samples older than the rolling window.
+            while self
+                .samples
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t) > WINDOW)
+            {
+                self.samples.pop_front();
             }
-            self.last_sample = Instant::now();
+
+            self.history.push_back(self.throughput());
+            if self.history.len() > 60 {
+                self.history.pop_front();
+            }
+            self.last_sample = now;
         }
     }
 
-    /// Overall bytes/sec since the tracker was created.
+    /// Current bytes/sec computed over the rolling window.
+    ///
+    /// Falls back to a lifetime average when fewer than two samples exist.
     #[must_use]
     pub fn throughput(&self) -> f64 {
+        if self.samples.len() >= 2 {
+            let (t_old, b_old) = self.samples.front().unwrap();
+            let (t_new, b_new) = self.samples.back().unwrap();
+            let dt = t_new.duration_since(*t_old).as_secs_f64();
+            if dt > 0.0 {
+                return b_new.saturating_sub(*b_old) as f64 / dt;
+            }
+        }
+        // Fallback: lifetime average until the window fills.
         let secs = self.started_at.elapsed().as_secs_f64();
         if secs > 0.0 {
             self.total_bytes as f64 / secs
@@ -75,7 +111,7 @@ impl ThroughputTracker {
 
     /// Read-only access to the throughput history for sparkline rendering.
     #[must_use]
-    pub fn history(&self) -> &[f64] {
+    pub fn history(&self) -> &VecDeque<f64> {
         &self.history
     }
 }
@@ -83,6 +119,31 @@ impl ThroughputTracker {
 impl Default for ThroughputTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// String truncation helpers
+// ---------------------------------------------------------------------------
+
+/// Truncate a string to fit within `max_chars` (by character count, not bytes).
+///
+/// If the string exceeds the limit, the *start* is elided and replaced with
+/// an ellipsis (`…`), keeping the last `max_chars - 1` characters visible.
+/// This is useful for identifiers and file paths where the tail is most
+/// informative.
+#[must_use]
+pub fn truncate_tail(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let start = s
+            .char_indices()
+            .rev()
+            .nth(keep.saturating_sub(1))
+            .map_or(0, |(i, _)| i);
+        format!("\u{2026}{}", &s[start..])
+    } else {
+        format!("{s:<max_chars$}")
     }
 }
 
@@ -136,9 +197,9 @@ pub fn format_eta(remaining_bytes: u64, bytes_per_sec: f64) -> String {
 ///
 /// `history` is a slice of bytes/sec values (most recent last), typically from
 /// [`ThroughputTracker::history`].
-pub fn draw_throughput_panel(frame: &mut Frame, area: Rect, history: &[f64]) {
+pub fn draw_throughput_panel(frame: &mut Frame, area: Rect, history: &VecDeque<f64>) {
     let block = Block::default()
-        .title(" Throughput (last 60s) ")
+        .title(" Speed (last 60s) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -295,9 +356,9 @@ mod tests {
         let mut tracker = ThroughputTracker::new();
         // Manually push 65 samples to verify the cap
         for i in 0..65 {
-            tracker.history.push(i as f64 * 100.0);
+            tracker.history.push_back(i as f64 * 100.0);
             if tracker.history.len() > 60 {
-                tracker.history.remove(0);
+                tracker.history.pop_front();
             }
         }
         assert_eq!(tracker.history().len(), 60);
@@ -310,5 +371,36 @@ mod tests {
         let tracker = ThroughputTracker::new();
         std::thread::sleep(Duration::from_millis(10));
         assert!(tracker.elapsed() >= Duration::from_millis(5));
+    }
+
+    // -- truncate_tail --------------------------------------------------------
+
+    #[test]
+    fn truncate_tail_short_string() {
+        assert_eq!(truncate_tail("hello", 10), "hello     ");
+    }
+
+    #[test]
+    fn truncate_tail_exact_length() {
+        assert_eq!(truncate_tail("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_tail_long_string() {
+        let result = truncate_tail("abcdefghijklmnop", 10);
+        assert!(result.starts_with('\u{2026}'));
+        assert_eq!(result.chars().count(), 10);
+        // 9 chars from end + ellipsis = 10
+        assert!(result.ends_with("hijklmnop"));
+    }
+
+    #[test]
+    fn truncate_tail_multibyte_utf8() {
+        // Japanese characters (3 bytes each in UTF-8)
+        let s = "\u{3042}\u{3044}\u{3046}\u{3048}\u{304a}"; // あいうえお
+        let result = truncate_tail(s, 4);
+        assert!(result.starts_with('\u{2026}'));
+        assert_eq!(result.chars().count(), 4);
+        // Should not panic — this is the key property
     }
 }

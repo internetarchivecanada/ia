@@ -189,14 +189,7 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &UploadTuiState) {
             "\u{2014}".to_string()
         };
 
-        let name = if item.identifier.len() > 25 {
-            format!(
-                "\u{2026}{}",
-                &item.identifier[item.identifier.len() - 24..]
-            )
-        } else {
-            format!("{:<25}", item.identifier)
-        };
+        let name = widgets::truncate_tail(&item.identifier, 25);
 
         lines.push(Line::from(vec![
             status_icon,
@@ -267,11 +260,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
             "\u{2591}".repeat(empty),
         );
 
-        let name = if fp.name.len() > 30 {
-            format!("\u{2026}{}", &fp.name[fp.name.len() - 29..])
-        } else {
-            format!("{:<30}", fp.name)
-        };
+        let name = widgets::truncate_tail(&fp.name, 30);
 
         lines.push(Line::from(vec![
             Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
@@ -295,11 +284,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
             .take(remaining.min(3));
 
         for name in recent {
-            let display_name = if name.len() > 30 {
-                format!("\u{2026}{}", &name[name.len() - 29..])
-            } else {
-                format!("{:<30}", name)
-            };
+            let display_name = widgets::truncate_tail(name, 30);
             lines.push(Line::from(vec![
                 Span::styled(" \u{2713} ", Style::default().fg(Color::Green)),
                 Span::styled(display_name, Style::default().fg(Color::DarkGray)),

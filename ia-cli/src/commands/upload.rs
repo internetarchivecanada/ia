@@ -601,13 +601,9 @@ async fn run_import(
         );
     }
 
-    let quiet_level = quiet;
     let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         if !json_mode && quiet == 0 {
             Some(std::sync::Arc::new(move |p: UploadProgress| {
-                if json_mode || quiet_level >= 1 {
-                    return;
-                }
                 match p.status {
                     UploadProgressStatus::Complete => {
                         eprintln!(
