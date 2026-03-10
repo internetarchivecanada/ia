@@ -90,7 +90,7 @@ struct Cli {
 enum Commands {
     /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
-    /// Download files from one or more items
+    /// Download files from an item
     #[command(visible_alias = "do")]
     Download(commands::download::DownloadArgs),
     /// List files in an item with filtering and formatting

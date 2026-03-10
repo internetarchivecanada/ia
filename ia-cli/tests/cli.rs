@@ -366,6 +366,24 @@ fn json_and_dashboard_are_mutually_exclusive() {
         .stderr(predicate::str::contains("mutually exclusive"));
 }
 
+// -- download file args tests --
+
+#[test]
+fn download_help_shows_file_example() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ia download nasa NASAarchiveLogo.jpg"));
+}
+
+#[test]
+fn download_help_shows_piped_example() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ia search -q collection:nasa --json | ia download"));
+}
+
 // -- --json integration tests --
 
 #[test]
