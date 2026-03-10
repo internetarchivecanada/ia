@@ -285,21 +285,13 @@ pub async fn download_file(
         Err(_) => None,
     };
 
-    // Build request — include S3 auth header if credentials are available,
-    // so restricted items can be downloaded by authenticated users.
-    let mut req = client.http().get(&url);
-    if let Some((access, secret)) = client
+    // Build auth header if credentials are available.
+    let auth_value = client
         .config()
         .s3_access
         .as_deref()
         .zip(client.config().s3_secret.as_deref())
-    {
-        req = req.header("Authorization", format!("LOW {access}:{secret}"));
-    }
-    if let Some(offset) = resume_from {
-        debug!(file = %file.name, offset, "resuming download");
-        req = req.header("Range", format!("bytes={offset}-"));
-    }
+        .map(|(access, secret)| format!("LOW {access}:{secret}"));
 
     if let Some(p) = progress {
         p(DownloadProgress {
@@ -311,7 +303,84 @@ pub async fn download_file(
         });
     }
 
-    let response = req.send().await?;
+    // Use the no-redirect client and follow redirects manually so the
+    // Authorization header is preserved. archive.org redirects /download/
+    // to data-node hosts (ia800XXX.us.archive.org), and reqwest strips
+    // Authorization on redirect by default. This is the equivalent of
+    // curl's --location-trusted flag.
+    let response = {
+        let max_redirects = 10;
+        let mut current_url = url;
+        let mut resp = None;
+
+        for _ in 0..=max_redirects {
+            let mut req = client.no_redirect_http().get(&current_url);
+            if let Some(ref auth) = auth_value {
+                req = req.header("Authorization", auth);
+            }
+            if let Some(offset) = resume_from {
+                debug!(file = %file.name, offset, "resuming download");
+                req = req.header("Range", format!("bytes={offset}-"));
+            }
+
+            let r = req.send().await.map_err(|e| {
+                // Wrap raw reqwest::Error into the middleware error type
+                // so it converts to IaError::Network (which is retryable).
+                IaError::Network(reqwest_middleware::Error::Reqwest(e))
+            })?;
+
+            if r.status().is_redirection() {
+                let location = r
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| IaError::Http {
+                        status: r.status().as_u16(),
+                        message: "redirect without Location header".to_string(),
+                    })?;
+
+                // Resolve relative URLs against the current URL.
+                let base = reqwest::Url::parse(&current_url).map_err(|e| {
+                    IaError::Config(format!("invalid download URL: {e}"))
+                })?;
+                let new_url = base.join(location).map_err(|e| {
+                    IaError::Config(format!("invalid redirect location: {e}"))
+                })?;
+
+                // Only follow redirects to *.archive.org (same SSRF guard
+                // as the main client's redirect policy). Also allow the
+                // configured host so tests with wiremock work correctly.
+                let config_host = client.host();
+                match new_url.host_str() {
+                    Some(host)
+                        if host == "archive.org"
+                            || host.ends_with(".archive.org")
+                            || new_url.authority() == config_host =>
+                    {
+                        debug!(file = %file.name, location = %new_url, "following redirect");
+                        current_url = new_url.to_string();
+                        continue;
+                    }
+                    _ => {
+                        return Err(IaError::Http {
+                            status: r.status().as_u16(),
+                            message: format!(
+                                "redirect to non-archive.org domain: {new_url}"
+                            ),
+                        });
+                    }
+                }
+            }
+
+            resp = Some(r);
+            break;
+        }
+
+        resp.ok_or_else(|| IaError::Http {
+            status: 0,
+            message: "too many redirects".to_string(),
+        })?
+    };
     let status = response.status();
 
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -649,7 +718,7 @@ pub async fn download_item(
                         if e.is_retryable() {
                             warn!(file = %file.name, attempt, error = %e, "download failed (will retry)");
                         } else {
-                            warn!(file = %file.name, error = %e, "download failed (not retryable)");
+                            debug!(file = %file.name, error = %e, "download failed (not retryable)");
                             last_err = Some(e);
                             break;
                         }
@@ -1171,16 +1240,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_error_is_retried() {
+    async fn server_error_returns_err() {
         let mock_server = MockServer::start().await;
 
-        // 500 should be retried at both middleware and app level.
-        // With reqwest-retry (3 middleware retries) and retries=1 (2 app attempts),
-        // we expect > 1 total request. Use expect(2..) to verify retry happened.
+        // download_file uses the no-redirect client (no retry middleware),
+        // so a 500 returns Err immediately. App-level retry is handled by
+        // download_item's retry loop, not here.
         let guard = Mock::given(method("GET"))
             .and(path("/download/test-item/flaky.txt"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
-            .expect(2..)
+            .expect(1)
             .mount_as_scoped(&mock_server)
             .await;
 
@@ -1788,5 +1857,96 @@ mod tests {
             !download_req.headers.contains_key("Authorization"),
             "should not send Authorization header without credentials"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_header_preserved_across_redirect() {
+        use wiremock::matchers::header;
+
+        let mock_server = MockServer::start().await;
+
+        // First request returns a redirect (simulating archive.org → data node).
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/secret.txt"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/data/secret.txt", mock_server.uri())),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Redirected request must have the Authorization header.
+        Mock::given(method("GET"))
+            .and(path("/data/secret.txt"))
+            .and(header("Authorization", "LOW test_access:test_secret"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"secret content".to_vec()),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut config = mock_config(&mock_server.uri());
+        config.s3_access = Some("test_access".to_string());
+        config.s3_secret = Some("test_secret".to_string());
+        let client = IaClient::from_config(config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("secret.txt", 14);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        let content = std::fs::read_to_string(dir.path().join("secret.txt")).unwrap();
+        assert_eq!(content, "secret content");
+    }
+
+    #[tokio::test]
+    async fn redirect_to_non_archive_org_blocked() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/evil.txt"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", "https://evil.example.com/steal"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("evil.txt", 100);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            IaError::Http { message, .. } => {
+                assert!(
+                    message.contains("non-archive.org"),
+                    "should mention non-archive.org: {message}"
+                );
+            }
+            other => panic!("expected Http error, got: {other:?}"),
+        }
     }
 }

@@ -32,6 +32,12 @@ impl std::error::Error for RedirectBlockedError {}
 #[derive(Clone)]
 pub struct IaClient {
     http: ClientWithMiddleware,
+    /// Client with redirects disabled, for requests that need to preserve
+    /// the `Authorization` header across redirects (equivalent to curl's
+    /// `--location-trusted`). archive.org redirects `/download/` requests
+    /// to data-node hosts like `ia600XXX.us.archive.org`, and reqwest
+    /// strips `Authorization` on redirects by default.
+    no_redirect_http: reqwest::Client,
     config: IaConfig,
     user_agent: String,
 }
@@ -44,7 +50,7 @@ impl IaClient {
     }
 
     /// Build the raw reqwest client with shared settings (headers, pool config).
-    fn build_raw_client(config: &IaConfig) -> Result<(reqwest::Client, String)> {
+    fn build_raw_client(config: &IaConfig) -> Result<(reqwest::Client, reqwest::Client, String)> {
         let user_agent = build_user_agent(config);
 
         let mut headers = HeaderMap::new();
@@ -63,18 +69,29 @@ impl IaClient {
         });
 
         let raw_client = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .pool_max_idle_per_host(10)
             .redirect(redirect_policy)
             .build()
             .map_err(|e| crate::error::IaError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        Ok((raw_client, user_agent))
+        // No-redirect client for download auth: archive.org redirects
+        // /download/ to data nodes, and reqwest strips Authorization on
+        // redirect. We handle redirects manually to preserve auth headers
+        // (equivalent to curl --location-trusted).
+        let no_redirect_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .pool_max_idle_per_host(10)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| crate::error::IaError::Config(format!("failed to build no-redirect client: {e}")))?;
+
+        Ok((raw_client, no_redirect_client, user_agent))
     }
 
     /// Create a new client with the provided config.
     pub fn from_config(config: IaConfig) -> Result<Self> {
-        let (raw_client, user_agent) = Self::build_raw_client(&config)?;
+        let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(
@@ -89,6 +106,7 @@ impl IaClient {
 
         Ok(Self {
             http,
+            no_redirect_http: no_redirect_client,
             config,
             user_agent,
         })
@@ -133,6 +151,16 @@ impl IaClient {
         &self.http
     }
 
+    /// HTTP client with redirects disabled, for manual redirect handling.
+    ///
+    /// Use this for requests that need to preserve the `Authorization`
+    /// header across redirects (archive.org redirects `/download/` to
+    /// data-node hosts, and reqwest strips auth headers on redirect).
+    /// Equivalent to curl's `--location-trusted`.
+    pub fn no_redirect_http(&self) -> &reqwest::Client {
+        &self.no_redirect_http
+    }
+
     /// The current configuration.
     pub fn config(&self) -> &IaConfig {
         &self.config
@@ -144,11 +172,12 @@ impl IaClient {
     /// needs to see raw HTTP responses without middleware intervention.
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
-        let (raw_client, user_agent) = Self::build_raw_client(&config)?;
+        let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
         let http = ClientBuilder::new(raw_client).build();
 
         Ok(Self {
             http,
+            no_redirect_http: no_redirect_client,
             config,
             user_agent,
         })
