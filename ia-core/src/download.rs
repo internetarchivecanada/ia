@@ -285,8 +285,17 @@ pub async fn download_file(
         Err(_) => None,
     };
 
-    // Build request
+    // Build request — include S3 auth header if credentials are available,
+    // so restricted items can be downloaded by authenticated users.
     let mut req = client.http().get(&url);
+    if let Some((access, secret)) = client
+        .config()
+        .s3_access
+        .as_deref()
+        .zip(client.config().s3_secret.as_deref())
+    {
+        req = req.header("Authorization", format!("LOW {access}:{secret}"));
+    }
     if let Some(offset) = resume_from {
         debug!(file = %file.name, offset, "resuming download");
         req = req.header("Range", format!("bytes={offset}-"));
@@ -307,9 +316,19 @@ pub async fn download_file(
 
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
         let body = response.text().await.unwrap_or_default();
+        // IA often returns full HTML error pages (e.g. "Item not available").
+        // Strip HTML and use the canonical reason phrase instead.
+        let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
+            status
+                .canonical_reason()
+                .unwrap_or("unknown error")
+                .to_string()
+        } else {
+            body
+        };
         return Err(IaError::Http {
             status: status.as_u16(),
-            message: body,
+            message,
         });
     }
 
@@ -1594,6 +1613,167 @@ mod tests {
         assert_eq!(
             target_content, "original content",
             "symlink target should not be modified even with 206 response"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_error_body_is_stripped() {
+        let mock_server = MockServer::start().await;
+
+        let html_body = r#"<!DOCTYPE html>
+<html lang="en"><head><title>Item not available</title></head>
+<body><h1>Item not available</h1></body></html>"#;
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/restricted.txt"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(html_body))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("restricted.txt", 100);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            IaError::Http { status, message } => {
+                assert_eq!(*status, 403);
+                // Message should be the canonical reason, not HTML
+                assert_eq!(message, "Forbidden");
+                assert!(!message.contains("<!DOCTYPE"));
+                assert!(!message.contains("<html"));
+            }
+            other => panic!("expected Http error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_text_error_body_is_preserved() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/gone.txt"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("No such file"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("gone.txt", 100);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            IaError::Http { status, message } => {
+                assert_eq!(*status, 404);
+                assert_eq!(message, "No such file");
+            }
+            other => panic!("expected Http error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_header_sent_when_credentials_configured() {
+        use wiremock::matchers::header;
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/secret.txt"))
+            .and(header("Authorization", "LOW test_access:test_secret"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"secret content".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = mock_config(&mock_server.uri());
+        config.s3_access = Some("test_access".to_string());
+        config.s3_secret = Some("test_secret".to_string());
+        let client = IaClient::from_config(config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("secret.txt", 14);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        let content = std::fs::read_to_string(dir.path().join("secret.txt")).unwrap();
+        assert_eq!(content, "secret content");
+    }
+
+    #[tokio::test]
+    async fn no_auth_header_when_no_credentials() {
+        use wiremock::matchers::header_exists;
+
+        let mock_server = MockServer::start().await;
+
+        // This mock only matches requests WITHOUT an Authorization header.
+        // If an auth header is sent, wiremock returns 404, failing the test.
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/public.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"public content".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // No s3 credentials configured
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("public.txt", 14);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+
+        // Verify the request was received (confirms no unexpected auth header issue)
+        let requests = mock_server.received_requests().await.unwrap();
+        let download_req = requests
+            .iter()
+            .find(|r| r.url.path().contains("public.txt"))
+            .expect("download request should have been made");
+        assert!(
+            !download_req.headers.contains_key("Authorization"),
+            "should not send Authorization header without credentials"
         );
     }
 }
