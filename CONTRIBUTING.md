@@ -8,11 +8,13 @@
 
 ## Setup
 
-After cloning, enable the commit hook that prevents direct commits to main:
+Optionally, enable the local pre-commit hook to prevent accidental commits to main:
 
 ```sh
 git config core.hooksPath scripts/hooks
 ```
+
+This is a convenience — GitHub branch protection is what actually guards main.
 
 ## Project Structure
 
@@ -28,7 +30,7 @@ ia/
 
 ## Workflow
 
-Work happens on feature branches — main is protected by a pre-commit hook and branch protection.
+Work happens on feature branches — main is protected by GitHub branch protection.
 
 ### Plan
 

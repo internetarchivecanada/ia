@@ -41,13 +41,12 @@ Don't add crates without asking. Prefer `std`, existing deps, or small focused c
 
 ## Workflow
 
-All work happens on feature branches in git worktrees. Commits to main are rejected by a pre-commit hook.
+Work happens on feature branches — main is protected by GitHub branch protection.
 
 - For non-trivial work, write a design doc or implementation plan in `docs/plans/` and commit it before implementation code.
-- Use `scripts/ia-worktree <type> <slug>` to create worktrees (types: `fix`, `feat`, `refactor`, `docs`, `chore`).
+- Helper scripts are available for git worktrees: `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`), `scripts/ia-cleanup <slug>` after merge.
 - Run `cargo test -p ia-core -p ia-cli` and `cargo clippy -p ia-core -p ia-cli -- -D warnings` before committing.
 - Update CLI help text (`about`, `long_about`, `after_long_help`) when modifying flags or subcommands.
-- After merge, clean up with `scripts/ia-cleanup <slug>` from outside the worktree.
 
 ## `--json` Output
 
