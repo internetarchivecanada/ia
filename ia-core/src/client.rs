@@ -32,6 +32,13 @@ impl std::error::Error for RedirectBlockedError {}
 #[derive(Clone)]
 pub struct IaClient {
     http: ClientWithMiddleware,
+    /// Raw reqwest client without retry middleware.
+    ///
+    /// Used by operations that manage their own retry loops (e.g., upload)
+    /// and need to send streaming (non-cloneable) request bodies.
+    /// The retry middleware requires cloneable requests, which conflicts
+    /// with `Body::wrap_stream()` and `Body::from(tokio::fs::File)`.
+    raw_http: reqwest::Client,
     /// Client with redirects disabled, for requests that need to preserve
     /// the `Authorization` header across redirects (equivalent to curl's
     /// `--location-trusted`). archive.org redirects `/download/` requests
@@ -100,12 +107,16 @@ impl IaClient {
             )
             .build_with_max_retries(3);
 
+        // Clone before moving into middleware — reqwest::Client is Arc-based, cheap to clone.
+        let raw_http = raw_client.clone();
+
         let http = ClientBuilder::new(raw_client)
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
         Ok(Self {
             http,
+            raw_http,
             no_redirect_http: no_redirect_client,
             config,
             user_agent,
@@ -151,6 +162,17 @@ impl IaClient {
         &self.http
     }
 
+    /// Raw HTTP client without retry middleware.
+    ///
+    /// Use this for requests with streaming (non-cloneable) bodies, such as
+    /// file uploads. The retry middleware requires `Request::try_clone()` to
+    /// succeed, which fails for `Body::wrap_stream()` and
+    /// `Body::from(tokio::fs::File)`. Operations using this client must
+    /// implement their own retry logic.
+    pub(crate) fn raw_http(&self) -> &reqwest::Client {
+        &self.raw_http
+    }
+
     /// HTTP client with redirects disabled, for manual redirect handling.
     ///
     /// Use this for requests that need to preserve the `Authorization`
@@ -173,10 +195,12 @@ impl IaClient {
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
         let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
+        let raw_http = raw_client.clone();
         let http = ClientBuilder::new(raw_client).build();
 
         Ok(Self {
             http,
+            raw_http,
             no_redirect_http: no_redirect_client,
             config,
             user_agent,
