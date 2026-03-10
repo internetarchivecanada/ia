@@ -23,20 +23,25 @@ use crate::output::DownloadDisplay;
 
 #[derive(Args)]
 #[command(
-    long_about = "Download files from the Internet Archive. Downloads all files from one or more \
-        items, with options to filter by format, glob pattern, or source type. Supports batch \
-        downloads via search queries or item lists.",
+    long_about = "Download files from the Internet Archive. Downloads all files from an item, \
+        or specific files when file names are given. Supports batch downloads via search queries, \
+        item lists, or piped identifiers from stdin.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
+         \n\n  <dim># Download specific files</dim>\n  <bold>$ ia download nasa NASAarchiveLogo.jpg</bold>\
          \n\n  <dim># Download only MP4 files</dim>\n  <bold>$ ia download nasa --glob \"*.mp4\"</bold>\
-         \n\n  <dim># Batch download items matching a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\
+         \n\n  <dim># Batch download from a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\
+         \n\n  <dim># Batch download from piped identifiers</dim>\n  <bold>$ ia search -q collection:nasa --json | ia download</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
 pub struct DownloadArgs {
-    /// Item identifier(s) to download
-    pub identifiers: Vec<String>,
+    /// Item identifier to download
+    pub identifier: Option<String>,
+
+    /// Specific file(s) to download from the item
+    pub files: Vec<String>,
 
     /// File containing item identifiers (one per line)
     #[arg(long)]
@@ -137,9 +142,16 @@ fn parse_identifier_line(line: &str) -> Option<String> {
 
 /// Collect all identifiers from args, --itemlist file, --search, and stdin.
 async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<Vec<String>> {
-    let mut ids = args.identifiers.clone();
+    let mut ids: Vec<String> = args.identifier.iter().cloned().collect();
+
+    if !args.files.is_empty() && ids.is_empty() {
+        bail!("file names require an identifier: ia download <identifier> <file> [file ...]");
+    }
 
     if let Some(path) = &args.itemlist {
+        if !args.files.is_empty() {
+            bail!("cannot combine file names with --itemlist (file names apply to a single item)");
+        }
         let content = std::fs::read_to_string(path)
             .context(format!("failed to read itemlist: {}", path.display()))?;
         for line in content.lines() {
@@ -151,6 +163,9 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
 
     // --search: collect identifiers from search results
     if let Some(ref query) = args.search {
+        if !args.files.is_empty() {
+            bail!("cannot combine file names with --search (file names apply to a single item)");
+        }
         let opts = SearchOpts::default();
         let mut stream = ia_core::search::scrape(client, query, &opts);
         while let Some(result) = stream.next().await {
@@ -159,17 +174,18 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
         }
     }
 
-    // Also read from stdin if no identifiers and no itemlist and no search
-    if ids.is_empty() && args.itemlist.is_none() && args.search.is_none() {
-        // Check if stdin is a pipe
-        if !std::io::stdin().is_terminal() {
-            use std::io::BufRead;
-            let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let line = line.context("failed to read from stdin")?;
-                if let Some(id) = parse_identifier_line(&line) {
-                    ids.push(id);
-                }
+    // Read from stdin if no identifier and no itemlist and no search
+    if ids.is_empty()
+        && args.itemlist.is_none()
+        && args.search.is_none()
+        && !std::io::stdin().is_terminal()
+    {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.context("failed to read from stdin")?;
+            if let Some(id) = parse_identifier_line(&line) {
+                ids.push(id);
             }
         }
     }
@@ -191,8 +207,8 @@ pub async fn run(
 
     let mut identifiers = collect_identifiers(&args, client).await?;
 
-    // Detect file paths passed as identifiers and suggest --itemlist
-    for id in &identifiers {
+    // Detect file paths passed as identifier and suggest --itemlist
+    if let Some(ref id) = args.identifier {
         if std::path::Path::new(id).exists() && (id.contains('/') || id.contains('\\')) {
             bail!(
                 "\"{}\" looks like a file path. Did you mean:\n  ia download --itemlist {}",
@@ -256,7 +272,7 @@ pub async fn run(
             formats: args.format.clone(),
             source: args.source.clone(),
             exclude_source: args.exclude_source.clone(),
-            names: vec![],
+            names: args.files.clone(),
         },
     };
 
