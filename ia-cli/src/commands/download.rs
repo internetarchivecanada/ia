@@ -293,9 +293,8 @@ pub async fn run(
             opts.clone()
         };
 
-        let multi = indicatif::MultiProgress::new();
         let display = if !args.json && quiet == 0 {
-            Some(Arc::new(DownloadDisplay::new(identifier, &multi)))
+            Some(Arc::new(DownloadDisplay::new(identifier)))
         } else {
             None
         };

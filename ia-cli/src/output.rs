@@ -7,94 +7,106 @@ use std::sync::Mutex;
 use ia_core::download::{DownloadProgress, DownloadStatus, ItemDownloadResult};
 use ia_core::upload::{UploadProgress, UploadProgressStatus};
 
+/// Single-item download progress: one aggregate bar, no dynamic insertion.
+///
+/// Uses a single `ProgressBar` tracking total bytes across all files.
+/// The header is printed once via `eprintln!`, errors are collected and
+/// printed at the end to avoid any redraw/flicker issues.
 pub struct DownloadDisplay {
     identifier: String,
-    multi: MultiProgress,
-    bars: Mutex<HashMap<String, ProgressBar>>,
-    header: ProgressBar,
-    separator: ProgressBar,
+    bar: ProgressBar,
+    per_file_bytes: Mutex<HashMap<String, u64>>,
+    files_done: Mutex<usize>,
+    files_total: Mutex<usize>,
+    errors: Mutex<Vec<String>>,
 }
 
 impl DownloadDisplay {
-    pub fn new(identifier: &str, multi: &MultiProgress) -> Self {
-        let header = multi.add(ProgressBar::new_spinner());
-        header.set_message(format!(
-            "{}  Resolving...",
-            style(identifier).bold()
-        ));
-        header.enable_steady_tick(std::time::Duration::from_millis(100));
-
-        let separator = multi.add(ProgressBar::new_spinner());
-        separator.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        separator.set_message(
-            style("────────────────────────────────────────────────────")
-                .dim()
-                .to_string(),
+    pub fn new(identifier: &str) -> Self {
+        eprintln!(
+            "{} {}",
+            style("▸").cyan(),
+            style(identifier).bold(),
         );
+
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "  {bar:40.cyan/dim} {bytes}/{total_bytes} {bytes_per_sec:.dim}  ({msg})",
+            )
+            .unwrap()
+            .progress_chars("━╸─"),
+        );
+        bar.set_message("starting...");
 
         Self {
             identifier: identifier.to_string(),
-            multi: multi.clone(),
-            bars: Mutex::new(HashMap::new()),
-            header,
-            separator,
+            bar,
+            per_file_bytes: Mutex::new(HashMap::new()),
+            files_done: Mutex::new(0),
+            files_total: Mutex::new(0),
+            errors: Mutex::new(Vec::new()),
         }
     }
 
     pub fn update(&self, progress: DownloadProgress) {
-        let mut bars = self.bars.lock().unwrap();
-
         match &progress.status {
+            DownloadStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                self.bar.set_length(*bytes_total);
+                *self.files_total.lock().unwrap() = *files_count;
+                self.bar.set_message(format!("0/{files_count} files"));
+            }
             DownloadStatus::Starting | DownloadStatus::Downloading => {
-                let bar = bars.entry(progress.file_name.clone()).or_insert_with(|| {
-                    let pb = self.multi.insert_before(
-                        &self.separator,
-                        ProgressBar::new(progress.total_bytes.unwrap_or(0)),
-                    );
-                    pb.set_style(
-                        ProgressStyle::default_bar()
-                            .template("  {prefix:.dim} {bar:20.cyan/dim} {bytes}/{total_bytes} {bytes_per_sec:.dim}")
-                            .unwrap()
-                            .progress_chars("━╸─"),
-                    );
-                    pb.set_prefix(progress.file_name.clone());
-                    pb
-                });
-                bar.set_position(progress.bytes_downloaded);
+                let mut map = self.per_file_bytes.lock().unwrap();
+                map.insert(progress.file_name.clone(), progress.bytes_downloaded);
+                let total: u64 = map.values().sum();
+                self.bar.set_position(total);
             }
             DownloadStatus::Complete => {
-                if let Some(bar) = bars.remove(&progress.file_name) {
-                    bar.finish_with_message(format!(
-                        "  {} {}",
-                        style(&progress.file_name).dim(),
-                        style("done").green()
-                    ));
+                if let Some(size) = progress.total_bytes {
+                    let mut map = self.per_file_bytes.lock().unwrap();
+                    map.insert(progress.file_name.clone(), size);
+                    let total: u64 = map.values().sum();
+                    self.bar.set_position(total);
                 }
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{total} files"));
             }
-            DownloadStatus::Skipped(reason) => {
-                if let Some(bar) = bars.remove(&progress.file_name) {
-                    bar.finish_with_message(format!(
-                        "  {} {}",
-                        style(&progress.file_name).dim(),
-                        style(format!("skipped ({reason})")).yellow()
-                    ));
-                }
+            DownloadStatus::Skipped(_) => {
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{total} files"));
             }
             DownloadStatus::Failed(err) => {
-                if let Some(bar) = bars.remove(&progress.file_name) {
-                    bar.finish_with_message(format!(
-                        "  {} {}",
-                        style(&progress.file_name).dim(),
-                        style(format!("FAILED: {err}")).red()
-                    ));
-                }
+                self.errors.lock().unwrap().push(format!(
+                    "  {} {} {}",
+                    style("✗").red(),
+                    style(&progress.file_name).dim(),
+                    style(format!("— {err}")).red(),
+                ));
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{total} files"));
             }
-            DownloadStatus::Enumerated { .. } | DownloadStatus::Verifying => {}
+            DownloadStatus::Verifying => {}
         }
     }
 
     pub fn finish(&self, result: &ItemDownloadResult, destdir: &Path) {
-        self.header.finish_and_clear();
+        self.bar.finish_and_clear();
+
+        // Print collected errors
+        let errors = self.errors.lock().unwrap();
+        for err in errors.iter() {
+            eprintln!("{err}");
+        }
 
         let elapsed = result.elapsed.as_secs_f64();
         let speed = if elapsed > 0.0 {
@@ -106,7 +118,7 @@ impl DownloadDisplay {
             String::new()
         };
 
-        let summary = format!(
+        eprintln!(
             "{}  {} files ({}) in {:.1}s{}",
             style(&self.identifier).bold(),
             result.files_downloaded,
@@ -114,8 +126,7 @@ impl DownloadDisplay {
             elapsed,
             style(&speed).dim(),
         );
-
-        let stats = format!(
+        eprintln!(
             "  {} {} downloaded · {} skipped · {} errors",
             style("✓").green(),
             result.files_downloaded,
@@ -133,10 +144,6 @@ impl DownloadDisplay {
             },
         );
 
-        eprintln!("{summary}");
-        eprintln!("{stats}");
-
-        // Disk space
         if let Some(free) = disk_space_free(destdir) {
             eprintln!(
                 "  {}: {} free",
