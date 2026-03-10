@@ -18,19 +18,17 @@ pub struct DownloadDisplay {
 impl DownloadDisplay {
     pub fn new(identifier: &str, multi: &MultiProgress) -> Self {
         let header = multi.add(ProgressBar::new_spinner());
+        header.set_style(ProgressStyle::with_template("{msg}").unwrap());
         header.set_message(format!(
-            "{}  Resolving...",
-            style(identifier).bold()
+            "{} {}",
+            style("▸").cyan(),
+            style(identifier).bold(),
         ));
-        header.enable_steady_tick(std::time::Duration::from_millis(100));
 
         let separator = multi.add(ProgressBar::new_spinner());
         separator.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        separator.set_message(
-            style("────────────────────────────────────────────────────")
-                .dim()
-                .to_string(),
-        );
+        separator.set_message("");
+        separator.finish();
 
         Self {
             identifier: identifier.to_string(),

@@ -658,12 +658,25 @@ pub async fn download_item(
                 }
             }
 
+            let status = DownloadStatus::Failed(
+                last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string()),
+            );
+
+            // Notify progress callback so the UI can clean up the file's bar.
+            if let Some(ref p) = progress {
+                p(DownloadProgress {
+                    identifier: identifier.clone(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded: 0,
+                    total_bytes: file.size,
+                    status: status.clone(),
+                });
+            }
+
             FileDownloadResult {
                 file_name: file.name.clone(),
                 bytes: 0,
-                status: DownloadStatus::Failed(
-                    last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string()),
-                ),
+                status,
                 elapsed: start.elapsed(),
             }
         });
