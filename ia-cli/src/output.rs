@@ -7,6 +7,161 @@ use std::sync::Mutex;
 use ia_core::download::{DownloadProgress, DownloadStatus, ItemDownloadResult};
 use ia_core::upload::{UploadProgress, UploadProgressStatus};
 
+// ─── Shared progress style ──────────────────────────────────────────────────
+
+/// Progress bar characters: filled, head, empty.
+const PROGRESS_CHARS: &str = "━╸─";
+
+/// Progress bar width in terminal columns.
+const BAR_WIDTH: usize = 40;
+
+// Icons used across all progress displays.
+const ICON_HEADER: &str = "▸";
+const ICON_SUCCESS: &str = "✓";
+const ICON_ERROR: &str = "✗";
+#[allow(dead_code)]
+const ICON_SKIPPED: &str = "–";
+#[allow(dead_code)]
+const ICON_DRY_RUN: &str = "⊘";
+
+/// Create a progress bar with the shared style.
+fn make_progress_bar(total_bytes: u64) -> ProgressBar {
+    let bar = ProgressBar::new(total_bytes);
+    bar.set_style(
+        ProgressStyle::with_template(&format!(
+            "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
+        ))
+        .unwrap()
+        .progress_chars(PROGRESS_CHARS),
+    );
+    bar.set_message("starting...");
+    bar
+}
+
+/// Print `▸ identifier` header line to stderr.
+fn print_item_header(identifier: &str) {
+    eprintln!(
+        "{} {}",
+        style(ICON_HEADER).cyan(),
+        style(identifier).bold(),
+    );
+}
+
+/// Format transfer speed as `· X.X MiB/s`, or empty string if elapsed is zero.
+fn format_speed(bytes: u64, elapsed_secs: f64) -> String {
+    if elapsed_secs > 0.0 {
+        format!(
+            " · {}/s",
+            format_bytes((bytes as f64 / elapsed_secs) as u64)
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Format a count: colored if non-zero, plain "0" otherwise.
+fn colored_count_yellow(count: usize) -> String {
+    if count > 0 {
+        style(count.to_string()).yellow().to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+fn colored_count_red(count: usize) -> String {
+    if count > 0 {
+        style(count.to_string()).red().to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Print the standard item completion block to stderr.
+fn print_item_finish(
+    identifier: &str,
+    verb: &str,
+    files_done: usize,
+    files_skipped: usize,
+    files_failed: usize,
+    bytes_total: u64,
+    elapsed_secs: f64,
+) {
+    let speed = format_speed(bytes_total, elapsed_secs);
+    eprintln!(
+        "{}  {} files ({}) in {:.1}s{}",
+        style(identifier).bold(),
+        files_done,
+        format_bytes(bytes_total),
+        elapsed_secs,
+        style(&speed).dim(),
+    );
+    eprintln!(
+        "  {} {} {} · {} skipped · {} errors",
+        style(ICON_SUCCESS).green(),
+        files_done,
+        verb,
+        colored_count_yellow(files_skipped),
+        colored_count_red(files_failed),
+    );
+}
+
+/// Aggregate stats for a batch operation's summary block.
+pub struct BatchSummary {
+    pub items_total: usize,
+    pub items_succeeded: usize,
+    pub items_failed: usize,
+    pub files_skipped: usize,
+    pub files_failed: usize,
+    pub bytes_total: u64,
+    pub elapsed_secs: f64,
+}
+
+/// Print the batch summary footer to stderr.
+pub fn print_batch_summary(
+    summary: &BatchSummary,
+    verb: &str,
+    disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>,
+) {
+    let speed = format_speed(summary.bytes_total, summary.elapsed_secs);
+
+    eprintln!(
+        "{}",
+        style("────────────────────────────────────────────────────").dim()
+    );
+    eprintln!(
+        "{}/{} items ({} done · {} skipped · {} errors)",
+        summary.items_succeeded,
+        summary.items_total,
+        style(summary.items_succeeded).green(),
+        colored_count_yellow(summary.files_skipped),
+        colored_count_red(summary.files_failed + summary.items_failed),
+    );
+    eprintln!(
+        "{} {}{}",
+        format_bytes(summary.bytes_total),
+        verb,
+        style(&speed).dim(),
+    );
+
+    if let Some(statuses) = disk_statuses {
+        let disk_line: Vec<String> = statuses
+            .iter()
+            .map(|ds| {
+                format!(
+                    "{}: {} free",
+                    style(ds.path.display()).dim(),
+                    format_bytes(ds.free_bytes)
+                )
+            })
+            .collect();
+        eprintln!("{}", disk_line.join(" │ "));
+    }
+
+    eprintln!("{:.1}s elapsed", summary.elapsed_secs);
+}
+
+// ─── DownloadDisplay ────────────────────────────────────────────────────────
+
 /// Single-item download progress: one aggregate bar, no dynamic insertion.
 ///
 /// Uses a single `ProgressBar` tracking total bytes across all files.
@@ -23,21 +178,8 @@ pub struct DownloadDisplay {
 
 impl DownloadDisplay {
     pub fn new(identifier: &str) -> Self {
-        eprintln!(
-            "{} {}",
-            style("▸").cyan(),
-            style(identifier).bold(),
-        );
-
-        let bar = ProgressBar::new(0);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "  {bar:40.cyan/dim} {bytes}/{total_bytes} {bytes_per_sec:.dim}  ({msg})",
-            )
-            .unwrap()
-            .progress_chars("━╸─"),
-        );
-        bar.set_message("starting...");
+        print_item_header(identifier);
+        let bar = make_progress_bar(0);
 
         Self {
             identifier: identifier.to_string(),
@@ -86,7 +228,7 @@ impl DownloadDisplay {
             DownloadStatus::Failed(err) => {
                 self.errors.lock().unwrap().push(format!(
                     "  {} {} {}",
-                    style("✗").red(),
+                    style(ICON_ERROR).red(),
                     style(&progress.file_name).dim(),
                     style(format!("— {err}")).red(),
                 ));
@@ -108,40 +250,14 @@ impl DownloadDisplay {
             eprintln!("{err}");
         }
 
-        let elapsed = result.elapsed.as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            format!(
-                " · {}/s",
-                format_bytes((result.bytes_total as f64 / elapsed) as u64)
-            )
-        } else {
-            String::new()
-        };
-
-        eprintln!(
-            "{}  {} files ({}) in {:.1}s{}",
-            style(&self.identifier).bold(),
+        print_item_finish(
+            &self.identifier,
+            "downloaded",
             result.files_downloaded,
-            format_bytes(result.bytes_total),
-            elapsed,
-            style(&speed).dim(),
-        );
-        eprintln!(
-            "  {} {} downloaded · {} skipped · {} errors",
-            style("✓").green(),
-            result.files_downloaded,
-            if result.files_skipped > 0 {
-                style(result.files_skipped.to_string())
-                    .yellow()
-                    .to_string()
-            } else {
-                "0".to_string()
-            },
-            if result.files_failed > 0 {
-                style(result.files_failed.to_string()).red().to_string()
-            } else {
-                "0".to_string()
-            },
+            result.files_skipped,
+            result.files_failed,
+            result.bytes_total,
+            result.elapsed.as_secs_f64(),
         );
 
         if let Some(free) = disk_space_free(destdir) {
@@ -154,6 +270,8 @@ impl DownloadDisplay {
     }
 }
 
+// ─── BatchDisplay ───────────────────────────────────────────────────────────
+
 pub struct BatchDisplay {
     multi: MultiProgress,
     batch_header: ProgressBar,
@@ -165,8 +283,10 @@ pub struct BatchDisplay {
 
 struct ItemBars {
     header: ProgressBar,
-    file_bars: HashMap<String, ProgressBar>,
-    sentinel: ProgressBar,
+    bar: ProgressBar,
+    per_file_bytes: HashMap<String, u64>,
+    files_done: usize,
+    files_total: usize,
 }
 
 impl BatchDisplay {
@@ -204,25 +324,32 @@ impl BatchDisplay {
         item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
         item_header.set_message(format!(
             "{} {}",
-            style("▸").cyan(),
+            style(ICON_HEADER).cyan(),
             style(identifier).bold(),
         ));
 
-        let sentinel = self.multi.insert_before(
+        let bar = self.multi.insert_before(
             &self.bottom_sentinel,
-            ProgressBar::new_spinner(),
+            ProgressBar::new(0),
         );
-        sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        sentinel.set_message("");
-        sentinel.finish();
+        bar.set_style(
+            ProgressStyle::with_template(&format!(
+                "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
+            ))
+            .unwrap()
+            .progress_chars(PROGRESS_CHARS),
+        );
+        bar.set_message("starting...");
 
         let mut items = self.active_item_bars.lock().unwrap();
         items.insert(
             identifier.to_string(),
             ItemBars {
                 header: item_header,
-                file_bars: HashMap::new(),
-                sentinel,
+                bar,
+                per_file_bytes: HashMap::new(),
+                files_done: 0,
+                files_total: 0,
             },
         );
     }
@@ -235,47 +362,41 @@ impl BatchDisplay {
         };
 
         match &progress.status {
+            DownloadStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                item.bar.set_length(*bytes_total);
+                item.files_total = *files_count;
+                item.bar.set_message(format!("0/{files_count} files"));
+            }
             DownloadStatus::Starting | DownloadStatus::Downloading => {
-                let bar = item
-                    .file_bars
-                    .entry(progress.file_name.clone())
-                    .or_insert_with(|| {
-                        let pb = self.multi.insert_before(
-                            &item.sentinel,
-                            ProgressBar::new(progress.total_bytes.unwrap_or(0)),
-                        );
-                        pb.set_style(
-                            ProgressStyle::default_bar()
-                                .template("  {prefix:.dim} {bar:20.cyan/dim} {bytes}/{total_bytes} {bytes_per_sec:.dim}")
-                                .unwrap()
-                                .progress_chars("━╸─"),
-                        );
-                        pb.set_prefix(progress.file_name.clone());
-                        pb
-                    });
-                bar.set_position(progress.bytes_downloaded);
+                item.per_file_bytes
+                    .insert(progress.file_name.clone(), progress.bytes_downloaded);
+                let total: u64 = item.per_file_bytes.values().sum();
+                item.bar.set_position(total);
             }
             DownloadStatus::Complete => {
-                if let Some(bar) = item.file_bars.remove(&progress.file_name) {
-                    bar.finish_and_clear();
+                if let Some(size) = progress.total_bytes {
+                    item.per_file_bytes.insert(progress.file_name.clone(), size);
+                    let total: u64 = item.per_file_bytes.values().sum();
+                    item.bar.set_position(total);
                 }
+                item.files_done += 1;
+                item.bar
+                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
             }
             DownloadStatus::Skipped(_) => {
-                if let Some(bar) = item.file_bars.remove(&progress.file_name) {
-                    bar.finish_and_clear();
-                }
+                item.files_done += 1;
+                item.bar
+                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
             }
-            DownloadStatus::Failed(err) => {
-                if let Some(bar) = item.file_bars.remove(&progress.file_name) {
-                    bar.finish_with_message(format!(
-                        "  {} {} {}",
-                        style("✗").red(),
-                        progress.file_name,
-                        style(err).red(),
-                    ));
-                }
+            DownloadStatus::Failed(_) => {
+                item.files_done += 1;
+                item.bar
+                    .set_message(format!("{}/{} files", item.files_done, item.files_total));
             }
-            DownloadStatus::Enumerated { .. } | DownloadStatus::Verifying => {}
+            DownloadStatus::Verifying => {}
         }
     }
 
@@ -283,20 +404,10 @@ impl BatchDisplay {
         let identifier = &result.identifier;
         let mut items = self.active_item_bars.lock().unwrap();
         if let Some(item) = items.remove(identifier) {
-            for (_, bar) in item.file_bars {
-                bar.finish_and_clear();
-            }
-            item.sentinel.finish_and_clear();
+            item.bar.finish_and_clear();
 
             let elapsed = result.elapsed.as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                format!(
-                    "  {}/s",
-                    format_bytes((result.bytes_total as f64 / elapsed) as u64)
-                )
-            } else {
-                String::new()
-            };
+            let speed = format_speed(result.bytes_total, elapsed);
 
             let skipped_info = if result.files_skipped > 0 {
                 format!(
@@ -310,7 +421,7 @@ impl BatchDisplay {
 
             item.header.set_message(format!(
                 "{} {}       {} files ({}) {:.0}s{}{}",
-                style("✓").green(),
+                style(ICON_SUCCESS).green(),
                 style(identifier).bold(),
                 result.files_downloaded,
                 format_bytes(result.bytes_total),
@@ -327,142 +438,144 @@ impl BatchDisplay {
         result: &ia_core::download::BatchDownloadResult,
         disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>,
     ) {
-        // Finish all multi-progress bars so they render their final state
         self.batch_header.finish_and_clear();
         self.bottom_sentinel.finish_and_clear();
 
-        let elapsed = result.elapsed.as_secs_f64();
-        let speed = if elapsed > 0.0 {
-            format!(
-                " · {}/s",
-                format_bytes((result.bytes_total as f64 / elapsed) as u64)
-            )
-        } else {
-            String::new()
+        let summary = BatchSummary {
+            items_total: result.items_total,
+            items_succeeded: result.items_succeeded,
+            items_failed: result.items_failed,
+            files_skipped: result.files_skipped,
+            files_failed: result.files_failed,
+            bytes_total: result.bytes_total,
+            elapsed_secs: result.elapsed.as_secs_f64(),
         };
-
-        eprintln!(
-            "{}",
-            style("────────────────────────────────────────────────────").dim()
-        );
-        eprintln!(
-            "{}/{} items ({} done · {} skipped · {} errors)",
-            result.items_succeeded,
-            result.items_total,
-            style(result.items_succeeded).green(),
-            if result.files_skipped > 0 {
-                style(result.files_skipped.to_string())
-                    .yellow()
-                    .to_string()
-            } else {
-                "0".to_string()
-            },
-            if result.files_failed > 0 || result.items_failed > 0 {
-                style((result.files_failed + result.items_failed).to_string())
-                    .red()
-                    .to_string()
-            } else {
-                "0".to_string()
-            },
-        );
-        eprintln!(
-            "{} downloaded{}",
-            format_bytes(result.bytes_total),
-            style(&speed).dim(),
-        );
-
-        if let Some(statuses) = disk_statuses {
-            let disk_line: Vec<String> = statuses
-                .iter()
-                .map(|ds| {
-                    format!(
-                        "{}: {} free",
-                        style(ds.path.display()).dim(),
-                        format_bytes(ds.free_bytes)
-                    )
-                })
-                .collect();
-            eprintln!("{}", disk_line.join(" │ "));
-        }
-
-        eprintln!("{:.1}s elapsed", elapsed);
+        print_batch_summary(&summary, "downloaded", disk_statuses);
     }
 }
 
-/// Progress display for file uploads.
+// ─── UploadDisplay ──────────────────────────────────────────────────────────
+
+/// Single-item upload progress: one aggregate bar, no per-file bars.
 ///
-/// Manages per-file progress bars via `MultiProgress`. Create once, then
-/// pass `update` as the progress callback to `upload_item`.
+/// Matches `DownloadDisplay` pattern: header on creation, aggregate byte
+/// bar during transfer, summary block on finish.
 pub struct UploadDisplay {
-    multi: MultiProgress,
-    bars: Mutex<HashMap<String, ProgressBar>>,
-    style: ProgressStyle,
+    #[allow(dead_code)] // used by finish(), wired up in a later task
+    identifier: String,
+    bar: ProgressBar,
+    per_file_bytes: Mutex<HashMap<String, u64>>,
+    files_done: Mutex<usize>,
+    files_total: Mutex<usize>,
+    bytes_total: Mutex<u64>,
+    errors: Mutex<Vec<String>>,
+    #[allow(dead_code)] // used by finish(), wired up in a later task
+    started_at: std::time::Instant,
 }
 
 impl UploadDisplay {
-    pub fn new() -> Self {
-        let style = ProgressStyle::with_template(
-            "{spinner:.green} {prefix:.bold} [{bar:30.cyan/dim}] {bytes}/{total_bytes} ({bytes_per_sec})",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("=> ");
+    pub fn new(identifier: &str) -> Self {
+        print_item_header(identifier);
+        let bar = make_progress_bar(0);
 
         Self {
-            multi: MultiProgress::new(),
-            bars: Mutex::new(HashMap::new()),
-            style,
+            identifier: identifier.to_string(),
+            bar,
+            per_file_bytes: Mutex::new(HashMap::new()),
+            files_done: Mutex::new(0),
+            files_total: Mutex::new(0),
+            bytes_total: Mutex::new(0),
+            errors: Mutex::new(Vec::new()),
+            started_at: std::time::Instant::now(),
         }
     }
 
-    /// Handle an upload progress event — create/update/remove progress bars.
+    /// Handle an upload progress event.
     pub fn update(&self, p: UploadProgress) {
-        let mut bars = self.bars.lock().unwrap_or_else(|e| e.into_inner());
         match p.status {
-            UploadProgressStatus::Enumerated { .. } => {
-                // Nothing to do here yet — future tasks will use this to set
-                // the aggregate bar length.
+            UploadProgressStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                self.bar.set_length(bytes_total);
+                *self.files_total.lock().unwrap() = files_count;
+                *self.bytes_total.lock().unwrap() = bytes_total;
+                self.bar.set_message(format!("0/{files_count} files"));
             }
             UploadProgressStatus::Uploading => {
-                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
-                    let pb = self.multi.add(ProgressBar::new(p.total_bytes));
-                    pb.set_style(self.style.clone());
-                    pb.set_prefix(p.key.clone());
-                    pb
-                });
-                pb.set_position(p.bytes_sent);
+                let mut map = self.per_file_bytes.lock().unwrap();
+                map.insert(p.key.clone(), p.bytes_sent);
+                let total: u64 = map.values().sum();
+                self.bar.set_position(total);
             }
             UploadProgressStatus::Verifying => {
-                let pb = bars.entry(p.key.clone()).or_insert_with(|| {
-                    let pb = self.multi.add(ProgressBar::new(p.total_bytes));
-                    pb.set_style(self.style.clone());
-                    pb.set_prefix(p.key.clone());
-                    pb
-                });
-                pb.set_message("verifying...");
+                // Verifying doesn't change byte count
             }
             UploadProgressStatus::Complete => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.finish_and_clear();
-                }
+                let mut map = self.per_file_bytes.lock().unwrap();
+                map.insert(p.key.clone(), p.total_bytes);
+                let total: u64 = map.values().sum();
+                self.bar.set_position(total);
+                drop(map);
+
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let files_total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{files_total} files"));
             }
             UploadProgressStatus::Skipped => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.finish_and_clear();
-                }
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let files_total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{files_total} files"));
             }
             UploadProgressStatus::Failed => {
-                if let Some(pb) = bars.remove(&p.key) {
-                    pb.abandon();
-                }
+                self.errors.lock().unwrap().push(format!(
+                    "  {} {} {}",
+                    style(ICON_ERROR).red(),
+                    style(&p.key).dim(),
+                    style("— upload failed").red(),
+                ));
+                let mut done = self.files_done.lock().unwrap();
+                *done += 1;
+                let files_total = *self.files_total.lock().unwrap();
+                self.bar.set_message(format!("{done}/{files_total} files"));
             }
             UploadProgressStatus::WaitingRateLimit => {
-                if let Some(pb) = bars.get(&p.key) {
-                    pb.set_message("rate limited, waiting...");
-                }
+                self.bar.set_message("rate limited, waiting...");
             }
         }
     }
+
+    /// Finish the display: clear the bar and print summary.
+    #[allow(dead_code)] // wired up in a later task
+    pub fn finish(&self) {
+        self.bar.finish_and_clear();
+
+        let errors = self.errors.lock().unwrap();
+        for err in errors.iter() {
+            eprintln!("{err}");
+        }
+
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        let files_done = *self.files_done.lock().unwrap();
+        let files_failed = errors.len();
+        let files_uploaded = files_done.saturating_sub(files_failed);
+        let bytes_total = *self.bytes_total.lock().unwrap();
+
+        print_item_finish(
+            &self.identifier,
+            "uploaded",
+            files_uploaded,
+            0, // skipped count tracked by caller
+            files_failed,
+            bytes_total,
+            elapsed,
+        );
+    }
 }
+
+// ─── Utilities ──────────────────────────────────────────────────────────────
 
 /// Get free disk space for a path (bytes).
 pub fn disk_space_free(path: &std::path::Path) -> Option<u64> {

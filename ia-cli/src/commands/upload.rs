@@ -453,7 +453,7 @@ async fn run_bare_upload(
         .context("failed to open joblog")?;
 
     // Set up progress display
-    let display = crate::output::UploadDisplay::new();
+    let display = crate::output::UploadDisplay::new(identifier);
     let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         if !args.json && quiet == 0 {
             Some(std::sync::Arc::new(move |p: UploadProgress| {
