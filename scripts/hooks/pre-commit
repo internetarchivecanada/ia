@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Reject commits on main. This is the only hard enforcement in the workflow.
+branch=$(git branch --show-current)
+if [ "$branch" = "main" ]; then
+    echo "ERROR: Direct commits to main are not allowed." >&2
+    echo "Create a worktree: scripts/ia-worktree <type> <slug>" >&2
+    exit 1
+fi

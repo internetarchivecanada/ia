@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# List all active worktrees and their PR status.
+# Usage: ia-status
+
+set -euo pipefail
+
+MAIN_WORKTREE=$(git worktree list | head -1 | awk '{print $1}')
+FOUND=false
+
+printf "\n%-25s %-25s %-10s %s\n" "SLUG" "BRANCH" "PR" "PATH"
+printf "%-25s %-25s %-10s %s\n" "----" "------" "--" "----"
+
+while IFS= read -r line; do
+    WT_PATH=$(echo "$line" | awk '{print $1}')
+
+    # Skip main
+    if [[ "$WT_PATH" == "$MAIN_WORKTREE" ]]; then
+        continue
+    fi
+
+    FOUND=true
+    WT_SLUG=$(basename "$WT_PATH")
+    WT_BRANCH=$(git -C "$WT_PATH" branch --show-current 2>/dev/null || echo "?")
+
+    # Check PR status
+    PR_STATUS="none"
+    if [[ "$WT_BRANCH" != "?" ]]; then
+        PR_JSON=$(gh pr list --head "$WT_BRANCH" --state all --limit 1 --json state -q '.[0].state' 2>/dev/null || echo "")
+        if [[ -n "$PR_JSON" ]]; then
+            PR_STATUS=$(echo "$PR_JSON" | tr '[:upper:]' '[:lower:]')
+        fi
+    fi
+
+    printf "%-25s %-25s %-10s %s\n" "$WT_SLUG" "$WT_BRANCH" "$PR_STATUS" "$WT_PATH"
+done < <(git worktree list)
+
+if [[ "$FOUND" == "false" ]]; then
+    echo "(no active worktrees)"
+fi
+
+echo ""
