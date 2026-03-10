@@ -173,6 +173,10 @@ impl UploadTuiState {
         if let Some(&idx) = self.item_index.get(&p.identifier) {
             let item = &mut self.items[idx];
             match p.status {
+                UploadProgressStatus::Enumerated { .. } => {
+                    // File list is now known — nothing to update in per-item
+                    // state here since Verifying events fill in the counts.
+                }
                 UploadProgressStatus::Verifying => {
                     if item.status == UploadItemStatus::Pending {
                         item.status = UploadItemStatus::Verifying;
@@ -250,6 +254,10 @@ impl UploadTuiState {
 
         // ── Global state ────────────────────────────────────────────
         match p.status {
+            UploadProgressStatus::Enumerated { .. } => {
+                // File list and total size are known — the TUI derives these
+                // values incrementally via Verifying events, so nothing to do.
+            }
             UploadProgressStatus::Verifying => {
                 // Guard: only count a file once (prevents double-count on retry).
                 if self.active_files.contains_key(&fk) {

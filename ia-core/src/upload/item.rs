@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{IaError, Result};
 use crate::upload::single::upload_file;
-use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
+use crate::upload::types::{UploadOpts, UploadProgress, UploadProgressStatus, UploadResult};
 use crate::upload::validate::{validate_file, validate_identifier, validate_required_metadata};
 use crate::IaClient;
 
@@ -85,12 +85,12 @@ pub async fn upload_item(
     // 7. Compute remote keys
     let keys = compute_keys(&expanded, &opts)?;
 
-    // 8. Compute size hint (unless disabled)
-    let size_hint = if opts.no_size_hint {
-        None
-    } else {
+    // 8. Compute total bytes (always needed for progress display).
+    //    Do a single stat pass here; conditionally set size_hint based on no_size_hint.
+    let file_count = expanded.len();
+    let total_bytes: u64 = {
         let paths = expanded.clone();
-        let total: u64 = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || -> u64 {
             paths
                 .iter()
                 .filter_map(|f| std::fs::metadata(f).ok())
@@ -98,12 +98,27 @@ pub async fn upload_item(
                 .sum()
         })
         .await
-        .unwrap_or(0);
-        Some(total)
+        // JoinError only fires on panic or runtime shutdown — propagate rather
+        // than silently defaulting to 0 so callers notice catastrophic failures.
+        .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?
     };
+    let size_hint = if opts.no_size_hint { None } else { Some(total_bytes) };
 
-    // 9. Upload sequentially
-    let file_count = expanded.len();
+    // 9. Emit Enumerated event so consumers know the file list and total size.
+    if let Some(ref cb) = progress {
+        cb(UploadProgress {
+            identifier: identifier.to_string(),
+            key: String::new(),
+            bytes_sent: 0,
+            total_bytes: 0,
+            status: UploadProgressStatus::Enumerated {
+                files_count: file_count,
+                bytes_total: total_bytes,
+            },
+        });
+    }
+
+    // 10. Upload sequentially
     let mut results = Vec::with_capacity(file_count);
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {

@@ -11,7 +11,7 @@ use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::upload::{
     generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
-    UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
+    UploadProgress, UploadResult, UploadStatus,
 };
 use ia_core::IaClient;
 
@@ -453,37 +453,52 @@ async fn run_bare_upload(
         .context("failed to open joblog")?;
 
     // Set up progress display
-    let display = crate::output::UploadDisplay::new();
-    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+    let display: Option<std::sync::Arc<crate::output::UploadDisplay>> =
         if !args.json && quiet == 0 {
-            Some(std::sync::Arc::new(move |p: UploadProgress| {
-                display.update(p);
-            }))
+            Some(std::sync::Arc::new(
+                crate::output::UploadDisplay::new(identifier, opts.dry_run),
+            ))
         } else {
             None
         };
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+        display.as_ref().map(|d| {
+            let d = std::sync::Arc::clone(d);
+            std::sync::Arc::new(move |p: UploadProgress| {
+                d.update(p);
+            }) as std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>
+        });
 
     let results = upload_item(client, identifier, &files, &opts, progress_ref)
         .await
         .context(format!("failed to upload to {identifier}"))?;
 
-    // Output results
-    let had_failure = output_results(&results, args.json, quiet, joblog.as_ref())?;
-
-    // Summary for quiet == 1
-    if !args.json && quiet == 1 {
-        let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
-        let total_ms: u64 = results.iter().map(|r| r.elapsed_ms).max().unwrap_or(0);
-        eprintln!(
-            "{}  {} uploaded, {} skipped, {} failed ({}) in {:.1}s",
-            identifier,
-            uploaded,
-            skipped,
-            failed,
-            crate::output::format_bytes(total_bytes),
-            total_ms as f64 / 1000.0,
-        );
+    // Finish display (prints summary)
+    if let Some(d) = &display {
+        d.finish();
     }
+
+    // Handle results: JSON output, joblog, failure detection
+    let had_failure = if args.json {
+        output_results(&results, true, quiet, joblog.as_ref())?
+    } else {
+        let failure = check_failures_and_log(&results, joblog.as_ref());
+        // quiet==1 summary (display handles quiet==0)
+        if quiet == 1 {
+            let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
+            let total_ms: u64 = results.iter().map(|r| r.elapsed_ms).max().unwrap_or(0);
+            eprintln!(
+                "{}  {} uploaded, {} skipped, {} failed ({}) in {:.1}s",
+                identifier,
+                uploaded,
+                skipped,
+                failed,
+                crate::output::format_bytes(total_bytes),
+                total_ms as f64 / 1000.0,
+            );
+        }
+        failure
+    };
 
     // Open in browser if requested
     if args.open_after_upload && !had_failure {
@@ -590,84 +605,67 @@ async fn run_import(
         .context("failed to open joblog")?;
 
     let json_mode = args.json;
-    let item_count = records.len();
 
-    if !json_mode && quiet == 0 {
-        eprintln!(
-            "{} Uploading {} records from {}",
-            style("▸").cyan(),
-            item_count,
-            args.spreadsheet.display(),
-        );
-    }
+    // Count unique identifiers for the batch display header
+    let item_count = {
+        let mut ids = std::collections::HashSet::new();
+        for (id, _) in &records {
+            ids.insert(id.as_str());
+        }
+        ids.len()
+    };
 
-    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+    // Set up batch progress display
+    let batch_display: Option<std::sync::Arc<crate::output::UploadBatchDisplay>> =
         if !json_mode && quiet == 0 {
-            Some(std::sync::Arc::new(move |p: UploadProgress| {
-                match p.status {
-                    UploadProgressStatus::Complete => {
-                        eprintln!(
-                            " {} {}/{}",
-                            style("\u{2713}").green(),
-                            p.identifier,
-                            p.key,
-                        );
-                    }
-                    UploadProgressStatus::Failed => {
-                        eprintln!(
-                            " {} {}/{}",
-                            style("\u{2717}").red(),
-                            p.identifier,
-                            p.key,
-                        );
-                    }
-                    UploadProgressStatus::Skipped => {
-                        eprintln!(
-                            " {} {}/{} (skipped)",
-                            style("\u{2013}").dim(),
-                            p.identifier,
-                            p.key,
-                        );
-                    }
-                    UploadProgressStatus::WaitingRateLimit => {
-                        eprintln!(
-                            " {} {} rate limited, polling...",
-                            style("\u{23F8}").yellow(),
-                            p.identifier,
-                        );
-                    }
-                    UploadProgressStatus::Uploading | UploadProgressStatus::Verifying => {
-                        // Too noisy for batch — skip
-                    }
-                }
-            }))
+            Some(std::sync::Arc::new(
+                crate::output::UploadBatchDisplay::new(item_count, jobs),
+            ))
         } else {
             None
         };
+    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+        batch_display.as_ref().map(|bd| {
+            let bd = std::sync::Arc::clone(bd);
+            std::sync::Arc::new(move |p: UploadProgress| {
+                bd.update(p);
+            }) as std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>
+        });
 
+    let start = std::time::Instant::now();
     let results = upload_batch(client, records, &opts, jobs, progress_ref)
         .await
         .context("batch upload failed")?;
+    let elapsed = start.elapsed();
 
-    // Output results
-    let had_failure = output_results(&results, json_mode, quiet, joblog.as_ref())?;
-
-    // Summary
-    if !json_mode && quiet < 2 {
-        let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
-        eprintln!(
-            "\n{} {} uploaded, {} skipped, {} failed ({})",
-            if had_failure {
-                style("done").red().bold().to_string()
-            } else {
-                style("done").green().bold().to_string()
-            },
-            uploaded,
-            skipped,
-            failed,
-            crate::output::format_bytes(total_bytes),
-        );
+    // Finish batch display (prints summary)
+    if let Some(bd) = &batch_display {
+        bd.finish(&results, elapsed);
     }
+
+    // Handle results: JSON output, joblog, failure detection
+    let had_failure = if json_mode {
+        output_results(&results, true, quiet, joblog.as_ref())?
+    } else {
+        let failure = check_failures_and_log(&results, joblog.as_ref());
+        // quiet==1 summary (batch display handles quiet==0)
+        if quiet == 1 {
+            let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
+            eprintln!(
+                "{} {} uploaded, {} skipped, {} failed ({})",
+                if failure {
+                    style("done").red().bold().to_string()
+                } else {
+                    style("done").green().bold().to_string()
+                },
+                uploaded,
+                skipped,
+                failed,
+                crate::output::format_bytes(total_bytes),
+            );
+        }
+        failure
+    };
 
     if had_failure {
         std::process::exit(1);
@@ -837,6 +835,20 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Write results to joblog and return whether any file failed.
+fn check_failures_and_log(results: &[UploadResult], joblog: Option<&JoblogWriter>) -> bool {
+    let mut had_failure = false;
+    for r in results {
+        if matches!(r.status, UploadStatus::Failed(_)) {
+            had_failure = true;
+        }
+        if let Some(jl) = joblog {
+            write_upload_result(jl, r);
+        }
+    }
+    had_failure
+}
 
 /// Output upload results: print per-line (JSON or human), write to joblog.
 /// Returns whether any file failed.
