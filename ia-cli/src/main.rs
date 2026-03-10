@@ -43,43 +43,43 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
 )]
 struct Cli {
     /// Path to configuration file
-    #[arg(short = 'c', long = "config-file", global = true)]
+    #[arg(short = 'c', long = "config-file", global = true, help_heading = "Global Options")]
     config: Option<PathBuf>,
 
     /// Enable logging
-    #[arg(short = 'l', long, global = true)]
+    #[arg(short = 'l', long, global = true, help_heading = "Global Options")]
     log: bool,
 
     /// Enable debug output
-    #[arg(short = 'd', long, global = true)]
+    #[arg(short = 'd', long, global = true, help_heading = "Global Options")]
     debug: bool,
 
     /// Allow insecure (HTTP) connections
-    #[arg(short = 'i', long, global = true)]
+    #[arg(short = 'i', long, global = true, help_heading = "Global Options")]
     insecure: bool,
 
     /// Host to connect to
-    #[arg(short = 'H', long, global = true)]
+    #[arg(short = 'H', long, global = true, help_heading = "Global Options")]
     host: Option<String>,
 
     /// Custom string to append to the default User-Agent
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global Options")]
     user_agent_suffix: Option<String>,
 
     /// Path to job log file
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
     /// Retry failed operations from job log
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global Options")]
     retry_failed: bool,
 
     /// Concurrent operations
-    #[arg(short = 'j', long, global = true, default_value = "2")]
+    #[arg(short = 'j', long, global = true, default_value = "2", help_heading = "Global Options")]
     jobs: usize,
 
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
-    #[arg(short = 'q', long, global = true, action = clap::ArgAction::Count)]
+    #[arg(short = 'q', long, global = true, action = clap::ArgAction::Count, help_heading = "Global Options")]
     quiet: u8,
 
     #[command(subcommand)]
