@@ -447,6 +447,7 @@ pub struct UploadDisplay {
     bar: ProgressBar,
     per_file_bytes: Mutex<HashMap<String, u64>>,
     files_done: Mutex<usize>,
+    files_skipped: Mutex<usize>,
     files_total: Mutex<usize>,
     bytes_total: Mutex<u64>,
     errors: Mutex<Vec<String>>,
@@ -463,6 +464,7 @@ impl UploadDisplay {
             bar,
             per_file_bytes: Mutex::new(HashMap::new()),
             files_done: Mutex::new(0),
+            files_skipped: Mutex::new(0),
             files_total: Mutex::new(0),
             bytes_total: Mutex::new(0),
             errors: Mutex::new(Vec::new()),
@@ -504,6 +506,7 @@ impl UploadDisplay {
                 self.bar.set_message(format!("{done}/{files_total} files"));
             }
             UploadProgressStatus::Skipped => {
+                *self.files_skipped.lock().unwrap() += 1;
                 let mut done = self.files_done.lock().unwrap();
                 *done += 1;
                 let files_total = *self.files_total.lock().unwrap();
@@ -540,14 +543,17 @@ impl UploadDisplay {
 
         let elapsed = self.started_at.elapsed().as_secs_f64();
         let files_done = *self.files_done.lock().unwrap();
-        let files_uploaded = files_done.saturating_sub(files_failed);
+        let files_skipped = *self.files_skipped.lock().unwrap();
+        let files_uploaded = files_done
+            .saturating_sub(files_failed)
+            .saturating_sub(files_skipped);
         let bytes_total = *self.bytes_total.lock().unwrap();
 
         print_item_finish(
             &self.identifier,
             "uploaded",
             files_uploaded,
-            0, // skipped count tracked by caller
+            files_skipped,
             files_failed,
             bytes_total,
             elapsed,
@@ -567,7 +573,6 @@ pub struct UploadBatchDisplay {
     batch_header: ProgressBar,
     bottom_sentinel: ProgressBar,
     active_items: Mutex<HashMap<String, UploadItemBars>>,
-    completed_items: Mutex<usize>,
     items_total: usize,
 }
 
@@ -604,7 +609,6 @@ impl UploadBatchDisplay {
             batch_header,
             bottom_sentinel,
             active_items: Mutex::new(HashMap::new()),
-            completed_items: Mutex::new(0),
             items_total,
         }
     }
@@ -765,8 +769,6 @@ impl UploadBatchDisplay {
                 error_info,
             ));
             item.header.finish();
-
-            *self.completed_items.lock().unwrap() += 1;
         }
     }
 

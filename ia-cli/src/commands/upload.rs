@@ -482,15 +482,7 @@ async fn run_bare_upload(
     let had_failure = if args.json {
         output_results(&results, true, quiet, joblog.as_ref())?
     } else {
-        let mut failure = false;
-        for r in &results {
-            if matches!(r.status, UploadStatus::Failed(_)) {
-                failure = true;
-            }
-            if let Some(jl) = &joblog {
-                write_upload_result(jl, r);
-            }
-        }
+        let failure = check_failures_and_log(&results, joblog.as_ref());
         // quiet==1 summary (display handles quiet==0)
         if quiet == 1 {
             let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
@@ -655,15 +647,7 @@ async fn run_import(
     let had_failure = if json_mode {
         output_results(&results, true, quiet, joblog.as_ref())?
     } else {
-        let mut failure = false;
-        for r in &results {
-            if matches!(r.status, UploadStatus::Failed(_)) {
-                failure = true;
-            }
-            if let Some(jl) = &joblog {
-                write_upload_result(jl, r);
-            }
-        }
+        let failure = check_failures_and_log(&results, joblog.as_ref());
         // quiet==1 summary (batch display handles quiet==0)
         if quiet == 1 {
             let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
@@ -851,6 +835,20 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Write results to joblog and return whether any file failed.
+fn check_failures_and_log(results: &[UploadResult], joblog: Option<&JoblogWriter>) -> bool {
+    let mut had_failure = false;
+    for r in results {
+        if matches!(r.status, UploadStatus::Failed(_)) {
+            had_failure = true;
+        }
+        if let Some(jl) = joblog {
+            write_upload_result(jl, r);
+        }
+    }
+    had_failure
+}
 
 /// Output upload results: print per-line (JSON or human), write to joblog.
 /// Returns whether any file failed.
