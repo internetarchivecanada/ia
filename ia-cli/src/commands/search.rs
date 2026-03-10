@@ -6,7 +6,7 @@ use color_print::cstr;
 use console::style;
 use futures::StreamExt;
 
-use ia_core::search::{SearchOpts, SearchResult, DEFAULT_ADVANCED_ROWS};
+use ia_core::search::{self, SearchOpts, SearchResult, DEFAULT_ADVANCED_ROWS};
 use ia_core::IaClient;
 
 /// Backend selector for the `--num-found` count query.
@@ -24,12 +24,9 @@ async fn handle_num_found(
     json: bool,
 ) -> Result<()> {
     let count = match backend {
-        NumFoundBackend::Scrape | NumFoundBackend::Advanced => {
-            ia_core::search::num_found(client, query).await?
-        }
-        NumFoundBackend::Fts { dsl } => {
-            ia_core::search::fts_num_found(client, query, dsl).await?
-        }
+        NumFoundBackend::Scrape => search::num_found(client, query).await?,
+        NumFoundBackend::Advanced => search::advanced_num_found(client, query).await?,
+        NumFoundBackend::Fts { dsl } => search::fts_num_found(client, query, dsl).await?,
     };
     if json {
         println!("{}", serde_json::json!({"num_found": count}));

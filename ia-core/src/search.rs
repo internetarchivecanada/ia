@@ -1,11 +1,27 @@
 use std::pin::Pin;
 
 use futures::Stream;
+use reqwest_middleware::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
+
+/// Attach S3 auth header if credentials are configured.
+fn with_s3_auth(req: RequestBuilder, client: &IaClient) -> RequestBuilder {
+    if let Some(auth) = client
+        .config()
+        .s3_access
+        .as_deref()
+        .zip(client.config().s3_secret.as_deref())
+        .map(|(a, s)| format!("LOW {a}:{s}"))
+    {
+        req.header("Authorization", auth)
+    } else {
+        req
+    }
+}
 
 /// Default page size for advanced search queries.
 pub const DEFAULT_ADVANCED_ROWS: usize = 50;
@@ -51,14 +67,15 @@ struct ScrapeResponse {
 }
 
 /// Count total results matching a scrape query without fetching items.
+///
+/// Uses POST (matching Python `internetarchive` behavior — GET returns wrong totals).
 pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
     let url = client.url("/services/search/v1/scrape");
-    let resp = client
+    let req = client
         .http()
-        .get(&url)
-        .query(&[("q", query), ("total_only", "true")])
-        .send()
-        .await?;
+        .post(&url)
+        .query(&[("q", query), ("total_only", "true")]);
+    let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
         return Err(IaError::Http {
@@ -69,6 +86,28 @@ pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
 
     let body: ScrapeResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
     Ok(body.total.unwrap_or(0))
+}
+
+/// Count total results matching an advanced search query without fetching items.
+///
+/// Uses GET to `/advancedsearch.php` and reads `response.numFound`.
+pub async fn advanced_num_found(client: &IaClient, query: &str) -> Result<u64> {
+    let url = client.url("/advancedsearch.php");
+    let req = client
+        .http()
+        .get(&url)
+        .query(&[("q", query), ("output", "json"), ("rows", "0")]);
+    let resp = with_s3_auth(req, client).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(IaError::Http {
+            status: resp.status().as_u16(),
+            message: resp.text().await.unwrap_or_default(),
+        });
+    }
+
+    let body: AdvancedSearchResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
+    Ok(body.response.num_found)
 }
 
 /// Count total FTS results matching a query without fetching items.
@@ -83,12 +122,11 @@ pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<
         format!("!L {query}")
     };
 
-    let resp = client
+    let req = client
         .http()
         .get(&base_url)
-        .query(&[("q", &q)])
-        .send()
-        .await?;
+        .query(&[("q", &q)]);
+    let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
         return Err(IaError::Http {
@@ -126,7 +164,7 @@ pub fn scrape<'a>(
         loop {
             let mut req = client
                 .http()
-                .get(&url)
+                .post(&url)
                 .query(&[("q", &query), ("fields", &fields)]);
 
             if !sorts.is_empty() {
@@ -141,7 +179,7 @@ pub fn scrape<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = req.send().await?;
+            let resp = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -237,7 +275,7 @@ pub fn advanced<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = req.send().await?;
+            let resp = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -333,7 +371,7 @@ pub fn fts<'a>(
         let mut yielded = 0usize;
 
         loop {
-            let resp: reqwest::Response = if let Some(ref sid) = scroll_id {
+            let req = if let Some(ref sid) = scroll_id {
                 // Scroll request
                 let body = serde_json::to_vec(&serde_json::json!({ "scroll_id": sid }))
                     .map_err(IaError::Json)?;
@@ -342,8 +380,6 @@ pub fn fts<'a>(
                     .post(format!("{base_url}?scroll=true"))
                     .header("content-type", "application/json")
                     .body(body)
-                    .send()
-                    .await?
             } else {
                 // Initial request
                 let mut json_body = serde_json::json!({
@@ -362,9 +398,8 @@ pub fn fts<'a>(
                     .post(&base_url)
                     .header("content-type", "application/json")
                     .body(body)
-                    .send()
-                    .await?
             };
+            let resp: reqwest::Response = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -439,8 +474,12 @@ fn parse_search_result(value: serde_json::Value) -> Result<SearchResult> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TEST_ACCESS: &str = "test_access";
+    const TEST_SECRET: &str = "test_secret";
+    const TEST_AUTH: &str = "LOW test_access:test_secret";
 
     fn mock_config(server_uri: &str) -> crate::config::IaConfig {
         let mut config = crate::config::IaConfig::default();
@@ -454,11 +493,18 @@ mod tests {
         config
     }
 
+    fn mock_config_with_auth(server_uri: &str) -> crate::config::IaConfig {
+        let mut config = mock_config(server_uri);
+        config.s3_access = Some(TEST_ACCESS.to_string());
+        config.s3_secret = Some(TEST_SECRET.to_string());
+        config
+    }
+
     #[tokio::test]
     async fn scrape_returns_results() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .and(query_param("q", "collection:test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -488,7 +534,7 @@ mod tests {
     async fn scrape_with_count_limit() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [
@@ -519,7 +565,7 @@ mod tests {
     async fn num_found_returns_total() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .and(query_param("total_only", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -615,7 +661,7 @@ mod tests {
     async fn scrape_handles_empty_response() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [],
@@ -748,5 +794,195 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
+    }
+
+    // ─── advanced_num_found ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn advanced_num_found_returns_total() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(query_param("q", "collection:test"))
+            .and(query_param("output", "json"))
+            .and(query_param("rows", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 11234,
+                    "docs": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = advanced_num_found(&client, "collection:test").await.unwrap();
+        assert_eq!(count, 11234);
+    }
+
+    // ─── S3 auth header tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn num_found_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/search/v1/scrape"))
+            .and(query_param("total_only", "true"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": 42
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let count = num_found(&client, "test").await.unwrap();
+        assert_eq!(count, 42);
+    }
+
+    #[tokio::test]
+    async fn advanced_num_found_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(query_param("rows", "0"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 99,
+                    "docs": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let count = advanced_num_found(&client, "test").await.unwrap();
+        assert_eq!(count, 99);
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 500,
+                    "hits": []
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "test", false).await.unwrap();
+        assert_eq!(count, 500);
+    }
+
+    #[tokio::test]
+    async fn scrape_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/search/v1/scrape"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{"identifier": "item1"}],
+                "cursor": "",
+                "total": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let results: Vec<Result<SearchResult>> =
+            scrape(&client, "test", &SearchOpts::default()).collect().await;
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn advanced_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 1,
+                    "docs": [{"identifier": "item1"}]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let results: Vec<Result<SearchResult>> =
+            advanced(&client, "test", &SearchOpts::default()).collect().await;
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fts_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(header("Authorization", TEST_AUTH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {
+                    "total": 1,
+                    "hits": [
+                        {
+                            "_id": "item1|abc",
+                            "_source": {},
+                            "fields": {}
+                        }
+                    ]
+                },
+                "_scroll_id": ""
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+        let results: Vec<Result<SearchResult>> =
+            fts(&client, "test", &SearchOpts::default()).collect().await;
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_auth_header_without_credentials() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/search/v1/scrape"))
+            .and(query_param("total_only", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": 10
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // mock_config does NOT set s3_access/s3_secret
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = num_found(&client, "test").await.unwrap();
+        assert_eq!(count, 10);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get("Authorization").is_none(),
+            "Authorization header should not be sent without S3 credentials"
+        );
     }
 }
