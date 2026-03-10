@@ -182,9 +182,15 @@ pub async fn upload_file(
             });
         }
 
-        // Build request with all required headers
+        // Build request with all required headers.
+        //
+        // Uses raw_http() to bypass the retry middleware: reqwest-retry
+        // requires cloneable request bodies (via try_clone()), but streaming
+        // bodies (wrap_stream / File) cannot be cloned. This function has
+        // its own retry loop with check_limit polling, so middleware retry
+        // is redundant.
         let mut request = client
-            .http()
+            .raw_http()
             .put(&s3_url)
             .header("Authorization", &auth_header)
             .header("Content-Length", file_size.to_string())

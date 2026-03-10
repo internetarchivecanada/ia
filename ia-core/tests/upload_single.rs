@@ -1275,3 +1275,105 @@ async fn upload_file_multipart_flag_dispatches() {
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
 }
+
+// -- Regression: upload with retry middleware (from_config) must not fail --
+//
+// Before the fix, the retry middleware (reqwest-retry) tried to clone the
+// request body via try_clone(). Streaming bodies (wrap_stream, File) are not
+// cloneable, causing immediate "Request object is not cloneable" errors on
+// every attempt. The upload code now uses raw_http() to bypass middleware.
+//
+// These tests use `from_config()` (NOT `from_config_no_retry()`) to exercise
+// the production client path that was broken.
+
+/// Create an `IaClient` with retry middleware, pointed at a wiremock server.
+fn test_client_with_retry(server: &MockServer) -> IaClient {
+    let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = host_port;
+    config.general.secure = false;
+    IaClient::from_config(config).unwrap()
+}
+
+#[tokio::test]
+async fn upload_with_retry_middleware_and_progress_callback() {
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"retry middleware regression test");
+    let client = test_client_with_retry(&server);
+    let opts = UploadOpts::default();
+
+    let statuses: Arc<Mutex<Vec<ia_core::upload::UploadProgressStatus>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let statuses_clone = statuses.clone();
+
+    let cb: Arc<dyn Fn(ia_core::upload::UploadProgress) + Send + Sync> =
+        Arc::new(move |p: ia_core::upload::UploadProgress| {
+            statuses_clone.lock().unwrap().push(p.status);
+        });
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        Some(cb),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+
+    let observed = statuses.lock().unwrap();
+    assert!(
+        observed.contains(&ia_core::upload::UploadProgressStatus::Uploading),
+        "expected Uploading in progress updates: {observed:?}"
+    );
+    assert!(
+        observed.contains(&ia_core::upload::UploadProgressStatus::Complete),
+        "expected Complete in progress updates: {observed:?}"
+    );
+}
+
+#[tokio::test]
+async fn upload_with_retry_middleware_no_progress() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"no progress callback test");
+    let client = test_client_with_retry(&server);
+    let opts = UploadOpts::default();
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
