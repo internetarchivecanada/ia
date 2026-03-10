@@ -4,8 +4,25 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use reqwest_middleware::RequestBuilder;
+
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
+
+/// Attach S3 auth header if credentials are configured.
+fn with_s3_auth(req: RequestBuilder, client: &IaClient) -> RequestBuilder {
+    if let Some(auth) = client
+        .config()
+        .s3_access
+        .as_deref()
+        .zip(client.config().s3_secret.as_deref())
+        .map(|(a, s)| format!("LOW {a}:{s}"))
+    {
+        req.header("Authorization", auth)
+    } else {
+        req
+    }
+}
 
 /// Default page size for advanced search queries.
 pub const DEFAULT_ADVANCED_ROWS: usize = 50;
@@ -51,14 +68,15 @@ struct ScrapeResponse {
 }
 
 /// Count total results matching a scrape query without fetching items.
+///
+/// Uses POST (matching Python `internetarchive` behavior — GET returns wrong totals).
 pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
     let url = client.url("/services/search/v1/scrape");
-    let resp = client
+    let req = client
         .http()
-        .get(&url)
-        .query(&[("q", query), ("total_only", "true")])
-        .send()
-        .await?;
+        .post(&url)
+        .query(&[("q", query), ("total_only", "true")]);
+    let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
         return Err(IaError::Http {
@@ -69,6 +87,28 @@ pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
 
     let body: ScrapeResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
     Ok(body.total.unwrap_or(0))
+}
+
+/// Count total results matching an advanced search query without fetching items.
+///
+/// Uses GET to `/advancedsearch.php` and reads `response.numFound`.
+pub async fn advanced_num_found(client: &IaClient, query: &str) -> Result<u64> {
+    let url = client.url("/advancedsearch.php");
+    let req = client
+        .http()
+        .get(&url)
+        .query(&[("q", query), ("output", "json"), ("rows", "0")]);
+    let resp = with_s3_auth(req, client).send().await?;
+
+    if !resp.status().is_success() {
+        return Err(IaError::Http {
+            status: resp.status().as_u16(),
+            message: resp.text().await.unwrap_or_default(),
+        });
+    }
+
+    let body: AdvancedSearchResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
+    Ok(body.response.num_found)
 }
 
 /// Count total FTS results matching a query without fetching items.
@@ -83,12 +123,11 @@ pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<
         format!("!L {query}")
     };
 
-    let resp = client
+    let req = client
         .http()
         .get(&base_url)
-        .query(&[("q", &q)])
-        .send()
-        .await?;
+        .query(&[("q", &q)]);
+    let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
         return Err(IaError::Http {
@@ -126,7 +165,7 @@ pub fn scrape<'a>(
         loop {
             let mut req = client
                 .http()
-                .get(&url)
+                .post(&url)
                 .query(&[("q", &query), ("fields", &fields)]);
 
             if !sorts.is_empty() {
@@ -141,7 +180,7 @@ pub fn scrape<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = req.send().await?;
+            let resp = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -237,7 +276,7 @@ pub fn advanced<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = req.send().await?;
+            let resp = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -333,7 +372,7 @@ pub fn fts<'a>(
         let mut yielded = 0usize;
 
         loop {
-            let resp: reqwest::Response = if let Some(ref sid) = scroll_id {
+            let req = if let Some(ref sid) = scroll_id {
                 // Scroll request
                 let body = serde_json::to_vec(&serde_json::json!({ "scroll_id": sid }))
                     .map_err(IaError::Json)?;
@@ -342,8 +381,6 @@ pub fn fts<'a>(
                     .post(format!("{base_url}?scroll=true"))
                     .header("content-type", "application/json")
                     .body(body)
-                    .send()
-                    .await?
             } else {
                 // Initial request
                 let mut json_body = serde_json::json!({
@@ -362,9 +399,8 @@ pub fn fts<'a>(
                     .post(&base_url)
                     .header("content-type", "application/json")
                     .body(body)
-                    .send()
-                    .await?
             };
+            let resp: reqwest::Response = with_s3_auth(req, client).send().await?;
 
             if !resp.status().is_success() {
                 Err(IaError::Http {
@@ -458,7 +494,7 @@ mod tests {
     async fn scrape_returns_results() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .and(query_param("q", "collection:test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -488,7 +524,7 @@ mod tests {
     async fn scrape_with_count_limit() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [
@@ -519,7 +555,7 @@ mod tests {
     async fn num_found_returns_total() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .and(query_param("total_only", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -615,7 +651,7 @@ mod tests {
     async fn scrape_handles_empty_response() {
         let mock_server = MockServer::start().await;
 
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/services/search/v1/scrape"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [],
