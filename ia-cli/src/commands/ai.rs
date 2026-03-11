@@ -88,7 +88,7 @@ pub struct AiArgs {
     pub dry_run: bool,
 
     // --- LLM configuration ---
-    /// LLM API base URL (default: https://api.openai.com/v1)
+    /// LLM API base URL (default: `https://api.openai.com/v1`)
     #[arg(long)]
     pub base_url: Option<String>,
 
@@ -246,10 +246,7 @@ pub async fn run(
                 eprintln!("  Items skipped: {}", summary.items_skipped);
             }
             if summary.items_errored > 0 {
-                eprintln!(
-                    "  Items errored: {}",
-                    style(summary.items_errored).red()
-                );
+                eprintln!("  Items errored: {}", style(summary.items_errored).red());
             }
         }
         if undo_args.json {
@@ -259,10 +256,7 @@ pub async fn run(
     }
 
     // Validate input sources
-    if args.identifiers.is_empty()
-        && args.itemlist.is_none()
-        && args.search.is_none()
-    {
+    if args.identifiers.is_empty() && args.itemlist.is_none() && args.search.is_none() {
         bail!(
             "no input specified. Provide identifiers, --itemlist, or --search.\n\
              Run 'ia ai --help' for usage."
@@ -357,11 +351,8 @@ pub async fn run(
 
     let summary = if let Some((analysis_rx, reviewed_tx, shutdown_for_tui)) = tui_channels {
         // Interactive mode: run pipeline and TUI concurrently
-        let pipeline_fut = ia_core::ai::pipeline::run_pipeline(
-            ia_client,
-            identifiers,
-            pipeline_config,
-        );
+        let pipeline_fut =
+            ia_core::ai::pipeline::run_pipeline(ia_client, identifiers, pipeline_config);
         let tui_fut = crate::tui::ai::run_ai_tui(
             analysis_rx,
             reviewed_tx,
@@ -374,12 +365,7 @@ pub async fn run(
         pipeline_result?
     } else {
         // Headless / record-only: no TUI
-        ia_core::ai::pipeline::run_pipeline(
-            ia_client,
-            identifiers,
-            pipeline_config,
-        )
-        .await?
+        ia_core::ai::pipeline::run_pipeline(ia_client, identifiers, pipeline_config).await?
     };
 
     // Print summary
@@ -441,49 +427,33 @@ async fn collect_identifiers(args: &AiArgs, client: &IaClient) -> Result<Vec<Str
 fn print_summary(summary: &PipelineSummary, dry_run: bool) {
     eprintln!();
     if dry_run {
-        eprintln!("{}", style("Dry run complete (no changes applied)").yellow());
+        eprintln!(
+            "{}",
+            style("Dry run complete (no changes applied)").yellow()
+        );
     } else {
         eprintln!("{}", style("Complete").green().bold());
     }
-    eprintln!(
-        "  Items analyzed: {}",
-        summary.items_analyzed
-    );
+    eprintln!("  Items analyzed: {}", summary.items_analyzed);
     if summary.items_with_changes > 0 {
-        eprintln!(
-            "  Items with changes: {}",
-            summary.items_with_changes
-        );
+        eprintln!("  Items with changes: {}", summary.items_with_changes);
     }
     if summary.changes_applied > 0 {
-        eprintln!(
-            "  Changes applied: {}",
-            summary.changes_applied
-        );
+        eprintln!("  Changes applied: {}", summary.changes_applied);
     }
     if summary.changes_rejected > 0 {
-        eprintln!(
-            "  Changes rejected: {}",
-            summary.changes_rejected
-        );
+        eprintln!("  Changes rejected: {}", summary.changes_rejected);
     }
     if summary.items_skipped > 0 {
-        eprintln!(
-            "  Items skipped: {}",
-            summary.items_skipped
-        );
+        eprintln!("  Items skipped: {}", summary.items_skipped);
     }
     if summary.items_errored > 0 {
-        eprintln!(
-            "  Items errored: {}",
-            style(summary.items_errored).red()
-        );
+        eprintln!("  Items errored: {}", style(summary.items_errored).red());
     }
     if summary.total_prompt_tokens > 0 || summary.total_completion_tokens > 0 {
         eprintln!(
             "  Tokens: {} prompt + {} completion",
-            summary.total_prompt_tokens,
-            summary.total_completion_tokens
+            summary.total_prompt_tokens, summary.total_completion_tokens
         );
     }
     eprintln!("  Elapsed: {:.1}s", summary.elapsed_secs);

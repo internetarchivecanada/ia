@@ -102,9 +102,7 @@ pub async fn check_keys(client: &IaClient) -> Result<AccountInfo> {
         .map_err(|e| IaError::Auth(format!("failed to parse response: {e}")))?;
 
     if !parsed.success {
-        let msg = parsed
-            .error
-            .unwrap_or_else(|| "invalid credentials".into());
+        let msg = parsed.error.unwrap_or_else(|| "invalid credentials".into());
         return Err(IaError::Auth(msg));
     }
 

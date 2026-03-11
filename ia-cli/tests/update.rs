@@ -50,7 +50,9 @@ mod with_feature {
         ia().args(["update", "install", "0.1.0"])
             .assert()
             .failure()
-            .stderr(predicate::str::contains("below minimum installable version"));
+            .stderr(predicate::str::contains(
+                "below minimum installable version",
+            ));
     }
 
     #[test]

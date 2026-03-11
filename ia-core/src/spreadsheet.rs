@@ -236,9 +236,7 @@ fn write_csv(path: &Path, records: &[SpreadsheetRecord], delimiter: u8) -> Resul
         for name in &field_names {
             row.push(fields.get(name).cloned().unwrap_or_default());
         }
-        writer
-            .write_record(&row)
-            .map_err(std::io::Error::other)?;
+        writer.write_record(&row).map_err(std::io::Error::other)?;
     }
 
     writer.flush()?;
@@ -289,9 +287,7 @@ fn write_xlsx(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
         }
     }
 
-    workbook
-        .save(path)
-        .map_err(std::io::Error::other)?;
+    workbook.save(path).map_err(std::io::Error::other)?;
 
     Ok(())
 }
@@ -321,7 +317,8 @@ mod tests {
 
     #[test]
     fn read_csv() {
-        let csv = "identifier,title,date\nnasa,NASA Images,2024-01-01\nmars,Mars Rover,2024-06-01\n";
+        let csv =
+            "identifier,title,date\nnasa,NASA Images,2024-01-01\nmars,Mars Rover,2024-06-01\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.csv");
         std::fs::write(&path, csv).unwrap();
@@ -526,7 +523,10 @@ mod tests {
         let records = vec![];
         let err = write_spreadsheet(&path, &records).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("import reads .ods"), "error should hint that ODS is read-only: {msg}");
+        assert!(
+            msg.contains("import reads .ods"),
+            "error should hint that ODS is read-only: {msg}"
+        );
     }
 
     #[test]
@@ -536,6 +536,9 @@ mod tests {
         let records = vec![];
         let err = write_spreadsheet(&path, &records).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unsupported export format"), "error should say unsupported: {msg}");
+        assert!(
+            msg.contains("unsupported export format"),
+            "error should say unsupported: {msg}"
+        );
     }
 }

@@ -194,7 +194,11 @@ impl IaConfig {
 
     /// The protocol to use for requests.
     pub fn protocol(&self) -> &str {
-        if self.general.secure { "https" } else { "http" }
+        if self.general.secure {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// Serialize config to JSON, optionally redacting secrets.
@@ -300,12 +304,17 @@ impl IaConfig {
         // Merge auth values
         ini.set("s3", "access", Some(auth.s3_access.clone()));
         ini.set("s3", "secret", Some(auth.s3_secret.clone()));
-        ini.set("cookies", "logged-in-user", Some(auth.logged_in_user.clone()));
+        ini.set(
+            "cookies",
+            "logged-in-user",
+            Some(auth.logged_in_user.clone()),
+        );
         ini.set("cookies", "logged-in-sig", Some(auth.logged_in_sig.clone()));
         ini.set("general", "screenname", Some(auth.screenname.clone()));
 
         // Write the INI file
-        ini.write(path).map_err(|e| IaError::Config(format!("failed to write config: {e}")))?;
+        ini.write(path)
+            .map_err(|e| IaError::Config(format!("failed to write config: {e}")))?;
 
         // Set file permissions to 0o600 (owner read/write only)
         #[cfg(unix)]
@@ -374,7 +383,10 @@ mod tests {
         assert_eq!(config.s3_secret.as_deref(), Some("test_secret"));
         assert_eq!(config.general.host, "test.archive.org");
         assert!(!config.general.secure);
-        assert_eq!(config.general.user_agent_suffix.as_deref(), Some("MyApp/1.0"));
+        assert_eq!(
+            config.general.user_agent_suffix.as_deref(),
+            Some("MyApp/1.0")
+        );
         assert_eq!(config.protocol(), "http");
     }
 
@@ -486,14 +498,24 @@ mod tests {
         };
 
         let result = IaConfig::write_config_file(&auth, &ini_path);
-        assert!(result.is_ok(), "write_config_file failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "write_config_file failed: {:?}",
+            result.err()
+        );
 
         // Read it back and verify
         let config = IaConfig::load_from_file(&ini_path).unwrap();
         assert_eq!(config.s3_access.as_deref(), Some("new-access"));
         assert_eq!(config.s3_secret.as_deref(), Some("new-secret"));
-        assert_eq!(config.cookies.get("logged-in-user").map(|s| s.as_str()), Some("user%40example.com"));
-        assert_eq!(config.cookies.get("logged-in-sig").map(|s| s.as_str()), Some("sig-value"));
+        assert_eq!(
+            config.cookies.get("logged-in-user").map(|s| s.as_str()),
+            Some("user%40example.com")
+        );
+        assert_eq!(
+            config.cookies.get("logged-in-sig").map(|s| s.as_str()),
+            Some("sig-value")
+        );
         assert_eq!(config.general.screenname.as_deref(), Some("testuser"));
     }
 
@@ -529,7 +551,10 @@ mod tests {
 
         // Verify existing settings were preserved
         assert_eq!(config.general.host, "custom.archive.org");
-        assert_eq!(config.general.user_agent_suffix.as_deref(), Some("MyApp/1.0"));
+        assert_eq!(
+            config.general.user_agent_suffix.as_deref(),
+            Some("MyApp/1.0")
+        );
         assert_eq!(config.logging.level.as_deref(), Some("debug"));
     }
 
@@ -580,8 +605,12 @@ mod tests {
         let mut config = IaConfig::default();
         config.s3_access = Some("my-access-key".into());
         config.s3_secret = Some("my-secret-key".into());
-        config.cookies.insert("logged-in-user".into(), "user%40example.com".into());
-        config.cookies.insert("logged-in-sig".into(), "secret-sig".into());
+        config
+            .cookies
+            .insert("logged-in-user".into(), "user%40example.com".into());
+        config
+            .cookies
+            .insert("logged-in-sig".into(), "secret-sig".into());
         config.general.screenname = Some("testuser".into());
 
         let json = config.to_json(false); // show_secrets=false (default)
@@ -609,8 +638,12 @@ mod tests {
         let mut config = IaConfig::default();
         config.s3_access = Some("my-access-key".into());
         config.s3_secret = Some("my-secret-key".into());
-        config.cookies.insert("logged-in-user".into(), "user%40example.com".into());
-        config.cookies.insert("logged-in-sig".into(), "secret-sig".into());
+        config
+            .cookies
+            .insert("logged-in-user".into(), "user%40example.com".into());
+        config
+            .cookies
+            .insert("logged-in-sig".into(), "secret-sig".into());
 
         let json = config.to_json(true); // show_secrets=true
         let s3 = json["s3"].as_object().unwrap();
@@ -621,5 +654,4 @@ mod tests {
         assert_eq!(cookies["logged-in-user"], "user%40example.com");
         assert_eq!(cookies["logged-in-sig"], "secret-sig");
     }
-
 }

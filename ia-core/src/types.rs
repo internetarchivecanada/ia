@@ -125,7 +125,9 @@ pub struct FileMetadata {
 }
 
 /// Custom deserializer for fields that IA returns as strings but are actually u64.
-fn deserialize_optional_string_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+fn deserialize_optional_string_u64<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -139,10 +141,7 @@ where
     }
 
     match Option::<StringOrNum>::deserialize(deserializer)? {
-        Some(StringOrNum::Str(s)) => s
-            .parse::<u64>()
-            .map(Some)
-            .map_err(de::Error::custom),
+        Some(StringOrNum::Str(s)) => s.parse::<u64>().map(Some).map_err(de::Error::custom),
         Some(StringOrNum::Num(n)) => Ok(Some(n)),
         None => Ok(None),
     }

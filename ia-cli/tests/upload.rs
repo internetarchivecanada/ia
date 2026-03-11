@@ -96,14 +96,18 @@ fn delete_after_upload_rejects_no_verify() {
         .arg("my-item")
         .arg(file.as_os_str())
         .args([
-            "-m", "mediatype:texts",
-            "-m", "collection:test_collection",
+            "-m",
+            "mediatype:texts",
+            "-m",
+            "collection:test_collection",
             "--delete-after-upload",
             "--no-verify",
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--delete-after-upload requires verification"));
+        .stderr(predicate::str::contains(
+            "--delete-after-upload requires verification",
+        ));
 }
 
 // ─── Dry run ─────────────────────────────────────────────────────────────────
@@ -148,7 +152,13 @@ fn upload_dry_run_with_test_item() {
         .arg("upload")
         .arg("my-item")
         .arg(file.as_os_str())
-        .args(["-m", "mediatype:texts", "--test-item", "--dry-run", "--no-verify"])
+        .args([
+            "-m",
+            "mediatype:texts",
+            "--test-item",
+            "--dry-run",
+            "--no-verify",
+        ])
         .assert()
         .success()
         // Aggregate display shows item name and summary instead of per-file "dry run" lines
@@ -369,7 +379,11 @@ fn upload_template_tsv_format() {
 fn upload_import_nonexistent_file() {
     let cfg = empty_config();
     ia_with_config(&cfg)
-        .args(["upload", "import", "/tmp/ia-cli-test-nonexistent-spreadsheet.csv"])
+        .args([
+            "upload",
+            "import",
+            "/tmp/ia-cli-test-nonexistent-spreadsheet.csv",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed to read spreadsheet"));

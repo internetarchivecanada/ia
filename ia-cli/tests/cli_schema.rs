@@ -212,7 +212,7 @@ async fn schema_required_filter() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
     assert!(stdout.contains("title")); // Recommended counts as required
-    // scanner is "No" required AND internal — should not appear
+                                       // scanner is "No" required AND internal — should not appear
 }
 
 #[tokio::test]
@@ -378,14 +378,7 @@ async fn schema_detail_case_insensitive() {
     let host = server.uri().replace("http://", "");
     let output = Command::cargo_bin("ia")
         .unwrap()
-        .args([
-            "--host",
-            &host,
-            "--insecure",
-            "metadata",
-            "schema",
-            "Title",
-        ])
+        .args(["--host", &host, "--insecure", "metadata", "schema", "Title"])
         .output()
         .unwrap();
 

@@ -48,15 +48,9 @@ async fn upload_item_single_file() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(
-        &client,
-        "test-item",
-        &[f],
-        &opts,
-        None,
-    )
-    .await
-    .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -104,10 +98,9 @@ async fn upload_item_multiple_files() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f1, f2], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f1, f2], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 2);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -221,10 +214,9 @@ async fn upload_item_test_item_injects_collection() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -259,10 +251,9 @@ async fn upload_item_with_remote_dir() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
 }
@@ -290,10 +281,9 @@ async fn upload_item_dry_run() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::DryRun));
@@ -352,10 +342,9 @@ async fn upload_item_no_collection_check_skips_validation() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -464,10 +453,9 @@ async fn upload_item_empty_metadata_skips_validation() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -560,15 +548,9 @@ async fn upload_item_remote_name_changes_put_path() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(
-        &client,
-        "test-item",
-        &[f],
-        &opts,
-        None,
-    )
-    .await
-    .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -605,10 +587,9 @@ async fn upload_item_test_item_replaces_existing_collection() {
         ..Default::default()
     };
 
-    let results =
-        upload::upload_item(&client, "test-item", &[f], &opts, None)
-            .await
-            .unwrap();
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
 }

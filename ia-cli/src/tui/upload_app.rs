@@ -2,7 +2,7 @@
 //!
 //! Tracks per-item and per-file upload progress with byte-level granularity,
 //! rate limit status, throughput sampling, and S3 task counts. Implements the
-//! [`Dashboard`](super::framework::Dashboard) trait via [`UploadDashboard`].
+//! [`Dashboard`] trait via [`UploadDashboard`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -310,8 +310,7 @@ impl UploadTuiState {
             UploadProgressStatus::Failed => {
                 self.active_files.remove(&fk);
                 self.files_failed += 1;
-                self.failed_files
-                    .push((p.key, "upload failed".to_string()));
+                self.failed_files.push((p.key, "upload failed".to_string()));
             }
         }
 
@@ -459,14 +458,9 @@ async fn run_dashboard_and_summarize(
     drop(_guard);
 
     // Let the user know if uploads are still in-flight.
-    let in_flight = handles
-        .iter()
-        .filter(|h| !h.is_finished())
-        .count();
+    let in_flight = handles.iter().filter(|h| !h.is_finished()).count();
     if in_flight > 0 {
-        eprintln!(
-            "Waiting for {in_flight} in-flight upload(s) to finish (Ctrl-C to abort)..."
-        );
+        eprintln!("Waiting for {in_flight} in-flight upload(s) to finish (Ctrl-C to abort)...");
     }
 
     // 4. Collect results and print summary
@@ -777,7 +771,10 @@ mod tests {
         assert_eq!(state.bytes_uploaded, 1000);
         assert_eq!(state.files_completed, 1);
         assert!(state.active_files.is_empty());
-        assert_eq!(state.completed_files, VecDeque::from(vec!["file.txt".to_string()]));
+        assert_eq!(
+            state.completed_files,
+            VecDeque::from(vec!["file.txt".to_string()])
+        );
         assert_eq!(state.items[0].status, UploadItemStatus::Complete);
         assert_eq!(state.items[0].bytes_uploaded, 1000);
     }
@@ -785,8 +782,7 @@ mod tests {
     // 2. Two items, verify independent tracking
     #[test]
     fn test_batch_progress_multiple_items() {
-        let mut state =
-            UploadTuiState::new(&["item-a".to_string(), "item-b".to_string()]);
+        let mut state = UploadTuiState::new(&["item-a".to_string(), "item-b".to_string()]);
 
         // Verify and upload item-a
         state.update(progress(
@@ -989,12 +985,12 @@ mod tests {
         assert_eq!(state.failed_files.len(), 1);
         assert_eq!(state.failed_files[0].0, "bad.txt");
         assert_eq!(state.items[0].files_failed, 1);
-        assert!(state.active_files.contains_key(
-            &UploadTuiState::file_key("item-a", "good.txt")
-        ));
-        assert!(!state.active_files.contains_key(
-            &UploadTuiState::file_key("item-a", "bad.txt")
-        ));
+        assert!(state
+            .active_files
+            .contains_key(&UploadTuiState::file_key("item-a", "good.txt")));
+        assert!(!state
+            .active_files
+            .contains_key(&UploadTuiState::file_key("item-a", "bad.txt")));
 
         // Complete good.txt — item should be Failed because of bad.txt
         state.update(progress(
@@ -1004,10 +1000,7 @@ mod tests {
             200,
             UploadProgressStatus::Complete,
         ));
-        assert!(matches!(
-            state.items[0].status,
-            UploadItemStatus::Failed(_)
-        ));
+        assert!(matches!(state.items[0].status, UploadItemStatus::Failed(_)));
     }
 
     // 6. Progress ratio calculation

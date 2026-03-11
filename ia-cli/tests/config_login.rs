@@ -7,9 +7,12 @@ fn config_login_missing_password_flag_without_tty() {
 
     let mut cmd = Command::cargo_bin("ia").unwrap();
     cmd.args([
-        "--config-file", ini_path.to_str().unwrap(),
-        "config", "login",
-        "-u", "user@example.com",
+        "--config-file",
+        ini_path.to_str().unwrap(),
+        "config",
+        "login",
+        "-u",
+        "user@example.com",
     ]);
     cmd.assert().failure();
 }

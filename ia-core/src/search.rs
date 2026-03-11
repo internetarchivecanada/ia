@@ -106,7 +106,8 @@ pub async fn advanced_num_found(client: &IaClient, query: &str) -> Result<u64> {
         });
     }
 
-    let body: AdvancedSearchResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
+    let body: AdvancedSearchResponse =
+        resp.json().await.map_err(reqwest_middleware::Error::from)?;
     Ok(body.response.num_found)
 }
 
@@ -122,10 +123,7 @@ pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<
         format!("!L {query}")
     };
 
-    let req = client
-        .http()
-        .get(&base_url)
-        .query(&[("q", &q)]);
+    let req = client.http().get(&base_url).query(&[("q", &q)]);
     let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
@@ -248,7 +246,11 @@ pub fn advanced<'a>(
     };
     let count = opts.count;
     let query = query.to_string();
-    let rows = if opts.rows > 0 { opts.rows } else { DEFAULT_ADVANCED_ROWS };
+    let rows = if opts.rows > 0 {
+        opts.rows
+    } else {
+        DEFAULT_ADVANCED_ROWS
+    };
     let extra_params = opts.params.clone();
 
     Box::pin(async_stream::try_stream! {
@@ -638,8 +640,7 @@ mod tests {
             rows: 50,
             ..Default::default()
         };
-        let results: Vec<Result<SearchResult>> =
-            advanced(&client, "test", &opts).collect().await;
+        let results: Vec<Result<SearchResult>> = advanced(&client, "test", &opts).collect().await;
 
         assert_eq!(results.len(), 1);
     }
@@ -671,10 +672,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let results: Vec<Result<SearchResult>> =
-            scrape(&client, "nothing", &SearchOpts::default())
-                .collect()
-                .await;
+        let results: Vec<Result<SearchResult>> = scrape(&client, "nothing", &SearchOpts::default())
+            .collect()
+            .await;
 
         assert!(results.is_empty());
     }
@@ -745,10 +745,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let results: Vec<Result<SearchResult>> =
-            fts(&client, "test query", &SearchOpts::default())
-                .collect()
-                .await;
+        let results: Vec<Result<SearchResult>> = fts(&client, "test query", &SearchOpts::default())
+            .collect()
+            .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
@@ -789,8 +788,7 @@ mod tests {
             dsl: true,
             ..Default::default()
         };
-        let results: Vec<Result<SearchResult>> =
-            fts(&client, "raw dsl", &opts).collect().await;
+        let results: Vec<Result<SearchResult>> = fts(&client, "raw dsl", &opts).collect().await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
@@ -817,7 +815,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = advanced_num_found(&client, "collection:test").await.unwrap();
+        let count = advanced_num_found(&client, "collection:test")
+            .await
+            .unwrap();
         assert_eq!(count, 11234);
     }
 
@@ -901,8 +901,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
-        let results: Vec<Result<SearchResult>> =
-            scrape(&client, "test", &SearchOpts::default()).collect().await;
+        let results: Vec<Result<SearchResult>> = scrape(&client, "test", &SearchOpts::default())
+            .collect()
+            .await;
 
         assert_eq!(results.len(), 1);
     }
@@ -924,8 +925,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
-        let results: Vec<Result<SearchResult>> =
-            advanced(&client, "test", &SearchOpts::default()).collect().await;
+        let results: Vec<Result<SearchResult>> = advanced(&client, "test", &SearchOpts::default())
+            .collect()
+            .await;
 
         assert_eq!(results.len(), 1);
     }

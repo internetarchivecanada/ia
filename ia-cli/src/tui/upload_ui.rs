@@ -153,9 +153,7 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &UploadTuiState) {
     let mut lines: Vec<Line> = Vec::new();
     for item in &state.items {
         let status_icon = match &item.status {
-            UploadItemStatus::Pending => {
-                Span::styled("  ", Style::default().fg(Color::DarkGray))
-            }
+            UploadItemStatus::Pending => Span::styled("  ", Style::default().fg(Color::DarkGray)),
             UploadItemStatus::Verifying => {
                 Span::styled(" \u{25c7}", Style::default().fg(Color::Yellow))
             }
@@ -255,11 +253,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
         let bar_width = 20;
         let filled = (progress * bar_width as f64) as usize;
         let empty = bar_width - filled;
-        let bar = format!(
-            "{}{}",
-            "\u{2588}".repeat(filled),
-            "\u{2591}".repeat(empty),
-        );
+        let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),);
 
         let name = widgets::truncate_tail(&fp.name, 30);
 
@@ -278,11 +272,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
     // Show recent completions if space permits.
     if lines.len() < inner.height as usize && !state.completed_files.is_empty() {
         let remaining = inner.height as usize - lines.len();
-        let recent = state
-            .completed_files
-            .iter()
-            .rev()
-            .take(remaining.min(3));
+        let recent = state.completed_files.iter().rev().take(remaining.min(3));
 
         for name in recent {
             let display_name = widgets::truncate_tail(name, 30);

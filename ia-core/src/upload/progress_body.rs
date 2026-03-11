@@ -107,7 +107,11 @@ mod tests {
         assert_eq!(total_bytes, data.len() as u64);
 
         // At least two callbacks (100 KiB > one 64 KiB chunk).
-        assert!(calls.len() >= 2, "expected multiple callbacks, got {}", calls.len());
+        assert!(
+            calls.len() >= 2,
+            "expected multiple callbacks, got {}",
+            calls.len()
+        );
 
         // Each callback must report a strictly increasing cumulative count.
         for window in calls.windows(2) {

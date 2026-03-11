@@ -12,11 +12,7 @@ struct RedirectBlockedError(reqwest::Url);
 
 impl std::fmt::Display for RedirectBlockedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "redirect to non-archive.org domain blocked: {}",
-            self.0
-        )
+        write!(f, "redirect to non-archive.org domain blocked: {}", self.0)
     }
 }
 
@@ -80,7 +76,9 @@ impl IaClient {
             .pool_max_idle_per_host(10)
             .redirect(redirect_policy)
             .build()
-            .map_err(|e| crate::error::IaError::Config(format!("failed to build HTTP client: {e}")))?;
+            .map_err(|e| {
+                crate::error::IaError::Config(format!("failed to build HTTP client: {e}"))
+            })?;
 
         // No-redirect client for download auth: archive.org redirects
         // /download/ to data nodes, and reqwest strips Authorization on
@@ -91,7 +89,9 @@ impl IaClient {
             .pool_max_idle_per_host(10)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| crate::error::IaError::Config(format!("failed to build no-redirect client: {e}")))?;
+            .map_err(|e| {
+                crate::error::IaError::Config(format!("failed to build no-redirect client: {e}"))
+            })?;
 
         Ok((raw_client, no_redirect_client, user_agent))
     }
@@ -337,8 +337,8 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_to_non_archive_org_is_blocked() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
@@ -362,9 +362,16 @@ mod tests {
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
 
-        let result = client.http().get(format!("{}/step1", mock_server.uri())).send().await;
+        let result = client
+            .http()
+            .get(format!("{}/step1", mock_server.uri()))
+            .send()
+            .await;
         // Should fail because 127.0.0.1 is not *.archive.org
-        assert!(result.is_err(), "redirect to non-archive.org should be blocked");
+        assert!(
+            result.is_err(),
+            "redirect to non-archive.org should be blocked"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("redirect") || err_msg.contains("non-archive.org"),
@@ -374,8 +381,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_redirect_request_succeeds() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         // Verify that normal (non-redirect) requests still work fine.
         let mock_server = MockServer::start().await;

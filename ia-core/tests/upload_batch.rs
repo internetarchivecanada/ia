@@ -86,18 +86,8 @@ async fn batch_upload_multiple_items() {
 
     let client = test_client(&server);
     let records = vec![
-        record(
-            "item-1",
-            f1.to_str().unwrap(),
-            "texts",
-            "test_collection",
-        ),
-        record(
-            "item-2",
-            f2.to_str().unwrap(),
-            "texts",
-            "test_collection",
-        ),
+        record("item-1", f1.to_str().unwrap(), "texts", "test_collection"),
+        record("item-2", f2.to_str().unwrap(), "texts", "test_collection"),
     ];
     let opts = UploadOpts {
         verify: false,
@@ -130,18 +120,8 @@ async fn batch_upload_grouped_by_identifier() {
 
     let client = test_client(&server);
     let records = vec![
-        record(
-            "item-1",
-            f1.to_str().unwrap(),
-            "texts",
-            "test_collection",
-        ),
-        record(
-            "item-1",
-            f2.to_str().unwrap(),
-            "texts",
-            "test_collection",
-        ),
+        record("item-1", f1.to_str().unwrap(), "texts", "test_collection"),
+        record("item-1", f2.to_str().unwrap(), "texts", "test_collection"),
     ];
     let opts = UploadOpts {
         verify: false,

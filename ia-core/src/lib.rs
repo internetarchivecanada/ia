@@ -19,7 +19,7 @@ pub mod user_agent;
 
 pub use client::IaClient;
 pub use config::IaConfig;
-pub use error::{IaError, JsonError, JsonErrorBody, Result, write_json_error};
+pub use error::{write_json_error, IaError, JsonError, JsonErrorBody, Result};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

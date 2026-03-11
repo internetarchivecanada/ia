@@ -62,11 +62,9 @@ async fn initiate_upload_403_fails() {
     Mock::given(method("POST"))
         .and(path("/test-item/file.zip"))
         .and(query_param("uploads", ""))
-        .respond_with(
-            ResponseTemplate::new(403).set_body_string(
-                "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
-            ),
-        )
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
         .mount(&server)
         .await;
 
@@ -87,9 +85,7 @@ async fn upload_part_success() {
         .and(query_param("uploadId", "upload-123"))
         .and(header("authorization", "LOW test-access:test-secret"))
         .and(header("content-length", "11"))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("ETag", "\"etag-part1\""),
-        )
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag-part1\""))
         .mount(&server)
         .await;
 
@@ -147,10 +143,7 @@ async fn complete_upload_success() {
         .await;
 
     let client = test_client(&server);
-    let parts = vec![
-        (1, "\"etag1\"".to_string()),
-        (2, "\"etag2\"".to_string()),
-    ];
+    let parts = vec![(1, "\"etag1\"".to_string()), (2, "\"etag2\"".to_string())];
     let result =
         multipart::complete_upload(&client, "test-item", "file.zip", "upload-123", &parts, true)
             .await;
@@ -171,9 +164,15 @@ async fn complete_upload_without_backup() {
 
     let client = test_client(&server);
     let parts = vec![(1, "\"etag1\"".to_string())];
-    let result =
-        multipart::complete_upload(&client, "test-item", "file.zip", "upload-123", &parts, false)
-            .await;
+    let result = multipart::complete_upload(
+        &client,
+        "test-item",
+        "file.zip",
+        "upload-123",
+        &parts,
+        false,
+    )
+    .await;
     assert!(result.is_ok());
 }
 
@@ -192,8 +191,7 @@ async fn abort_upload_success() {
         .await;
 
     let client = test_client(&server);
-    let result =
-        multipart::abort_upload(&client, "test-item", "file.zip", "upload-123").await;
+    let result = multipart::abort_upload(&client, "test-item", "file.zip", "upload-123").await;
     assert!(result.is_ok());
 }
 
@@ -302,9 +300,10 @@ async fn upload_file_multipart_success() {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(query_param("uploads", ""))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
         .mount(&server)
         .await;
 
@@ -388,9 +387,10 @@ async fn upload_file_multipart_part_retry_on_503() {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(query_param("uploads", ""))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
         .mount(&server)
         .await;
 
@@ -465,9 +465,10 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(query_param("uploads", ""))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
         .mount(&server)
         .await;
 
@@ -631,9 +632,10 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(query_param("uploads", ""))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
         .mount(&server)
         .await;
 

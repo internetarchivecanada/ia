@@ -35,7 +35,9 @@ impl DiskPool {
     /// Create a new disk pool from a list of directory paths.
     pub fn new(paths: &[PathBuf]) -> Result<Self> {
         if paths.is_empty() {
-            return Err(IaError::Config("disk pool requires at least one path".to_string()));
+            return Err(IaError::Config(
+                "disk pool requires at least one path".to_string(),
+            ));
         }
 
         let mut disks = Vec::new();
@@ -73,7 +75,8 @@ impl DiskPool {
 
         match best_idx {
             Some(idx) => {
-                self.disks[idx].free_bytes = self.disks[idx].free_bytes.saturating_sub(estimated_size);
+                self.disks[idx].free_bytes =
+                    self.disks[idx].free_bytes.saturating_sub(estimated_size);
                 self.disks[idx].assigned_items.push(item_id.to_string());
                 self.assignments.insert(item_id.to_string(), idx);
                 debug!(
@@ -83,7 +86,9 @@ impl DiskPool {
                 );
                 Ok(&self.disks[idx].path)
             }
-            None => Err(IaError::NoDiskSpace { needed: estimated_size }),
+            None => Err(IaError::NoDiskSpace {
+                needed: estimated_size,
+            }),
         }
     }
 
@@ -168,14 +173,12 @@ fn disk_space(path: &Path) -> Result<(u64, u64)> {
     // Use std::fs to get disk space via statvfs on unix
     #[cfg(unix)]
     {
-        let _ = std::fs::metadata(path).map_err(|_| {
-            IaError::Config(format!("cannot access disk: {}", path.display()))
-        })?;
+        let _ = std::fs::metadata(path)
+            .map_err(|_| IaError::Config(format!("cannot access disk: {}", path.display())))?;
 
         // Use nix or manual statvfs
-        let c_path = std::ffi::CString::new(path.to_str().unwrap_or("")).map_err(|_| {
-            IaError::Config(format!("invalid path: {}", path.display()))
-        })?;
+        let c_path = std::ffi::CString::new(path.to_str().unwrap_or(""))
+            .map_err(|_| IaError::Config(format!("invalid path: {}", path.display())))?;
 
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
@@ -219,7 +222,8 @@ mod tests {
     fn assign_returns_disk_with_most_space() {
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
-        let mut pool = DiskPool::new(&[dir1.path().to_path_buf(), dir2.path().to_path_buf()]).unwrap();
+        let mut pool =
+            DiskPool::new(&[dir1.path().to_path_buf(), dir2.path().to_path_buf()]).unwrap();
 
         // Both disks should have space
         let dest = pool.assign_item("item1", 1024).unwrap();

@@ -13,16 +13,30 @@ fn config_show_displays_json() {
     writeln!(f, "host = archive.org").unwrap();
 
     let mut cmd = Command::cargo_bin("ia").unwrap();
-    cmd.args(["--config-file", ini_path.to_str().unwrap(), "config", "show"]);
+    cmd.args([
+        "--config-file",
+        ini_path.to_str().unwrap(),
+        "config",
+        "show",
+    ]);
     let output = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Identifiers should be shown
-    assert!(stdout.contains("test-access"), "should show access key (identifier): {stdout}");
+    assert!(
+        stdout.contains("test-access"),
+        "should show access key (identifier): {stdout}"
+    );
     assert!(stdout.contains("archive.org"), "should show host: {stdout}");
     // Secrets should be redacted
-    assert!(stdout.contains("REDACTED"), "secrets should be redacted: {stdout}");
-    assert!(!stdout.contains("test-secret"), "should NOT show raw secret key: {stdout}");
+    assert!(
+        stdout.contains("REDACTED"),
+        "secrets should be redacted: {stdout}"
+    );
+    assert!(
+        !stdout.contains("test-secret"),
+        "should NOT show raw secret key: {stdout}"
+    );
 }
 
 #[test]
@@ -34,12 +48,18 @@ fn config_show_json_mode() {
     writeln!(f, "host = archive.org").unwrap();
 
     let mut cmd = Command::cargo_bin("ia").unwrap();
-    cmd.args(["--config-file", ini_path.to_str().unwrap(), "config", "show", "--json"]);
+    cmd.args([
+        "--config-file",
+        ini_path.to_str().unwrap(),
+        "config",
+        "show",
+        "--json",
+    ]);
     let output = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|_| panic!("should be valid JSON: {stdout}"));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("should be valid JSON: {stdout}"));
     assert!(parsed.get("general").is_some());
 }
 
@@ -55,11 +75,26 @@ fn config_show_secrets_flag() {
     writeln!(f, "logged-in-sig = secret-sig").unwrap();
 
     let mut cmd = Command::cargo_bin("ia").unwrap();
-    cmd.args(["--config-file", ini_path.to_str().unwrap(), "config", "show", "--show-secrets"]);
+    cmd.args([
+        "--config-file",
+        ini_path.to_str().unwrap(),
+        "config",
+        "show",
+        "--show-secrets",
+    ]);
     let output = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("test-secret"), "should show raw secret key: {stdout}");
-    assert!(stdout.contains("secret-sig"), "should show raw cookie sig: {stdout}");
-    assert!(!stdout.contains("REDACTED"), "should not contain REDACTED: {stdout}");
+    assert!(
+        stdout.contains("test-secret"),
+        "should show raw secret key: {stdout}"
+    );
+    assert!(
+        stdout.contains("secret-sig"),
+        "should show raw cookie sig: {stdout}"
+    );
+    assert!(
+        !stdout.contains("REDACTED"),
+        "should not contain REDACTED: {stdout}"
+    );
 }

@@ -111,9 +111,7 @@ async fn upload_503_spam_detection() {
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
-        .respond_with(
-            ResponseTemplate::new(503).set_body_string("Your upload appears to be spam."),
-        )
+        .respond_with(ResponseTemplate::new(503).set_body_string("Your upload appears to be spam."))
         .mount(&server)
         .await;
 
@@ -620,7 +618,9 @@ async fn upload_503_rate_limit_retry() {
     // First PUT returns 503 (non-spam), second succeeds
     Mock::given(method("PUT"))
         .and(path("/test-item/file.txt"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("Please reduce your request rate."))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("Please reduce your request rate."),
+        )
         .up_to_n_times(1)
         .expect(1)
         .mount(&server)
@@ -637,8 +637,7 @@ async fn upload_503_rate_limit_retry() {
     Mock::given(method("GET"))
         .and(wiremock::matchers::query_param("check_limit", "1"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
         )
         .mount(&server)
         .await;
@@ -746,7 +745,10 @@ async fn upload_403_is_not_retried() {
     .await;
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("AccessDenied"), "expected AccessDenied in error: {err}");
+    assert!(
+        err.to_string().contains("AccessDenied"),
+        "expected AccessDenied in error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -822,7 +824,15 @@ async fn upload_checksum_skip_when_md5_matches() {
     };
 
     let result = upload::upload_file(
-        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -859,7 +869,15 @@ async fn upload_checksum_no_skip_when_md5_differs() {
     };
 
     let result = upload::upload_file(
-        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -896,7 +914,15 @@ async fn upload_checksum_no_skip_when_file_not_on_remote() {
     };
 
     let result = upload::upload_file(
-        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -933,7 +959,15 @@ async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
     };
 
     let result = upload::upload_file(
-        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -960,7 +994,15 @@ async fn upload_empty_file() {
 
     let opts = UploadOpts::default();
     let result = upload::upload_file(
-        &client, "test-item", &file, "empty.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        &file,
+        "empty.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -996,7 +1038,15 @@ async fn upload_precomputed_checksum_used_for_content_md5() {
     };
 
     let result = upload::upload_file(
-        &client, "test-item", f.path(), "test.txt", &opts, true, true, None, None,
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -1036,8 +1086,7 @@ async fn upload_retries_on_server_error() {
     Mock::given(method("GET"))
         .and(wiremock::matchers::query_param("check_limit", "1"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
         )
         .mount(&server)
         .await;
@@ -1221,9 +1270,10 @@ async fn upload_file_multipart_flag_dispatches() {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(wiremock::matchers::query_param("uploads", ""))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListMultipartUploadsResult></ListMultipartUploadsResult>",
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
         .mount(&server)
         .await;
 

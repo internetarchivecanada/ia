@@ -110,9 +110,7 @@ async fn pipeline_headless_dry_run_single_item() {
     // Mock LLM chat completions endpoint
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .expect(1)
         .mount(&llm_server)
         .await;
@@ -172,9 +170,7 @@ async fn pipeline_headless_dry_run_multiple_items() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 
@@ -231,9 +227,7 @@ async fn pipeline_writes_joblog() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 
@@ -264,13 +258,9 @@ async fn pipeline_writes_joblog() {
         shutdown_tx: None,
     };
 
-    ia_core::ai::pipeline::run_pipeline(
-        Arc::new(ia_client),
-        vec!["test-item".to_string()],
-        config,
-    )
-    .await
-    .unwrap();
+    ia_core::ai::pipeline::run_pipeline(Arc::new(ia_client), vec!["test-item".to_string()], config)
+        .await
+        .unwrap();
 
     // Verify joblog was written
     let entries = joblog::read(&joblog_path).unwrap();
@@ -301,9 +291,7 @@ async fn pipeline_source_error_tracked_in_summary() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 
@@ -410,9 +398,7 @@ async fn pipeline_record_only_writes_output_file() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 
@@ -531,20 +517,18 @@ async fn undo_dry_run() {
 
     // Write a fake AI joblog entry
     let writer = JoblogWriter::open(&joblog_path).unwrap();
-    writer.write(
-        &JoblogEntry::new("ai", "test-item", "").ai_ok(
-            vec![JoblogChange {
-                field: "title".to_string(),
-                old: Some(json!("old title")),
-                new: json!("New Title"),
-            }],
-            Some(JoblogTokens {
-                prompt: 500,
-                completion: 100,
-            }),
-            1000,
-        ),
-    );
+    writer.write(&JoblogEntry::new("ai", "test-item", "").ai_ok(
+        vec![JoblogChange {
+            field: "title".to_string(),
+            old: Some(json!("old title")),
+            new: json!("New Title"),
+        }],
+        Some(JoblogTokens {
+            prompt: 500,
+            completion: 100,
+        }),
+        1000,
+    ));
 
     let summary = undo_from_joblog(&client, &joblog_path, None, true)
         .await
@@ -593,24 +577,22 @@ async fn undo_applies_reverse_changes() {
     let joblog_path = dir.path().join("test.jsonl");
 
     let writer = JoblogWriter::open(&joblog_path).unwrap();
-    writer.write(
-        &JoblogEntry::new("ai", "test-item", "").ai_ok(
-            vec![
-                JoblogChange {
-                    field: "title".to_string(),
-                    old: Some(json!("old title")),
-                    new: json!("New Title"),
-                },
-                JoblogChange {
-                    field: "date".to_string(),
-                    old: None,
-                    new: json!("1969-07-20"),
-                },
-            ],
-            None,
-            500,
-        ),
-    );
+    writer.write(&JoblogEntry::new("ai", "test-item", "").ai_ok(
+        vec![
+            JoblogChange {
+                field: "title".to_string(),
+                old: Some(json!("old title")),
+                new: json!("New Title"),
+            },
+            JoblogChange {
+                field: "date".to_string(),
+                old: None,
+                new: json!("1969-07-20"),
+            },
+        ],
+        None,
+        500,
+    ));
 
     let summary = undo_from_joblog(&client, &joblog_path, None, false)
         .await
@@ -699,17 +681,15 @@ async fn undo_writes_joblog() {
 
     // Write source joblog
     let source_writer = JoblogWriter::open(&source_path).unwrap();
-    source_writer.write(
-        &JoblogEntry::new("ai", "test-item", "").ai_ok(
-            vec![JoblogChange {
-                field: "title".to_string(),
-                old: Some(json!("old title")),
-                new: json!("New Title"),
-            }],
-            None,
-            500,
-        ),
-    );
+    source_writer.write(&JoblogEntry::new("ai", "test-item", "").ai_ok(
+        vec![JoblogChange {
+            field: "title".to_string(),
+            old: Some(json!("old title")),
+            new: json!("New Title"),
+        }],
+        None,
+        500,
+    ));
 
     // Write undo with logging
     let undo_writer = JoblogWriter::open(&undo_path).unwrap();
@@ -744,9 +724,7 @@ async fn pipeline_interactive_mode_accepts_all() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .expect(1)
         .mount(&llm_server)
         .await;
@@ -819,9 +797,7 @@ async fn pipeline_interactive_mode_rejects_all() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 
@@ -895,9 +871,7 @@ async fn pipeline_interactive_mode_early_quit() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
 

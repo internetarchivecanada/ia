@@ -335,8 +335,7 @@ mod tests {
 
     #[test]
     fn error_entry_includes_error_and_retries() {
-        let entry =
-            JoblogEntry::new("download", "nasa", "video.mp4").error("timeout after 12s", 5);
+        let entry = JoblogEntry::new("download", "nasa", "video.mp4").error("timeout after 12s", 5);
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"status\":\"error\""));
         assert!(json.contains("\"error\":\"timeout after 12s\""));
@@ -467,8 +466,8 @@ mod tests {
 
     #[test]
     fn ai_error_entry_has_empty_changes() {
-        let entry = JoblogEntry::new("ai", "bad_item", "")
-            .ai_error("metadata write failed: 403", 500);
+        let entry =
+            JoblogEntry::new("ai", "bad_item", "").ai_error("metadata write failed: 403", 500);
 
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"status\":\"error\""));
@@ -545,8 +544,7 @@ mod tests {
     fn failed_items_includes_ai_ops() {
         let entries = vec![
             JoblogEntry::new("ai", "good_item", "").ai_ok(vec![], None, 100),
-            JoblogEntry::new("ai", "bad_item", "")
-                .ai_error("write failed", 200),
+            JoblogEntry::new("ai", "bad_item", "").ai_error("write failed", 200),
         ];
         let failed = failed_items(&entries);
         assert_eq!(failed.len(), 1);
@@ -560,20 +558,18 @@ mod tests {
 
         let writer = JoblogWriter::open(&path).unwrap();
         writer.write(&JoblogEntry::new("download", "nasa", "a.jpg").ok(100, 50));
-        writer.write(
-            &JoblogEntry::new("ai", "nasa", "").ai_ok(
-                vec![JoblogChange {
-                    field: "title".to_string(),
-                    old: Some(serde_json::json!("old")),
-                    new: serde_json::json!("new"),
-                }],
-                Some(JoblogTokens {
-                    prompt: 1000,
-                    completion: 200,
-                }),
-                1500,
-            ),
-        );
+        writer.write(&JoblogEntry::new("ai", "nasa", "").ai_ok(
+            vec![JoblogChange {
+                field: "title".to_string(),
+                old: Some(serde_json::json!("old")),
+                new: serde_json::json!("new"),
+            }],
+            Some(JoblogTokens {
+                prompt: 1000,
+                completion: 200,
+            }),
+            1500,
+        ));
 
         let entries = read(&path).unwrap();
         assert_eq!(entries.len(), 2);

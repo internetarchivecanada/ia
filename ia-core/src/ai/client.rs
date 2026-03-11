@@ -71,12 +71,11 @@ impl LlmClient {
     /// Send a chat completion request and return the parsed response.
     ///
     /// Retries with exponential backoff on 429/5xx errors.
-    pub async fn chat(
-        &self,
-        system_prompt: &str,
-        user_message: &str,
-    ) -> Result<LlmResponse> {
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+    pub async fn chat(&self, system_prompt: &str, user_message: &str) -> Result<LlmResponse> {
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
 
         let request = ChatRequest {
             model: self.config.model.clone(),
@@ -149,14 +148,13 @@ impl LlmClient {
                 message: format!("failed to read response body: {}", e),
             })?;
 
-            let chat_response: ChatResponse =
-                serde_json::from_str(&body).map_err(|e| {
-                    let preview: String = body.chars().take(500).collect();
-                    IaError::LlmApi {
-                        status: 200,
-                        message: format!("failed to parse LLM response: {} — body: {}", e, preview),
-                    }
-                })?;
+            let chat_response: ChatResponse = serde_json::from_str(&body).map_err(|e| {
+                let preview: String = body.chars().take(500).collect();
+                IaError::LlmApi {
+                    status: 200,
+                    message: format!("failed to parse LLM response: {} — body: {}", e, preview),
+                }
+            })?;
 
             let content = chat_response
                 .choices

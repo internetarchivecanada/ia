@@ -118,7 +118,11 @@ pub enum IaError {
     MultipartAborted { identifier: String, key: String },
 
     #[error("multipart upload incomplete for {identifier}/{key} (upload_id: {upload_id})")]
-    MultipartIncomplete { identifier: String, key: String, upload_id: String },
+    MultipartIncomplete {
+        identifier: String,
+        key: String,
+        upload_id: String,
+    },
 
     #[error("schema field not found: {field}")]
     SchemaFieldNotFound { field: String },
@@ -145,9 +149,7 @@ impl IaError {
     pub fn is_retryable(&self) -> bool {
         match self {
             // HTTP 4xx client errors are permanent (except 429 rate-limit)
-            IaError::Http { status, .. } => {
-                *status == 429 || *status >= 500
-            }
+            IaError::Http { status, .. } => *status == 429 || *status >= 500,
             // Transient — may succeed on retry
             IaError::RateLimited { .. } => true,
             IaError::Network(_) => true,
@@ -155,13 +157,9 @@ impl IaError {
             IaError::ChecksumMismatch { .. } => true,
             IaError::ResumeFailed { .. } => true,
             // LLM API errors: retry on 429/5xx, not on 4xx
-            IaError::LlmApi { status, .. } => {
-                *status == 429 || *status >= 500
-            }
+            IaError::LlmApi { status, .. } => *status == 429 || *status >= 500,
             // Update errors: API errors retry on 5xx, others are permanent
-            IaError::UpdateApiError { status, .. } => {
-                *status == 429 || *status >= 500
-            }
+            IaError::UpdateApiError { status, .. } => *status == 429 || *status >= 500,
             IaError::UpdateNoAsset { .. } => false,
             IaError::UpdateVerifyFailed { .. } => false,
             IaError::UpdateBelowMinimum { .. } => false,
@@ -170,8 +168,8 @@ impl IaError {
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
             // Upload errors
-            IaError::UploadFailed { .. } => false,  // terminal — retry logic is in single.rs
-            IaError::SpamDetected { .. } => false,   // permanent
+            IaError::UploadFailed { .. } => false, // terminal — retry logic is in single.rs
+            IaError::SpamDetected { .. } => false, // permanent
             IaError::CollectionNotFound { .. } => false,
             IaError::InvalidIdentifier { .. } => false,
             IaError::MissingRequiredMetadata { .. } => false,
@@ -279,7 +277,12 @@ impl IaError {
                 extra.insert("received".into(), (*received).into());
                 "download_too_large"
             }
-            IaError::UploadFailed { identifier, key, status, .. } => {
+            IaError::UploadFailed {
+                identifier,
+                key,
+                status,
+                ..
+            } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("key".into(), key.clone().into());
                 if let Some(code) = status {
@@ -323,7 +326,11 @@ impl IaError {
                 extra.insert("key".into(), key.clone().into());
                 "multipart_aborted"
             }
-            IaError::MultipartIncomplete { identifier, key, upload_id } => {
+            IaError::MultipartIncomplete {
+                identifier,
+                key,
+                upload_id,
+            } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("key".into(), key.clone().into());
                 extra.insert("upload_id".into(), upload_id.clone().into());
@@ -507,7 +514,10 @@ mod tests {
         let err = IaError::Config("bad value".into());
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "config_error");
-        assert!(v["error"]["message"].as_str().unwrap().contains("bad value"));
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bad value"));
     }
 
     #[test]
@@ -530,8 +540,7 @@ mod tests {
 
     #[test]
     fn json_io_error() {
-        let err: IaError =
-            std::io::Error::new(std::io::ErrorKind::NotFound, "file missing").into();
+        let err: IaError = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing").into();
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "io");
     }
@@ -660,8 +669,7 @@ mod tests {
 
     #[test]
     fn io_error_is_retryable() {
-        let err: IaError =
-            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into();
+        let err: IaError = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into();
         assert!(err.is_retryable());
     }
 

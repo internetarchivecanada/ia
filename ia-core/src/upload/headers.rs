@@ -106,8 +106,7 @@ mod tests {
 
     #[test]
     fn simple_single_value() {
-        let headers =
-            encode_metadata_headers(&[("title".into(), "My Item".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "My Item".into())]);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "x-archive-meta00-title");
         assert_eq!(headers[0].1, "uri(My%20Item)");
@@ -115,15 +114,13 @@ mod tests {
 
     #[test]
     fn no_space_no_encoding() {
-        let headers =
-            encode_metadata_headers(&[("mediatype".into(), "texts".into())]);
+        let headers = encode_metadata_headers(&[("mediatype".into(), "texts".into())]);
         assert_eq!(headers[0].1, "texts");
     }
 
     #[test]
     fn underscore_in_key_becomes_double_dash() {
-        let headers =
-            encode_metadata_headers(&[("my_field".into(), "value".into())]);
+        let headers = encode_metadata_headers(&[("my_field".into(), "value".into())]);
         assert_eq!(headers[0].0, "x-archive-meta00-my--field");
     }
 
@@ -171,22 +168,19 @@ mod tests {
 
     #[test]
     fn non_ascii_uri_encoded() {
-        let headers =
-            encode_metadata_headers(&[("title".into(), "snowman ☃".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "snowman ☃".into())]);
         assert_eq!(headers[0].1, "uri(snowman%20%E2%98%83)");
     }
 
     #[test]
     fn cjk_uri_encoded() {
-        let headers =
-            encode_metadata_headers(&[("title".into(), "日本語".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "日本語".into())]);
         assert!(headers[0].1.starts_with("uri("));
     }
 
     #[test]
     fn emoji_uri_encoded() {
-        let headers =
-            encode_metadata_headers(&[("title".into(), "🚀".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "🚀".into())]);
         assert!(headers[0].1.starts_with("uri("));
     }
 
@@ -194,9 +188,7 @@ mod tests {
 
     #[test]
     fn file_metadata_uses_filemeta_prefix() {
-        let headers =
-            encode_file_metadata_headers(&[("title".into(), "MyFile".into())]);
+        let headers = encode_file_metadata_headers(&[("title".into(), "MyFile".into())]);
         assert_eq!(headers[0].0, "x-archive-filemeta00-title");
     }
-
 }

@@ -49,12 +49,7 @@ pub struct ModifyResponse {
 pub const REMOVE_TAG: &str = "REMOVE_TAG";
 
 /// Fields that cannot be modified by users.
-pub const IMMUTABLE_FIELDS: &[&str] = &[
-    "identifier",
-    "addeddate",
-    "publicdate",
-    "uploader",
-];
+pub const IMMUTABLE_FIELDS: &[&str] = &["identifier", "addeddate", "publicdate", "uploader"];
 
 /// Fields that only IA admins can modify (warn but don't block).
 pub const ADMIN_ONLY_FIELDS: &[&str] = &["mediatype"];
@@ -136,10 +131,7 @@ pub fn prepare_metadata(
                         );
                     }
                     _ => {
-                        obj.insert(
-                            key.clone(),
-                            serde_json::Value::Array(vec![value.clone()]),
-                        );
+                        obj.insert(key.clone(), serde_json::Value::Array(vec![value.clone()]));
                     }
                 }
             }
@@ -181,17 +173,12 @@ pub fn prepare_metadata(
                         let value_str = value.as_str().unwrap_or("");
                         // Handle semicolon-delimited subjects
                         if key == "subject" && s.contains(';') {
-                            let parts: Vec<&str> = s
-                                .split(';')
-                                .filter(|p| p.trim() != value_str)
-                                .collect();
+                            let parts: Vec<&str> =
+                                s.split(';').filter(|p| p.trim() != value_str).collect();
                             if parts.is_empty() {
                                 obj.remove(key);
                             } else {
-                                obj.insert(
-                                    key.clone(),
-                                    serde_json::Value::String(parts.join(";")),
-                                );
+                                obj.insert(key.clone(), serde_json::Value::String(parts.join(";")));
                             }
                         } else if s == value_str {
                             if key == "collection" {
@@ -368,8 +355,7 @@ pub async fn modify_compound(
     let source = extract_target_metadata(&item, &req.target, identifier)?;
 
     // 4. Compute compound patch
-    let patch_ops =
-        compute_compound_patch(&source, &req.groups, req.expect.as_ref(), identifier)?;
+    let patch_ops = compute_compound_patch(&source, &req.groups, req.expect.as_ref(), identifier)?;
     if patch_ops.is_empty() {
         return Err(IaError::MetadataWrite {
             identifier: identifier.to_string(),
@@ -436,13 +422,13 @@ pub async fn modify_compound(
 /// This is a convenience wrapper around `modify_compound` for single-operation use.
 ///
 /// Returns `ModifyResponse` with task_id on success.
-pub async fn modify(
-    client: &IaClient,
-    req: &ModifyRequest,
-) -> Result<ModifyResponse> {
+pub async fn modify(client: &IaClient, req: &ModifyRequest) -> Result<ModifyResponse> {
     let compound_req = CompoundModifyRequest {
         identifier: req.identifier.clone(),
-        groups: vec![ChangeGroup { changes: req.changes.clone(), op: req.op.clone() }],
+        groups: vec![ChangeGroup {
+            changes: req.changes.clone(),
+            op: req.op.clone(),
+        }],
         target: req.target.clone(),
         expect: req.expect.clone(),
         priority: req.priority,
@@ -491,7 +477,7 @@ pub fn extract_target_metadata(
         .ok_or_else(|| IaError::Config(format!("unknown target: {target}")))
 }
 
-/// Parse an indexed key like "collection[0]" into ("collection", 0).
+/// Parse an indexed key like `collection[0]` into `("collection", 0)`.
 /// Returns None if the key doesn't contain brackets.
 pub fn parse_indexed_key(key: &str) -> Option<(String, usize)> {
     let bracket_start = key.find('[')?;
@@ -578,7 +564,8 @@ mod tests {
 
     #[test]
     fn modify_response_deserializes_success() {
-        let json = r#"{"success":true,"task_id":12345,"log":"https://catalogd.archive.org/log/12345"}"#;
+        let json =
+            r#"{"success":true,"task_id":12345,"log":"https://catalogd.archive.org/log/12345"}"#;
         let resp: ModifyResponse = serde_json::from_str(json).unwrap();
         assert!(resp.success);
         assert_eq!(resp.task_id, Some(12345));
@@ -659,7 +646,10 @@ mod tests {
         let source = serde_json::json!({"description": "Original text"});
         let changes = vec![("description".to_string(), serde_json::json!("and more"))];
         let dest = prepare_metadata(&source, &changes, &MetadataOp::Append, "test").unwrap();
-        assert_eq!(dest["description"], serde_json::json!("Original text and more"));
+        assert_eq!(
+            dest["description"],
+            serde_json::json!("Original text and more")
+        );
     }
 
     #[test]
@@ -694,7 +684,10 @@ mod tests {
         let source = serde_json::json!({"subject": ["math", "science"]});
         let changes = vec![("subject".to_string(), serde_json::json!("physics"))];
         let dest = prepare_metadata(&source, &changes, &MetadataOp::AppendList, "test").unwrap();
-        assert_eq!(dest["subject"], serde_json::json!(["math", "science", "physics"]));
+        assert_eq!(
+            dest["subject"],
+            serde_json::json!(["math", "science", "physics"])
+        );
     }
 
     #[test]
@@ -728,7 +721,10 @@ mod tests {
         let source = serde_json::json!({"collection": ["existing"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
         let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
-        assert_eq!(dest["collection"], serde_json::json!(["featured", "existing"]));
+        assert_eq!(
+            dest["collection"],
+            serde_json::json!(["featured", "existing"])
+        );
     }
 
     #[test]
@@ -736,7 +732,10 @@ mod tests {
         let source = serde_json::json!({"collection": ["a", "featured", "b"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
         let dest = prepare_metadata(&source, &changes, &MetadataOp::Insert(0), "test").unwrap();
-        assert_eq!(dest["collection"], serde_json::json!(["featured", "a", "b"]));
+        assert_eq!(
+            dest["collection"],
+            serde_json::json!(["featured", "a", "b"])
+        );
     }
 
     #[test]
@@ -794,10 +793,16 @@ mod tests {
     #[test]
     fn prepare_remove_last_collection_string_errors() {
         let source = serde_json::json!({"collection": "only-collection", "title": "Test"});
-        let changes = vec![("collection".to_string(), serde_json::json!("only-collection"))];
+        let changes = vec![(
+            "collection".to_string(),
+            serde_json::json!("only-collection"),
+        )];
         let result = prepare_metadata(&source, &changes, &MetadataOp::Remove, "my-item");
         match result.unwrap_err() {
-            IaError::MetadataWrite { identifier, message } => {
+            IaError::MetadataWrite {
+                identifier,
+                message,
+            } => {
                 assert_eq!(identifier, "my-item");
                 assert!(message.contains("cannot remove last collection"));
             }
@@ -808,10 +813,16 @@ mod tests {
     #[test]
     fn prepare_remove_last_collection_array_errors() {
         let source = serde_json::json!({"collection": ["only-collection"], "title": "Test"});
-        let changes = vec![("collection".to_string(), serde_json::json!("only-collection"))];
+        let changes = vec![(
+            "collection".to_string(),
+            serde_json::json!("only-collection"),
+        )];
         let result = prepare_metadata(&source, &changes, &MetadataOp::Remove, "my-item");
         match result.unwrap_err() {
-            IaError::MetadataWrite { identifier, message } => {
+            IaError::MetadataWrite {
+                identifier,
+                message,
+            } => {
                 assert_eq!(identifier, "my-item");
                 assert!(message.contains("cannot remove last collection"));
             }
@@ -875,7 +886,8 @@ mod tests {
         let source = serde_json::json!({"title": "Old"});
         let changes = vec![("title".to_string(), serde_json::json!("New"))];
         let expect = HashMap::from([("title".to_string(), serde_json::json!("Old"))]);
-        let patch = compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect), "test").unwrap();
+        let patch =
+            compute_patch(&source, &changes, &MetadataOp::Set, Some(&expect), "test").unwrap();
         assert!(patch.len() >= 2);
         assert_eq!(patch[0]["op"], "test");
         assert_eq!(patch[0]["path"], "/title");
@@ -887,8 +899,16 @@ mod tests {
         use std::collections::HashMap;
         let source = serde_json::json!({"collection": ["opensource", "community"]});
         let changes = vec![("collection".to_string(), serde_json::json!("featured"))];
-        let expect = HashMap::from([("collection[0]".to_string(), serde_json::json!("opensource"))]);
-        let patch = compute_patch(&source, &changes, &MetadataOp::AppendList, Some(&expect), "test").unwrap();
+        let expect =
+            HashMap::from([("collection[0]".to_string(), serde_json::json!("opensource"))]);
+        let patch = compute_patch(
+            &source,
+            &changes,
+            &MetadataOp::AppendList,
+            Some(&expect),
+            "test",
+        )
+        .unwrap();
         // First op should be the test with indexed path
         assert_eq!(patch[0]["op"], "test");
         assert_eq!(patch[0]["path"], "/collection/0");
@@ -940,7 +960,10 @@ mod tests {
         });
         let result = extract_target_metadata(&item, "files/missing.txt", "my-item-id");
         match result.unwrap_err() {
-            IaError::MetadataWrite { identifier, message } => {
+            IaError::MetadataWrite {
+                identifier,
+                message,
+            } => {
                 assert_eq!(identifier, "my-item-id");
                 assert!(message.contains("file not found"));
                 assert!(message.contains("missing.txt"));
@@ -1067,7 +1090,10 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            IaError::MetadataWrite { identifier, message } => {
+            IaError::MetadataWrite {
+                identifier,
+                message,
+            } => {
                 assert_eq!(identifier, "test-item");
                 assert!(message.contains("no changes"));
             }
@@ -1146,10 +1172,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/metadata/test-item"))
-            .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("Retry-After", "60")
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
             .mount(&mock_server)
             .await;
 
@@ -1254,11 +1277,13 @@ mod tests {
     fn compound_patch_single_group_matches_compute_patch() {
         let source = serde_json::json!({"title": "Old", "date": "2020"});
         let changes = vec![("title".to_string(), serde_json::json!("New"))];
-        let single =
-            compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
+        let single = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
         let compound = compute_compound_patch(
             &source,
-            &[ChangeGroup { changes, op: MetadataOp::Set }],
+            &[ChangeGroup {
+                changes,
+                op: MetadataOp::Set,
+            }],
             None,
             "test",
         )
@@ -1355,8 +1380,7 @@ mod tests {
             op: MetadataOp::Set,
         }];
         let expect = HashMap::from([("title".to_string(), serde_json::json!("Old"))]);
-        let patch =
-            compute_compound_patch(&source, &groups, Some(&expect), "test").unwrap();
+        let patch = compute_compound_patch(&source, &groups, Some(&expect), "test").unwrap();
         assert!(patch.len() >= 2);
         assert_eq!(patch[0]["op"], "test");
     }

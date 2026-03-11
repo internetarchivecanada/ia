@@ -140,16 +140,27 @@ fn status_subcommand_help() {
 #[test]
 fn global_options_before_subcommand() {
     // Global options should be accepted before the subcommand
-    ia().args(["--insecure", "--host", "test.archive.org", "download", "--help"])
-        .assert()
-        .success();
+    ia().args([
+        "--insecure",
+        "--host",
+        "test.archive.org",
+        "download",
+        "--help",
+    ])
+    .assert()
+    .success();
 }
 
 #[test]
 fn config_file_flag_accepts_path() {
-    ia().args(["--config-file", "/nonexistent/path.ini", "download", "--help"])
-        .assert()
-        .success();
+    ia().args([
+        "--config-file",
+        "/nonexistent/path.ini",
+        "download",
+        "--help",
+    ])
+    .assert()
+    .success();
 }
 
 #[test]
@@ -215,9 +226,7 @@ fn metadata_write_flags_in_modify_help() {
 #[test]
 fn metadata_no_identifier_errors() {
     // Read mode with no identifier should fail
-    ia().args(["metadata"])
-        .assert()
-        .failure();
+    ia().args(["metadata"]).assert().failure();
 }
 
 #[test]
@@ -373,7 +382,9 @@ fn download_help_shows_file_example() {
     ia().args(["download", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ia download nasa NASAarchiveLogo.jpg"));
+        .stdout(predicate::str::contains(
+            "ia download nasa NASAarchiveLogo.jpg",
+        ));
 }
 
 #[test]
@@ -381,7 +392,9 @@ fn download_help_shows_piped_example() {
     ia().args(["download", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ia search -q collection:nasa --json | ia download"));
+        .stdout(predicate::str::contains(
+            "ia search -q collection:nasa --json | ia download",
+        ));
 }
 
 // -- --json integration tests --
@@ -515,7 +528,14 @@ fn all_commands_show_json_in_help() {
             .stdout(predicate::str::contains("--json"));
     }
     // Config subcommands each have their own --json flag
-    for subcmd in ["show", "login", "check", "whoami", "print-cookies", "print-auth"] {
+    for subcmd in [
+        "show",
+        "login",
+        "check",
+        "whoami",
+        "print-cookies",
+        "print-auth",
+    ] {
         ia().args(["config", subcmd, "--help"])
             .assert()
             .success()
@@ -708,7 +728,11 @@ fn metadata_import_with_column_prefixes() {
     // import with column prefixes should be accepted
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("test.csv");
-    std::fs::write(&csv_path, "identifier,append-list:subject\ntest-item,science\n").unwrap();
+    std::fs::write(
+        &csv_path,
+        "identifier,append-list:subject\ntest-item,science\n",
+    )
+    .unwrap();
 
     ia().args(["metadata", "import", csv_path.to_str().unwrap()])
         .assert()
@@ -758,7 +782,15 @@ fn metadata_compound_trailing_plus_error() {
 #[test]
 fn metadata_compound_unknown_op_error() {
     ia().args([
-        "metadata", "modify", "test-item", "-m", "title:New", "+", "download", "-m", "x:y",
+        "metadata",
+        "modify",
+        "test-item",
+        "-m",
+        "title:New",
+        "+",
+        "download",
+        "-m",
+        "x:y",
     ])
     .assert()
     .failure()
@@ -768,8 +800,16 @@ fn metadata_compound_unknown_op_error() {
 #[test]
 fn metadata_compound_shared_option_in_continuation_error() {
     ia().args([
-        "metadata", "modify", "test-item", "-m", "title:New", "+", "remove", "--dry-run",
-        "-m", "x:y",
+        "metadata",
+        "modify",
+        "test-item",
+        "-m",
+        "title:New",
+        "+",
+        "remove",
+        "--dry-run",
+        "-m",
+        "x:y",
     ])
     .assert()
     .failure()
@@ -779,7 +819,15 @@ fn metadata_compound_shared_option_in_continuation_error() {
 #[test]
 fn metadata_compound_empty_continuation_error() {
     ia().args([
-        "metadata", "modify", "test-item", "-m", "title:New", "+", "+", "remove", "-m",
+        "metadata",
+        "modify",
+        "test-item",
+        "-m",
+        "title:New",
+        "+",
+        "+",
+        "remove",
+        "-m",
         "x:y",
     ])
     .assert()
@@ -790,12 +838,12 @@ fn metadata_compound_empty_continuation_error() {
 #[test]
 fn metadata_import_with_compound_errors() {
     // import uses its own column-prefix system, not compatible with +
-    ia().args([
-        "metadata", "import", "data.csv", "+", "remove", "-m", "x:y",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("compound operations (+) cannot be used with import"));
+    ia().args(["metadata", "import", "data.csv", "+", "remove", "-m", "x:y"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "compound operations (+) cannot be used with import",
+        ));
 }
 
 #[test]
@@ -803,7 +851,9 @@ fn metadata_help_mentions_compound_ops() {
     ia().args(["metadata", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Compound operations (single request)"));
+        .stdout(predicate::str::contains(
+            "Compound operations (single request)",
+        ));
 }
 
 #[test]

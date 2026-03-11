@@ -257,7 +257,11 @@ mod tests {
     fn custom_prompt_file_appended() {
         let dir = tempfile::tempdir().unwrap();
         let prompt_path = dir.path().join("custom.txt");
-        std::fs::write(&prompt_path, "Always prioritize NASA collections.\nBe extra thorough with dates.").unwrap();
+        std::fs::write(
+            &prompt_path,
+            "Always prioritize NASA collections.\nBe extra thorough with dates.",
+        )
+        .unwrap();
 
         let focus = FocusConfig {
             prompt_file: Some(prompt_path),

@@ -192,16 +192,18 @@ impl TuiState {
                 DownloadStatus::Starting => {}
                 DownloadStatus::Downloading => {
                     if let Some(fp) = self.active_files.get(&file_key) {
-                        let delta =
-                            progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                        let delta = progress
+                            .bytes_downloaded
+                            .saturating_sub(fp.bytes_downloaded);
                         item.bytes_downloaded += delta;
                     }
                 }
                 DownloadStatus::Complete => {
                     item.files_completed += 1;
                     if let Some(fp) = self.active_files.get(&file_key) {
-                        let delta =
-                            progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                        let delta = progress
+                            .bytes_downloaded
+                            .saturating_sub(fp.bytes_downloaded);
                         item.bytes_downloaded += delta;
                     } else {
                         item.bytes_downloaded += progress.bytes_downloaded;
@@ -239,14 +241,18 @@ impl TuiState {
             }
             DownloadStatus::Downloading => {
                 if let Some(fp) = self.active_files.get_mut(&file_key) {
-                    let delta = progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                    let delta = progress
+                        .bytes_downloaded
+                        .saturating_sub(fp.bytes_downloaded);
                     self.bytes_downloaded += delta;
                     fp.bytes_downloaded = progress.bytes_downloaded;
                 }
             }
             DownloadStatus::Complete => {
                 if let Some(fp) = self.active_files.remove(&file_key) {
-                    let delta = progress.bytes_downloaded.saturating_sub(fp.bytes_downloaded);
+                    let delta = progress
+                        .bytes_downloaded
+                        .saturating_sub(fp.bytes_downloaded);
                     self.bytes_downloaded += delta;
                 } else {
                     // File wasn't in active_files (e.g. Starting event missed) —
@@ -610,10 +616,7 @@ mod tests {
         // At this point: item "a" is 2/2 = 1.0, "b" and "c" are 0.0
         // Progress = 1.0 / 3 = 0.333
         let p = state.overall_progress();
-        assert!(
-            (p - 1.0 / 3.0).abs() < 0.01,
-            "expected ~0.333, got {p}"
-        );
+        assert!((p - 1.0 / 3.0).abs() < 0.01, "expected ~0.333, got {p}");
 
         // Now item "b" enumerates
         state.update(progress(
@@ -854,13 +857,13 @@ pub async fn run_tui(
                     }
                 }));
 
-            let result =
-                ia_core::download::download_item(&client, &id, &opts, sem, progress).await;
+            let result = ia_core::download::download_item(&client, &id, &opts, sem, progress).await;
 
             if let Ok(mut s) = download_state.lock() {
                 // Clean up any leaked active_files for this item (e.g. files
                 // that failed all retries without sending a Complete event).
-                s.active_files.retain(|k, _| !k.starts_with(&format!("{id}\0")));
+                s.active_files
+                    .retain(|k, _| !k.starts_with(&format!("{id}\0")));
 
                 // Mark item as complete or failed
                 if let Some(item) = s.items.iter_mut().find(|i| i.identifier == id) {
@@ -870,9 +873,10 @@ pub async fn run_tui(
                     }
                 }
                 // Check if all items done
-                if s.items.iter().all(|i| {
-                    matches!(i.status, ItemStatus::Complete | ItemStatus::Failed(_))
-                }) {
+                if s.items
+                    .iter()
+                    .all(|i| matches!(i.status, ItemStatus::Complete | ItemStatus::Failed(_)))
+                {
                     s.done = true;
                 }
             }

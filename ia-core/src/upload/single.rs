@@ -87,9 +87,9 @@ pub async fn upload_file(
 
     // Skip-existing: compare local MD5 with remote, skip if match
     if opts.skip_existing {
-        let local_md5 = md5_hex.as_deref().ok_or_else(|| IaError::Config(
-            "internal error: MD5 not computed for skip_existing check".into()
-        ))?;
+        let local_md5 = md5_hex.as_deref().ok_or_else(|| {
+            IaError::Config("internal error: MD5 not computed for skip_existing check".into())
+        })?;
         match client.get_item(identifier).await {
             Ok(item) => {
                 let remote_md5 = item
@@ -245,18 +245,15 @@ pub async fn upload_file(
             let id = identifier.to_string();
             let k = key.to_string();
             let fs = file_size;
-            let stream = super::progress_body::ProgressBody::new(
-                file_handle,
-                move |bytes_sent| {
-                    cb(UploadProgress {
-                        identifier: id.clone(),
-                        key: k.clone(),
-                        bytes_sent,
-                        total_bytes: fs,
-                        status: UploadProgressStatus::Uploading,
-                    });
-                },
-            );
+            let stream = super::progress_body::ProgressBody::new(file_handle, move |bytes_sent| {
+                cb(UploadProgress {
+                    identifier: id.clone(),
+                    key: k.clone(),
+                    bytes_sent,
+                    total_bytes: fs,
+                    status: UploadProgressStatus::Uploading,
+                });
+            });
             request
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
@@ -282,10 +279,7 @@ pub async fn upload_file(
                     // Delete local file after successful upload if requested
                     if opts.delete_after_upload {
                         if let Err(e) = tokio::fs::remove_file(file).await {
-                            tracing::warn!(
-                                "failed to delete {} after upload: {e}",
-                                file.display()
-                            );
+                            tracing::warn!("failed to delete {} after upload: {e}", file.display());
                         }
                     }
 
@@ -313,9 +307,7 @@ pub async fn upload_file(
                         return Err(IaError::UploadFailed {
                             identifier: identifier.to_string(),
                             key: key.to_string(),
-                            message: format!(
-                                "503 after {retries} retries: {body_text}"
-                            ),
+                            message: format!("503 after {retries} retries: {body_text}"),
                             status: Some(503),
                         });
                     }
@@ -451,8 +443,7 @@ async fn poll_check_limit(
 /// Used for Content-MD5 header value. Avoids adding the `base64` crate
 /// for a single call site.
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -482,7 +473,10 @@ fn base64_encode(data: &[u8]) -> String {
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
-        .filter_map(|i| hex.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok()))
+        .filter_map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+        })
         .collect()
 }
 

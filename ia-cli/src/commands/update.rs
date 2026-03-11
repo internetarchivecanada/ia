@@ -281,10 +281,7 @@ async fn run_install(args: InstallArgs, parent_json: bool) -> Result<()> {
 
     // Validate the version floor before printing progress — avoids a
     // misleading "Installing..." message when the version is rejected.
-    let clean_version = args
-        .version
-        .strip_prefix('v')
-        .unwrap_or(&args.version);
+    let clean_version = args.version.strip_prefix('v').unwrap_or(&args.version);
     if !ia_core::update::is_at_or_above_minimum(clean_version) {
         let err = ia_core::error::IaError::UpdateBelowMinimum {
             version: clean_version.to_string(),

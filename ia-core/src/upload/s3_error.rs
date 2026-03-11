@@ -123,9 +123,17 @@ mod tests {
 
     #[test]
     fn retryable_codes() {
-        let retryable = ["SlowDown", "InternalError", "ServiceUnavailable", "OperationAborted"];
+        let retryable = [
+            "SlowDown",
+            "InternalError",
+            "ServiceUnavailable",
+            "OperationAborted",
+        ];
         for code in retryable {
-            let err = S3Error { code: code.into(), message: String::new() };
+            let err = S3Error {
+                code: code.into(),
+                message: String::new(),
+            };
             assert!(err.is_retryable(), "{code} should be retryable");
         }
     }
@@ -133,11 +141,18 @@ mod tests {
     #[test]
     fn non_retryable_codes() {
         let non_retryable = [
-            "AccessDenied", "InvalidAccessKeyId", "BadDigest",
-            "MissingContentLength", "NoSuchBucket", "InvalidArgument",
+            "AccessDenied",
+            "InvalidAccessKeyId",
+            "BadDigest",
+            "MissingContentLength",
+            "NoSuchBucket",
+            "InvalidArgument",
         ];
         for code in non_retryable {
-            let err = S3Error { code: code.into(), message: String::new() };
+            let err = S3Error {
+                code: code.into(),
+                message: String::new(),
+            };
             assert!(!err.is_retryable(), "{code} should NOT be retryable");
         }
     }

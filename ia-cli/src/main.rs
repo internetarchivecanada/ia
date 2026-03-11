@@ -9,21 +9,9 @@ mod output;
 mod tui;
 
 const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
-    .header(
-        clap::builder::styling::AnsiColor::Green
-            .on_default()
-            .bold(),
-    )
-    .usage(
-        clap::builder::styling::AnsiColor::Green
-            .on_default()
-            .bold(),
-    )
-    .literal(
-        clap::builder::styling::AnsiColor::Cyan
-            .on_default()
-            .bold(),
-    )
+    .header(clap::builder::styling::AnsiColor::Green.on_default().bold())
+    .usage(clap::builder::styling::AnsiColor::Green.on_default().bold())
+    .literal(clap::builder::styling::AnsiColor::Cyan.on_default().bold())
     .placeholder(clap::builder::styling::AnsiColor::Cyan.on_default());
 
 #[derive(Parser)]
@@ -43,7 +31,12 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
 )]
 struct Cli {
     /// Path to configuration file
-    #[arg(short = 'c', long = "config-file", global = true, help_heading = "Global Options")]
+    #[arg(
+        short = 'c',
+        long = "config-file",
+        global = true,
+        help_heading = "Global Options"
+    )]
     config: Option<PathBuf>,
 
     /// Enable logging
@@ -75,7 +68,13 @@ struct Cli {
     retry_failed: bool,
 
     /// Concurrent operations
-    #[arg(short = 'j', long, global = true, default_value = "2", help_heading = "Global Options")]
+    #[arg(
+        short = 'j',
+        long,
+        global = true,
+        default_value = "2",
+        help_heading = "Global Options"
+    )]
     jobs: usize,
 
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
@@ -221,13 +220,28 @@ async fn main() -> Result<()> {
             commands::ai::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
         }
         Commands::Download(args) => {
-            commands::download::run(&client, args, cli.quiet, cli.jobs, cli.joblog, cli.retry_failed).await?
+            commands::download::run(
+                &client,
+                args,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog,
+                cli.retry_failed,
+            )
+            .await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {
             let conts = compound_continuations.map(|c| c.continuations);
-            commands::metadata::run(&client, args, conts, cli.quiet, cli.jobs, cli.joblog.clone())
-                .await?
+            commands::metadata::run(
+                &client,
+                args,
+                conts,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog.clone(),
+            )
+            .await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,

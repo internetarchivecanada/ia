@@ -132,9 +132,7 @@ impl AiTuiState {
         if let Some(ref item) = self.current_item {
             if self.selected_change < item.changes.len() {
                 let value = &item.changes[self.selected_change].new_value;
-                self.edit_buffer = Some(
-                    serde_json::to_string(value).unwrap_or_default(),
-                );
+                self.edit_buffer = Some(serde_json::to_string(value).unwrap_or_default());
             }
         }
     }
@@ -145,8 +143,7 @@ impl AiTuiState {
             if let Some(ref mut item) = self.current_item {
                 if self.selected_change < item.changes.len() {
                     if let Ok(value) = serde_json::from_str(&buffer) {
-                        item.changes[self.selected_change].status =
-                            ChangeStatus::Edited(value);
+                        item.changes[self.selected_change].status = ChangeStatus::Edited(value);
                     } else {
                         // Treat as raw string
                         item.changes[self.selected_change].status =
@@ -280,7 +277,7 @@ pub fn draw(f: &mut ratatui::Frame, state: &AiTuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Min(5),   // Main content
+            Constraint::Min(5),    // Main content
             Constraint::Length(1), // Status bar
         ])
         .split(f.area());
@@ -397,16 +394,16 @@ fn draw_metadata_panel(f: &mut ratatui::Frame, state: &AiTuiState, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}: ", field),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(display),
             ]));
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     f.render_widget(paragraph, area);
 }
 
@@ -506,7 +503,9 @@ fn draw_changes_panel(f: &mut ratatui::Frame, state: &AiTuiState, area: Rect) {
                     Span::raw("    "),
                     Span::styled(
                         &change.reason,
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             }
@@ -537,19 +536,54 @@ fn draw_status_bar(f: &mut ratatui::Frame, state: &AiTuiState, area: Rect) {
             String::new()
         };
         Line::from(vec![
-            Span::styled(" A", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " A",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("ccept All  "),
-            Span::styled("a", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("ccept  "),
-            Span::styled("r", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "r",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("eject  "),
-            Span::styled("e", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "e",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("dit  "),
-            Span::styled("s", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "s",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("kip  "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("=confirm  "),
-            Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("uit  ↑↓=navigate"),
             Span::styled(pending_str, Style::default().fg(Color::DarkGray)),
         ])

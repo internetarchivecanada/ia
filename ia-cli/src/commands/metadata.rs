@@ -432,14 +432,35 @@ pub async fn run(
             run_export(client, sub, ctx.quiet).await
         }
         Some(MetadataCommand::Modify(sub)) => {
-            run_write(client, sub.input, sub.write, MetadataOp::Set, continuations, &ctx).await
+            run_write(
+                client,
+                sub.input,
+                sub.write,
+                MetadataOp::Set,
+                continuations,
+                &ctx,
+            )
+            .await
         }
         Some(MetadataCommand::Append(sub)) => {
-            run_write(client, sub.input, sub.write, MetadataOp::Append, continuations, &ctx).await
+            run_write(
+                client,
+                sub.input,
+                sub.write,
+                MetadataOp::Append,
+                continuations,
+                &ctx,
+            )
+            .await
         }
         Some(MetadataCommand::AppendList(sub)) => {
             run_write(
-                client, sub.input, sub.write, MetadataOp::AppendList, continuations, &ctx,
+                client,
+                sub.input,
+                sub.write,
+                MetadataOp::AppendList,
+                continuations,
+                &ctx,
             )
             .await
         }
@@ -447,7 +468,15 @@ pub async fn run(
             run_write_insert(client, sub.input, sub.write, continuations, &ctx).await
         }
         Some(MetadataCommand::Remove(sub)) => {
-            run_write(client, sub.input, sub.write, MetadataOp::Remove, continuations, &ctx).await
+            run_write(
+                client,
+                sub.input,
+                sub.write,
+                MetadataOp::Remove,
+                continuations,
+                &ctx,
+            )
+            .await
         }
         Some(MetadataCommand::Import(sub)) => {
             if continuations.is_some() {
@@ -469,8 +498,15 @@ pub async fn run(
             let identifier = args.identifier.ok_or_else(|| {
                 anyhow::anyhow!("identifier required. Run 'ia metadata --help' for usage.")
             })?;
-            run_read(client, &identifier, args.exists, args.formats, args.pretty, args.json)
-                .await
+            run_read(
+                client,
+                &identifier,
+                args.exists,
+                args.formats,
+                args.pretty,
+                args.json,
+            )
+            .await
         }
     }
 }
@@ -510,11 +546,7 @@ async fn run_read(
         .context(format!("failed to fetch metadata for {identifier}"))?;
 
     if formats {
-        let mut fmts: Vec<String> = item
-            .files
-            .iter()
-            .filter_map(|f| f.format.clone())
-            .collect();
+        let mut fmts: Vec<String> = item.files.iter().filter_map(|f| f.format.clone()).collect();
         fmts.sort();
         fmts.dedup();
         if json {
@@ -646,10 +678,7 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
                 }
                 let mut msg = format!("field '{}' not found in schema", field_name);
                 if !suggestions.is_empty() {
-                    msg.push_str(&format!(
-                        ". Did you mean: {}?",
-                        suggestions.join(", ")
-                    ));
+                    msg.push_str(&format!(". Did you mean: {}?", suggestions.join(", ")));
                 }
                 bail!("{msg}");
             }
@@ -1046,9 +1075,7 @@ fn parse_column_op(column_name: &str) -> Result<(MetadataOp, String)> {
 /// Non-indexed columns and prefixed columns (e.g. `append:subject`) pass
 /// through unchanged. Merged entries appear at the position of their first
 /// indexed column.
-fn merge_indexed_columns(
-    fields: &HashMap<String, String>,
-) -> Vec<(String, serde_json::Value)> {
+fn merge_indexed_columns(fields: &HashMap<String, String>) -> Vec<(String, serde_json::Value)> {
     let mut resolved: Vec<(String, serde_json::Value)> = Vec::new();
     let mut indexed: HashMap<String, Vec<(usize, String)>> = HashMap::new();
 
@@ -1265,11 +1292,10 @@ async fn run_dry_run_compound(
     let resp = client.http().get(&url).send().await?;
     let item: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let source = extract_target_metadata(&item, target, identifier)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let source =
+        extract_target_metadata(&item, target, identifier).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let patch =
-        ia_core::metadata::compute_compound_patch(&source, groups, expect, identifier)?;
+    let patch = ia_core::metadata::compute_compound_patch(&source, groups, expect, identifier)?;
 
     let change_count = patch
         .iter()
@@ -1349,14 +1375,10 @@ fn record_modify_outcome(
                     })
                 );
             } else if quiet == 0 {
-                println!(
-                    "{identifier}: success (task_id: {})",
-                    task_id.unwrap_or(0)
-                );
+                println!("{identifier}: success (task_id: {})", task_id.unwrap_or(0));
             }
             if let Some(jl) = joblog {
-                let entry =
-                    JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
+                let entry = JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
                 jl.write(&entry);
             }
             false
@@ -1524,9 +1546,7 @@ fn split_compound_args(args: &[String]) -> Result<Option<CompoundSplit>> {
             } else if let Some(value) = arg.strip_prefix("--metadata=") {
                 changes.push(value.to_string());
             } else if SHARED_OPTIONS.contains(&arg.as_str()) {
-                bail!(
-                    "{arg} must appear in the first operation segment (before any +)"
-                );
+                bail!("{arg} must appear in the first operation segment (before any +)");
             } else {
                 bail!(
                     "unexpected argument {arg:?} in {op_name} continuation \
@@ -1766,15 +1786,20 @@ mod tests {
         .collect();
         let merged = merge_indexed_columns(&fields);
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|(k, v)| k == "append:subject" && v == &json!("new-tag")));
-        assert!(merged.iter().any(|(k, v)| k == "title" && v == &json!("Test")));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "append:subject" && v == &json!("new-tag")));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "title" && v == &json!("Test")));
     }
 
     #[test]
     fn merge_indexed_columns_single_index_becomes_scalar() {
         // Single indexed column treated as bare field (matches export behavior)
-        let fields: HashMap<String, String> =
-            [("subject[0]".into(), "science".into())].into_iter().collect();
+        let fields: HashMap<String, String> = [("subject[0]".into(), "science".into())]
+            .into_iter()
+            .collect();
         let merged = merge_indexed_columns(&fields);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0], ("subject".into(), json!("science")));
@@ -1791,10 +1816,7 @@ mod tests {
         .collect();
         let merged = merge_indexed_columns(&fields);
         assert_eq!(merged.len(), 1);
-        assert_eq!(
-            merged[0],
-            ("subject".into(), json!(["science", "nasa"]))
-        );
+        assert_eq!(merged[0], ("subject".into(), json!(["science", "nasa"])));
     }
 
     #[test]
@@ -1905,8 +1927,7 @@ mod compound_tests {
 
     #[test]
     fn parse_continuation_modify() {
-        let groups =
-            parse_continuation_groups("modify", &["title:New".to_string()]).unwrap();
+        let groups = parse_continuation_groups("modify", &["title:New".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert!(matches!(groups[0].op, MetadataOp::Set));
         assert_eq!(groups[0].changes[0].0, "title");
@@ -1914,19 +1935,15 @@ mod compound_tests {
 
     #[test]
     fn parse_continuation_insert_with_index() {
-        let groups = parse_continuation_groups(
-            "insert",
-            &["collection[0]:featured".to_string()],
-        )
-        .unwrap();
+        let groups =
+            parse_continuation_groups("insert", &["collection[0]:featured".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert!(matches!(groups[0].op, MetadataOp::Insert(0)));
     }
 
     #[test]
     fn parse_continuation_remove() {
-        let groups =
-            parse_continuation_groups("remove", &["subject:old".to_string()]).unwrap();
+        let groups = parse_continuation_groups("remove", &["subject:old".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert!(matches!(groups[0].op, MetadataOp::Remove));
     }
@@ -1939,11 +1956,8 @@ mod compound_tests {
 
     #[test]
     fn parse_continuation_append_list() {
-        let groups = parse_continuation_groups(
-            "append-list",
-            &["subject:physics".to_string()],
-        )
-        .unwrap();
+        let groups =
+            parse_continuation_groups("append-list", &["subject:physics".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert!(matches!(groups[0].op, MetadataOp::AppendList));
     }
@@ -1967,22 +1981,16 @@ mod compound_tests {
 
     #[test]
     fn parse_continuation_insert_single_still_works() {
-        let groups = parse_continuation_groups(
-            "insert",
-            &["collection[0]:featured".to_string()],
-        )
-        .unwrap();
+        let groups =
+            parse_continuation_groups("insert", &["collection[0]:featured".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].op, MetadataOp::Insert(0));
     }
 
     #[test]
     fn parse_continuation_insert_no_index_defaults_zero() {
-        let groups = parse_continuation_groups(
-            "insert",
-            &["collection:featured".to_string()],
-        )
-        .unwrap();
+        let groups =
+            parse_continuation_groups("insert", &["collection:featured".to_string()]).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].op, MetadataOp::Insert(0));
     }
@@ -2004,21 +2012,37 @@ mod compound_tests {
     /// finding the first positional). Production uses dynamic derivation
     /// from Cli::command() so this list never needs manual sync.
     fn test_value_flags() -> Vec<String> {
-        ["-c", "--config-file", "-H", "--host", "--user-agent-suffix",
-         "-j", "--jobs", "--joblog"]
-            .iter().map(|s| s.to_string()).collect()
+        [
+            "-c",
+            "--config-file",
+            "-H",
+            "--host",
+            "--user-agent-suffix",
+            "-j",
+            "--jobs",
+            "--joblog",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     #[test]
     fn find_subcommand_bare_metadata() {
         let a = args("ia metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(1));
+        assert_eq!(
+            find_metadata_subcommand_pos(&a, &test_value_flags()),
+            Some(1)
+        );
     }
 
     #[test]
     fn find_subcommand_with_flags() {
         let a = args("ia -d -j 4 metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(4));
+        assert_eq!(
+            find_metadata_subcommand_pos(&a, &test_value_flags()),
+            Some(4)
+        );
     }
 
     #[test]
@@ -2030,13 +2054,19 @@ mod compound_tests {
     #[test]
     fn find_subcommand_host_metadata_skips_flag_value() {
         let a = args("ia --host metadata metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(3));
+        assert_eq!(
+            find_metadata_subcommand_pos(&a, &test_value_flags()),
+            Some(3)
+        );
     }
 
     #[test]
     fn find_subcommand_config_file_skips_flag_value() {
         let a = args("ia -c /path/to/config metadata modify test -m title:New");
-        assert_eq!(find_metadata_subcommand_pos(&a, &test_value_flags()), Some(3));
+        assert_eq!(
+            find_metadata_subcommand_pos(&a, &test_value_flags()),
+            Some(3)
+        );
     }
 
     // ─── extract_compound_from_argv tests ────────────────────────────────
@@ -2058,7 +2088,9 @@ mod compound_tests {
     #[test]
     fn extract_compound_metadata_with_plus() {
         let a = args("ia metadata modify test-item -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia metadata modify test-item -m title:New")
@@ -2080,7 +2112,9 @@ mod compound_tests {
     #[test]
     fn extract_compound_host_metadata_not_detected() {
         let a = args("ia --host metadata metadata modify test -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia --host metadata metadata modify test -m title:New")
@@ -2090,7 +2124,9 @@ mod compound_tests {
     #[test]
     fn extract_compound_flags_before_metadata() {
         let a = args("ia -d -j 4 metadata modify test -m title:New + remove -m x:y");
-        let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap().unwrap();
+        let result = extract_compound_from_argv(&a, &test_value_flags())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             result.filtered_argv,
             args("ia -d -j 4 metadata modify test -m title:New")

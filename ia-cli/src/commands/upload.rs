@@ -357,11 +357,15 @@ pub async fn run(
 
     #[cfg(not(feature = "tui"))]
     if args.dashboard {
-        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
+        bail!(
+            "Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui"
+        );
     }
 
     match args.command {
-        Some(UploadCommand::Import(sub)) => run_import(client, sub, quiet, jobs, joblog_path, args.dashboard).await,
+        Some(UploadCommand::Import(sub)) => {
+            run_import(client, sub, quiet, jobs, joblog_path, args.dashboard).await
+        }
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         None => run_bare_upload(client, args, quiet, joblog_path).await,
@@ -453,14 +457,15 @@ async fn run_bare_upload(
         .context("failed to open joblog")?;
 
     // Set up progress display
-    let display: Option<std::sync::Arc<crate::output::UploadDisplay>> =
-        if !args.json && quiet == 0 {
-            Some(std::sync::Arc::new(
-                crate::output::UploadDisplay::new(identifier, opts.dry_run),
-            ))
-        } else {
-            None
-        };
+    let display: Option<std::sync::Arc<crate::output::UploadDisplay>> = if !args.json && quiet == 0
+    {
+        Some(std::sync::Arc::new(crate::output::UploadDisplay::new(
+            identifier,
+            opts.dry_run,
+        )))
+    } else {
+        None
+    };
     let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         display.as_ref().map(|d| {
             let d = std::sync::Arc::clone(d);
@@ -537,8 +542,10 @@ async fn run_import(
     joblog_path: Option<PathBuf>,
     dashboard: bool,
 ) -> Result<()> {
-    let records = read_spreadsheet(&args.spreadsheet)
-        .context(format!("failed to read spreadsheet: {}", args.spreadsheet.display()))?;
+    let records = read_spreadsheet(&args.spreadsheet).context(format!(
+        "failed to read spreadsheet: {}",
+        args.spreadsheet.display()
+    ))?;
 
     if records.is_empty() {
         bail!("spreadsheet is empty — no records to upload");
@@ -586,13 +593,7 @@ async fn run_import(
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
     if dashboard {
-        return crate::tui::run_upload_batch_tui(
-            client,
-            records,
-            opts,
-            jobs,
-        )
-        .await;
+        return crate::tui::run_upload_batch_tui(client, records, opts, jobs).await;
     }
     #[cfg(not(feature = "tui"))]
     let _ = dashboard;
@@ -618,9 +619,9 @@ async fn run_import(
     // Set up batch progress display
     let batch_display: Option<std::sync::Arc<crate::output::UploadBatchDisplay>> =
         if !json_mode && quiet == 0 {
-            Some(std::sync::Arc::new(
-                crate::output::UploadBatchDisplay::new(item_count, jobs),
-            ))
+            Some(std::sync::Arc::new(crate::output::UploadBatchDisplay::new(
+                item_count, jobs,
+            )))
         } else {
             None
         };
@@ -692,7 +693,10 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 
     if args.json {
         for row in &rows {
-            println!("{}", serde_json::to_string(row).context("failed to serialize template row")?);
+            println!(
+                "{}",
+                serde_json::to_string(row).context("failed to serialize template row")?
+            );
         }
         return Ok(());
     }
@@ -797,14 +801,9 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
                 args.identifier,
             );
             for u in &targets {
-                eprintln!(
-                    "  {} {} (initiated: {})",
-                    u.upload_id, u.key, u.initiated,
-                );
+                eprintln!("  {} {} (initiated: {})", u.upload_id, u.key, u.initiated,);
             }
-            eprintln!(
-                "\nUse --abort-all or specify a file to abort."
-            );
+            eprintln!("\nUse --abort-all or specify a file to abort.");
         }
         return Ok(());
     }
@@ -963,8 +962,7 @@ fn handle_stdin_files(
     }
 
     let mut temp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
-    std::io::copy(&mut std::io::stdin().lock(), &mut temp)
-        .context("failed to read from stdin")?;
+    std::io::copy(&mut std::io::stdin().lock(), &mut temp).context("failed to read from stdin")?;
 
     let real_files: Vec<PathBuf> = files
         .iter()
@@ -1002,13 +1000,7 @@ fn print_result_line(r: &UploadResult) {
             );
         }
         UploadStatus::Failed(msg) => {
-            eprintln!(
-                " {} {}/{}: {}",
-                style("✗").red(),
-                r.identifier,
-                r.key,
-                msg,
-            );
+            eprintln!(" {} {}/{}: {}", style("✗").red(), r.identifier, r.key, msg,);
         }
         UploadStatus::DryRun => {
             eprintln!(
@@ -1141,19 +1133,23 @@ mod tests {
     fn parse_key_values_basic() {
         let items = vec!["title:My Book".to_string(), "mediatype:texts".to_string()];
         let result = parse_key_values(&items).unwrap();
-        assert_eq!(result, vec![
-            ("title".to_string(), "My Book".to_string()),
-            ("mediatype".to_string(), "texts".to_string()),
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                ("title".to_string(), "My Book".to_string()),
+                ("mediatype".to_string(), "texts".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn parse_key_values_with_colon_in_value() {
         let items = vec!["description:foo:bar:baz".to_string()];
         let result = parse_key_values(&items).unwrap();
-        assert_eq!(result, vec![
-            ("description".to_string(), "foo:bar:baz".to_string()),
-        ]);
+        assert_eq!(
+            result,
+            vec![("description".to_string(), "foo:bar:baz".to_string()),]
+        );
     }
 
     #[test]
