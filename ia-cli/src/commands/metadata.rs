@@ -580,12 +580,12 @@ fn filter_schema_fields<'a>(fields: &'a [SchemaField], args: &SchemaArgs) -> Vec
         .filter(|f| {
             args.defined_by
                 .as_ref()
-                .map_or(true, |db| db.matches(&f.defined_by))
+                .is_none_or(|db| db.matches(&f.defined_by))
         })
         .filter(|f| {
             args.edit_access
                 .as_ref()
-                .map_or(true, |ea| ea.matches(&f.edit_access))
+                .is_none_or(|ea| ea.matches(&f.edit_access))
         })
         .collect()
 }
