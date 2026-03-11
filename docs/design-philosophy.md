@@ -66,7 +66,7 @@ The Python `internetarchive` library sets `Connection: close` on every request a
 - **Byte-range resume.** Interrupted downloads continue where they left off via `Range` headers. The completed file's checksum is verified against server metadata.
 - **Retry with backoff.** Transient failures (5xx, timeouts) are retried automatically with exponential backoff via `reqwest-middleware`.
 - **Rate limit coordination.** When the server returns `429 Too Many Requests`, a shared `RateLimiter` pauses all concurrent workers — not just the one that got throttled. Downloads resume together when the cooldown expires.
-- **`Expect: 100-continue`** for uploads (future). Avoids sending a large request body only to get a 4xx rejection.
+- **`Expect: 100-continue`** for uploads. Avoids sending a large request body only to get a 4xx rejection.
 
 See the [architecture design](plans/2026-02-20-ia-rust-port-design.md) for implementation details.
 

@@ -305,6 +305,281 @@ ia completions bash > ~/.local/share/bash-completion/completions/ia
 ia completions zsh > ~/.local/share/zsh/site-functions/_ia
 ```
 
+### `ia upload`
+
+Upload files to the Internet Archive. Supports single-file, multi-file, directory, and stdin uploads. Batch uploads from spreadsheets and template generation are available as subcommands.
+
+```sh
+ia upload <IDENTIFIER> <FILES>... [OPTIONS]
+```
+
+#### Flags
+
+| Flag | Description |
+|------|-------------|
+| `<IDENTIFIER>` | Item identifier |
+| `<FILES>...` | Files or directories to upload |
+| `-m, --metadata <K:V>` | Set metadata field (repeatable) |
+| `--header <K:V>` | Additional HTTP header (repeatable) |
+| `--remote-name <NAME>` | Explicit remote filename (required for stdin) |
+| `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
+| `--keep-directories` | Preserve relative path structure |
+| `--skip-existing` | Skip files already uploaded (MD5 match) |
+| `--checksums <PATH>` | Path to pre-computed MD5 checksums file |
+| `--delete-after-upload` | Delete local file after verified upload |
+| `--no-verify` | Skip Content-MD5 verification |
+| `--no-derive` | Skip derivative generation |
+| `--no-backup` | Don't keep old file versions |
+| `--no-auto-make-bucket` | Error if item doesn't already exist |
+| `--no-collection-check` | Skip collection existence check |
+| `--test-item` | Upload to test_collection (auto-removed after 30 days) |
+| `--multipart` | Use multipart upload (recommended for files >5 GB) |
+| `--retries <N>` | Retry attempts per file (default: 10) |
+| `--retry-sleep <SECS>` | Sleep between retries in seconds (default: 30) |
+| `--dry-run` | Validate everything, upload nothing |
+| `--dashboard` | Full-screen TUI dashboard |
+| `--json` | Output results as JSONL |
+
+#### Subcommands
+
+**`ia upload import <SPREADSHEET>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
+
+Required columns: `identifier`, `file`. All other columns become metadata.
+
+**`ia upload template <DIR>`** — Generate a CSV template from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload import`.
+
+**`ia upload cleanup <IDENTIFIER>`** — Abort incomplete multipart uploads for an item.
+
+#### Examples
+
+```sh
+# Upload a file to an existing or new item
+ia upload my-item file.pdf -m mediatype:texts -m collection:opensource
+
+# Upload a directory, preserving structure
+ia upload my-item ./scans/ --keep-directories
+
+# Upload from stdin with an explicit remote name
+cat data.csv | ia upload my-item - --remote-name data.csv
+
+# Multipart upload for large files
+ia upload my-item big-video.mp4 --multipart
+
+# Skip files that already exist on the server
+ia upload my-item ./files/ --skip-existing
+
+# Batch upload from a spreadsheet
+ia upload import batch.csv
+
+# Generate a template, edit it, then batch upload
+ia upload template ./files/ -o template.csv
+# ... edit template.csv to add metadata columns ...
+ia upload import template.csv
+
+# Abort stale multipart uploads
+ia upload cleanup my-item
+
+# Dry run — validate without uploading
+ia upload my-item file.pdf --dry-run
+
+# Upload with dashboard
+ia upload my-item ./files/ --dashboard
+```
+
+### `ia config`
+
+Configure Internet Archive credentials and settings.
+
+```sh
+ia config <SUBCOMMAND>
+```
+
+#### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `login` | Log in to archive.org and save credentials |
+| `show` | Print current configuration as JSON |
+| `check` | Validate stored S3 credentials |
+| `whoami` | Show account information (screenname, email) |
+| `print-cookies` | Print cookies in Netscape format |
+| `print-auth` | Print the Authorization header for S3 API requests |
+
+#### Flags
+
+| Flag | Subcommand | Description |
+|------|------------|-------------|
+| `-u, --username <EMAIL>` | `login` | Email address (prompts if omitted) |
+| `-p, --password <PASS>` | `login` | Password (prompts if omitted) |
+| `--netrc` | `login` | Read credentials from `~/.netrc` |
+| `--show-secrets` | `show` | Show secret values instead of redacting them |
+| `--json` | all | Output as JSON |
+
+#### Examples
+
+```sh
+# Interactive login (prompts for email and password)
+ia config login
+
+# Non-interactive login
+ia config login -u user@example.com -p mypassword
+
+# Login using .netrc credentials
+ia config login --netrc
+
+# Show current config (secrets redacted)
+ia config show
+
+# Show config with all secret values visible
+ia config show --show-secrets
+
+# Check if stored credentials are valid
+ia config check
+
+# Show account info
+ia config whoami
+
+# Save cookies for use with curl
+ia config print-cookies > cookies.txt
+curl -b cookies.txt https://archive.org/...
+
+# Use auth header with curl
+curl -H "$(ia config print-auth)" https://s3.us.archive.org/...
+```
+
+### `ia update`
+
+Check for updates, list available versions, or install a specific version. This command is only available in standalone release builds (feature-gated behind `self-update`). If you installed via `cargo install`, use cargo to update instead.
+
+```sh
+ia update [OPTIONS]
+ia update list [OPTIONS]
+ia update install <VERSION> [OPTIONS]
+```
+
+#### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| *(bare)* | Check for updates and install the latest version |
+| `list` | List available versions from GitHub Releases |
+| `install <VERSION>` | Install a specific version |
+
+#### Flags
+
+| Flag | Subcommand | Description |
+|------|------------|-------------|
+| `--check` | *(bare)* | Only check for updates, don't install |
+| `--all` | `list` | Show all versions (not just the 5 most recent) |
+| `--json` | all | Output results as JSON |
+
+#### Examples
+
+```sh
+# Update to the latest version
+ia update
+
+# Check for updates without installing
+ia update --check
+
+# Machine-readable check
+ia update --check --json
+
+# List available versions
+ia update list
+
+# List all versions
+ia update list --all
+
+# Install a specific version
+ia update install 0.5.1
+```
+
+### `ia ai`
+
+AI-assisted metadata cleanup using an LLM. Analyzes item metadata, suggests improvements (typo fixes, date normalization, missing fields, schema conformance), and optionally applies changes. **Experimental.**
+
+```sh
+ia ai <IDENTIFIER>... [OPTIONS]
+ia ai undo <JOBLOG>
+```
+
+#### Modes
+
+| Flag | Description |
+|------|-------------|
+| *(default)* | Interactive TUI review — approve/reject each suggestion |
+| `--headless` | Auto-accept all suggestions, output JSONL (no TUI) |
+| `--record-only` | TUI review, save to local JSON instead of writing to IA |
+| `--dry-run` | Show suggestions without applying any changes |
+
+#### Input sources
+
+| Flag | Description |
+|------|-------------|
+| `<IDENTIFIER>...` | Item identifier(s) to analyze |
+| `--itemlist <PATH>` | Read identifiers from file (one per line) |
+| `--search <QUERY>` | Use search results as input |
+
+#### Focus flags
+
+| Flag | Description |
+|------|-------------|
+| `--dates-only` | Only suggest date-related changes |
+| `--titles-only` | Only suggest title changes |
+| `--descriptions-only` | Only suggest description changes |
+| `--missing-fields` | Only fill empty/missing fields |
+| `--schema-fix` | Only fix schema conformance issues |
+| `--typos` | Only fix typos |
+| `--only-fields <FIELDS>` | Only suggest changes to these fields (comma-separated) |
+| `--exclude-fields <FIELDS>` | Never suggest changes to these fields (comma-separated) |
+
+#### LLM configuration
+
+| Flag | Description |
+|------|-------------|
+| `--base-url <URL>` | LLM API base URL (default: OpenAI) |
+| `--api-key <KEY>` | LLM API key (or set `IA_AI_API_KEY` env var, or `[ai] api_key` in ia.ini) |
+| `--model <NAME>` | Model name (default: gpt-4o-mini) |
+| `--temperature <FLOAT>` | Sampling temperature (default: 0.2) |
+| `--max-tokens <N>` | Max tokens in response (default: 4096) |
+
+#### Other flags
+
+| Flag | Description |
+|------|-------------|
+| `--ai-jobs <N>` | Concurrent LLM requests (default: 1) |
+| `--prefetch <N>` | Items to prefetch ahead (default: 5) |
+| `--max-tokens-budget <N>` | Stop after this many total tokens |
+| `-o, --output <PATH>` | Write accepted changes to JSON file (record-only mode) |
+| `--json` | Output results as JSON/JSONL |
+
+#### Subcommands
+
+**`ia ai undo <JOBLOG>`** — Reverse metadata changes from a previous AI session. Reads the joblog, finds successful changes, and applies reverse operations. Supports `--dry-run` and `--json`.
+
+#### Examples
+
+```sh
+# Interactive review of one item
+ia ai nasa_photo_apollo11
+
+# Headless batch processing
+ia ai --headless --search "collection:nasa"
+
+# Dry run — show suggestions without applying
+ia ai --dry-run nasa
+
+# Focus on date fixes only
+ia ai --dates-only --itemlist items.txt
+
+# Undo changes from a previous session
+ia ai undo session.jsonl
+
+# Preview what would be undone
+ia ai undo session.jsonl --dry-run
+```
+
 ## Global options
 
 These options can be used with any subcommand:
@@ -399,7 +674,7 @@ When `--json` is active:
 - Progress bars, color, and decorative output are suppressed
 - Exit codes are binary: `0` for success, `1` for failure (details in stderr JSON)
 
-Currently supported on: `ia download`, `ia search`.
+Supported on all commands.
 
 ## Architecture
 
