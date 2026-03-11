@@ -61,6 +61,7 @@ After merge, `scripts/ia-cleanup <slug>` removes the worktree and local branch.
 - Write tests alongside your code.
 - Commit in logical chunks, not one giant commit at the end.
 - Reference issue numbers in commits when applicable.
+- Update CHANGELOG.md and docs/usage.md if your change affects user-visible behavior.
 - Before committing:
   ```sh
   cargo check

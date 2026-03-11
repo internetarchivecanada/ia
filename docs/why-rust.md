@@ -13,7 +13,7 @@ The Python `internetarchive` library explicitly sets `Connection: close` on ever
 Beyond connection handling:
 - **Concurrent downloads.** The Python CLI downloads one file at a time. The Rust version downloads files in parallel by default (`--jobs`).
 - **Byte-range resume.** Interrupted downloads continue where they left off with `Range` headers and checksum verification.
-- **`Expect: 100-continue` for uploads** (future). `requests`/`urllib3` don't support this at all. hyper does natively — avoiding sending a multi-GB upload body only to receive a 4xx rejection.
+- **`Expect: 100-continue` for uploads.** `requests`/`urllib3` don't support this at all. hyper does natively — avoiding sending a multi-GB upload body only to receive a 4xx rejection.
 
 ## Single binary
 
@@ -42,6 +42,13 @@ Every command supports `--json` for structured output. AI agents read `--help` a
 Rust is also an unusually good language for AI agents to *maintain*. The compiler catches entire classes of bugs — null references, use-after-free, data races, unhandled error variants — before any test runs. An agent can iterate against `cargo check` the way a human iterates against a linter: make a change, ask the compiler what broke, fix it. Refactoring is safe because changing a type or function signature produces errors at every affected call site. The test suite runs with a single `cargo test` — no virtualenv, no Docker, no setup steps. Typed errors (`IaError` variants) tell an agent *what went wrong* structurally, which is more actionable than parsing Python tracebacks.
 
 See [Design philosophy](design-philosophy.md) for how this works and where we're heading.
+
+## Bugs the Rust port prevents
+
+- **Path traversal in downloads** (CVE-2025-58438 equivalent) — caught during security audit before any public release. The Rust port validates all filenames before writing to disk.
+- **Connection pool corruption from `Connection: close`** — eliminated by design. hyper/reqwest manage keep-alive connections correctly without the defensive workarounds the Python CLI requires.
+- **Data races from concurrent file operations** — prevented by Rust's ownership system. The borrow checker enforces exclusive access at compile time, making concurrent download/upload workers safe by construction.
+- **Unhandled error variants** — exhaustive `match` on `IaError` means no silently swallowed failures. Adding a new error variant forces every call site to handle it.
 
 ## Further reading
 

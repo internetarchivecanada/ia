@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <b>This project is in alpha. It works well for read-only operations but bugs exist and the API may change. Not yet recommended for production workflows.</b>
+  <b>This project is in alpha. Download, upload, search, and metadata operations are production-ready, but bugs may exist and the API may change.</b>
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@ sudo mv ia /usr/local/bin/
 <details>
 <summary>Build from source</summary>
 
-Requires [Rust](https://www.rust-lang.org/tools/install) 1.75+.
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.85+.
 
 ```sh
 git clone https://github.com/jjjake/ia.git
@@ -59,6 +59,17 @@ cargo install --path ia-cli
 ```
 
 </details>
+
+## Features
+
+- **Download** — concurrent file downloads with resume, checksum verification, glob/format filtering, multi-disk pool, and a full-screen TUI dashboard
+- **Upload** — single file, batch (from spreadsheet), multipart for large files, automatic resume, streaming progress dashboard
+- **Search** — three backends: scrape (cursor), advanced (paged), full-text search (scroll)
+- **Metadata** — read, write (modify/append/insert/remove), compound operations (`+` chaining), bulk import/export, schema lookup
+- **Config & Auth** — login, credential validation, whoami, cookie/auth header export
+- **Self-update** — check, list versions, install specific releases from GitHub
+- **`--json` on all commands** — structured JSON/JSONL output for scripts, AI agents, and MCP tool servers
+- **Job logging** — JSONL audit trail with `--retry-failed` support
 
 ## Documentation
 
