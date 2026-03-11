@@ -3,6 +3,9 @@
 # Must be run from OUTSIDE the worktree being cleaned up.
 # Usage: ia-cleanup <slug>
 #
+# Finds the worktree by matching <slug> against paths in `git worktree list`,
+# so it works regardless of where the worktree was created.
+#
 # Example:
 #   ia-cleanup search-count
 
@@ -15,17 +18,35 @@ fi
 
 SLUG="$1"
 REPO_ROOT=$(git worktree list | head -1 | awk '{print $1}')
-WORKTREE_PATH="$(dirname "$REPO_ROOT")/worktrees/$SLUG"
 
-# Find the branch associated with this worktree
-if [[ -d "$WORKTREE_PATH" ]]; then
-    BRANCH=$(git -C "$WORKTREE_PATH" branch --show-current 2>/dev/null || echo "")
-else
-    echo "ERROR: Worktree not found at $WORKTREE_PATH" >&2
+# Find worktree path by matching slug against all worktree paths
+WORKTREE_PATH=""
+while IFS= read -r line; do
+    wt_path=$(echo "$line" | awk '{print $1}')
+    # Match slug at end of path (e.g., .../worktrees/foo or .../foo)
+    if [[ "$wt_path" == */"$SLUG" ]]; then
+        WORKTREE_PATH="$wt_path"
+        break
+    fi
+done < <(git worktree list | tail -n +2)
+
+# Fallback: try the conventional location
+if [[ -z "$WORKTREE_PATH" ]]; then
+    FALLBACK="$(dirname "$REPO_ROOT")/worktrees/$SLUG"
+    if [[ -d "$FALLBACK" ]]; then
+        WORKTREE_PATH="$FALLBACK"
+    fi
+fi
+
+if [[ -z "$WORKTREE_PATH" || ! -d "$WORKTREE_PATH" ]]; then
+    echo "ERROR: No worktree found matching slug '$SLUG'" >&2
     echo "Active worktrees:" >&2
     git worktree list >&2
     exit 1
 fi
+
+# Find the branch associated with this worktree
+BRANCH=$(git -C "$WORKTREE_PATH" branch --show-current 2>/dev/null || echo "")
 
 # Safety: don't delete from inside the worktree
 CURRENT_DIR=$(pwd -P)
@@ -53,6 +74,8 @@ git worktree remove --force "$WORKTREE_PATH"
 
 # Delete local branch
 if [[ -n "$BRANCH" ]]; then
+    # Fetch so local main knows about the merge (branch -d checks merge status)
+    git fetch origin main 2>/dev/null || true
     echo "Deleting branch: $BRANCH"
     if ! git branch -d "$BRANCH" 2>/dev/null; then
         echo "WARNING: 'git branch -d $BRANCH' failed."
