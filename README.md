@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <b>This project is in alpha. Download, upload, search, and metadata operations are production-ready, but bugs may exist and the API may change.</b>
+  <b>This project is in alpha. Bugs may exist and the CLI interface may change between releases. Use caution with write operations (upload, metadata modify).</b>
 </p>
 
 <p align="center">

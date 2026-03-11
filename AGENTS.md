@@ -47,7 +47,7 @@ Work happens on feature branches — main is protected by GitHub branch protecti
 - Helper scripts are available for git worktrees: `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`), `scripts/ia-cleanup <slug>` after merge.
 - Run `cargo test -p ia-core -p ia-cli` and `cargo clippy -p ia-core -p ia-cli -- -D warnings` before committing.
 - Update CLI help text (`about`, `long_about`, `after_long_help`) when modifying flags or subcommands.
-- When changing user-visible behavior (new flags, commands, or defaults), update: CHANGELOG.md, docs/usage.md, and README.md.
+- When changing user-visible behavior (new flags, commands, or defaults), update: docs/usage.md and README.md.
 
 ## `--json` Output
 

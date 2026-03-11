@@ -61,7 +61,7 @@ After merge, `scripts/ia-cleanup <slug>` removes the worktree and local branch.
 - Write tests alongside your code.
 - Commit in logical chunks, not one giant commit at the end.
 - Reference issue numbers in commits when applicable.
-- Update CHANGELOG.md and docs/usage.md if your change affects user-visible behavior.
+- Update docs/usage.md if your change affects user-visible behavior.
 - Before committing:
   ```sh
   cargo check
@@ -97,6 +97,19 @@ assistants — architecture context, safety rules, API quirks, and workflow guid
 agentic tools will read this automatically or can be configured to.
 
 Claude Code users will also find a [`CLAUDE.md`](./CLAUDE.md) with additional tool-specific notes.
+
+## Releasing
+
+Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release):
+
+    cargo release <version>    # e.g., cargo release 0.9.0
+
+This bumps the workspace version, commits, tags, and pushes. The GitHub Actions
+release workflow then builds binaries and creates the GitHub Release.
+
+To preview without making changes:
+
+    cargo release <version> --dry-run
 
 ## Safety
 

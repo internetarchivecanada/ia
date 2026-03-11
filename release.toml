@@ -1,0 +1,7 @@
+[workspace]
+pre-release-commit-message = "release: v{{version}}"
+tag-prefix = "v"
+tag-message = "v{{version}}"
+publish = false
+push-remote = "origin"
+pre-release-hook = ["cargo", "test", "-p", "ia-core", "-p", "ia-cli"]
