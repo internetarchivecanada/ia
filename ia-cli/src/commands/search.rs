@@ -223,7 +223,10 @@ pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
             run_scrape(client, sub.query, sub.sort, sub.field, sub.shared, quiet).await
         }
         Some(SearchCommand::Advanced(sub)) => {
-            run_advanced(client, sub.query, sub.sort, sub.field, sub.rows, sub.shared, quiet).await
+            run_advanced(
+                client, sub.query, sub.sort, sub.field, sub.rows, sub.shared, quiet,
+            )
+            .await
         }
         Some(SearchCommand::Fts(sub)) => run_fts(client, sub, quiet).await,
         None => {
@@ -322,11 +325,7 @@ async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
     run_output(stream, &args.shared, &[], &args.query, quiet).await
 }
 
-fn build_search_opts(
-    field: &[String],
-    sort: &[String],
-    shared: &SharedSearchArgs,
-) -> SearchOpts {
+fn build_search_opts(field: &[String], sort: &[String], shared: &SharedSearchArgs) -> SearchOpts {
     // In non-JSON mode with no explicit fields, request only identifiers
     let fields = if !field.is_empty() {
         field.to_vec()
@@ -392,9 +391,7 @@ async fn run_output(
         } else if quiet == 0 && !item.fields.is_empty() {
             print!("{}", style(&item.identifier).bold());
             for (key, value) in &item.fields {
-                if !fields_requested.is_empty()
-                    && !fields_requested.iter().any(|f| f == key)
-                {
+                if !fields_requested.is_empty() && !fields_requested.iter().any(|f| f == key) {
                     continue;
                 }
                 let display = match value {
@@ -410,11 +407,7 @@ async fn run_output(
     }
 
     if quiet < 2 && !shared.itemlist && !shared.json {
-        eprintln!(
-            "\n{}  {} results",
-            style("search").bold(),
-            count,
-        );
+        eprintln!("\n{}  {} results", style("search").bold(), count,);
     }
 
     if count == 0 {

@@ -66,9 +66,7 @@ pub async fn undo_from_joblog(
                     Some(v) if !v.is_null() => v.clone(),
                     _ => {
                         // Field didn't exist before — set to REMOVE_TAG to delete
-                        serde_json::Value::String(
-                            crate::metadata::write::REMOVE_TAG.to_string(),
-                        )
+                        serde_json::Value::String(crate::metadata::write::REMOVE_TAG.to_string())
                     }
                 };
                 (c.field.clone(), restore_value)
@@ -112,9 +110,11 @@ pub async fn undo_from_joblog(
                                 new: c.old.clone().unwrap_or(serde_json::Value::Null),
                             })
                             .collect();
-                        let undo_entry =
-                            JoblogEntry::new("ai-undo", &entry.item, "")
-                                .ai_ok(undo_changes, None, 0);
+                        let undo_entry = JoblogEntry::new("ai-undo", &entry.item, "").ai_ok(
+                            undo_changes,
+                            None,
+                            0,
+                        );
                         writer.write(&undo_entry);
                     }
                 } else {
@@ -126,8 +126,7 @@ pub async fn undo_from_joblog(
 
                     if let Some(writer) = undo_log_writer {
                         let undo_entry =
-                            JoblogEntry::new("ai-undo", &entry.item, "")
-                                .ai_error(&error_msg, 0);
+                            JoblogEntry::new("ai-undo", &entry.item, "").ai_error(&error_msg, 0);
                         writer.write(&undo_entry);
                     }
                 }
@@ -137,8 +136,8 @@ pub async fn undo_from_joblog(
                 summary.items_errored += 1;
 
                 if let Some(writer) = undo_log_writer {
-                    let undo_entry = JoblogEntry::new("ai-undo", &entry.item, "")
-                        .ai_error(&e.to_string(), 0);
+                    let undo_entry =
+                        JoblogEntry::new("ai-undo", &entry.item, "").ai_error(&e.to_string(), 0);
                     writer.write(&undo_entry);
                 }
             }
@@ -159,29 +158,21 @@ mod tests {
 
         let writer = JoblogWriter::open(&path).unwrap();
         // AI success entry
-        writer.write(
-            &JoblogEntry::new("ai", "item1", "").ai_ok(
-                vec![JoblogChange {
-                    field: "title".to_string(),
-                    old: Some(serde_json::json!("old title")),
-                    new: serde_json::json!("New Title"),
-                }],
-                None,
-                100,
-            ),
-        );
+        writer.write(&JoblogEntry::new("ai", "item1", "").ai_ok(
+            vec![JoblogChange {
+                field: "title".to_string(),
+                old: Some(serde_json::json!("old title")),
+                new: serde_json::json!("New Title"),
+            }],
+            None,
+            100,
+        ));
         // AI error entry (should be skipped)
-        writer.write(
-            &JoblogEntry::new("ai", "item2", "").ai_error("failed", 50),
-        );
+        writer.write(&JoblogEntry::new("ai", "item2", "").ai_error("failed", 50));
         // Download entry (should be skipped)
-        writer.write(
-            &JoblogEntry::new("download", "item3", "file.txt").ok(1000, 100),
-        );
+        writer.write(&JoblogEntry::new("download", "item3", "file.txt").ok(1000, 100));
         // AI skipped entry (should be skipped)
-        writer.write(
-            &JoblogEntry::new("ai", "item4", "").skipped(),
-        );
+        writer.write(&JoblogEntry::new("ai", "item4", "").skipped());
 
         let entries = joblog::read(&path).unwrap();
         let ai_ok: Vec<_> = entries

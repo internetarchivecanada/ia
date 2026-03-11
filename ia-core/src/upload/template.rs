@@ -308,11 +308,8 @@ mod tests {
         fs::write(dir.path().join("real.txt"), "content").unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(
-                dir.path().join("real.txt"),
-                dir.path().join("link.txt"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt"))
+                .unwrap();
         }
 
         let rows = generate_template(dir.path(), &TemplateOpts::default()).unwrap();

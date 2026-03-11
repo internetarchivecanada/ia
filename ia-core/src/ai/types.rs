@@ -258,7 +258,10 @@ mod tests {
         let status = ChangeStatus::Edited(serde_json::json!("custom value"));
         let json = serde_json::to_string(&status).unwrap();
         let parsed: ChangeStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, ChangeStatus::Edited(serde_json::json!("custom value")));
+        assert_eq!(
+            parsed,
+            ChangeStatus::Edited(serde_json::json!("custom value"))
+        );
     }
 
     #[test]

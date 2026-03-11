@@ -250,8 +250,8 @@ pub async fn run(
             let auth = ia_core::auth::login(&client, &email, &password).await?;
 
             // Determine where to write the config
-            let write_path = config_path
-                .unwrap_or_else(ia_core::IaConfig::find_or_default_config_path);
+            let write_path =
+                config_path.unwrap_or_else(ia_core::IaConfig::find_or_default_config_path);
 
             ia_core::IaConfig::write_config_file(&auth, &write_path)?;
 
@@ -339,24 +339,19 @@ pub async fn run(
                 println!("{}", serde_json::to_string(&json)?);
             } else {
                 for (name, value) in &config.cookies {
-                    println!(
-                        ".archive.org\tTRUE\t/\tTRUE\t0\t{}\t{}",
-                        name, value
-                    );
+                    println!(".archive.org\tTRUE\t/\tTRUE\t0\t{}\t{}", name, value);
                 }
             }
             Ok(())
         }
 
         ConfigCommand::PrintAuth(args) => {
-            let access = config
-                .s3_access
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("no S3 access key found in config. Run `ia config login` first."))?;
-            let secret = config
-                .s3_secret
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("no S3 secret key found in config. Run `ia config login` first."))?;
+            let access = config.s3_access.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("no S3 access key found in config. Run `ia config login` first.")
+            })?;
+            let secret = config.s3_secret.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("no S3 secret key found in config. Run `ia config login` first.")
+            })?;
 
             let header = format!("Authorization: LOW {access}:{secret}");
 

@@ -39,11 +39,7 @@ fn make_progress_bar(total_bytes: u64) -> ProgressBar {
 
 /// Print `▸ identifier` header line to stderr.
 fn print_item_header(identifier: &str) {
-    eprintln!(
-        "{} {}",
-        style(ICON_HEADER).cyan(),
-        style(identifier).bold(),
-    );
+    eprintln!("{} {}", style(ICON_HEADER).cyan(), style(identifier).bold(),);
 }
 
 /// Format transfer speed as `· X.X MiB/s`, or empty string if elapsed is zero.
@@ -323,10 +319,9 @@ impl BatchDisplay {
     }
 
     pub fn on_item_start(&self, identifier: &str, _current: usize, _total: usize) {
-        let item_header = self.multi.insert_before(
-            &self.bottom_sentinel,
-            ProgressBar::new_spinner(),
-        );
+        let item_header = self
+            .multi
+            .insert_before(&self.bottom_sentinel, ProgressBar::new_spinner());
         item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
         item_header.set_message(format!(
             "{} {}",
@@ -334,7 +329,9 @@ impl BatchDisplay {
             style(identifier).bold(),
         ));
 
-        let bar = self.multi.insert_before(&self.bottom_sentinel, make_progress_bar(0));
+        let bar = self
+            .multi
+            .insert_before(&self.bottom_sentinel, make_progress_bar(0));
 
         let mut items = self.active_item_bars.lock().unwrap();
         items.insert(
@@ -378,18 +375,24 @@ impl BatchDisplay {
                     item.bar.set_position(total);
                 }
                 item.files_processed += 1;
-                item.bar
-                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
+                item.bar.set_message(format!(
+                    "{}/{} files",
+                    item.files_processed, item.files_total
+                ));
             }
             DownloadStatus::Skipped(_) => {
                 item.files_processed += 1;
-                item.bar
-                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
+                item.bar.set_message(format!(
+                    "{}/{} files",
+                    item.files_processed, item.files_total
+                ));
             }
             DownloadStatus::Failed(_) => {
                 item.files_processed += 1;
-                item.bar
-                    .set_message(format!("{}/{} files", item.files_processed, item.files_total));
+                item.bar.set_message(format!(
+                    "{}/{} files",
+                    item.files_processed, item.files_total
+                ));
             }
             DownloadStatus::Verifying => {}
         }
@@ -518,14 +521,16 @@ impl UploadDisplay {
                 let mut processed = self.files_processed.lock().unwrap();
                 *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{files_total} files"));
+                self.bar
+                    .set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::Skipped => {
                 *self.files_skipped.lock().unwrap() += 1;
                 let mut processed = self.files_processed.lock().unwrap();
                 *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{files_total} files"));
+                self.bar
+                    .set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::Failed => {
                 self.errors.lock().unwrap().push(format!(
@@ -537,7 +542,8 @@ impl UploadDisplay {
                 let mut processed = self.files_processed.lock().unwrap();
                 *processed += 1;
                 let files_total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{files_total} files"));
+                self.bar
+                    .set_message(format!("{processed}/{files_total} files"));
             }
             UploadProgressStatus::WaitingRateLimit => {
                 self.bar.set_message("rate limited, waiting...");
@@ -646,10 +652,9 @@ impl UploadBatchDisplay {
                     return;
                 }
 
-                let item_header = self.multi.insert_before(
-                    &self.bottom_sentinel,
-                    ProgressBar::new_spinner(),
-                );
+                let item_header = self
+                    .multi
+                    .insert_before(&self.bottom_sentinel, ProgressBar::new_spinner());
                 item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
                 item_header.set_message(format!(
                     "{} {}",
@@ -954,7 +959,10 @@ mod tests {
     #[test]
     fn format_bytes_gib() {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024), "2.50 GiB");
+        assert_eq!(
+            format_bytes(2 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "2.50 GiB"
+        );
     }
 
     #[test]

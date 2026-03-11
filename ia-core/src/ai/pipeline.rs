@@ -9,8 +9,8 @@ use tracing::{debug, error, warn};
 use crate::ai::client::LlmClient;
 use crate::ai::prompt;
 use crate::ai::types::{
-    AiConfig, ApplyResult, ApplyStatus, ChangeCategory, ChangeStatus, FocusConfig,
-    ItemAnalysis, JoblogChange, JoblogTokens, MetadataChange,
+    AiConfig, ApplyResult, ApplyStatus, ChangeCategory, ChangeStatus, FocusConfig, ItemAnalysis,
+    JoblogChange, JoblogTokens, MetadataChange,
 };
 use crate::client::IaClient;
 use crate::joblog::{JoblogEntry, JoblogWriter};
@@ -129,7 +129,14 @@ pub async fn run_pipeline(
     let source_errors = Arc::new(AtomicU64::new(0));
     let source_errors_clone = source_errors.clone();
     let source_handle = tokio::spawn(async move {
-        run_source(source_client, identifiers, source_tx, source_shutdown, source_errors_clone).await;
+        run_source(
+            source_client,
+            identifiers,
+            source_tx,
+            source_shutdown,
+            source_errors_clone,
+        )
+        .await;
     });
 
     // Stage 2: Analyzer — call LLM
@@ -336,9 +343,10 @@ pub fn parse_llm_changes(content: &str) -> Vec<MetadataChange> {
         .filter_map(|v| {
             let field = v.get("field")?.as_str()?.to_string();
             let new_value = v.get("new_value").cloned()?;
-            let old_value = v.get("old_value").cloned().and_then(|v| {
-                if v.is_null() { None } else { Some(v) }
-            });
+            let old_value =
+                v.get("old_value")
+                    .cloned()
+                    .and_then(|v| if v.is_null() { None } else { Some(v) });
             let reason = v
                 .get("reason")
                 .and_then(|r| r.as_str())
@@ -542,11 +550,7 @@ async fn run_writer(
 }
 
 /// Process a single item: apply accepted changes.
-async fn process_item(
-    client: &IaClient,
-    analysis: &ItemAnalysis,
-    dry_run: bool,
-) -> ApplyResult {
+async fn process_item(client: &IaClient, analysis: &ItemAnalysis, dry_run: bool) -> ApplyResult {
     let accepted: Vec<&MetadataChange> = analysis
         .changes
         .iter()
@@ -621,11 +625,7 @@ async fn process_item(
 }
 
 /// Write a joblog entry for an AI operation.
-fn write_joblog_entry(
-    writer: &JoblogWriter,
-    analysis: &ItemAnalysis,
-    result: &ApplyResult,
-) {
+fn write_joblog_entry(writer: &JoblogWriter, analysis: &ItemAnalysis, result: &ApplyResult) {
     let changes: Vec<JoblogChange> = result
         .changes_applied
         .iter()
@@ -650,16 +650,14 @@ fn write_joblog_entry(
 
     let entry = match result.status {
         ApplyStatus::Ok => {
-            JoblogEntry::new("ai", &analysis.identifier, "")
-                .ai_ok(changes, tokens, 0)
+            JoblogEntry::new("ai", &analysis.identifier, "").ai_ok(changes, tokens, 0)
         }
         ApplyStatus::Skipped | ApplyStatus::DryRun => {
             JoblogEntry::new("ai", &analysis.identifier, "").skipped()
         }
         ApplyStatus::Error => {
             let msg = result.error.as_deref().unwrap_or("unknown error");
-            JoblogEntry::new("ai", &analysis.identifier, "")
-                .ai_error(msg, 0)
+            JoblogEntry::new("ai", &analysis.identifier, "").ai_error(msg, 0)
         }
     };
 

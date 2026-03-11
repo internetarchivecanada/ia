@@ -179,15 +179,12 @@ pub async fn initiate_upload(
         req = req.header(k.as_str(), v.as_str());
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("initiate multipart: {e}"),
-            status: None,
-        })?;
+    let resp = req.send().await.map_err(|e| IaError::UploadFailed {
+        identifier: identifier.into(),
+        key: key.into(),
+        message: format!("initiate multipart: {e}"),
+        status: None,
+    })?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -376,10 +373,7 @@ pub async fn abort_upload(
 /// List all in-progress multipart uploads for an item.
 ///
 /// `GET /{identifier}?uploads`
-pub async fn list_uploads(
-    client: &IaClient,
-    identifier: &str,
-) -> Result<Vec<MultipartUploadInfo>> {
+pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<MultipartUploadInfo>> {
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads=", build_s3_item_url(client, identifier));
 

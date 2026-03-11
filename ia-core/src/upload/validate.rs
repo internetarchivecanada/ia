@@ -95,10 +95,7 @@ pub fn validate_required_metadata(metadata: &[(String, String)]) -> Result<(), I
 ///
 /// This is a pre-flight validation: better to fail early than to upload
 /// files and discover the collection doesn't exist.
-pub async fn check_collections(
-    client: &IaClient,
-    collections: &[&str],
-) -> Result<(), IaError> {
+pub async fn check_collections(client: &IaClient, collections: &[&str]) -> Result<(), IaError> {
     let mut not_found = Vec::new();
 
     for collection in collections {
@@ -197,18 +194,14 @@ mod tests {
     fn missing_mediatype() {
         let meta = vec![("collection".into(), "test_collection".into())];
         let err = validate_required_metadata(&meta).unwrap_err();
-        assert!(
-            matches!(err, IaError::MissingRequiredMetadata { field } if field == "mediatype")
-        );
+        assert!(matches!(err, IaError::MissingRequiredMetadata { field } if field == "mediatype"));
     }
 
     #[test]
     fn missing_collection() {
         let meta = vec![("mediatype".into(), "texts".into())];
         let err = validate_required_metadata(&meta).unwrap_err();
-        assert!(
-            matches!(err, IaError::MissingRequiredMetadata { field } if field == "collection")
-        );
+        assert!(matches!(err, IaError::MissingRequiredMetadata { field } if field == "collection"));
     }
 
     #[test]
@@ -218,9 +211,7 @@ mod tests {
             ("collection".into(), "test_collection".into()),
         ];
         let err = validate_required_metadata(&meta).unwrap_err();
-        assert!(
-            matches!(err, IaError::MissingRequiredMetadata { field } if field == "mediatype")
-        );
+        assert!(matches!(err, IaError::MissingRequiredMetadata { field } if field == "mediatype"));
     }
 
     #[test]
@@ -230,9 +221,7 @@ mod tests {
             ("collection".into(), "".into()),
         ];
         let err = validate_required_metadata(&meta).unwrap_err();
-        assert!(
-            matches!(err, IaError::MissingRequiredMetadata { field } if field == "collection")
-        );
+        assert!(matches!(err, IaError::MissingRequiredMetadata { field } if field == "collection"));
     }
 
     // -- validate_file tests --
@@ -259,6 +248,9 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path(), &link_path).unwrap();
         let result = validate_file(&link_path);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), IaError::SymlinkSkipped { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            IaError::SymlinkSkipped { .. }
+        ));
     }
 }

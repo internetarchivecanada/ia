@@ -68,9 +68,14 @@ pub async fn upload_batch(
                     }
                 }
 
-                let result =
-                    upload_item(client, &group.identifier, &group.files, &item_opts, progress)
-                        .await;
+                let result = upload_item(
+                    client,
+                    &group.identifier,
+                    &group.files,
+                    &item_opts,
+                    progress,
+                )
+                .await;
                 (id, result)
             }
         })
@@ -102,7 +107,10 @@ pub async fn upload_batch(
     }
 
     // If ALL items failed and we have no real results, return the first error
-    if all_results.iter().all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_))) {
+    if all_results
+        .iter()
+        .all(|r| matches!(r.status, crate::upload::types::UploadStatus::Failed(_)))
+    {
         if let Some((_, first_err)) = errors.into_iter().next() {
             return Err(first_err);
         }
@@ -117,24 +125,22 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
     let mut map: BTreeMap<String, ItemGroup> = BTreeMap::new();
 
     for (identifier, mut fields) in records {
-        let file_path = fields
-            .remove("file")
-            .ok_or_else(|| IaError::Config(format!(
+        let file_path = fields.remove("file").ok_or_else(|| {
+            IaError::Config(format!(
                 "record for identifier '{identifier}' is missing required 'file' field"
-            )))?;
+            ))
+        })?;
 
         // Strip REMOTE_NAME from metadata — it's a template column, not an IA metadata field
         fields.remove("REMOTE_NAME");
 
         let metadata: Vec<(String, String)> = fields.into_iter().collect();
 
-        let group = map
-            .entry(identifier.clone())
-            .or_insert_with(|| ItemGroup {
-                identifier,
-                metadata: Vec::new(),
-                files: Vec::new(),
-            });
+        let group = map.entry(identifier.clone()).or_insert_with(|| ItemGroup {
+            identifier,
+            metadata: Vec::new(),
+            files: Vec::new(),
+        });
 
         // Use metadata from the first record for this identifier
         if group.metadata.is_empty() {
@@ -188,11 +194,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn record(
-        id: &str,
-        file: &str,
-        extra: &[(&str, &str)],
-    ) -> SpreadsheetRecord {
+    fn record(id: &str, file: &str, extra: &[(&str, &str)]) -> SpreadsheetRecord {
         let mut fields = HashMap::new();
         fields.insert("file".into(), file.into());
         for (k, v) in extra {

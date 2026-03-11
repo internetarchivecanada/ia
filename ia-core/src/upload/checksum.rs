@@ -83,7 +83,9 @@ fn try_parse_bsd(line: &str) -> Option<(String, String)> {
 ///
 /// MD5 computation is CPU + I/O intensive. Running it on tokio's async
 /// runtime blocks the executor. This spawns it on the blocking thread pool.
-pub async fn compute_file_md5_async(path: &std::path::Path) -> std::result::Result<String, std::io::Error> {
+pub async fn compute_file_md5_async(
+    path: &std::path::Path,
+) -> std::result::Result<String, std::io::Error> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || compute_file_md5(&path))
         .await

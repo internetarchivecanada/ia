@@ -101,7 +101,10 @@ pub const MIN_INSTALLABLE_VERSION: &str = "0.6.0";
 ///
 /// Returns `false` for unparseable version strings.
 pub fn is_at_or_above_minimum(version: &str) -> bool {
-    match (parse_version(version), parse_version(MIN_INSTALLABLE_VERSION)) {
+    match (
+        parse_version(version),
+        parse_version(MIN_INSTALLABLE_VERSION),
+    ) {
         (Some(v), Some(min)) => v >= min,
         _ => false,
     }
@@ -260,11 +263,10 @@ pub async fn fetch_release_by_tag(
         });
     }
 
-    let release: GitHubRelease =
-        response.json().await.map_err(|e| IaError::UpdateApiError {
-            status: 0,
-            message: format!("failed to parse release JSON: {e}"),
-        })?;
+    let release: GitHubRelease = response.json().await.map_err(|e| IaError::UpdateApiError {
+        status: 0,
+        message: format!("failed to parse release JSON: {e}"),
+    })?;
 
     Ok(release)
 }
@@ -309,7 +311,11 @@ pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::R
         current_version: current_version.to_string(),
         latest_version,
         update_available,
-        release: if update_available { Some(release) } else { None },
+        release: if update_available {
+            Some(release)
+        } else {
+            None
+        },
     })
 }
 
@@ -332,10 +338,13 @@ pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> cr
         });
     }
 
-    let bytes = response.bytes().await.map_err(|e| IaError::UpdateApiError {
-        status: 0,
-        message: format!("failed to read download body: {e}"),
-    })?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| IaError::UpdateApiError {
+            status: 0,
+            message: format!("failed to read download body: {e}"),
+        })?;
 
     let mut file = tokio::fs::File::create(dest).await?;
     file.write_all(&bytes).await?;
@@ -399,8 +408,7 @@ async fn download_and_replace(
     let temp_path = current_exe.with_extension("update-tmp");
     let _ = std::fs::remove_file(&temp_path);
 
-    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await
-    {
+    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await {
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
@@ -475,7 +483,14 @@ pub async fn install_version(
             target: target.to_string(),
         })?;
 
-    download_and_replace(asset, current_exe, current_version, clean_version, skip_verify).await?;
+    download_and_replace(
+        asset,
+        current_exe,
+        current_version,
+        clean_version,
+        skip_verify,
+    )
+    .await?;
 
     Ok(UpdateResult {
         current_version: current_version.to_string(),
@@ -504,14 +519,19 @@ pub async fn perform_update(
     }
 
     let release = check.release.as_ref().unwrap();
-    let asset = find_matching_asset(&release.assets, target).ok_or_else(|| {
-        IaError::UpdateNoAsset {
+    let asset =
+        find_matching_asset(&release.assets, target).ok_or_else(|| IaError::UpdateNoAsset {
             target: target.to_string(),
-        }
-    })?;
+        })?;
 
-    download_and_replace(asset, current_exe, current_version, &check.latest_version, skip_verify)
-        .await?;
+    download_and_replace(
+        asset,
+        current_exe,
+        current_version,
+        &check.latest_version,
+        skip_verify,
+    )
+    .await?;
 
     Ok(UpdateResult {
         current_version: check.current_version,
@@ -647,16 +667,16 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v99.0.0",
                     "assets": [{
                         "name": "ia-aarch64-apple-darwin",
                         "browser_download_url": "https://example.com/ia-aarch64-apple-darwin",
                         "size": 100
                     }]
-                }),
-            ))
+                })),
+            )
             .mount(&mock_server)
             .await;
 
@@ -672,12 +692,12 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v0.4.3",
                     "assets": []
-                }),
-            ))
+                })),
+            )
             .mount(&mock_server)
             .await;
 
@@ -764,10 +784,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download/ia-test-target"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_bytes(fake_binary.to_vec()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -861,7 +878,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let releases = list_releases(&mock_server.uri(), "98.0.0", "test-target").await.unwrap();
+        let releases = list_releases(&mock_server.uri(), "98.0.0", "test-target")
+            .await
+            .unwrap();
         assert_eq!(releases.len(), 3);
         assert_eq!(releases[0].version, "97.0.0");
         assert_eq!(releases[1].version, "98.0.0");
@@ -888,7 +907,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target").await.unwrap();
+        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target")
+            .await
+            .unwrap();
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].version, "99.0.0");
     }
@@ -908,7 +929,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target").await.unwrap();
+        let releases = list_releases(&mock_server.uri(), "99.0.0", "test-target")
+            .await
+            .unwrap();
         assert_eq!(releases.len(), 1);
         assert!(!releases[0].has_asset);
     }
@@ -924,7 +947,9 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let release = fetch_release_by_tag("1.2.3", "0.5.0", &mock_server.uri()).await.unwrap();
+        let release = fetch_release_by_tag("1.2.3", "0.5.0", &mock_server.uri())
+            .await
+            .unwrap();
         assert_eq!(release.tag_name, "v1.2.3");
         assert_eq!(release.assets.len(), 1);
     }
@@ -933,16 +958,22 @@ mod tests {
     async fn fetch_release_by_tag_not_found() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.99.99"))
-            .respond_with(wiremock::ResponseTemplate::new(404).set_body_json(
-                serde_json::json!({"message": "Not Found"}),
+            .and(wiremock::matchers::path(
+                "/repos/jjjake/ia/releases/tags/v99.99.99",
             ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message": "Not Found"})),
+            )
             .mount(&mock_server)
             .await;
 
         let result = fetch_release_by_tag("99.99.99", "0.5.0", &mock_server.uri()).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::error::IaError::UpdateVersionNotFound { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::IaError::UpdateVersionNotFound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -950,16 +981,16 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v99.0.0",
                     "assets": [{
                         "name": "ia-some-other-target",
                         "browser_download_url": "https://example.com/ia-other",
                         "size": 100
                     }]
-                }),
-            ))
+                })),
+            )
             .mount(&mock_server)
             .await;
 
@@ -1017,9 +1048,7 @@ mod tests {
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download/ia-test-target"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()))
             .mount(&mock_server)
             .await;
 

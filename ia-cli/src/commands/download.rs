@@ -113,7 +113,9 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
         "original" => Ok(FileSource::Original),
         "derivative" => Ok(FileSource::Derivative),
         "metadata" => Ok(FileSource::Metadata),
-        _ => Err(format!("unknown source: {s} (expected: original, derivative, metadata)")),
+        _ => Err(format!(
+            "unknown source: {s} (expected: original, derivative, metadata)"
+        )),
     }
 }
 
@@ -257,7 +259,10 @@ pub async fn run(
         None
     };
 
-    let base_destdir = destdirs.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+    let base_destdir = destdirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let make_opts = |destdir: PathBuf| DownloadOpts {
         destdir,
@@ -294,7 +299,9 @@ pub async fn run(
 
     #[cfg(not(feature = "tui"))]
     if args.dashboard {
-        bail!("Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui");
+        bail!(
+            "Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui"
+        );
     }
 
     // Single item — use the original simple path
@@ -316,9 +323,11 @@ pub async fn run(
         };
 
         let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
-            display.clone().map(|d| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
-                Arc::new(move |p| d.update(p))
-            });
+            display
+                .clone()
+                .map(|d| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+                    Arc::new(move |p| d.update(p))
+                });
 
         let result = ia_core::download::download_item(
             client,
@@ -362,20 +371,27 @@ pub async fn run(
     // Batch mode
     let json_mode = args.json;
     let batch_display = if !json_mode && quiet == 0 {
-        Some(Arc::new(crate::output::BatchDisplay::new(identifiers.len(), jobs)))
+        Some(Arc::new(crate::output::BatchDisplay::new(
+            identifiers.len(),
+            jobs,
+        )))
     } else {
         None
     };
 
     let on_item_start: Option<ia_core::download::OnItemStartFn> =
-        batch_display.clone().map(|bd| -> ia_core::download::OnItemStartFn {
-            Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
-        });
+        batch_display
+            .clone()
+            .map(|bd| -> ia_core::download::OnItemStartFn {
+                Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
+            });
 
     let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
-        batch_display.clone().map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
-            Arc::new(move |p: DownloadProgress| bd.on_progress(p))
-        });
+        batch_display
+            .clone()
+            .map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+                Arc::new(move |p: DownloadProgress| bd.on_progress(p))
+            });
 
     let on_item_complete: Option<ia_core::download::OnItemCompleteFn> = if json_mode {
         Some(Arc::new(move |result: &ItemDownloadResult| {
@@ -391,9 +407,11 @@ pub async fn run(
             println!("{}", obj);
         }))
     } else {
-        batch_display.clone().map(|bd| -> ia_core::download::OnItemCompleteFn {
-            Arc::new(move |result| bd.on_item_complete(result))
-        })
+        batch_display
+            .clone()
+            .map(|bd| -> ia_core::download::OnItemCompleteFn {
+                Arc::new(move |result| bd.on_item_complete(result))
+            })
     };
 
     let result = ia_core::download::download_batch(
@@ -423,9 +441,7 @@ pub async fn run(
             match item_result {
                 Ok(ir) => write_item_results(jl, &ir.identifier, &ir.results),
                 Err((id, err)) => {
-                    jl.write(
-                        &JoblogEntry::new("download", id, "").error(&err.to_string(), 0),
-                    );
+                    jl.write(&JoblogEntry::new("download", id, "").error(&err.to_string(), 0));
                 }
             }
         }
@@ -519,7 +535,9 @@ fn print_json_file_result(identifier: &str, r: &FileDownloadResult) {
 }
 
 /// Build a JSON value for an item-level result (batch mode).
-fn json_item_result(result: &std::result::Result<ItemDownloadResult, (String, IaError)>) -> serde_json::Value {
+fn json_item_result(
+    result: &std::result::Result<ItemDownloadResult, (String, IaError)>,
+) -> serde_json::Value {
     match result {
         Ok(ir) => serde_json::json!({
             "item": ir.identifier,
@@ -638,18 +656,12 @@ mod tests {
 
     #[test]
     fn parse_plain_identifier() {
-        assert_eq!(
-            parse_identifier_line("nasa"),
-            Some("nasa".to_string())
-        );
+        assert_eq!(parse_identifier_line("nasa"), Some("nasa".to_string()));
     }
 
     #[test]
     fn parse_plain_identifier_with_whitespace() {
-        assert_eq!(
-            parse_identifier_line("  nasa  "),
-            Some("nasa".to_string())
-        );
+        assert_eq!(parse_identifier_line("  nasa  "), Some("nasa".to_string()));
     }
 
     #[test]
@@ -686,4 +698,3 @@ mod tests {
         );
     }
 }
-

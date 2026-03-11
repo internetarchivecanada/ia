@@ -123,9 +123,7 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
         let status_icon = match &item.status {
             ItemStatus::Pending => Span::styled("  ", Style::default().fg(Color::DarkGray)),
             ItemStatus::Downloading => Span::styled(" \u{25b8}", Style::default().fg(Color::Cyan)),
-            ItemStatus::Complete => {
-                Span::styled(" \u{2713}", Style::default().fg(Color::Green))
-            }
+            ItemStatus::Complete => Span::styled(" \u{2713}", Style::default().fg(Color::Green)),
             ItemStatus::Failed(_) => Span::styled(" \u{2717}", Style::default().fg(Color::Red)),
         };
 
@@ -213,11 +211,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
         let bar_width = 20;
         let filled = (progress * bar_width as f64) as usize;
         let empty = bar_width - filled;
-        let bar = format!(
-            "{}{}",
-            "\u{2588}".repeat(filled),
-            "\u{2591}".repeat(empty)
-        );
+        let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty));
 
         let speed = {
             let secs = fp.started_at.elapsed().as_secs_f64();
@@ -250,19 +244,12 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
     // Recent completions
     if lines.len() < inner.height as usize && !state.completed_files.is_empty() {
         let remaining = inner.height as usize - lines.len();
-        let recent = state
-            .completed_files
-            .iter()
-            .rev()
-            .take(remaining.min(3));
+        let recent = state.completed_files.iter().rev().take(remaining.min(3));
 
         for name in recent {
             let display_name = widgets::truncate_tail(name, 30);
             lines.push(Line::from(vec![
-                Span::styled(
-                    " \u{2713} ",
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled(" \u{2713} ", Style::default().fg(Color::Green)),
                 Span::styled(display_name, Style::default().fg(Color::DarkGray)),
                 Span::styled(" done", Style::default().fg(Color::DarkGray)),
             ]));
@@ -400,4 +387,3 @@ fn draw_status_bar(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(status), layout[0]);
     widgets::draw_key_hints(f, layout[1], &[("j/k", " scroll  "), ("q", "uit")]);
 }
-

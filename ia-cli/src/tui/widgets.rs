@@ -163,7 +163,12 @@ pub use crate::output::format_bytes;
 pub fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3600 {
-        format!("{}h{:02}m{:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{}h{:02}m{:02}s",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     } else if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {

@@ -340,12 +340,11 @@ pub async fn download_file(
                     })?;
 
                 // Resolve relative URLs against the current URL.
-                let base = reqwest::Url::parse(&current_url).map_err(|e| {
-                    IaError::Config(format!("invalid download URL: {e}"))
-                })?;
-                let new_url = base.join(location).map_err(|e| {
-                    IaError::Config(format!("invalid redirect location: {e}"))
-                })?;
+                let base = reqwest::Url::parse(&current_url)
+                    .map_err(|e| IaError::Config(format!("invalid download URL: {e}")))?;
+                let new_url = base
+                    .join(location)
+                    .map_err(|e| IaError::Config(format!("invalid redirect location: {e}")))?;
 
                 // Only follow redirects to *.archive.org (same SSRF guard
                 // as the main client's redirect policy). Also allow the
@@ -364,9 +363,7 @@ pub async fn download_file(
                     _ => {
                         return Err(IaError::Http {
                             status: r.status().as_u16(),
-                            message: format!(
-                                "redirect to non-archive.org domain: {new_url}"
-                            ),
+                            message: format!("redirect to non-archive.org domain: {new_url}"),
                         });
                     }
                 }
@@ -434,10 +431,7 @@ pub async fn download_file(
 
     // Stream to .part file
     let mut output = if resume_from.is_some() {
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&part_path)
-            .await?
+        fs::OpenOptions::new().append(true).open(&part_path).await?
     } else {
         fs::File::create(&part_path).await?
     };
@@ -514,13 +508,11 @@ pub async fn download_file(
 
     // Set mtime from Last-Modified header
     if !opts.no_timestamps {
-        if let Some(mtime) = last_modified.or_else(|| {
-            file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t))
-        }) {
-            let _ = filetime::set_file_mtime(
-                &file_path,
-                filetime::FileTime::from_system_time(mtime),
-            );
+        if let Some(mtime) =
+            last_modified.or_else(|| file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t)))
+        {
+            let _ =
+                filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(mtime));
         }
     }
 
@@ -596,7 +588,7 @@ async fn should_skip_checksum(path: &Path, file: &FileMetadata) -> Option<String
 
 /// Compute MD5 hash of a file.
 async fn compute_md5(path: &Path) -> Result<String> {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     use tokio::io::AsyncReadExt;
 
     let mut file = fs::File::open(path).await?;
@@ -605,7 +597,9 @@ async fn compute_md5(path: &Path) -> Result<String> {
 
     loop {
         let n = file.read(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
 
@@ -703,16 +697,7 @@ pub async fn download_item(
                     tokio::time::sleep(delay).await;
                 }
 
-                match download_file(
-                    &client,
-                    &identifier,
-                    &file,
-                    &dest_dir,
-                    &opts,
-                    prog_ref,
-                )
-                .await
-                {
+                match download_file(&client, &identifier, &file, &dest_dir, &opts, prog_ref).await {
                     Ok(result) => return result,
                     Err(e) => {
                         if e.is_retryable() {
@@ -728,7 +713,9 @@ pub async fn download_item(
             }
 
             let status = DownloadStatus::Failed(
-                last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string()),
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string()),
             );
 
             // Notify progress callback so the UI can clean up the file's bar.
@@ -767,9 +754,18 @@ pub async fn download_item(
         }
     }
 
-    let files_downloaded = results.iter().filter(|r| r.status == DownloadStatus::Complete).count();
-    let files_skipped = results.iter().filter(|r| matches!(r.status, DownloadStatus::Skipped(_))).count();
-    let files_failed = results.iter().filter(|r| matches!(r.status, DownloadStatus::Failed(_))).count();
+    let files_downloaded = results
+        .iter()
+        .filter(|r| r.status == DownloadStatus::Complete)
+        .count();
+    let files_skipped = results
+        .iter()
+        .filter(|r| matches!(r.status, DownloadStatus::Skipped(_)))
+        .count();
+    let files_failed = results
+        .iter()
+        .filter(|r| matches!(r.status, DownloadStatus::Failed(_)))
+        .count();
     let bytes_total = results.iter().map(|r| r.bytes).sum();
 
     Ok(ItemDownloadResult {
@@ -835,16 +831,13 @@ pub async fn download_batch(
                 let on_item_complete = on_item_complete.clone();
 
                 async move {
-                    let idx =
-                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if let Some(ref cb) = on_item_start {
                         cb(&identifier, idx, items_total);
                     }
                     info!(item = %identifier, idx, "starting item download");
 
-                    match download_item(&client, &identifier, &opts, semaphore, progress)
-                        .await
-                    {
+                    match download_item(&client, &identifier, &opts, semaphore, progress).await {
                         Ok(result) => {
                             if let Some(ref cb) = on_item_complete {
                                 cb(&result);
@@ -872,10 +865,26 @@ fn collect_batch_results(
 ) -> BatchDownloadResult {
     let items_succeeded = item_results.iter().filter(|r| r.is_ok()).count();
     let items_failed = item_results.iter().filter(|r| r.is_err()).count();
-    let files_downloaded: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_downloaded).sum();
-    let files_skipped: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_skipped).sum();
-    let files_failed: usize = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.files_failed).sum();
-    let bytes_total: u64 = item_results.iter().filter_map(|r| r.as_ref().ok()).map(|r| r.bytes_total).sum();
+    let files_downloaded: usize = item_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.files_downloaded)
+        .sum();
+    let files_skipped: usize = item_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.files_skipped)
+        .sum();
+    let files_failed: usize = item_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.files_failed)
+        .sum();
+    let bytes_total: u64 = item_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.bytes_total)
+        .sum();
 
     BatchDownloadResult {
         items_total,
@@ -916,7 +925,10 @@ mod tests {
             md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
             size: Some(size),
             mtime: Some(1700000000),
-            sha1: None, crc32: None, original: None, rotation: None,
+            sha1: None,
+            crc32: None,
+            original: None,
+            rotation: None,
             extra: HashMap::new(),
         }
     }
@@ -1021,8 +1033,12 @@ mod tests {
         let file = test_file_meta("subdir/test.txt", 4);
 
         let result = download_file(
-            &client, "test-item", &file, dir.path(),
-            &DownloadOpts::default(), None,
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1066,7 +1082,9 @@ mod tests {
         };
         let semaphore = Arc::new(Semaphore::new(2));
 
-        let result = download_item(&client, "test-item", &opts, semaphore, None).await.unwrap();
+        let result = download_item(&client, "test-item", &opts, semaphore, None)
+            .await
+            .unwrap();
 
         assert_eq!(result.files_total, 3);
         assert_eq!(result.files_downloaded, 3);
@@ -1233,7 +1251,9 @@ mod tests {
         assert_eq!(result.files_downloaded, 0);
         for r in &result.results {
             match &r.status {
-                DownloadStatus::Failed(msg) => assert!(msg.contains("403"), "error should mention 403: {msg}"),
+                DownloadStatus::Failed(msg) => {
+                    assert!(msg.contains("403"), "error should mention 403: {msg}")
+                }
                 other => panic!("expected Failed, got {:?}", other),
             }
         }
@@ -1264,7 +1284,10 @@ mod tests {
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), IaError::Http { status: 500, .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            IaError::Http { status: 500, .. }
+        ));
         drop(guard);
     }
 
@@ -1340,10 +1363,7 @@ mod tests {
 
         let result = validate_download_path(dir, "a/b/c/deep.txt");
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            Path::new("/tmp/downloads/a/b/c/deep.txt")
-        );
+        assert_eq!(result.unwrap(), Path::new("/tmp/downloads/a/b/c/deep.txt"));
     }
 
     #[test]
@@ -1450,9 +1470,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/download/test-item/small.txt"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(oversized_body),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized_body))
             .mount(&mock_server)
             .await;
 
@@ -1594,9 +1612,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/download/test-item/data.txt"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(body.to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -1659,9 +1675,7 @@ mod tests {
         // Fallback: return full content when no Range header
         Mock::given(method("GET"))
             .and(path("/download/test-item/ranged.txt"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -1782,10 +1796,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/download/test-item/secret.txt"))
             .and(header("Authorization", "LOW test_access:test_secret"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(b"secret content".to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret content".to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -1822,10 +1833,7 @@ mod tests {
         // If an auth header is sent, wiremock returns 404, failing the test.
         Mock::given(method("GET"))
             .and(path("/download/test-item/public.txt"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(b"public content".to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"public content".to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -1880,10 +1888,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/data/secret.txt"))
             .and(header("Authorization", "LOW test_access:test_secret"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(b"secret content".to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"secret content".to_vec()))
             .expect(1)
             .mount(&mock_server)
             .await;

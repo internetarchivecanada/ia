@@ -6,11 +6,7 @@ use crate::types::ItemMetadata;
 pub async fn get(client: &IaClient, identifier: &str) -> Result<ItemMetadata> {
     let url = client.url(&format!("/metadata/{identifier}"));
 
-    let response = client
-        .http()
-        .get(&url)
-        .send()
-        .await?;
+    let response = client.http().get(&url).send().await?;
 
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {

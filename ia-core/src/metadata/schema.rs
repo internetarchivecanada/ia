@@ -23,10 +23,7 @@ pub struct SchemaField {
     /// Whether the field accepts multiple values: "Yes" or "No"
     pub repeatable: String,
     /// Whether this is an internal-only field: "Yes" or "No"
-    #[serde(
-        rename(deserialize = "internal use only"),
-        alias = "internal_use_only"
-    )]
+    #[serde(rename(deserialize = "internal use only"), alias = "internal_use_only")]
     pub internal_use_only: String,
     /// Who defines this field: "uploader", "IA admin", "IA software", "user admin"
     #[serde(rename(deserialize = "defined by"), alias = "defined_by")]
@@ -45,11 +42,7 @@ pub struct SchemaField {
     )]
     pub accepted_values: String,
     /// Additional usage guidance
-    #[serde(
-        rename(deserialize = "usage notes"),
-        alias = "usage_notes",
-        default
-    )]
+    #[serde(rename(deserialize = "usage notes"), alias = "usage_notes", default)]
     pub usage_notes: String,
     /// Example values
     #[serde(default)]
@@ -83,10 +76,7 @@ pub async fn fetch_schema(client: &IaClient) -> crate::Result<SchemaData> {
             message: format!("failed to fetch metadata schema: {status}"),
         });
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(reqwest_middleware::Error::from)?;
+    let body = resp.text().await.map_err(reqwest_middleware::Error::from)?;
     let data: SchemaData = serde_json::from_str(&body)?;
     Ok(data)
 }
@@ -206,14 +196,11 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/download/ia-metadata/ia-metadata_schema.json"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(sample_schema_json()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
             .mount(&mock_server)
             .await;
 
-        let client =
-            crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let client = crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let data = fetch_schema(&client).await.unwrap();
         assert_eq!(data.metadata_schema.len(), 2);
         assert_eq!(data.files_schema.len(), 1);
@@ -232,8 +219,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let client =
-            crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let client = crate::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let result = fetch_schema(&client).await;
         assert!(result.is_err());
     }

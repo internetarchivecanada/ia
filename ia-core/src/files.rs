@@ -22,7 +22,11 @@ pub fn list<'a>(item: &'a ItemMetadata, filter: &FileFilter) -> Vec<&'a FileMeta
             .split('|')
             .filter_map(|p| Glob::new(p.trim()).ok().map(|g| g.compile_matcher()))
             .collect();
-        if patterns.is_empty() { None } else { Some(patterns) }
+        if patterns.is_empty() {
+            None
+        } else {
+            Some(patterns)
+        }
     });
 
     let exclude_matcher = filter.exclude.as_ref().and_then(|g| {
@@ -30,7 +34,11 @@ pub fn list<'a>(item: &'a ItemMetadata, filter: &FileFilter) -> Vec<&'a FileMeta
             .split('|')
             .filter_map(|p| Glob::new(p.trim()).ok().map(|g| g.compile_matcher()))
             .collect();
-        if patterns.is_empty() { None } else { Some(patterns) }
+        if patterns.is_empty() {
+            None
+        } else {
+            Some(patterns)
+        }
     });
 
     item.files
@@ -100,8 +108,13 @@ mod tests {
         ItemMetadata {
             metadata: MetadataFields::default(),
             files,
-            server: None, d1: None, d2: None, dir: None,
-            files_count: None, item_size: None, is_dark: false,
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
         }
     }
 
@@ -111,8 +124,12 @@ mod tests {
             source: Some(source.to_string()),
             format: Some(format.to_string()),
             size: Some(size),
-            md5: None, mtime: None, sha1: None, crc32: None,
-            original: None, rotation: None,
+            md5: None,
+            mtime: None,
+            sha1: None,
+            crc32: None,
+            original: None,
+            rotation: None,
             extra: HashMap::new(),
         }
     }
@@ -134,10 +151,13 @@ mod tests {
             make_file("b.mp4", "original", "MPEG4", 200),
             make_file("c.jpg", "original", "JPEG", 150),
         ]);
-        let result = list(&item, &FileFilter {
-            glob: Some("*.jpg".to_string()),
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                glob: Some("*.jpg".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|f| f.name.ends_with(".jpg")));
     }
@@ -149,10 +169,13 @@ mod tests {
             make_file("b.mp4", "original", "MPEG4", 200),
             make_file("c.png", "original", "PNG", 150),
         ]);
-        let result = list(&item, &FileFilter {
-            glob: Some("*.jpg|*.png".to_string()),
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                glob: Some("*.jpg|*.png".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 2);
     }
 
@@ -163,10 +186,13 @@ mod tests {
             make_file("a_thumb.jpg", "derivative", "JPEG", 10),
             make_file("b.jpg", "original", "JPEG", 200),
         ]);
-        let result = list(&item, &FileFilter {
-            exclude: Some("*_thumb*".to_string()),
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                exclude: Some("*_thumb*".to_string()),
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 2);
     }
 
@@ -176,10 +202,13 @@ mod tests {
             make_file("a.jpg", "original", "JPEG", 100),
             make_file("a_thumb.jpg", "derivative", "JPEG", 10),
         ]);
-        let result = list(&item, &FileFilter {
-            source: Some(FileSource::Original),
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                source: Some(FileSource::Original),
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "a.jpg");
     }
@@ -190,10 +219,13 @@ mod tests {
             make_file("a.jpg", "original", "JPEG", 100),
             make_file("b.mp4", "original", "MPEG4", 200),
         ]);
-        let result = list(&item, &FileFilter {
-            formats: vec!["JPEG".to_string()],
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                formats: vec!["JPEG".to_string()],
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 1);
     }
 
@@ -204,10 +236,13 @@ mod tests {
             make_file("b.mp4", "original", "MPEG4", 200),
             make_file("c.jpg", "original", "JPEG", 150),
         ]);
-        let result = list(&item, &FileFilter {
-            names: vec!["a.jpg".to_string(), "c.jpg".to_string()],
-            ..Default::default()
-        });
+        let result = list(
+            &item,
+            &FileFilter {
+                names: vec!["a.jpg".to_string(), "c.jpg".to_string()],
+                ..Default::default()
+            },
+        );
         assert_eq!(result.len(), 2);
     }
 

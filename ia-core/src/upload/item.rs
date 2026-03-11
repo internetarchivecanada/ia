@@ -102,7 +102,11 @@ pub async fn upload_item(
         // than silently defaulting to 0 so callers notice catastrophic failures.
         .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))?
     };
-    let size_hint = if opts.no_size_hint { None } else { Some(total_bytes) };
+    let size_hint = if opts.no_size_hint {
+        None
+    } else {
+        Some(total_bytes)
+    };
 
     // 9. Emit Enumerated event so consumers know the file list and total size.
     if let Some(ref cb) = progress {
@@ -129,7 +133,15 @@ pub async fn upload_item(
         let hint = if is_first { size_hint } else { None };
 
         let result = upload_file(
-            client, identifier, file, key, &opts, is_first, is_last, hint, progress.clone(),
+            client,
+            identifier,
+            file,
+            key,
+            &opts,
+            is_first,
+            is_last,
+            hint,
+            progress.clone(),
         )
         .await?;
 
@@ -302,10 +314,7 @@ mod tests {
 
     #[test]
     fn keys_with_remote_name_multi_uses_basename() {
-        let files = vec![
-            PathBuf::from("/tmp/a.txt"),
-            PathBuf::from("/tmp/b.txt"),
-        ];
+        let files = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
         let opts = UploadOpts {
             remote_name: Some("renamed.txt".into()),
             ..Default::default()
