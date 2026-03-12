@@ -1,5 +1,6 @@
 pre-release-commit-message = "release: v{{version}}"
-tag-prefix = "v"
+tag-prefix = ""
+tag-name = "v{{version}}"
 tag-message = "v{{version}}"
 publish = false
 push-remote = "origin"
