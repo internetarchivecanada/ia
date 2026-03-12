@@ -25,3 +25,10 @@ Thumbs.db
 # AI tool config (local per-contributor)
 .claude/
 .cursor/
+
+# Local scratch files
+FEATURE-GAP.md
+TODO.md
+nasa/
+stairs/
+test-upload-data/

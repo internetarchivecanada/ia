@@ -1,4 +1,3 @@
-[workspace]
 pre-release-commit-message = "release: v{{version}}"
 tag-prefix = "v"
 tag-message = "v{{version}}"
