@@ -127,6 +127,15 @@ pub enum IaError {
     #[error("schema field not found: {field}")]
     SchemaFieldNotFound { field: String },
 
+    #[error("task submission failed: {message}")]
+    TaskSubmitFailed { message: String },
+
+    #[error("task rerun failed for task {task_id}: {message}")]
+    TaskRerunFailed { task_id: u64, message: String },
+
+    #[error("task log not found for task {task_id}")]
+    TaskNotFound { task_id: u64 },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -180,6 +189,10 @@ impl IaError {
             IaError::MultipartAborted { .. } => false,
             IaError::MultipartIncomplete { .. } => false,
             IaError::SchemaFieldNotFound { .. } => false,
+            // Task errors — permanent (API-level rejections)
+            IaError::TaskSubmitFailed { .. } => false,
+            IaError::TaskRerunFailed { .. } => false,
+            IaError::TaskNotFound { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -339,6 +352,15 @@ impl IaError {
             IaError::SchemaFieldNotFound { field } => {
                 extra.insert("field".into(), field.clone().into());
                 "schema_field_not_found"
+            }
+            IaError::TaskSubmitFailed { .. } => "task_submit_failed",
+            IaError::TaskRerunFailed { task_id, .. } => {
+                extra.insert("task_id".into(), (*task_id).into());
+                "task_rerun_failed"
+            }
+            IaError::TaskNotFound { task_id } => {
+                extra.insert("task_id".into(), (*task_id).into());
+                "task_not_found"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -1064,5 +1086,58 @@ mod tests {
         assert_eq!(v["error"]["code"], "multipart_incomplete");
         assert_eq!(v["error"]["identifier"], "my-item");
         assert_eq!(v["error"]["upload_id"], "abc123");
+    }
+
+    // -- Task error tests --
+
+    #[test]
+    fn task_submit_failed_is_not_retryable() {
+        let err = IaError::TaskSubmitFailed {
+            message: "denied".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn task_rerun_failed_is_not_retryable() {
+        let err = IaError::TaskRerunFailed {
+            task_id: 123,
+            message: "not error state".into(),
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn task_not_found_is_not_retryable() {
+        let err = IaError::TaskNotFound { task_id: 123 };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn json_task_submit_failed() {
+        let err = IaError::TaskSubmitFailed {
+            message: "denied".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "task_submit_failed");
+    }
+
+    #[test]
+    fn json_task_rerun_failed() {
+        let err = IaError::TaskRerunFailed {
+            task_id: 123,
+            message: "not error state".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "task_rerun_failed");
+        assert_eq!(v["error"]["task_id"], 123);
+    }
+
+    #[test]
+    fn json_task_not_found() {
+        let err = IaError::TaskNotFound { task_id: 123 };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "task_not_found");
+        assert_eq!(v["error"]["task_id"], 123);
     }
 }

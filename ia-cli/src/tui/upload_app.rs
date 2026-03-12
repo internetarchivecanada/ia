@@ -425,6 +425,8 @@ async fn run_dashboard_and_summarize(
                 &ia_core::tasks::TasksQuery {
                     args: Some("*s3-put*".to_string()),
                     submitter: submitter.clone(),
+                    catalog: Some(true),
+                    history: Some(false),
                     ..Default::default()
                 },
             )

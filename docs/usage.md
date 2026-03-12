@@ -386,6 +386,187 @@ ia upload my-item file.pdf --dry-run
 ia upload my-item ./files/ --dashboard
 ```
 
+### `ia tasks`
+
+Manage Internet Archive catalog tasks: list, submit, view logs, rerun failed tasks, and check rate limits. Alias: `ia ta`.
+
+```sh
+ia tasks [IDENTIFIER] [OPTIONS]
+```
+
+#### Listing tasks (bare command)
+
+By default, `ia tasks` shows your queued/running tasks. When given an identifier, it shows both active and completed tasks for that item.
+
+| Flag | Description |
+|------|-------------|
+| `[IDENTIFIER]` | Item identifier (shows catalog + history for that item) |
+| `--cmd <CMD>` | Filter by task command (e.g. `derive.php`) |
+| `--submitter <EMAIL>` | Filter by submitter email |
+| `--server <SERVER>` | Filter by server name |
+| `--priority <N>` | Filter by priority |
+| `--args <ARGS>` | Filter by args (supports wildcards `*`/`%`) |
+| `--color <COLOR>` | Filter by status color: `green` (queued), `blue` (running), `red` (error), `brown` (paused) |
+| `--task-id <ID>` | Filter by specific task ID |
+| `--since <DATE>` | Show tasks submitted after this date/time |
+| `--before <DATE>` | Show tasks submitted before this date/time |
+| `--limit <N>` | Cap number of results returned |
+| `--active-only` | Only show active tasks (mutually exclusive with `--completed-only`) |
+| `--completed-only` | Only show completed tasks (requires identifier or task_id) |
+| `--no-summary` | Hide the summary counts header |
+| `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
+| `--json` | Output as JSONL |
+
+```sh
+# List your pending tasks
+ia tasks
+
+# List tasks for an item (active + completed)
+ia tasks my-item
+
+# Filter by command
+ia tasks --cmd derive.php
+
+# Show only running tasks
+ia tasks --color blue
+
+# Show only completed tasks for an item
+ia tasks my-item --completed-only
+
+# Show a specific task
+ia tasks --task-id 101247325
+
+# Filter by date range
+ia tasks --since "2026-03-01" --before "2026-03-10"
+
+# JSON output for piping
+ia tasks --json
+```
+
+#### `ia tasks submit`
+
+Submit a new task to the Tasks API.
+
+```sh
+ia tasks submit <CMD> [IDENTIFIER] [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<CMD>` | Task command (e.g. `derive`, auto-appends `.php` if needed) |
+| `[IDENTIFIER]` | Item identifier (omit for batch mode) |
+| `--args <K=V>` | Task arguments (repeatable) |
+| `--comment <TEXT>` | Explanation for why the task is being submitted |
+| `--priority <N>` | Task priority (-10 to 10, default: 0) |
+| `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
+| `--wait` | Poll until task completes |
+| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff) |
+| `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
+| `--itemlist <PATH>` | Batch mode: file with one identifier per line |
+| `--search <QUERY>` | Batch mode: submit task to all matching items |
+| `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
+| `--json` | Output as JSON |
+
+```sh
+# Submit a derive task
+ia tasks submit derive my-item
+
+# Submit with a comment
+ia tasks submit make_dark my-item --comment "curation request"
+
+# Submit to multiple items from a file
+ia tasks submit derive --itemlist items.txt --comment "re-derive"
+
+# Submit to items from a search query
+ia tasks submit derive --search "collection:nasa" --comment "re-derive all"
+
+# Submit with custom args
+ia tasks submit derive my-item --args remove_derived="*.jpg"
+
+# Submit and wait for completion
+ia tasks submit derive my-item --wait
+```
+
+#### `ia tasks log`
+
+Fetch and display the execution log for a task.
+
+```sh
+ia tasks log <TASK_ID> [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<TASK_ID>` | Task ID (integer) |
+| `--json` | Output as JSON |
+
+```sh
+# View a task log
+ia tasks log 1234567
+
+# Save a task log to a file
+ia tasks log 1234567 > task.log
+
+# Output as JSON
+ia tasks log 1234567 --json
+```
+
+#### `ia tasks rerun`
+
+Rerun failed tasks. Accepts task IDs as arguments, from stdin, or via query filters.
+
+```sh
+ia tasks rerun <TASK_ID>... [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<TASK_ID>...` | Task IDs to rerun (use `-` for stdin) |
+| `--cmd <CMD>` | Rerun all failed tasks matching this command |
+| `--color <COLOR>` | Filter by status color (default: `red` when using query filters) |
+| `--submitter <EMAIL>` | Filter by submitter |
+| `--identifier <ID>` | Filter by identifier |
+| `--max-retries <N>` | Max retries per rerun request on failure |
+| `--json` | Output as JSON |
+
+```sh
+# Rerun a single failed task
+ia tasks rerun 1234567
+
+# Rerun multiple tasks
+ia tasks rerun 1234567 1234568 1234569
+
+# Rerun all failed derive tasks
+ia tasks rerun --cmd derive.php
+
+# Rerun from a pipeline
+ia tasks --cmd derive.php --color red --json | ia tasks rerun -
+```
+
+#### `ia tasks rate-limit`
+
+Check task submission rate limits.
+
+```sh
+ia tasks rate-limit [CMD] [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `[CMD]` | Task command to check (default: `derive.php`, auto-appends `.php`) |
+| `--json` | Output as JSON |
+
+```sh
+# Check derive rate limits (default)
+ia tasks rate-limit
+
+# Check a specific command
+ia tasks rate-limit make_dark
+
+# JSON output
+ia tasks rate-limit --json
+```
+
 ### `ia config`
 
 Configure Internet Archive credentials and settings.

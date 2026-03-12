@@ -66,6 +66,7 @@ cargo install --path ia-cli
 - **Upload** — single file, batch (from spreadsheet), multipart for large files, automatic resume, streaming progress dashboard
 - **Search** — three backends: scrape (cursor), advanced (paged), full-text search (scroll)
 - **Metadata** — read, write (modify/append/insert/remove), compound operations (`+` chaining), bulk import/export, schema lookup
+- **Tasks** — list, submit, rerun, and monitor catalog tasks; view task logs; check rate limits
 - **Config & Auth** — login, credential validation, whoami, cookie/auth header export
 - **Self-update** — check, list versions, install specific releases from GitHub
 - **`--json` on all commands** — structured JSON/JSONL output for scripts, AI agents, and MCP tool servers

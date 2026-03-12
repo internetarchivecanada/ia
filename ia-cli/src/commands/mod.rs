@@ -7,6 +7,7 @@ pub mod list;
 pub mod metadata;
 pub mod search;
 pub mod status;
+pub mod tasks;
 #[cfg(feature = "self-update")]
 pub mod update;
 pub mod upload;

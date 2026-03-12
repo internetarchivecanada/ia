@@ -106,6 +106,9 @@ enum Commands {
     Search(commands::search::SearchArgs),
     /// Show job log summary and failed operations
     Status(commands::status::StatusArgs),
+    /// Manage archive.org catalog tasks
+    #[command(visible_alias = "ta")]
+    Tasks(commands::tasks::TasksArgs),
     /// Upload files to the Internet Archive
     #[command(visible_alias = "up")]
     Upload(commands::upload::UploadArgs),
@@ -249,6 +252,17 @@ async fn main() -> Result<()> {
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args).await?,
+        Commands::Tasks(args) => {
+            commands::tasks::run(
+                &client,
+                args,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog,
+                cli.retry_failed,
+            )
+            .await?
+        }
         Commands::Upload(args) => {
             commands::upload::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
         }
