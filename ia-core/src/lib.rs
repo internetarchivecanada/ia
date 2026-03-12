@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod auth;
 pub mod client;
+pub mod collection;
 pub mod config;
 pub mod disk_pool;
 pub mod download;

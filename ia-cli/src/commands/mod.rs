@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod collection;
 pub mod completions;
 pub mod config;
 pub mod download;

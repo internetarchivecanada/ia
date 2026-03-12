@@ -89,6 +89,9 @@ struct Cli {
 enum Commands {
     /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
+    /// Create and manage collections
+    #[command(visible_alias = "col")]
+    Collection(commands::collection::CollectionArgs),
     /// Download files from an item
     #[command(visible_alias = "do")]
     Download(commands::download::DownloadArgs),
@@ -219,6 +222,7 @@ async fn main() -> Result<()> {
         Commands::Ai(args) => {
             commands::ai::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
         }
+        Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
         Commands::Download(args) => {
             commands::download::run(
                 &client,
