@@ -550,7 +550,9 @@ async fn run_submit(
         let (k, v) = p
             .split_once('=')
             .or_else(|| p.split_once(':'))
-            .ok_or_else(|| anyhow::anyhow!("invalid --parameter value (expected KEY=VALUE): {p}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("invalid --parameter value (expected KEY=VALUE): {p}")
+            })?;
         extra_params.push((k.to_string(), v.to_string()));
     }
 
@@ -615,13 +617,24 @@ async fn run_submit(
                     if task_args.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({})", task_args.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", "))
+                        format!(
+                            " ({})",
+                            task_args
+                                .iter()
+                                .map(|(k, v)| format!("{k}={v}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
                     }
                 );
             }
         }
         if !args.json && quiet < 2 {
-            eprintln!("\n{} would submit {} task(s)", style("dry-run").dim(), identifiers.len());
+            eprintln!(
+                "\n{} would submit {} task(s)",
+                style("dry-run").dim(),
+                identifiers.len()
+            );
         }
         return Ok(());
     }

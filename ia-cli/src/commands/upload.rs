@@ -793,11 +793,7 @@ async fn run_import_dry_run(
 
         eprintln!(
             "    {}",
-            style(format!(
-                "https://archive.org/details/{}",
-                group.identifier
-            ))
-            .dim(),
+            style(format!("https://archive.org/details/{}", group.identifier)).dim(),
         );
     }
 
@@ -813,11 +809,7 @@ fn print_dry_run_results(
     metadata: &[(String, String)],
 ) {
     let total_bytes: u64 = results.iter().map(|r| r.bytes).sum();
-    let file_word = if results.len() == 1 {
-        "file"
-    } else {
-        "files"
-    };
+    let file_word = if results.len() == 1 { "file" } else { "files" };
     eprintln!(
         "{} {} — {} {} ({}) → {}",
         style("⊘").dim(),
