@@ -9,6 +9,7 @@ use console::style;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
+use ia_core::upload::batch::{group_records, validate_groups};
 use ia_core::upload::{
     generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
     UploadProgress, UploadResult, UploadStatus,
@@ -436,6 +437,15 @@ async fn run_bare_upload(
         dry_run: args.dry_run,
     };
 
+    // Dry run (interactive): validate and print what would be uploaded
+    if opts.dry_run && !args.json {
+        let results = upload_item(client, identifier, &files, &opts, None)
+            .await
+            .context(format!("failed to validate upload to {identifier}"))?;
+        print_dry_run_results(identifier, &results, &opts.metadata);
+        return Ok(());
+    }
+
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
     if args.dashboard {
@@ -590,6 +600,11 @@ async fn run_import(
         ..UploadOpts::default()
     };
 
+    // Dry run (interactive): validate and print what would be uploaded
+    if opts.dry_run && !args.json {
+        return run_import_dry_run(client, records, &opts).await;
+    }
+
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
     if dashboard {
@@ -676,6 +691,197 @@ async fn run_import(
 }
 
 // ─── Template ────────────────────────────────────────────────────────────────
+
+// ─── Dry-run display ─────────────────────────────────────────────────────────
+
+/// Dry-run for batch import: validate groups and print what would be uploaded.
+async fn run_import_dry_run(
+    client: &IaClient,
+    records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
+    opts: &UploadOpts,
+) -> Result<()> {
+    let groups = group_records(records)?;
+    validate_groups(&groups)?;
+
+    // Check collections exist (unless --no-collection-check)
+    if !opts.no_collection_check {
+        let collections: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| g.metadata.iter())
+            .filter(|(k, _)| k == "collection")
+            .map(|(_, v)| v.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !collections.is_empty() {
+            ia_core::upload::validate::check_collections(client, &collections).await?;
+        }
+    }
+
+    // Compute totals and per-group file info
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+
+    struct GroupInfo {
+        group_bytes: u64,
+        file_details: Vec<(String, u64)>,
+    }
+
+    let mut infos: Vec<GroupInfo> = Vec::new();
+    for group in &groups {
+        let mut group_bytes = 0u64;
+        let mut file_details = Vec::new();
+        total_files += group.files.len();
+
+        for file in &group.files {
+            let size = std::fs::metadata(file)
+                .map(|m| m.len())
+                .context(format!("cannot read file: {}", file.display()))?;
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string());
+            file_details.push((name, size));
+            group_bytes += size;
+        }
+        total_bytes += group_bytes;
+        infos.push(GroupInfo {
+            group_bytes,
+            file_details,
+        });
+    }
+
+    // Header
+    eprintln!(
+        "{} {} — {} items, {} files ({})",
+        style("⊘").dim(),
+        style("Dry run").bold(),
+        style(groups.len()).bold(),
+        total_files,
+        crate::output::format_bytes(total_bytes),
+    );
+
+    // Per-item details
+    for (group, info) in groups.iter().zip(infos.iter()) {
+        eprintln!();
+        let file_word = if group.files.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        eprintln!(
+            "  {}  {} {}  {}",
+            style(&group.identifier).bold(),
+            group.files.len(),
+            style(file_word).dim(),
+            style(crate::output::format_bytes(info.group_bytes)).dim(),
+        );
+
+        // Metadata (merged: CLI opts overridden by spreadsheet per-group)
+        let merged = merge_metadata(&opts.metadata, &group.metadata);
+        print_metadata(&merged, 4);
+
+        // Files
+        for (name, size) in &info.file_details {
+            eprintln!(
+                "    {} {}  {}",
+                style("→").dim(),
+                name,
+                style(crate::output::format_bytes(*size)).dim(),
+            );
+        }
+
+        eprintln!(
+            "    {}",
+            style(format!(
+                "https://archive.org/details/{}",
+                group.identifier
+            ))
+            .dim(),
+        );
+    }
+
+    eprintln!();
+    eprintln!("{}", style("Validation passed.").green());
+    Ok(())
+}
+
+/// Print dry-run results for a single-item upload.
+fn print_dry_run_results(
+    identifier: &str,
+    results: &[UploadResult],
+    metadata: &[(String, String)],
+) {
+    let total_bytes: u64 = results.iter().map(|r| r.bytes).sum();
+    let file_word = if results.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    eprintln!(
+        "{} {} — {} {} ({}) → {}",
+        style("⊘").dim(),
+        style("Dry run").bold(),
+        results.len(),
+        file_word,
+        crate::output::format_bytes(total_bytes),
+        style(identifier).bold(),
+    );
+    eprintln!();
+
+    // Metadata
+    print_metadata(metadata, 2);
+
+    // Files with remote keys
+    for r in results {
+        eprintln!(
+            "  {} {}  {}",
+            style("→").dim(),
+            r.key,
+            style(crate::output::format_bytes(r.bytes)).dim(),
+        );
+    }
+
+    eprintln!(
+        "  {}",
+        style(format!("https://archive.org/details/{identifier}")).dim(),
+    );
+    eprintln!();
+    eprintln!("{}", style("Validation passed.").green());
+}
+
+/// Print metadata key-value pairs with aligned columns.
+fn print_metadata(metadata: &[(String, String)], indent: usize) {
+    if metadata.is_empty() {
+        return;
+    }
+    let max_key_len = metadata.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let pad = " ".repeat(indent);
+    for (key, value) in metadata {
+        eprintln!(
+            "{pad}{:<width$}  {}",
+            style(format!("{key}:")).dim(),
+            value,
+            width = max_key_len + 1, // +1 for the colon
+        );
+    }
+}
+
+/// Merge CLI metadata with per-item metadata (per-item overrides CLI for same key).
+fn merge_metadata(
+    cli_metadata: &[(String, String)],
+    item_metadata: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = cli_metadata.to_vec();
+    for (key, value) in item_metadata {
+        if let Some(existing) = merged.iter_mut().find(|(k, _)| k == key) {
+            existing.1 = value.clone();
+        } else {
+            merged.push((key.clone(), value.clone()));
+        }
+    }
+    merged
+}
 
 fn run_template(args: TemplateArgs) -> Result<()> {
     let template_opts = TemplateOpts {
@@ -1316,5 +1522,60 @@ mod tests {
 
         let had_failure = output_results(&results, true, 0, None).unwrap();
         assert!(!had_failure);
+    }
+
+    #[test]
+    fn merge_metadata_no_overlap() {
+        let cli = vec![("mediatype".into(), "texts".into())];
+        let item = vec![("title".into(), "My Book".into())];
+        let merged = merge_metadata(&cli, &item);
+        assert_eq!(
+            merged,
+            vec![
+                ("mediatype".into(), "texts".into()),
+                ("title".into(), "My Book".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_metadata_item_overrides_cli() {
+        let cli = vec![
+            ("mediatype".into(), "texts".into()),
+            ("collection".into(), "default-coll".into()),
+        ];
+        let item = vec![("collection".into(), "special-coll".into())];
+        let merged = merge_metadata(&cli, &item);
+        assert_eq!(
+            merged,
+            vec![
+                ("mediatype".into(), "texts".into()),
+                ("collection".into(), "special-coll".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_metadata_both_empty() {
+        let merged = merge_metadata(&[], &[]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_metadata_duplicate_cli_keys_first_wins() {
+        // If CLI has duplicate keys, only the first is overridden by item metadata
+        let cli = vec![
+            ("subject".into(), "first".into()),
+            ("subject".into(), "second".into()),
+        ];
+        let item = vec![("subject".into(), "override".into())];
+        let merged = merge_metadata(&cli, &item);
+        assert_eq!(
+            merged,
+            vec![
+                ("subject".into(), "override".into()),
+                ("subject".into(), "second".into()),
+            ]
+        );
     }
 }
