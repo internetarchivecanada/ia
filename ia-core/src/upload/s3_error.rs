@@ -40,12 +40,19 @@ fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
 impl S3Error {
     /// Whether this S3 error code indicates a retryable condition.
     ///
-    /// Retryable: SlowDown, InternalError, ServiceUnavailable, OperationAborted
+    /// Retryable: SlowDown, InternalError, ServiceUnavailable, OperationAborted,
+    /// RequestTimeout, RequestLimitExceeded, ThrottlingException
     /// Non-retryable: AccessDenied, InvalidAccessKeyId, BadDigest, MissingContentLength, etc.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.code.as_str(),
-            "SlowDown" | "InternalError" | "ServiceUnavailable" | "OperationAborted"
+            "SlowDown"
+                | "InternalError"
+                | "ServiceUnavailable"
+                | "OperationAborted"
+                | "RequestTimeout"
+                | "RequestLimitExceeded"
+                | "ThrottlingException"
         )
     }
 }
@@ -128,6 +135,9 @@ mod tests {
             "InternalError",
             "ServiceUnavailable",
             "OperationAborted",
+            "RequestTimeout",
+            "RequestLimitExceeded",
+            "ThrottlingException",
         ];
         for code in retryable {
             let err = S3Error {

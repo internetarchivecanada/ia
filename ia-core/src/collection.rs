@@ -83,7 +83,15 @@ pub async fn create_collection(
         )
         .await
     } else {
-        create_without_image(client, identifier, &full_metadata, dry_run, url).await
+        create_without_image(
+            client,
+            identifier,
+            &full_metadata,
+            queue_derive,
+            dry_run,
+            url,
+        )
+        .await
     }
 }
 
@@ -179,6 +187,7 @@ async fn create_without_image(
     client: &IaClient,
     identifier: &str,
     metadata: &[(String, String)],
+    queue_derive: bool,
     dry_run: bool,
     url: String,
 ) -> Result<CreateCollectionResult> {
@@ -200,6 +209,10 @@ async fn create_without_image(
         .put(&s3_url)
         .header("Authorization", &auth_header)
         .header("x-amz-auto-make-bucket", "1")
+        .header(
+            "x-archive-queue-derive",
+            if queue_derive { "1" } else { "0" },
+        )
         .header("Content-Length", "0");
 
     for (k, v) in &metadata_headers {
@@ -406,6 +419,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/test-collection"))
             .and(header("x-amz-auto-make-bucket", "1"))
+            .and(header("x-archive-queue-derive", "0"))
             .and(header("content-length", "0"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
@@ -417,6 +431,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.identifier, "test-collection");
+        assert_eq!(result.status, 200);
+    }
+
+    #[tokio::test]
+    async fn create_without_image_sends_queue_derive_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/test-collection"))
+            .and(header("x-archive-queue-derive", "1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server).await;
+        let result = create_collection(&client, "test-collection", &[], None, true, false)
+            .await
+            .unwrap();
+
         assert_eq!(result.status, 200);
     }
 
