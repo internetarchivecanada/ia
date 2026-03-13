@@ -1825,8 +1825,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_auth_header_when_no_credentials() {
-        use wiremock::matchers::header_exists;
-
         let mock_server = MockServer::start().await;
 
         // This mock only matches requests WITHOUT an Authorization header.
