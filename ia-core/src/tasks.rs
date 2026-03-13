@@ -436,10 +436,7 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            tracing::warn!(
-                task_id,
-                "rerun response missing identifier in value field"
-            );
+            tracing::warn!(task_id, "rerun response missing identifier in value field");
             task_id.to_string()
         });
 

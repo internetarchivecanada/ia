@@ -83,14 +83,7 @@ pub async fn create_collection(
         )
         .await
     } else {
-        create_without_image(
-            client,
-            identifier,
-            &full_metadata,
-            dry_run,
-            url,
-        )
-        .await
+        create_without_image(client, identifier, &full_metadata, dry_run, url).await
     }
 }
 
@@ -213,15 +206,12 @@ async fn create_without_image(
         request = request.header(k.as_str(), v.as_str());
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.to_string(),
-            key: String::new(),
-            message: e.to_string(),
-            status: None,
-        })?;
+    let response = request.send().await.map_err(|e| IaError::UploadFailed {
+        identifier: identifier.to_string(),
+        key: String::new(),
+        message: e.to_string(),
+        status: None,
+    })?;
 
     let status = response.status();
     if status.is_success() {
