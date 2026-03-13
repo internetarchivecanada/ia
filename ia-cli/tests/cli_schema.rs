@@ -1,4 +1,3 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json;
 use wiremock::matchers::{method, path};

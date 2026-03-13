@@ -1,5 +1,3 @@
-use assert_cmd::Command;
-
 #[test]
 fn config_login_missing_password_flag_without_tty() {
     let dir = tempfile::tempdir().unwrap();

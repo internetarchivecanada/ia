@@ -226,9 +226,11 @@ async fn create_without_image(
             Some(s3_err) => format!("{}: {}", s3_err.code, s3_err.message),
             None => format!("HTTP {status}: {body_text}"),
         };
-        Err(IaError::Http {
-            status: status.as_u16(),
+        Err(IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key: String::new(),
             message,
+            status: Some(status.as_u16()),
         })
     }
 }
@@ -512,11 +514,17 @@ mod tests {
             .unwrap_err();
 
         match err {
-            IaError::Http { status, message } => {
-                assert_eq!(status, 403);
+            IaError::UploadFailed {
+                identifier,
+                status,
+                message,
+                ..
+            } => {
+                assert_eq!(identifier, "my-coll");
+                assert_eq!(status, Some(403));
                 assert!(message.contains("AccessDenied") || message.contains("Access Denied"));
             }
-            other => panic!("expected IaError::Http, got {other:?}"),
+            other => panic!("expected IaError::UploadFailed, got {other:?}"),
         }
     }
 
