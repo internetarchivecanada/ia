@@ -1,4 +1,3 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json;
 use wiremock::matchers::{method, path};
@@ -67,8 +66,7 @@ async fn schema_table_hides_internal_by_default() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    Command::cargo_bin("ia")
-        .unwrap()
+    assert_cmd::cargo_bin_cmd!("ia")
         .args(["--host", &host, "--insecure", "metadata", "schema"])
         .assert()
         .success()
@@ -87,8 +85,7 @@ async fn schema_table_shows_internal_with_flag() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    Command::cargo_bin("ia")
-        .unwrap()
+    assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -113,8 +110,7 @@ async fn schema_detail_shows_all_properties() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args(["--host", &host, "--insecure", "metadata", "schema", "title"])
         .output()
         .unwrap();
@@ -140,8 +136,7 @@ async fn schema_detail_unknown_field_fails() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    Command::cargo_bin("ia")
-        .unwrap()
+    assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -165,8 +160,7 @@ async fn schema_detail_json_outputs_single_object() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -196,8 +190,7 @@ async fn schema_required_filter() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -225,8 +218,7 @@ async fn schema_files_flag() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -256,8 +248,7 @@ async fn schema_json_outputs_array() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -285,8 +276,7 @@ async fn schema_defined_by_filter() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -316,8 +306,7 @@ async fn schema_repeatable_filter() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -345,8 +334,7 @@ async fn schema_edit_access_filter() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -376,8 +364,7 @@ async fn schema_detail_case_insensitive() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args(["--host", &host, "--insecure", "metadata", "schema", "Title"])
         .output()
         .unwrap();
@@ -398,8 +385,7 @@ async fn schema_detail_unknown_field_json_error() {
         .await;
 
     let host = server.uri().replace("http://", "");
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,
@@ -432,8 +418,7 @@ async fn schema_empty_filter_result() {
     // --repeatable + --required filters to repeatable AND required fields
     // "subject" is repeatable+recommended, so it should appear
     // But --defined-by ia-software excludes all uploader fields — nothing matches
-    let output = Command::cargo_bin("ia")
-        .unwrap()
+    let output = assert_cmd::cargo_bin_cmd!("ia")
         .args([
             "--host",
             &host,

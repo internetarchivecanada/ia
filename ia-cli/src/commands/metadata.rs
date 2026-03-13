@@ -1174,6 +1174,19 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
 
     let item_count = work_items.len();
 
+    // Parse --expect values
+    let expect: Option<HashMap<String, serde_json::Value>> = if !args.expect.is_empty() {
+        let mut map = HashMap::new();
+        for s in &args.expect {
+            let (key, value) =
+                parse_key_value(s).context(format!("invalid expect key:value: {s:?}"))?;
+            map.insert(key, json!(value));
+        }
+        Some(map)
+    } else {
+        None
+    };
+
     // Dry-run
     if args.dry_run {
         if !json && ctx.quiet == 0 {
@@ -1186,7 +1199,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
                 identifier,
                 groups,
                 &args.target,
-                None,
+                expect.as_ref(),
                 ctx.quiet,
                 json,
             )
@@ -1215,6 +1228,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
         let rl = rate_limiter.clone();
         let target = args.target.clone();
         let reduced_priority = args.reduced_priority;
+        let expect = expect.clone();
 
         set.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -1224,7 +1238,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
                 identifier: identifier.clone(),
                 groups,
                 target,
-                expect: None,
+                expect,
                 priority: Some(priority),
                 reduced_priority,
             };
@@ -1290,6 +1304,14 @@ async fn run_dry_run_compound(
 ) -> Result<usize> {
     let url = client.url(&format!("/metadata/{identifier}"));
     let resp = client.http().get(&url).send().await?;
+    let status = resp.status().as_u16();
+    if status == 404 {
+        bail!("item not found: {identifier}");
+    }
+    if !(200..300).contains(&status) {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("failed to fetch metadata for {identifier}: HTTP {status} {body}");
+    }
     let item: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let source =

@@ -83,7 +83,15 @@ pub async fn create_collection(
         )
         .await
     } else {
-        create_without_image(client, identifier, &full_metadata, dry_run, url).await
+        create_without_image(
+            client,
+            identifier,
+            &full_metadata,
+            queue_derive,
+            dry_run,
+            url,
+        )
+        .await
     }
 }
 
@@ -179,6 +187,7 @@ async fn create_without_image(
     client: &IaClient,
     identifier: &str,
     metadata: &[(String, String)],
+    queue_derive: bool,
     dry_run: bool,
     url: String,
 ) -> Result<CreateCollectionResult> {
@@ -200,6 +209,10 @@ async fn create_without_image(
         .put(&s3_url)
         .header("Authorization", &auth_header)
         .header("x-amz-auto-make-bucket", "1")
+        .header(
+            "x-archive-queue-derive",
+            if queue_derive { "1" } else { "0" },
+        )
         .header("Content-Length", "0");
 
     for (k, v) in &metadata_headers {
@@ -226,9 +239,11 @@ async fn create_without_image(
             Some(s3_err) => format!("{}: {}", s3_err.code, s3_err.message),
             None => format!("HTTP {status}: {body_text}"),
         };
-        Err(IaError::Http {
-            status: status.as_u16(),
+        Err(IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key: String::new(),
             message,
+            status: Some(status.as_u16()),
         })
     }
 }
@@ -404,6 +419,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/test-collection"))
             .and(header("x-amz-auto-make-bucket", "1"))
+            .and(header("x-archive-queue-derive", "0"))
             .and(header("content-length", "0"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
@@ -415,6 +431,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.identifier, "test-collection");
+        assert_eq!(result.status, 200);
+    }
+
+    #[tokio::test]
+    async fn create_without_image_sends_queue_derive_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/test-collection"))
+            .and(header("x-archive-queue-derive", "1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server).await;
+        let result = create_collection(&client, "test-collection", &[], None, true, false)
+            .await
+            .unwrap();
+
         assert_eq!(result.status, 200);
     }
 
@@ -512,11 +547,17 @@ mod tests {
             .unwrap_err();
 
         match err {
-            IaError::Http { status, message } => {
-                assert_eq!(status, 403);
+            IaError::UploadFailed {
+                identifier,
+                status,
+                message,
+                ..
+            } => {
+                assert_eq!(identifier, "my-coll");
+                assert_eq!(status, Some(403));
                 assert!(message.contains("AccessDenied") || message.contains("Access Denied"));
             }
-            other => panic!("expected IaError::Http, got {other:?}"),
+            other => panic!("expected IaError::UploadFailed, got {other:?}"),
         }
     }
 

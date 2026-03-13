@@ -23,7 +23,7 @@ ia metadata nasa
 Download files from one or more Internet Archive items.
 
 ```sh
-ia download <IDENTIFIER>... [OPTIONS]
+ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 ```
 
 #### Flags
@@ -31,6 +31,7 @@ ia download <IDENTIFIER>... [OPTIONS]
 | Flag | Description |
 |------|-------------|
 | `<IDENTIFIER>...` | Item identifier(s) to download |
+| `[FILES]...` | Specific files to download from the item |
 | `--itemlist <PATH>` | File containing identifiers (one per line) |
 | `-s, --search <QUERY>` | Download items matching a search query |
 | `-g, --glob <PATTERN>` | Filter files by glob pattern (pipe-separated: `"*.mp4\|*.webm"`) |
@@ -332,7 +333,9 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-backup` | Don't keep old file versions |
 | `--no-auto-make-bucket` | Error if item doesn't already exist |
 | `--no-collection-check` | Skip collection existence check |
+| `--no-size-hint` | Don't send x-archive-size-hint header |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
+| `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB) |
 | `--retries <N>` | Retry attempts per file (default: 10) |
 | `--retry-sleep <SECS>` | Sleep between retries in seconds (default: 30) |
@@ -346,9 +349,28 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
-**`ia upload template <DIR>`** — Generate a CSV template from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload import`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--skip-existing`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
 
-**`ia upload cleanup <IDENTIFIER>`** — Abort incomplete multipart uploads for an item.
+**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload import`.
+
+| Flag | Description |
+|------|-------------|
+| `<DIR>` | Directory to scan for files |
+| `-o, --output <PATH>` | Output file (default: stdout) |
+| `--format <FORMAT>` | Output format: `csv` (default), `tsv`, `xlsx` |
+| `--identifier-prefix <PREFIX>` | Prefix to prepend to generated identifiers |
+| `--identifier-from-filename` | Generate identifiers from filenames |
+| `--identifier-from-dirname` | Generate identifiers from parent directory names |
+| `--json` | Output template as JSONL |
+
+**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item.
+
+| Flag | Description |
+|------|-------------|
+| `<IDENTIFIER>` | Item identifier |
+| `[FILE]` | Specific file to clean up |
+| `--abort-all` | Abort all incomplete uploads without confirmation |
+| `--json` | Output as JSON |
 
 #### Examples
 
@@ -465,6 +487,7 @@ ia tasks submit <CMD> [IDENTIFIER] [OPTIONS]
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
 | `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
+| `--dry-run` | Print what would be submitted without sending |
 | `--json` | Output as JSON |
 
 ```sh
@@ -565,6 +588,61 @@ ia tasks rate-limit make_dark
 
 # JSON output
 ia tasks rate-limit --json
+```
+
+### `ia collection`
+
+Manage Internet Archive collections.
+
+#### `ia collection create`
+
+Create a new collection item on Internet Archive via S3. Requires title, description, subject, and parent collection. Optionally upload a collection image.
+
+```sh
+ia collection create <IDENTIFIER> --title <TITLE> --description <DESC> --subject <SUBJ> --collection <COLL> [OPTIONS]
+```
+
+| Flag | Description |
+|------|-------------|
+| `<IDENTIFIER>` | Collection identifier (3-100 chars, alphanumeric + `._-@`) |
+| `-t, --title <TITLE>` | Collection title (required) |
+| `--description <DESC>` | Collection description (required) |
+| `-s, --subject <SUBJ>` | Subject/topic (required) |
+| `-C, --collection <COLL>` | Parent collection identifier (required) |
+| `-I, --image <PATH>` | Path to collection cover image |
+| `-m, --metadata <K:V>` | Additional metadata (repeatable) |
+| `--derive` | Enable derivative generation (off by default for collections) |
+| `--dry-run` | Validate everything without creating the collection |
+| `--json` | Output as JSON |
+
+```sh
+# Create a simple collection
+ia collection create my-collection \
+    --title "My Collection" \
+    --description "A collection of things" \
+    --subject "things" \
+    --collection opensource
+
+# Create with an image
+ia collection create my-collection \
+    --title "My Collection" \
+    --description "A collection of things" \
+    --subject "things" \
+    --collection opensource \
+    --image logo.png
+
+# Create with extra metadata
+ia collection create my-collection \
+    --title "My Collection" \
+    --description "Desc" \
+    --subject "things" \
+    --collection opensource \
+    -m hidden:true -m num-top-dl:5
+
+# Dry run
+ia collection create my-collection \
+    --title "Test" --description "Test" --subject "test" --collection opensource \
+    --dry-run
 ```
 
 ### `ia config`
@@ -823,13 +901,14 @@ Items are assigned to the disk with the most free space. If a disk fills up, dow
 
 ### Dashboard mode
 
-A full-screen terminal dashboard for monitoring batch downloads, built with ratatui (ships by default):
+A full-screen terminal dashboard for monitoring batch operations, built with ratatui (ships by default):
 
 ```sh
 ia download --search "collection:nasa" --dashboard
+ia upload my-item ./files/ --dashboard
 ```
 
-The dashboard shows panels for items, disks, errors, and throughput. Press `q` to quit.
+The dashboard shows panels for items, workers, errors, and throughput. Press `q` to quit.
 
 Note: `--dashboard` and `--json` are mutually exclusive.
 

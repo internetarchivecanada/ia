@@ -1,4 +1,3 @@
-use assert_cmd::Command;
 use std::io::Write;
 
 #[test]
@@ -10,7 +9,7 @@ fn print_auth_outputs_header() {
     writeln!(f, "access = myaccess").unwrap();
     writeln!(f, "secret = mysecret").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -32,7 +31,7 @@ fn print_auth_json() {
     writeln!(f, "access = myaccess").unwrap();
     writeln!(f, "secret = mysecret").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -55,7 +54,7 @@ fn print_cookies_outputs_netscape_format() {
     writeln!(f, "logged-in-user = user%40example.com").unwrap();
     writeln!(f, "logged-in-sig = test-sig").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -84,7 +83,7 @@ fn print_cookies_json() {
     writeln!(f, "logged-in-user = user%40example.com").unwrap();
     writeln!(f, "logged-in-sig = test-sig").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -108,7 +107,7 @@ fn print_auth_no_credentials_fails() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -126,7 +125,7 @@ fn print_cookies_no_cookies_fails() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -144,7 +143,7 @@ fn check_no_credentials_fails() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -162,7 +161,7 @@ fn whoami_no_credentials_fails() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = Command::cargo_bin("ia").unwrap();
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),

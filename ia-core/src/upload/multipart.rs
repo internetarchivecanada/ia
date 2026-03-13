@@ -632,7 +632,17 @@ pub async fn upload_file_multipart(
                         part_num,
                         "multipart part failed, aborting upload"
                     );
-                    let _ = abort_upload(client, identifier, key, &upload_id).await;
+                    if let Err(abort_err) = abort_upload(client, identifier, key, &upload_id).await
+                    {
+                        tracing::warn!(
+                            identifier,
+                            key,
+                            %upload_id,
+                            error = %abort_err,
+                            "failed to abort multipart upload after part failure — \
+                             run `ia upload cleanup` to clean up orphaned uploads"
+                        );
+                    }
                     return Err(e);
                 }
             }
