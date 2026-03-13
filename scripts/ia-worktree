@@ -52,6 +52,15 @@ fi
 mkdir -p "$(dirname "$WORKTREE_PATH")"
 git worktree add -b "$BRANCH" "$WORKTREE_PATH" main
 
+# Symlink .claude settings so subagents inherit project permissions
+if [[ -d "$REPO_ROOT/.claude" ]]; then
+    mkdir -p "$WORKTREE_PATH/.claude"
+    for f in "$REPO_ROOT/.claude"/*.json; do
+        [[ -e "$f" ]] || continue
+        ln -sf "$f" "$WORKTREE_PATH/.claude/$(basename "$f")"
+    done
+fi
+
 echo ""
 echo "Worktree: $WORKTREE_PATH"
 echo "Branch:   $BRANCH"
