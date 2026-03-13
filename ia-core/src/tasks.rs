@@ -11,22 +11,35 @@ use crate::error::{IaError, Result};
 /// Query parameters for the Tasks API.
 #[derive(Debug, Default, Clone)]
 pub struct TasksQuery {
+    /// Filter by item identifier.
     pub identifier: Option<String>,
+    /// Filter by task command name (e.g. `"derive.php"`).
     pub cmd: Option<String>,
+    /// Maximum number of results to return.
     pub limit: Option<u32>,
+    /// Filter by the user who submitted the task.
     pub submitter: Option<String>,
+    /// Filter by task arguments (JSON string match).
     pub args: Option<String>,
+    /// Filter by the server executing the task.
     pub server: Option<String>,
+    /// Filter by task priority level.
     pub priority: Option<i32>,
+    /// Filter by task state color (`"green"`, `"blue"`, `"red"`, `"brown"`).
     pub color: Option<String>,
+    /// Look up a specific task by its numeric ID.
     pub task_id: Option<u64>,
-    /// Filter by submittime >= value (parseable date/time string)
+    /// Filter by submittime >= value (parseable date/time string).
     pub submittime_after: Option<String>,
-    /// Filter by submittime <= value (parseable date/time string)
+    /// Filter by submittime <= value (parseable date/time string).
     pub submittime_before: Option<String>,
+    /// Include active (catalog) tasks in the response.
     pub catalog: Option<bool>,
+    /// Include completed (history) tasks in the response.
     pub history: Option<bool>,
+    /// Include aggregate task counts in the response.
     pub summary: Option<bool>,
+    /// Additional query parameters passed through to the API.
     pub extra_params: Vec<(String, String)>,
 }
 
@@ -61,23 +74,34 @@ pub struct TasksSummary {
 /// A single task entry from the catalog or history.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TaskEntry {
+    /// Unique numeric task identifier.
     pub task_id: u64,
+    /// Item identifier this task operates on.
     pub identifier: String,
+    /// Task command (e.g. `"derive.php"`, `"fixer.php"`).
     pub cmd: String,
+    /// Email of the user who submitted the task.
     #[serde(default)]
     pub submitter: String,
+    /// When the task was submitted (ISO-8601 or epoch string).
     #[serde(default)]
     pub submittime: String,
+    /// Server executing the task (empty if queued).
     #[serde(default)]
     pub server: String,
+    /// Task state: `"green"` (running), `"blue"` (queued), `"red"` (error), `"brown"` (paused).
     #[serde(default)]
     pub color: String,
+    /// Execution priority (higher = sooner, negative = deprioritized).
     #[serde(default)]
     pub priority: i32,
+    /// Task-specific arguments as freeform JSON.
     #[serde(default)]
     pub args: Option<serde_json::Value>,
+    /// Entry source: `"catalog"` (active) or `"history"` (completed).
     #[serde(default)]
     pub category: Option<String>,
+    /// Completion timestamp (epoch seconds), present only for history entries.
     #[serde(default)]
     pub finished: Option<u64>,
 }
@@ -85,28 +109,41 @@ pub struct TaskEntry {
 /// Task submission request body.
 #[derive(Debug, Clone)]
 pub struct TaskSubmission {
+    /// Item identifier to run the task against.
     pub identifier: String,
+    /// Task command name (`.php` suffix appended automatically if missing).
     pub cmd: String,
+    /// Task arguments as key-value pairs.
     pub args: Option<HashMap<String, String>>,
+    /// Comment merged into args as `args["comment"]`.
     pub comment: Option<String>,
+    /// Task priority (default determined by server).
     pub priority: Option<i32>,
+    /// Send `X-Accept-Reduced-Priority: 1` header to avoid rate-limit errors.
     pub reduced_priority: bool,
+    /// Additional JSON fields merged into the request body.
     pub extra_params: Vec<(String, String)>,
 }
 
 /// Response from a successful task submission.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TaskSubmitResponse {
+    /// Numeric ID of the newly created task.
     pub task_id: u64,
+    /// Server log message from task creation.
     pub log: String,
 }
 
 /// Rate limit information for a task command.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitInfo {
+    /// The task command these limits apply to.
     pub cmd: String,
+    /// Maximum concurrent tasks allowed for this command.
     pub task_limits: u32,
+    /// Number of tasks currently running for this command.
     pub tasks_inflight: u32,
+    /// Tasks blocked because target servers are offline.
     pub tasks_blocked_by_offline: u32,
 }
 
