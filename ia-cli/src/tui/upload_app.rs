@@ -204,6 +204,10 @@ impl UploadTuiState {
                 UploadProgressStatus::WaitingRateLimit => {
                     item.status = UploadItemStatus::RateLimited;
                 }
+                UploadProgressStatus::Retrying => {
+                    // Treat the same as rate limited in the TUI
+                    item.status = UploadItemStatus::RateLimited;
+                }
                 UploadProgressStatus::Complete => {
                     item.files_completed += 1;
                     // Account for any remaining byte delta.
@@ -288,6 +292,11 @@ impl UploadTuiState {
             UploadProgressStatus::WaitingRateLimit => {
                 if let Some(fp) = self.active_files.get_mut(&fk) {
                     fp.status = UploadProgressStatus::WaitingRateLimit;
+                }
+            }
+            UploadProgressStatus::Retrying => {
+                if let Some(fp) = self.active_files.get_mut(&fk) {
+                    fp.status = UploadProgressStatus::Retrying;
                 }
             }
             UploadProgressStatus::Complete => {

@@ -3,7 +3,10 @@ use urlencoding::encode as url_encode;
 
 /// Check if a string value needs uri() encoding.
 ///
-/// Returns true if the string contains non-ASCII characters or any whitespace.
+/// Returns true if the string contains non-ASCII characters, whitespace,
+/// or ASCII control characters that are invalid in HTTP header values
+/// (0x00-0x08, 0x0A-0x1F, 0x7F). Tab (0x09) is technically allowed by
+/// HTTP but we encode it anyway since IA headers don't need it.
 pub(crate) fn needs_quote(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -11,7 +14,8 @@ pub(crate) fn needs_quote(s: &str) -> bool {
     if !s.is_ascii() {
         return true;
     }
-    s.chars().any(|c| c.is_whitespace())
+    s.bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
 }
 
 /// Encode a value for an IA S3 metadata header.
@@ -27,9 +31,25 @@ fn encode_value(value: &str) -> String {
 
 /// Encode a metadata key for IA S3 headers.
 ///
-/// Replaces underscores with double-dashes per IA convention.
+/// Replaces underscores with double-dashes per IA convention, then strips
+/// any characters that are invalid in HTTP header names (RFC 7230 token).
+/// This prevents reqwest builder errors when spreadsheet columns contain
+/// spaces, parentheses, slashes, or other non-token characters.
 fn encode_key(key: &str) -> String {
-    key.replace('_', "--")
+    let mut result = String::with_capacity(key.len() * 2);
+    for c in key.chars() {
+        match c {
+            // IA convention: underscores become double-dash in headers
+            '_' => result.push_str("--"),
+            // Dashes pass through as-is (valid in HTTP header names)
+            '-' => result.push('-'),
+            // Keep other valid HTTP header name characters
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' => result.push(c),
+            // Strip everything else (spaces, parens, slashes, etc.)
+            _ => {}
+        }
+    }
+    result
 }
 
 /// Encode metadata key-value pairs into x-archive-meta headers.
@@ -100,6 +120,60 @@ mod tests {
     #[test]
     fn needs_quote_empty() {
         assert!(!needs_quote(""));
+    }
+
+    #[test]
+    fn needs_quote_ascii_control_chars() {
+        // NUL, BEL, BS — all invalid in HTTP header values
+        assert!(needs_quote("has\x00null"));
+        assert!(needs_quote("has\x07bell"));
+        assert!(needs_quote("has\x08backspace"));
+        // SO, US — also invalid
+        assert!(needs_quote("has\x0Eshift-out"));
+        assert!(needs_quote("has\x1Funit-sep"));
+        // DEL (0x7F) — control character
+        assert!(needs_quote("has\x7Fdel"));
+    }
+
+    #[test]
+    fn needs_quote_printable_ascii_no_spaces() {
+        // Printable ASCII without spaces should NOT need quoting
+        assert!(!needs_quote("hello"));
+        assert!(!needs_quote("foo-bar_baz.123"));
+        assert!(!needs_quote("key=value;other"));
+    }
+
+    // -- encode_key tests --
+
+    #[test]
+    fn encode_key_strips_spaces() {
+        assert_eq!(encode_key("date created"), "datecreated");
+    }
+
+    #[test]
+    fn encode_key_strips_parens_and_spaces() {
+        assert_eq!(encode_key("date (yyyy)"), "dateyyyy");
+    }
+
+    #[test]
+    fn encode_key_strips_slashes() {
+        assert_eq!(encode_key("subject/topic"), "subjecttopic");
+    }
+
+    #[test]
+    fn encode_key_dash_passes_through() {
+        assert_eq!(encode_key("my-field.v2"), "my-field.v2");
+    }
+
+    #[test]
+    fn encode_key_underscore_to_double_dash() {
+        assert_eq!(encode_key("my_field"), "my--field");
+    }
+
+    #[test]
+    fn encode_key_dash_vs_underscore() {
+        // Dashes stay single, underscores become double-dash
+        assert_eq!(encode_key("date-created_v2"), "date-created--v2");
     }
 
     // -- encode_metadata_headers tests --

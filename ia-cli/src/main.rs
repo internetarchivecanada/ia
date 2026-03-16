@@ -264,7 +264,15 @@ async fn main() -> Result<()> {
             .await?
         }
         Commands::Upload(args) => {
-            commands::upload::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
+            commands::upload::run(
+                &client,
+                args,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog,
+                cli.retry_failed,
+            )
+            .await?
         }
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),

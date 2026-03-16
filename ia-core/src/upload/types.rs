@@ -287,6 +287,8 @@ pub enum UploadProgressStatus {
     },
     Verifying,
     Uploading,
+    /// Retrying after a non-503 error (network error, server error, etc.).
+    Retrying,
     WaitingRateLimit,
     Complete,
     Skipped,

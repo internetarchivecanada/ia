@@ -1,9 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::{IaError, Result};
 use crate::upload::single::upload_file;
-use crate::upload::types::{UploadOpts, UploadProgress, UploadProgressStatus, UploadResult};
+use crate::upload::types::{
+    UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
+};
 use crate::upload::validate::{validate_file, validate_identifier, validate_required_metadata};
 use crate::IaClient;
 
@@ -122,17 +125,19 @@ pub async fn upload_item(
         });
     }
 
-    // 10. Upload sequentially
+    // 10. Upload sequentially (track start for error elapsed_ms)
+    let start = Instant::now();
     let mut results = Vec::with_capacity(file_count);
+    let mut first_file_succeeded = false;
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {
-        let is_first = i == 0;
+        let is_first = i == 0 || !first_file_succeeded;
         let is_last = i == file_count - 1;
 
         // Size hint only on first file
-        let hint = if is_first { size_hint } else { None };
+        let hint = if i == 0 { size_hint } else { None };
 
-        let result = upload_file(
+        match upload_file(
             client,
             identifier,
             file,
@@ -143,9 +148,53 @@ pub async fn upload_item(
             hint,
             progress.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(result) => {
+                if matches!(result.status, UploadStatus::Uploaded) {
+                    first_file_succeeded = true;
+                }
+                results.push(result);
+            }
+            Err(
+                e @ (IaError::Auth(_)
+                | IaError::Config(_)
+                | IaError::SpamDetected { .. }
+                | IaError::CheckLimitFailed { .. }),
+            ) => {
+                // Fatal errors — bail immediately, no point continuing
+                return Err(e);
+            }
+            Err(e) => {
+                // Non-fatal: record failure and continue with remaining files
+                let err_msg = e.to_string();
+                tracing::warn!(identifier, key, "file upload failed, continuing: {err_msg}");
 
-        results.push(result);
+                if let Some(ref cb) = progress {
+                    cb(UploadProgress {
+                        identifier: identifier.to_string(),
+                        key: key.to_string(),
+                        bytes_sent: 0,
+                        total_bytes: 0,
+                        status: UploadProgressStatus::Failed,
+                    });
+                }
+
+                let file_size = tokio::fs::metadata(file)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                results.push(UploadResult {
+                    identifier: identifier.to_string(),
+                    key: key.to_string(),
+                    status: UploadStatus::Failed(err_msg),
+                    bytes: file_size,
+                    md5: None,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    retries: 0,
+                });
+            }
+        }
     }
 
     Ok(results)

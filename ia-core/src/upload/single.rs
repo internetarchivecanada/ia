@@ -165,10 +165,25 @@ pub async fn upload_file(
 
     // Retry loop
     let mut retries = 0u32;
+    let mut last_was_503 = false;
     loop {
-        // On retry, poll check_limit before re-uploading
+        // On retry: poll check_limit only after 503, otherwise just backoff sleep
         if retries > 0 {
-            poll_check_limit(client, identifier, opts, progress.clone()).await?;
+            if last_was_503 {
+                poll_check_limit(client, identifier, opts, progress.clone()).await?;
+            } else {
+                // Report retrying status for non-503 errors
+                if let Some(ref cb) = progress {
+                    cb(UploadProgress {
+                        identifier: identifier.to_string(),
+                        key: key.to_string(),
+                        bytes_sent: 0,
+                        total_bytes: file_size,
+                        status: UploadProgressStatus::Retrying,
+                    });
+                }
+                tokio::time::sleep(opts.retry_sleep).await;
+            }
         }
 
         // Report progress: uploading
@@ -311,12 +326,13 @@ pub async fn upload_file(
                             status: Some(503),
                         });
                     }
-                    tracing::warn!(
+                    tracing::debug!(
                         identifier,
                         key,
                         retry = retries + 1,
                         "503 rate limited, will poll check_limit"
                     );
+                    last_was_503 = true;
                     retries += 1;
                     continue;
                 } else {
@@ -337,13 +353,14 @@ pub async fn upload_file(
                     );
 
                     if should_retry && retries < opts.retries {
-                        tracing::warn!(
+                        tracing::debug!(
                             identifier,
                             key,
                             retry = retries + 1,
                             %status,
                             "retrying upload: {err_msg}"
                         );
+                        last_was_503 = false;
                         retries += 1;
                         continue;
                     }
@@ -357,20 +374,27 @@ pub async fn upload_file(
                 }
             }
             Err(e) => {
+                let full_message = format_error_chain(&e);
                 if retries < opts.retries {
-                    tracing::warn!(
+                    tracing::debug!(
                         identifier,
                         key,
                         retry = retries + 1,
-                        "network error, retrying: {e}"
+                        "network error, retrying: {full_message}"
                     );
+                    last_was_503 = false;
                     retries += 1;
                     continue;
                 }
+                tracing::error!(
+                    identifier,
+                    key,
+                    "upload failed after {retries} retries: {full_message}"
+                );
                 return Err(IaError::UploadFailed {
                     identifier: identifier.to_string(),
                     key: key.to_string(),
-                    message: e.to_string(),
+                    message: full_message,
                     status: None,
                 });
             }
@@ -426,7 +450,7 @@ async fn poll_check_limit(
                 // Don't log the error — the check_limit URL contains the
                 // access key as a query parameter, and reqwest may include
                 // the URL in error messages.
-                tracing::warn!(identifier, "check_limit request failed");
+                tracing::debug!(identifier, "check_limit request failed");
             }
         }
 
@@ -436,6 +460,22 @@ async fn poll_check_limit(
     Err(IaError::CheckLimitFailed {
         identifier: identifier.to_string(),
     })
+}
+
+/// Format a full error chain, walking `.source()` to capture all causes.
+///
+/// reqwest errors often wrap inner causes (e.g., "builder error" wraps
+/// "invalid header value"). This function produces a message like:
+/// `"builder error: invalid header value: \x01 is not visible ASCII"`
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    chain
 }
 
 /// Encode bytes as base64 (standard alphabet, with padding).
@@ -483,6 +523,39 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- format_error_chain tests --
+
+    #[test]
+    fn format_error_chain_single_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let chain = format_error_chain(&err);
+        assert_eq!(chain, "file missing");
+    }
+
+    #[test]
+    fn format_error_chain_nested_errors() {
+        // Simulate a nested error chain: outer wraps inner
+        #[derive(Debug)]
+        struct Outer {
+            source: std::io::Error,
+        }
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "builder error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        let inner = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid header value");
+        let outer = Outer { source: inner };
+        let chain = format_error_chain(&outer);
+        assert_eq!(chain, "builder error: invalid header value");
+    }
 
     #[test]
     fn base64_encode_empty() {

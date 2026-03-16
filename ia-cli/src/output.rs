@@ -13,8 +13,9 @@ use ia_core::upload::{UploadProgress, UploadProgressStatus, UploadResult, Upload
 /// Progress bar characters: filled, head, empty.
 const PROGRESS_CHARS: &str = "━╸─";
 
-/// Progress bar width in terminal columns.
-const BAR_WIDTH: usize = 40;
+/// Progress bar width for per-item bars.
+/// Total line: 2 (indent) + BAR + bytes + speed + msg ≈ 78 cols.
+const BAR_WIDTH: usize = 28;
 
 // Icons used across all progress displays.
 const ICON_HEADER: &str = "▸";
@@ -319,6 +320,8 @@ impl BatchDisplay {
     }
 
     pub fn on_item_start(&self, identifier: &str, _current: usize, _total: usize) {
+        // Insert bare bars first, configure after — configuring before
+        // insertion corrupts MultiProgress cursor tracking (indicatif #677).
         let item_header = self
             .multi
             .insert_before(&self.bottom_sentinel, ProgressBar::new_spinner());
@@ -331,7 +334,15 @@ impl BatchDisplay {
 
         let bar = self
             .multi
-            .insert_before(&self.bottom_sentinel, make_progress_bar(0));
+            .insert_before(&self.bottom_sentinel, ProgressBar::new(0));
+        bar.set_style(
+            ProgressStyle::with_template(&format!(
+                "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
+            ))
+            .unwrap()
+            .progress_chars(PROGRESS_CHARS),
+        );
+        bar.set_message("starting...");
 
         let mut items = self.active_item_bars.lock().unwrap();
         items.insert(
@@ -548,6 +559,9 @@ impl UploadDisplay {
             UploadProgressStatus::WaitingRateLimit => {
                 self.bar.set_message("rate limited, waiting...");
             }
+            UploadProgressStatus::Retrying => {
+                self.bar.set_message("retrying...");
+            }
         }
     }
 
@@ -612,16 +626,23 @@ struct UploadItemBars {
 }
 
 impl UploadBatchDisplay {
-    pub fn new(items_total: usize, jobs: usize) -> Self {
+    pub fn new(items_total: usize, jobs: usize, retry_mode: bool) -> Self {
         let multi = MultiProgress::new();
 
-        let batch_header = multi.add(ProgressBar::new_spinner());
-        batch_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        batch_header.set_message(format!(
-            "Uploading {} items ({} workers)...",
+        let verb = if retry_mode { "Retrying" } else { "Uploading" };
+        let _ = multi.println(format!(
+            "{verb} {} items ({} workers)...",
             style(items_total).bold(),
             jobs,
         ));
+        let batch_header = multi.add(ProgressBar::new(0));
+        batch_header.set_style(
+            ProgressStyle::with_template(
+                "  {bar:40.cyan/dim} {bytes}/{total_bytes}  {bytes_per_sec:.dim}",
+            )
+            .unwrap()
+            .progress_chars(PROGRESS_CHARS),
+        );
 
         let bottom_sentinel = multi.add(ProgressBar::new_spinner());
         bottom_sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
@@ -652,24 +673,38 @@ impl UploadBatchDisplay {
                     return;
                 }
 
-                let item_header = self
+                // Update aggregate batch progress bar total
+                self.batch_header
+                    .set_length(self.batch_header.length().unwrap_or(0) + bytes_total);
+
+                // Insert bare bars into MultiProgress THEN configure — configuring
+                // before insertion corrupts cursor tracking (indicatif #677).
+                let header = self
                     .multi
                     .insert_before(&self.bottom_sentinel, ProgressBar::new_spinner());
-                item_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                item_header.set_message(format!(
+                header.set_style(ProgressStyle::with_template("{msg}").unwrap());
+                header.set_message(format!(
                     "{} {}",
                     style(ICON_HEADER).cyan(),
                     style(identifier).bold(),
                 ));
 
-                let bar = make_progress_bar(bytes_total);
-                let bar = self.multi.insert_before(&self.bottom_sentinel, bar);
+                let bar = self
+                    .multi
+                    .insert_before(&self.bottom_sentinel, ProgressBar::new(bytes_total));
+                bar.set_style(
+                    ProgressStyle::with_template(&format!(
+                        "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
+                    ))
+                    .unwrap()
+                    .progress_chars(PROGRESS_CHARS),
+                );
                 bar.set_message(format!("0/{files_count} files"));
 
                 items.insert(
                     identifier.to_string(),
                     UploadItemBars {
-                        header: item_header,
+                        header,
                         bar,
                         per_file_bytes: HashMap::new(),
                         files_processed: 0,
@@ -684,9 +719,15 @@ impl UploadBatchDisplay {
             UploadProgressStatus::Uploading => {
                 let mut items = self.active_items.lock().unwrap();
                 if let Some(item) = items.get_mut(identifier) {
+                    let prev: u64 = item.per_file_bytes.values().sum();
                     item.per_file_bytes.insert(p.key.clone(), p.bytes_sent);
-                    let total: u64 = item.per_file_bytes.values().sum();
-                    item.bar.set_position(total);
+                    let now: u64 = item.per_file_bytes.values().sum();
+                    item.bar.set_position(now);
+                    // Update aggregate batch bar
+                    let delta = now.saturating_sub(prev);
+                    if delta > 0 {
+                        self.batch_header.inc(delta);
+                    }
                 }
             }
             UploadProgressStatus::Complete => {
@@ -759,6 +800,12 @@ impl UploadBatchDisplay {
                     item.bar.set_message("rate limited, waiting...");
                 }
             }
+            UploadProgressStatus::Retrying => {
+                let mut items = self.active_items.lock().unwrap();
+                if let Some(item) = items.get_mut(identifier) {
+                    item.bar.set_message("retrying...");
+                }
+            }
             UploadProgressStatus::Verifying => {
                 // No visual update needed
             }
@@ -767,61 +814,72 @@ impl UploadBatchDisplay {
 
     /// Finalize an item when all its files are done.
     fn maybe_finish_item(&self, identifier: &str) {
-        let mut items = self.active_items.lock().unwrap();
-        if let Some(item) = items.remove(identifier) {
-            item.bar.finish_and_clear();
+        // Extract the item from the lock, then release the lock before
+        // calling multi.println() (which must not be called while holding
+        // the items mutex).
+        let item = {
+            let mut items = self.active_items.lock().unwrap();
+            items.remove(identifier)
+        };
 
-            // Print collected errors
-            for err in &item.errors {
-                eprintln!("{err}");
-            }
+        let Some(item) = item else { return };
 
-            let elapsed = item.started_at.elapsed().as_secs_f64();
-            let speed = format_speed(item.bytes_total, elapsed);
-            let files_uploaded = item
-                .files_processed
-                .saturating_sub(item.errors.len())
-                .saturating_sub(item.files_skipped);
-            let error_info = if !item.errors.is_empty() {
-                format!(
-                    "\n  {} {} errors",
-                    style(ICON_ERROR).red(),
-                    style(item.errors.len()).red()
-                )
-            } else {
-                String::new()
-            };
-            let skipped_info = if item.files_skipped > 0 {
-                format!(
-                    "\n  {} {} skipped",
-                    style(ICON_SKIPPED).dim(),
-                    style(item.files_skipped).yellow()
-                )
-            } else {
-                String::new()
-            };
+        item.bar.finish_and_clear();
 
-            // Choose icon: errors → red ✗, all skipped → dim –, otherwise → green ✓
-            let icon = if !item.errors.is_empty() {
-                style(ICON_ERROR).red()
-            } else if files_uploaded == 0 && item.files_skipped > 0 {
-                style(ICON_SKIPPED).dim()
-            } else {
-                style(ICON_SUCCESS).green()
-            };
+        for err in &item.errors {
+            let _ = self.multi.println(err);
+        }
 
-            item.header.set_message(format!(
-                "{} {}       {} files ({}) {:.0}s{}{}{}",
-                icon,
-                style(identifier).bold(),
-                files_uploaded,
-                format_bytes(item.bytes_total),
-                elapsed,
-                style(&speed).dim(),
-                error_info,
-                skipped_info,
-            ));
+        let has_errors = !item.errors.is_empty();
+        let elapsed = item.started_at.elapsed().as_secs_f64();
+        let speed = format_speed(item.bytes_total, elapsed);
+        let files_uploaded = item
+            .files_processed
+            .saturating_sub(item.errors.len())
+            .saturating_sub(item.files_skipped);
+        let error_info = if has_errors {
+            format!(
+                "  {} {} errors",
+                style(ICON_ERROR).red(),
+                style(item.errors.len()).red()
+            )
+        } else {
+            String::new()
+        };
+        let skipped_info = if item.files_skipped > 0 {
+            format!(
+                "  {} {} skipped",
+                style(ICON_SKIPPED).dim(),
+                style(item.files_skipped).yellow()
+            )
+        } else {
+            String::new()
+        };
+
+        let icon = if has_errors {
+            style(ICON_ERROR).red()
+        } else if files_uploaded == 0 && item.files_skipped > 0 {
+            style(ICON_SKIPPED).dim()
+        } else {
+            style(ICON_SUCCESS).green()
+        };
+
+        item.header.set_message(format!(
+            "{} {}  {} files ({}) {:.0}s{}{}{}",
+            icon,
+            style(identifier).bold(),
+            files_uploaded,
+            format_bytes(item.bytes_total),
+            elapsed,
+            style(&speed).dim(),
+            error_info,
+            skipped_info,
+        ));
+
+        if has_errors {
             item.header.finish();
+        } else {
+            item.header.finish_and_clear();
         }
     }
 

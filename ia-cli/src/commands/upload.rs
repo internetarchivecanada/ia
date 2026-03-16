@@ -337,6 +337,7 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    retry_failed: bool,
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
@@ -363,9 +364,26 @@ pub async fn run(
         );
     }
 
+    // --retry-failed is only supported for import (batch) uploads
+    if retry_failed && !matches!(args.command, Some(UploadCommand::Import(_))) {
+        bail!(
+            "--retry-failed is only supported with 'ia upload import'.\n\
+             For single-item uploads, re-run the same upload command."
+        );
+    }
+
     match args.command {
         Some(UploadCommand::Import(sub)) => {
-            run_import(client, sub, quiet, jobs, joblog_path, args.dashboard).await
+            run_import(
+                client,
+                sub,
+                quiet,
+                jobs,
+                joblog_path,
+                args.dashboard,
+                retry_failed,
+            )
+            .await
         }
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
@@ -551,6 +569,7 @@ async fn run_import(
     jobs: usize,
     joblog_path: Option<PathBuf>,
     dashboard: bool,
+    retry_failed: bool,
 ) -> Result<()> {
     let records = read_spreadsheet(&args.spreadsheet).context(format!(
         "failed to read spreadsheet: {}",
@@ -560,6 +579,33 @@ async fn run_import(
     if records.is_empty() {
         bail!("spreadsheet is empty — no records to upload");
     }
+
+    // --retry-failed: filter to only items that failed in a previous run
+    let records = if retry_failed {
+        let jl_path = joblog_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--retry-failed requires --joblog <path> so we know which items failed")
+        })?;
+        let entries = ia_core::joblog::read(jl_path)
+            .context(format!("failed to read joblog: {}", jl_path.display()))?;
+        let failed = ia_core::joblog::failed_items(&entries);
+        if failed.is_empty() {
+            eprintln!("No failed items found in joblog — nothing to retry.");
+            return Ok(());
+        }
+        let failed_set: std::collections::HashSet<&str> =
+            failed.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<_> = records
+            .into_iter()
+            .filter(|(id, _)| failed_set.contains(id.as_str()))
+            .collect();
+        if filtered.is_empty() {
+            eprintln!("No matching records found in spreadsheet for failed items.");
+            return Ok(());
+        }
+        filtered
+    } else {
+        records
+    };
 
     // Parse extra -m metadata and --header
     let extra_metadata = parse_key_values(&args.metadata)?;
@@ -635,7 +681,9 @@ async fn run_import(
     let batch_display: Option<std::sync::Arc<crate::output::UploadBatchDisplay>> =
         if !json_mode && quiet == 0 {
             Some(std::sync::Arc::new(crate::output::UploadBatchDisplay::new(
-                item_count, jobs,
+                item_count,
+                jobs,
+                retry_failed,
             )))
         } else {
             None
