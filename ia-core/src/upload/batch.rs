@@ -5,6 +5,7 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
+use crate::metadata::write::parse_indexed_key;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
@@ -134,7 +135,15 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
         // Strip REMOTE_NAME from metadata — it's a template column, not an IA metadata field
         fields.remove("REMOTE_NAME");
 
-        let metadata: Vec<(String, String)> = fields.into_iter().collect();
+        // Collapse indexed columns (e.g., "subject[0]"/"subject[1]")
+        // into multi-value metadata pairs.
+        let metadata: Vec<(String, String)> = fields
+            .into_iter()
+            .map(|(k, v)| {
+                let base = parse_indexed_key(&k).map(|(name, _)| name).unwrap_or(k);
+                (base, v)
+            })
+            .collect();
 
         let group = map.entry(identifier.clone()).or_insert_with(|| ItemGroup {
             identifier,
@@ -193,6 +202,8 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // -- group_records tests --
 
     fn record(id: &str, file: &str, extra: &[(&str, &str)]) -> SpreadsheetRecord {
         let mut fields = HashMap::new();

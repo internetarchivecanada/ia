@@ -181,6 +181,67 @@ fn read_jsonl(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
     Ok(records)
 }
 
+/// Merge bracket-indexed columns into JSON arrays.
+///
+/// Spreadsheets may use `subject[0]`, `subject[1]`, etc. to represent
+/// multi-value fields. This function groups them into a single field with
+/// a JSON array value, sorted by index.
+///
+/// - Non-indexed columns pass through as scalar JSON strings.
+/// - Columns with an op-prefix (containing `:`) are never treated as indexed.
+/// - A single indexed value (e.g. only `subject[0]`) becomes a scalar, not
+///   a one-element array (matches export behavior).
+/// - Entries whose value is `REMOVE_TAG` are filtered out; if all entries for
+///   a field are `REMOVE_TAG`, the field emits `REMOVE_TAG` as a sentinel.
+pub fn merge_indexed_columns(fields: &HashMap<String, String>) -> Vec<(String, serde_json::Value)> {
+    use crate::metadata::write::{parse_indexed_key, REMOVE_TAG};
+    use serde_json::json;
+
+    let mut resolved: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut indexed: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+
+    for (col_name, value) in fields {
+        // Only bare columns (no op-prefix) can be indexed
+        if !col_name.contains(':') {
+            if let Some((base_field, idx)) = parse_indexed_key(col_name) {
+                indexed
+                    .entry(base_field)
+                    .or_default()
+                    .push((idx, value.clone()));
+                continue;
+            }
+        }
+        resolved.push((col_name.clone(), json!(value)));
+    }
+
+    // Append merged indexed fields as array values.
+    // - Single index (e.g. only subject[0]) → bare scalar (same as unindexed)
+    // - REMOVE_TAG entries are filtered out; if all are REMOVE_TAG, remove field
+    for (base_field, mut entries) in indexed {
+        entries.sort_by_key(|(idx, _)| *idx);
+        let values: Vec<serde_json::Value> = entries
+            .into_iter()
+            .filter(|(_, v)| v != REMOVE_TAG)
+            .map(|(_, v)| json!(v))
+            .collect();
+        match values.len() {
+            0 => {
+                // All entries were REMOVE_TAG → delete the field
+                resolved.push((base_field, json!(REMOVE_TAG)));
+            }
+            1 => {
+                // Single value → bare scalar (matches export of single-element arrays)
+                resolved.push((base_field, values.into_iter().next().unwrap()));
+            }
+            _ => {
+                resolved.push((base_field, serde_json::Value::Array(values)));
+            }
+        }
+    }
+
+    resolved
+}
+
 /// Write records to a spreadsheet file.
 /// Format auto-detected by file extension: .csv, .tsv, .xlsx, .jsonl
 pub fn write_spreadsheet(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
@@ -539,6 +600,113 @@ mod tests {
         assert!(
             msg.contains("unsupported export format"),
             "error should say unsupported: {msg}"
+        );
+    }
+
+    // -- merge_indexed_columns tests --
+
+    #[test]
+    fn merge_indexed_columns_combines_into_array() {
+        let fields: HashMap<String, String> = [
+            ("title".into(), "Apollo 11".into()),
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "nasa".into()),
+            ("description".into(), "Moon landing".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        // 3 entries: title, description, and subject (merged)
+        assert_eq!(merged.len(), 3);
+        // Find each by field name since HashMap order is non-deterministic
+        let subject = merged.iter().find(|(k, _)| k == "subject").unwrap();
+        assert_eq!(subject.1, serde_json::json!(["science", "nasa"]));
+        let title = merged.iter().find(|(k, _)| k == "title").unwrap();
+        assert_eq!(title.1, serde_json::json!("Apollo 11"));
+        let desc = merged.iter().find(|(k, _)| k == "description").unwrap();
+        assert_eq!(desc.1, serde_json::json!("Moon landing"));
+    }
+
+    #[test]
+    fn merge_indexed_columns_sorts_by_index() {
+        let fields: HashMap<String, String> = [
+            ("subject[2]".into(), "history".into()),
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "nasa".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0],
+            (
+                "subject".into(),
+                serde_json::json!(["science", "nasa", "history"])
+            )
+        );
+    }
+
+    #[test]
+    fn merge_indexed_columns_preserves_prefixed_columns() {
+        let fields: HashMap<String, String> = [
+            ("append:subject".into(), "new-tag".into()),
+            ("title".into(), "Test".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 2);
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "append:subject" && v == &serde_json::json!("new-tag")));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "title" && v == &serde_json::json!("Test")));
+    }
+
+    #[test]
+    fn merge_indexed_columns_single_index_becomes_scalar() {
+        // Single indexed column treated as bare field (matches export behavior)
+        let fields: HashMap<String, String> = [("subject[0]".into(), "science".into())]
+            .into_iter()
+            .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0], ("subject".into(), serde_json::json!("science")));
+    }
+
+    #[test]
+    fn merge_indexed_columns_remove_tag_filters_entries() {
+        let fields: HashMap<String, String> = [
+            ("subject[0]".into(), "science".into()),
+            ("subject[1]".into(), "REMOVE_TAG".into()),
+            ("subject[2]".into(), "nasa".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0],
+            ("subject".into(), serde_json::json!(["science", "nasa"]))
+        );
+    }
+
+    #[test]
+    fn merge_indexed_columns_all_remove_tag_deletes_field() {
+        let fields: HashMap<String, String> = [
+            ("subject[0]".into(), "REMOVE_TAG".into()),
+            ("subject[1]".into(), "REMOVE_TAG".into()),
+        ]
+        .into_iter()
+        .collect();
+        let merged = merge_indexed_columns(&fields);
+        assert_eq!(merged.len(), 1);
+        // Emits REMOVE_TAG sentinel so MetadataOp::Set removes the field
+        assert_eq!(
+            merged[0],
+            ("subject".into(), serde_json::json!("REMOVE_TAG"))
         );
     }
 }
