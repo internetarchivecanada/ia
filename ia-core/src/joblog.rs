@@ -175,8 +175,11 @@ pub fn read(path: &Path) -> crate::Result<Vec<JoblogEntry>> {
 }
 
 /// Get identifiers of files that failed (for --retry-failed).
+///
+/// Deduplicates by (item, file) latest status. Item-level errors (file == "")
+/// are superseded if any later entry for that item succeeds.
 pub fn failed_files(entries: &[JoblogEntry]) -> Vec<(String, String)> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Build a map of (item, file) -> latest status
     let mut latest: HashMap<(String, String), &str> = HashMap::new();
@@ -193,9 +196,25 @@ pub fn failed_files(entries: &[JoblogEntry]) -> Vec<(String, String)> {
         );
     }
 
+    // Items that have any success — used to supersede item-level errors (file == "")
+    let items_with_success: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.status == "ok" && !e.file.is_empty())
+        .map(|e| e.item.as_str())
+        .collect();
+
     latest
         .into_iter()
-        .filter(|(_, status)| *status == "error")
+        .filter(|((item, file), status)| {
+            if *status != "error" {
+                return false;
+            }
+            // Item-level errors (file == "") are superseded by any per-file success
+            if file.is_empty() && items_with_success.contains(item.as_str()) {
+                return false;
+            }
+            true
+        })
         .map(|((item, file), _)| (item, file))
         .collect()
 }
@@ -241,7 +260,7 @@ pub struct AiSummary {
     pub changes_reversed: usize,
 }
 
-/// Compute summary statistics from entries.
+/// Compute summary statistics from entries (raw count, no dedup).
 pub fn summarize(entries: &[JoblogEntry]) -> JoblogSummary {
     let mut summary = JoblogSummary {
         total: entries.len(),
@@ -249,6 +268,51 @@ pub fn summarize(entries: &[JoblogEntry]) -> JoblogSummary {
     };
     for entry in entries {
         match entry.status.as_str() {
+            "ok" => summary.succeeded += 1,
+            "error" => summary.failed += 1,
+            "skipped" => summary.skipped += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+/// Compute deduplicated summary: only the latest status per (item, file).
+///
+/// If a file failed then succeeded on retry, it counts as succeeded.
+/// Item-level errors (file == "") are superseded by any per-file success.
+pub fn summarize_dedup(entries: &[JoblogEntry]) -> JoblogSummary {
+    use std::collections::{HashMap, HashSet};
+
+    let mut latest: HashMap<(String, String), &str> = HashMap::new();
+    for entry in entries {
+        latest.insert(
+            (entry.item.clone(), entry.file.clone()),
+            entry.status.as_str(),
+        );
+    }
+
+    // Items that have any per-file success
+    let items_with_success: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.status == "ok" && !e.file.is_empty())
+        .map(|e| e.item.as_str())
+        .collect();
+
+    // Filter out item-level errors superseded by per-file successes
+    let latest: HashMap<_, _> = latest
+        .into_iter()
+        .filter(|((item, file), status)| {
+            !(file.is_empty() && *status == "error" && items_with_success.contains(item.as_str()))
+        })
+        .collect();
+
+    let mut summary = JoblogSummary {
+        total: latest.len(),
+        ..Default::default()
+    };
+    for status in latest.values() {
+        match *status {
             "ok" => summary.succeeded += 1,
             "error" => summary.failed += 1,
             "skipped" => summary.skipped += 1,

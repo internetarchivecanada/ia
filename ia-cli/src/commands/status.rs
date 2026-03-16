@@ -53,7 +53,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    let summary = joblog::summarize(&entries);
+    let summary = joblog::summarize_dedup(&entries);
 
     if args.json {
         let failed = joblog::failed_files(&entries);
@@ -70,6 +70,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             })
             .collect();
 
+        let summary = joblog::summarize_dedup(&entries);
         println!(
             "{}",
             serde_json::json!({
@@ -111,7 +112,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         mtime_str
     );
 
-    println!("  Total operations: {:>6}", summary.total);
+    println!("  Total files:      {:>6}", summary.total);
 
     if summary.succeeded > 0 {
         let pct = 100.0 * summary.succeeded as f64 / summary.total as f64;
@@ -148,7 +149,6 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     if !failed.is_empty() {
         println!("\n  Failed files:");
         for (item, file) in &failed {
-            // Find the error message for this file
             let error_msg = entries
                 .iter()
                 .rev()
@@ -156,18 +156,18 @@ pub async fn run(args: StatusArgs) -> Result<()> {
                 .and_then(|e| e.error.clone())
                 .unwrap_or_else(|| "unknown error".to_string());
 
-            println!(
-                "    {}/{:<30} {}",
-                style(item).dim(),
-                file,
-                style(&error_msg).red()
-            );
+            println!("    {}/{}", style(item).dim(), file);
+            println!("      {}", style(&error_msg).red());
         }
 
-        println!(
-            "\n  Run {} to retry failures.",
-            style("ia download --retry-failed --joblog <file>").cyan()
-        );
+        // Detect operation type for the retry hint
+        let has_uploads = entries.iter().any(|e| e.op == "upload");
+        let retry_cmd = if has_uploads {
+            "ia upload import <spreadsheet> --retry-failed --joblog <file>"
+        } else {
+            "ia download --retry-failed --joblog <file>"
+        };
+        println!("\n  Run {} to retry failures.", style(retry_cmd).cyan());
     }
 
     // Show AI section if present
