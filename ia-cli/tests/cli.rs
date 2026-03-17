@@ -834,7 +834,7 @@ fn metadata_export_file_not_found_error() {
     ia().args(["metadata", "export", "/nonexistent/file.csv"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No such file")));
+        .stderr(predicate::str::contains("failed to read identifiers from"));
 }
 
 #[test]

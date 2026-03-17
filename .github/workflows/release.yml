@@ -9,8 +9,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Run CI checks first — release only proceeds if all pass
+  check:
+    name: CI Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p ia-core -p ia-cli -- -D warnings
+      - run: cargo doc --no-deps -p ia-core -p ia-cli
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      - run: cargo test -p ia-core -p ia-cli
+
   build:
     name: Build (${{ matrix.target }})
+    needs: [check, test]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -36,9 +67,6 @@ jobs:
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Run tests
-        run: cargo test -p ia-core -p ia-cli
 
       - name: Build release binary
         run: cargo build -p ia-cli --release --target ${{ matrix.target }} --features self-update
