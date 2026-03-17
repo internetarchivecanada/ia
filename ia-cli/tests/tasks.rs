@@ -1211,7 +1211,7 @@ async fn test_tasks_submit_spreadsheet_nonexistent() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to read spreadsheet") || stderr.contains("No such file"),
+        stderr.contains("failed to read spreadsheet"),
         "should report file error, got: {stderr}"
     );
 }
