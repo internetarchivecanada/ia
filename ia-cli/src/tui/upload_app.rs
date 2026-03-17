@@ -637,7 +637,7 @@ pub async fn run_upload_tui(
 // Batch (import) entry point
 // ---------------------------------------------------------------------------
 
-/// Entry point for `ia upload import --dashboard`.
+/// Entry point for `ia upload --spreadsheet <FILE> --dashboard`.
 ///
 /// Groups spreadsheet records by identifier (reusing `batch::group_records`),
 /// validates them, then runs the upload dashboard with per-item concurrency

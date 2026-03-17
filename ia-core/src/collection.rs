@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use crate::error::{IaError, Result};
+use crate::identifier::validate_identifier;
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::parse_s3_error;
-use crate::upload::validate::validate_identifier;
 use crate::upload::{build_s3_item_url, upload_file, UploadOpts, UploadStatus};
 use crate::IaClient;
 

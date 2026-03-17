@@ -134,7 +134,7 @@ async fn run_create(client: &IaClient, args: CreateArgs, quiet: u8) -> Result<()
     .await;
 
     match result {
-        Ok(ref r) => print_success(r, args.json, args.dry_run, quiet),
+        Ok(ref r) => print_success(r, args.json, args.dry_run, quiet)?,
         Err(ref e) => {
             if args.json {
                 let json = serde_json::json!({
@@ -150,14 +150,19 @@ async fn run_create(client: &IaClient, args: CreateArgs, quiet: u8) -> Result<()
     result.map(|_| ()).map_err(Into::into)
 }
 
-fn print_success(result: &CreateCollectionResult, json: bool, dry_run: bool, quiet: u8) {
+fn print_success(
+    result: &CreateCollectionResult,
+    json: bool,
+    dry_run: bool,
+    quiet: u8,
+) -> Result<()> {
     if json {
         let json = serde_json::json!({
             "identifier": result.identifier,
             "status": result.status,
             "url": result.url,
         });
-        println!("{}", serde_json::to_string(&json).unwrap());
+        println!("{}", serde_json::to_string(&json)?);
     } else if quiet == 0 {
         let prefix = if dry_run {
             style("dry-run:").yellow().bold()
@@ -166,4 +171,5 @@ fn print_success(result: &CreateCollectionResult, json: bool, dry_run: bool, qui
         };
         println!("{prefix} {}", result.url);
     }
+    Ok(())
 }

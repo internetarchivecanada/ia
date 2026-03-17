@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use color_print::cstr;
 use console::style;
@@ -197,6 +197,7 @@ pub async fn run(
     args: ConfigArgs,
     config: ia_core::IaConfig,
     config_path: Option<PathBuf>,
+    quiet: u8,
 ) -> Result<()> {
     match args.command {
         ConfigCommand::Show(show_args) => {
@@ -261,7 +262,7 @@ pub async fn run(
                     "screenname": auth.screenname,
                 });
                 println!("{}", serde_json::to_string(&json)?);
-            } else {
+            } else if quiet == 0 {
                 eprintln!(
                     "{} Config saved to {}",
                     style("✓").green().bold(),
@@ -283,7 +284,7 @@ pub async fn run(
                             "itemname": info.itemname,
                         });
                         println!("{}", serde_json::to_string(&json)?);
-                    } else {
+                    } else if quiet == 0 {
                         eprintln!(
                             "{} Credentials valid ({})",
                             style("✓").green().bold(),
@@ -299,11 +300,16 @@ pub async fn run(
                             "error": e.to_string(),
                         });
                         println!("{}", serde_json::to_string(&json)?);
+                        // Intentional: exit with code 1 after clean JSON output.
+                        // Using bail!() would cause anyhow to print an extra error line
+                        // after the JSON, breaking machine-readable output.
                         std::process::exit(1);
-                    } else {
+                    }
+                    if quiet == 0 {
                         eprintln!("{} {}", style("✗").red().bold(), e);
                         std::process::exit(1);
                     }
+                    bail!("credentials invalid: {e}");
                 }
             }
         }
@@ -319,7 +325,7 @@ pub async fn run(
                     "itemname": info.itemname,
                 });
                 println!("{}", serde_json::to_string(&json)?);
-            } else {
+            } else if quiet == 0 {
                 println!("Screenname: {}", style(&info.screenname).cyan());
                 println!("Email:      {}", info.email);
                 if let Some(itemname) = &info.itemname {

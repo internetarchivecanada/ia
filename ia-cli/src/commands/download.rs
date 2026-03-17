@@ -14,6 +14,7 @@ use ia_core::download::{
 };
 use ia_core::error::IaError;
 use ia_core::files::FileFilter;
+use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::search::SearchOpts;
 use ia_core::types::FileSource;
@@ -117,29 +118,6 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
             "unknown source: {s} (expected: original, derivative, metadata)"
         )),
     }
-}
-
-/// Extract an identifier from a line, handling both plain text and JSONL formats.
-///
-/// Supports:
-///   - Plain identifier: `my-item-id`
-///   - JSONL from `ia search --json`: `{"identifier": "my-item-id", ...}`
-fn parse_identifier_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return None;
-    }
-
-    // Try to parse as JSON if it looks like a JSON object
-    if trimmed.starts_with('{') {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(id) = obj.get("identifier").and_then(|v| v.as_str()) {
-                return Some(id.to_string());
-            }
-        }
-    }
-
-    Some(trimmed.to_string())
 }
 
 /// Collect all identifiers from args, --itemlist file, --search, and stdin.
@@ -650,51 +628,5 @@ mod tests {
         assert_eq!(v["status"], "error");
         assert_eq!(v["error"]["code"], "not_found");
         assert!(v["error"]["message"].as_str().unwrap().contains("broken"));
-    }
-
-    // --- parse_identifier_line tests ---
-
-    #[test]
-    fn parse_plain_identifier() {
-        assert_eq!(parse_identifier_line("nasa"), Some("nasa".to_string()));
-    }
-
-    #[test]
-    fn parse_plain_identifier_with_whitespace() {
-        assert_eq!(parse_identifier_line("  nasa  "), Some("nasa".to_string()));
-    }
-
-    #[test]
-    fn parse_jsonl_identifier() {
-        assert_eq!(
-            parse_identifier_line(r#"{"identifier": "cubanc_000418"}"#),
-            Some("cubanc_000418".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_jsonl_with_extra_fields() {
-        assert_eq!(
-            parse_identifier_line(
-                r#"{"identifier": "nasa", "title": "NASA Images", "mediatype": "image"}"#
-            ),
-            Some("nasa".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_empty_and_comment_lines() {
-        assert_eq!(parse_identifier_line(""), None);
-        assert_eq!(parse_identifier_line("  "), None);
-        assert_eq!(parse_identifier_line("# comment"), None);
-    }
-
-    #[test]
-    fn parse_json_without_identifier_field() {
-        // JSON object without "identifier" — use raw line as fallback
-        assert_eq!(
-            parse_identifier_line(r#"{"title": "something"}"#),
-            Some(r#"{"title": "something"}"#.to_string())
-        );
     }
 }

@@ -5,11 +5,12 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
+use crate::identifier::validate_identifier;
 use crate::metadata::write::parse_indexed_key;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
-use crate::upload::validate::{validate_file, validate_identifier};
+use crate::upload::validate::validate_file;
 use crate::IaClient;
 
 /// A group of files and metadata for a single IA item.

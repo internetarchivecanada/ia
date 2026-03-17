@@ -7,6 +7,7 @@ pub mod disk_pool;
 pub mod download;
 pub mod error;
 pub mod files;
+pub mod identifier;
 pub mod joblog;
 pub mod metadata;
 pub mod rate_limit;

@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
             } else {
                 ia_core::IaConfig::load()?
             };
-            return commands::config::run(args, config, cli.config.clone()).await;
+            return commands::config::run(args, config, cli.config.clone(), cli.quiet).await;
         }
         _ => {}
     }
@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
-        Commands::Status(args) => commands::status::run(args).await?,
+        Commands::Status(args) => commands::status::run(args, cli.quiet).await?,
         Commands::Tasks(args) => {
             commands::tasks::run(
                 &client,

@@ -10,7 +10,9 @@ use console::style;
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{self, JoblogEntry, JoblogWriter};
+use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::tasks::{self, TaskEntry, TaskSubmission, TasksQuery, TasksSummary};
 use ia_core::IaClient;
 
@@ -29,7 +31,7 @@ use ia_core::IaClient;
          \n\n  <dim># Filter by command</dim>\
          \n  <bold>$ ia tasks --cmd derive.php</bold>\
          \n\n  <dim># Submit a derive task</dim>\
-         \n  <bold>$ ia tasks submit derive my-item</bold>\
+         \n  <bold>$ ia tasks submit my-item --cmd derive</bold>\
          \n\n  <dim># View a task log</dim>\
          \n  <bold>$ ia tasks log 1234567</bold>\n"
     ),
@@ -111,11 +113,15 @@ pub enum TasksCommand {
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Submit a derive task</dim>\
-             \n  <bold>$ ia tasks submit derive my-item</bold>\
+             \n  <bold>$ ia tasks submit my-item --cmd derive</bold>\
              \n\n  <dim># Submit with a comment</dim>\
-             \n  <bold>$ ia tasks submit make_dark my-item --comment \"curation request\"</bold>\
+             \n  <bold>$ ia tasks submit my-item --cmd make_dark --comment \"curation request\"</bold>\
              \n\n  <dim># Submit to multiple items</dim>\
-             \n  <bold>$ ia tasks submit derive --itemlist items.txt --comment \"re-derive\"</bold>\n"
+             \n  <bold>$ ia tasks submit --cmd derive --itemlist items.txt --comment \"re-derive\"</bold>\
+             \n\n  <dim># Batch submit from a spreadsheet</dim>\
+             \n  <bold>$ ia tasks submit --spreadsheet jobs.csv</bold>\
+             \n\n  <dim># Submit from piped identifiers</dim>\
+             \n  <bold>$ cat ids.txt | ia tasks submit --cmd derive</bold>\n"
         ),
     )]
     Submit(SubmitArgs),
@@ -141,7 +147,7 @@ pub enum TasksCommand {
              \n\n  <dim># Rerun all failed derive tasks</dim>\
              \n  <bold>$ ia tasks rerun --cmd derive.php</bold>\
              \n\n  <dim># Rerun from pipeline</dim>\
-             \n  <bold>$ ia tasks --cmd derive.php --color red --json | ia tasks rerun -</bold>\n"
+             \n  <bold>$ ia tasks --cmd derive.php --color red --json | ia tasks rerun</bold>\n"
         ),
     )]
     Rerun(RerunArgs),
@@ -162,13 +168,13 @@ pub enum TasksCommand {
 
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
-    /// Task command (e.g. derive, make_dark)
-    #[arg()]
-    pub cmd: String,
-
-    /// Item identifier (omit for batch mode with --itemlist/--search)
+    /// Item identifier (omit for batch mode with --itemlist/--search/--spreadsheet)
     #[arg()]
     pub identifier: Option<String>,
+
+    /// Task command (e.g. derive, make_dark)
+    #[arg(long, required_unless_present = "spreadsheet")]
+    pub cmd: Option<String>,
 
     /// Task arguments as KEY=VALUE (repeatable)
     #[arg(long = "args")]
@@ -217,6 +223,10 @@ pub struct SubmitArgs {
     /// Use search results as input
     #[arg(long)]
     pub search: Option<String>,
+
+    /// Batch submit tasks from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
+    #[arg(long, conflicts_with_all = ["identifier", "itemlist", "search"])]
+    pub spreadsheet: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -232,7 +242,7 @@ pub struct LogArgs {
 
 #[derive(Debug, Args)]
 pub struct RerunArgs {
-    /// Task ID(s) to rerun (use - for stdin)
+    /// Task ID(s) to rerun (stdin auto-detected when piped)
     #[arg()]
     pub task_ids: Vec<String>,
 
@@ -536,6 +546,17 @@ async fn run_submit(
     joblog: Option<std::path::PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
+    // For spreadsheet mode, cmd comes from the spreadsheet rows
+    if args.spreadsheet.is_some() {
+        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog, retry_failed).await;
+    }
+
+    // Outside spreadsheet mode, cmd is required
+    let cmd = match args.cmd {
+        Some(ref c) => c.clone(),
+        None => bail!("task command is required (e.g. derive, make_dark)"),
+    };
+
     let mut task_args = HashMap::new();
     for a in &args.task_args {
         let (k, v) = a
@@ -589,10 +610,10 @@ async fn run_submit(
     }
 
     if args.dry_run {
-        let cmd_display = if args.cmd.ends_with(".php") {
-            args.cmd.clone()
+        let cmd_display = if cmd.ends_with(".php") {
+            cmd.clone()
         } else {
-            format!("{}.php", args.cmd)
+            format!("{cmd}.php")
         };
         for id in &identifiers {
             if args.json {
@@ -643,7 +664,7 @@ async fn run_submit(
     if identifiers.len() == 1 {
         let submission = TaskSubmission {
             identifier: identifiers[0].clone(),
-            cmd: args.cmd.clone(),
+            cmd: cmd.clone(),
             args: if task_args.is_empty() {
                 None
             } else {
@@ -775,7 +796,6 @@ async fn run_submit(
     let joblog_writer = joblog_writer.map(std::sync::Arc::new);
 
     let client = client.clone();
-    let cmd = args.cmd.clone();
     let comment = args.comment.clone();
     let json_output = args.json;
     let max_retries = args.max_retries;
@@ -874,6 +894,233 @@ async fn run_submit(
     Ok(())
 }
 
+/// Handle `--spreadsheet` mode for task submission.
+///
+/// Expected columns: `identifier`, `cmd`, `comment` (optional), `priority` (optional).
+/// Task arguments use indexed columns with `args.` prefix (e.g. `args.remove_derived`).
+/// Each row becomes a separate task submission.
+async fn run_submit_spreadsheet(
+    client: &IaClient,
+    args: &SubmitArgs,
+    quiet: u8,
+    jobs: usize,
+    joblog: Option<std::path::PathBuf>,
+    retry_failed: bool,
+) -> Result<()> {
+    let spreadsheet_path = args
+        .spreadsheet
+        .as_ref()
+        .context("spreadsheet path required")?;
+    let records = read_spreadsheet(spreadsheet_path).context(format!(
+        "failed to read spreadsheet: {}",
+        spreadsheet_path.display()
+    ))?;
+
+    if records.is_empty() {
+        bail!("spreadsheet contains no records");
+    }
+
+    // Build submissions from spreadsheet rows
+    let mut submissions: Vec<TaskSubmission> = Vec::new();
+    for (identifier, fields) in &records {
+        let cmd = fields.get("cmd").cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "spreadsheet row for '{}' is missing required 'cmd' column",
+                identifier
+            )
+        })?;
+
+        // Collect task args from `args.KEY` columns (e.g. args.remove_derived=*.jpg)
+        let mut task_args: HashMap<String, String> = fields
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("args.")
+                    .filter(|_| !v.is_empty())
+                    .map(|arg_name| (arg_name.to_string(), v.clone()))
+            })
+            .collect();
+
+        // Merge CLI --args into spreadsheet args (CLI takes precedence)
+        for a in &args.task_args {
+            if let Some((k, v)) = a.split_once('=').or_else(|| a.split_once(':')) {
+                task_args.insert(k.to_string(), v.to_string());
+            }
+        }
+
+        let comment = fields
+            .get("comment")
+            .cloned()
+            .or_else(|| args.comment.clone());
+
+        let priority = fields
+            .get("priority")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(args.priority);
+
+        submissions.push(TaskSubmission {
+            identifier: identifier.clone(),
+            cmd,
+            args: if task_args.is_empty() {
+                None
+            } else {
+                Some(task_args)
+            },
+            comment,
+            priority: if priority == 0 { None } else { Some(priority) },
+            reduced_priority: args.reduced_priority,
+            extra_params: Vec::new(),
+        });
+    }
+
+    // Handle --retry-failed
+    if retry_failed {
+        if let Some(ref path) = joblog {
+            let entries =
+                joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
+            let failed_ids: std::collections::HashSet<String> =
+                joblog::failed_items(&entries).into_iter().collect();
+            if failed_ids.is_empty() {
+                if quiet == 0 {
+                    eprintln!("{} No failed items in joblog", style("ok").green());
+                }
+                return Ok(());
+            }
+            submissions.retain(|s| failed_ids.contains(&s.identifier));
+        } else {
+            bail!("--retry-failed requires --joblog");
+        }
+    }
+
+    if submissions.is_empty() {
+        bail!("no tasks to submit");
+    }
+
+    if args.dry_run {
+        for sub in &submissions {
+            let cmd_display = if sub.cmd.ends_with(".php") {
+                sub.cmd.clone()
+            } else {
+                format!("{}.php", sub.cmd)
+            };
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "identifier": sub.identifier,
+                        "cmd": cmd_display,
+                        "args": sub.args,
+                        "comment": sub.comment,
+                        "priority": sub.priority.unwrap_or(0),
+                        "dry_run": true,
+                    }))?
+                );
+            } else {
+                eprintln!(
+                    "{} {} → {}",
+                    style("dry-run").dim(),
+                    sub.identifier,
+                    cmd_display,
+                );
+            }
+        }
+        if !args.json && quiet < 2 {
+            eprintln!(
+                "\n{} would submit {} task(s)",
+                style("dry-run").dim(),
+                submissions.len()
+            );
+        }
+        return Ok(());
+    }
+
+    // Concurrent batch submission
+    let joblog_writer = joblog
+        .as_ref()
+        .map(|p| JoblogWriter::open(p))
+        .transpose()
+        .context("failed to open joblog")?;
+    let joblog_writer = joblog_writer.map(std::sync::Arc::new);
+
+    let client = client.clone();
+    let json_output = args.json;
+    let max_retries = args.max_retries;
+
+    let results: Vec<(String, Result<tasks::TaskSubmitResponse>)> = stream::iter(submissions)
+        .map(|sub| {
+            let client = client.clone();
+            async move {
+                let id = sub.identifier.clone();
+                let result = submit_with_retry(&client, &sub, max_retries, quiet).await;
+                (id, result)
+            }
+        })
+        .buffer_unordered(jobs)
+        .collect()
+        .await;
+
+    let mut succeeded = 0u32;
+    let mut failed = 0u32;
+
+    for (id, result) in &results {
+        match result {
+            Ok(resp) => {
+                succeeded += 1;
+                if json_output {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "identifier": id,
+                            "task_id": resp.task_id,
+                            "success": true,
+                        }))?
+                    );
+                } else if quiet == 0 {
+                    eprintln!("{} {} (task {})", style("ok").green(), id, resp.task_id);
+                }
+                if let Some(ref writer) = joblog_writer {
+                    let entry = JoblogEntry::new("task-submit", id, "").ok(0, 0);
+                    writer.write(&entry);
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                if json_output {
+                    let json_err = serde_json::json!({
+                        "identifier": id,
+                        "success": false,
+                        "error": e.to_string(),
+                    });
+                    eprintln!("{}", serde_json::to_string(&json_err)?);
+                } else {
+                    eprintln!("{} {}: {}", style("error").red(), id, e);
+                }
+                if let Some(ref writer) = joblog_writer {
+                    let entry = JoblogEntry::new("task-submit", id, "").error(&e.to_string(), 0);
+                    writer.write(&entry);
+                }
+            }
+        }
+    }
+
+    if !json_output && quiet < 2 {
+        eprintln!(
+            "\n{} submitted, {} failed",
+            style(succeeded).green(),
+            if failed > 0 {
+                style(failed).red().to_string()
+            } else {
+                style(failed).dim().to_string()
+            }
+        );
+    }
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
 async fn collect_submit_identifiers(args: &SubmitArgs, client: &IaClient) -> Result<Vec<String>> {
     let mut ids = Vec::new();
 
@@ -885,9 +1132,8 @@ async fn collect_submit_identifiers(args: &SubmitArgs, client: &IaClient) -> Res
         let content = std::fs::read_to_string(path)
             .context(format!("failed to read itemlist: {}", path.display()))?;
         for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed.to_string());
+            if let Some(id) = parse_identifier_line(line) {
+                ids.push(id);
             }
         }
     }
@@ -898,6 +1144,24 @@ async fn collect_submit_identifiers(args: &SubmitArgs, client: &IaClient) -> Res
         while let Some(result) = stream.next().await {
             let item = result.context("search failed")?;
             ids.push(item.identifier);
+        }
+    }
+
+    // Auto-detect stdin when piped and no other sources provided
+    if ids.is_empty()
+        && args.identifier.is_none()
+        && args.itemlist.is_none()
+        && args.search.is_none()
+        && args.spreadsheet.is_none()
+        && !std::io::stdin().is_terminal()
+    {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.context("failed to read from stdin")?;
+            if let Some(id) = parse_identifier_line(&line) {
+                ids.push(id);
+            }
         }
     }
 
@@ -1074,31 +1338,41 @@ async fn rerun_with_retry(
     }
 }
 
+/// Read task IDs from stdin (shared between explicit `-` and auto-detect).
+fn read_task_ids_from_stdin(ids: &mut Vec<u64>) -> Result<()> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Ok(id) = trimmed.parse::<u64>() {
+            ids.push(id);
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(id) = value.get("task_id").and_then(|v| v.as_u64()) {
+                ids.push(id);
+                continue;
+            }
+        }
+        tracing::debug!("skipping unrecognized stdin line: {trimmed}");
+    }
+    Ok(())
+}
+
 async fn collect_rerun_task_ids(args: &RerunArgs, client: &IaClient) -> Result<Vec<u64>> {
     let mut ids = Vec::new();
 
     for arg in &args.task_ids {
         if arg == "-" {
-            use std::io::BufRead;
-            let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
-                let line = line?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                if let Ok(id) = trimmed.parse::<u64>() {
-                    ids.push(id);
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if let Some(id) = value.get("task_id").and_then(|v| v.as_u64()) {
-                        ids.push(id);
-                        continue;
-                    }
-                }
-                tracing::debug!("skipping unrecognized stdin line: {trimmed}");
-            }
+            eprintln!(
+                "{}: explicit '-' for stdin is deprecated; stdin is auto-detected when piped",
+                style("warning").yellow()
+            );
+            read_task_ids_from_stdin(&mut ids)?;
         } else {
             ids.push(
                 arg.parse::<u64>()
@@ -1111,6 +1385,12 @@ async fn collect_rerun_task_ids(args: &RerunArgs, client: &IaClient) -> Result<V
         || args.submitter.is_some()
         || args.identifier.is_some()
         || args.color.is_some();
+
+    // Auto-detect stdin when piped and no IDs or filters provided
+    if ids.is_empty() && args.task_ids.is_empty() && !has_filters && !std::io::stdin().is_terminal()
+    {
+        read_task_ids_from_stdin(&mut ids)?;
+    }
 
     if has_filters && ids.is_empty() {
         let query = TasksQuery {

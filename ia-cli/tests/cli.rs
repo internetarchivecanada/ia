@@ -282,6 +282,61 @@ fn metadata_import_csv_accepted() {
 }
 
 #[test]
+fn metadata_import_shows_deprecation_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(&csv_path, "identifier,title\ntest-item,New Title\n").unwrap();
+
+    ia().args(["metadata", "import", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("deprecated"));
+}
+
+#[test]
+fn metadata_spreadsheet_shown_in_help() {
+    ia().args(["metadata", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--spreadsheet"));
+}
+
+#[test]
+fn metadata_spreadsheet_nonexistent_file_errors() {
+    ia().args([
+        "metadata",
+        "--spreadsheet",
+        "/tmp/nonexistent_ia_test_file.csv",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("failed to read"));
+}
+
+#[test]
+fn metadata_spreadsheet_csv_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("test.csv");
+    std::fs::write(&csv_path, "identifier,title\ntest-item,New Title\n").unwrap();
+
+    let result = ia()
+        .args(["metadata", "--spreadsheet", csv_path.to_str().unwrap()])
+        .assert()
+        .failure();
+
+    // Should reach the spreadsheet import logic (fails with auth, not with parse error)
+    result.stderr(predicate::str::contains("not yet implemented").not());
+}
+
+#[test]
+fn metadata_export_itemlist_shown_in_help() {
+    ia().args(["metadata", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--itemlist"));
+}
+
+#[test]
 fn help_output_contains_examples_section() {
     ia().arg("--help")
         .assert()
@@ -978,7 +1033,7 @@ fn metadata_import_with_compound_errors() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "compound operations (+) cannot be used with import",
+            "compound operations (+) cannot be used with --spreadsheet",
         ));
 }
 

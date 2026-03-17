@@ -32,7 +32,7 @@ use ia_core::IaClient;
          \n\n  <dim># Upload from stdin with an explicit remote name</dim>\
          \n  <bold>$ cat data.csv | ia upload my-item - --remote-name data.csv</bold>\
          \n\n  <dim># Batch upload from a spreadsheet</dim>\
-         \n  <bold>$ ia upload import batch.csv</bold>\
+         \n  <bold>$ ia upload --spreadsheet batch.csv</bold>\
          \n\n  <dim># Generate a template spreadsheet from a directory</dim>\
          \n  <bold>$ ia upload template ./files/ -o template.csv</bold>\
          \n\n  <dim># Dry run — validate without uploading</dim>\
@@ -41,6 +41,10 @@ use ia_core::IaClient;
     subcommand_required = false,
 )]
 pub struct UploadArgs {
+    /// Batch upload from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
+    #[arg(long, conflicts_with_all = ["identifier", "files"])]
+    pub spreadsheet: Option<PathBuf>,
+
     /// Item identifier
     #[arg()]
     pub identifier: Option<String>,
@@ -143,30 +147,15 @@ pub struct UploadArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum UploadCommand {
-    /// Batch upload from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
-    #[command(
-        long_about = "Upload items in batch from a spreadsheet file. Each row specifies an \
-            identifier, a file path, and optional metadata columns. Rows sharing the same \
-            identifier are grouped into a single item upload.\n\n\
-            Required columns: identifier, file\n\
-            All other columns become metadata key-value pairs.",
-        after_long_help = cstr!(
-            "<bold><underline>Examples:</underline></bold>\n\
-             \n  <dim># Batch upload from CSV</dim>\
-             \n  <bold>$ ia upload import batch.csv</bold>\
-             \n\n  <dim># Batch upload from XLSX with dry run</dim>\
-             \n  <bold>$ ia upload import batch.xlsx --dry-run</bold>\
-             \n\n  <dim># Batch upload with JSON output</dim>\
-             \n  <bold>$ ia upload import batch.csv --json</bold>\n"
-        ),
-    )]
+    /// Batch upload from a spreadsheet (deprecated: use --spreadsheet)
+    #[command(hide = true)]
     Import(ImportArgs),
 
     /// Generate a template spreadsheet from a directory
     #[command(
         long_about = "Scan a directory and generate a template spreadsheet with one row per file. \
             The template includes columns for identifier, file, mediatype, collection, title, \
-            and other common metadata fields. Fill in the template and use 'ia upload import' \
+            and other common metadata fields. Fill in the template and use 'ia upload --spreadsheet' \
             to perform the batch upload.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
@@ -344,15 +333,20 @@ pub async fn run(
     }
     #[cfg(feature = "tui")]
     if args.dashboard {
+        let is_spreadsheet =
+            args.spreadsheet.is_some() || matches!(args.command, Some(UploadCommand::Import(_)));
         match &args.command {
+            None if is_spreadsheet => {
+                // Dashboard supported for spreadsheet — handled in run_import
+            }
             None => {
                 // Dashboard supported for bare upload — handled in run_bare_upload
             }
             Some(UploadCommand::Template(_) | UploadCommand::Cleanup(_)) => {
-                bail!("--dashboard is only supported for bare upload and import");
+                bail!("--dashboard is only supported for bare upload and --spreadsheet");
             }
             Some(UploadCommand::Import(_)) => {
-                // Dashboard supported for import — handled in run_import
+                // Dashboard supported for deprecated import — handled in run_import
             }
         }
     }
@@ -364,29 +358,62 @@ pub async fn run(
         );
     }
 
-    // --retry-failed is only supported for import (batch) uploads
-    if retry_failed && !matches!(args.command, Some(UploadCommand::Import(_))) {
+    // --retry-failed is only supported for spreadsheet (batch) uploads
+    let is_batch =
+        args.spreadsheet.is_some() || matches!(args.command, Some(UploadCommand::Import(_)));
+    if retry_failed && !is_batch {
         bail!(
-            "--retry-failed is only supported with 'ia upload import'.\n\
+            "--retry-failed is only supported with 'ia upload --spreadsheet'.\n\
              For single-item uploads, re-run the same upload command."
         );
     }
 
+    // Deprecated `import` subcommand → redirect to --spreadsheet path
+    if let Some(UploadCommand::Import(sub)) = args.command {
+        eprintln!(
+            "{}: 'ia upload import' is deprecated, use 'ia upload --spreadsheet <FILE>' instead",
+            style("warning").yellow().bold(),
+        );
+        // Build an UploadArgs from the ImportArgs for run_import
+        let merged = UploadArgs {
+            spreadsheet: Some(sub.spreadsheet),
+            identifier: None,
+            files: vec![],
+            metadata: sub.metadata,
+            header: sub.header,
+            remote_name: None,
+            remote_dir: None,
+            keep_directories: false,
+            no_derive: sub.no_derive,
+            no_backup: sub.no_backup,
+            no_auto_make_bucket: sub.no_auto_make_bucket,
+            no_verify: sub.no_verify,
+            no_size_hint: sub.no_size_hint,
+            no_collection_check: sub.no_collection_check,
+            checksums: sub.checksums,
+            skip_existing: sub.skip_existing,
+            delete_after_upload: sub.delete_after_upload,
+            test_item: sub.test_item,
+            open_after_upload: false,
+            dry_run: sub.dry_run,
+            retries: sub.retries,
+            retry_sleep: sub.retry_sleep,
+            json: sub.json,
+            multipart: sub.multipart,
+            dashboard: args.dashboard,
+            command: None,
+        };
+        return run_import(client, &merged, quiet, jobs, joblog_path, retry_failed).await;
+    }
+
+    if args.spreadsheet.is_some() {
+        return run_import(client, &args, quiet, jobs, joblog_path, retry_failed).await;
+    }
+
     match args.command {
-        Some(UploadCommand::Import(sub)) => {
-            run_import(
-                client,
-                sub,
-                quiet,
-                jobs,
-                joblog_path,
-                args.dashboard,
-                retry_failed,
-            )
-            .await
-        }
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
+        Some(UploadCommand::Import(_)) => unreachable!("handled above"),
         None => run_bare_upload(client, args, quiet, joblog_path).await,
     }
 }
@@ -564,16 +591,19 @@ async fn run_bare_upload(
 
 async fn run_import(
     client: &IaClient,
-    args: ImportArgs,
+    args: &UploadArgs,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    dashboard: bool,
     retry_failed: bool,
 ) -> Result<()> {
-    let records = read_spreadsheet(&args.spreadsheet).context(format!(
+    let spreadsheet = args
+        .spreadsheet
+        .as_ref()
+        .context("spreadsheet path required")?;
+    let records = read_spreadsheet(spreadsheet).context(format!(
         "failed to read spreadsheet: {}",
-        args.spreadsheet.display()
+        spreadsheet.display()
     ))?;
 
     if records.is_empty() {
@@ -653,11 +683,11 @@ async fn run_import(
 
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
-    if dashboard {
+    if args.dashboard {
         return crate::tui::run_upload_batch_tui(client, records, opts, jobs).await;
     }
     #[cfg(not(feature = "tui"))]
-    let _ = dashboard;
+    let _ = args.dashboard;
 
     // Open joblog writer if path provided
     let joblog = joblog_path

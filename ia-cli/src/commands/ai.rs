@@ -10,6 +10,7 @@ use futures::StreamExt;
 
 use ia_core::ai::pipeline::{PipelineConfig, PipelineSummary, ReviewMode};
 use ia_core::ai::types::{AiConfig, FocusConfig, ItemAnalysis};
+use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::JoblogWriter;
 use ia_core::search::SearchOpts;
 use ia_core::IaClient;
@@ -388,9 +389,8 @@ async fn collect_identifiers(args: &AiArgs, client: &IaClient) -> Result<Vec<Str
         let content = std::fs::read_to_string(path)
             .context(format!("failed to read itemlist: {}", path.display()))?;
         for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed.to_string());
+            if let Some(id) = parse_identifier_line(line) {
+                ids.push(id);
             }
         }
     }
@@ -414,9 +414,8 @@ async fn collect_identifiers(args: &AiArgs, client: &IaClient) -> Result<Vec<Str
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let line = line.context("failed to read from stdin")?;
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed);
+            if let Some(id) = parse_identifier_line(&line) {
+                ids.push(id);
             }
         }
     }

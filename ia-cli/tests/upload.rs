@@ -263,19 +263,19 @@ fn upload_dashboard_on_cleanup_errors() {
 }
 
 #[test]
-fn upload_dashboard_accepted_on_import() {
+fn upload_dashboard_accepted_on_spreadsheet() {
     let cfg = empty_config();
     ia_with_config(&cfg)
         .args([
             "upload",
             "--dashboard",
-            "import",
+            "--spreadsheet",
             "/tmp/nonexistent-test-file.csv",
         ])
         .assert()
         .failure()
         // Should fail for a reason OTHER than dashboard restriction —
-        // verifies import is recognized as a valid dashboard target.
+        // verifies --spreadsheet is recognized as a valid dashboard target.
         .stderr(predicate::str::contains("only supported for").not());
 }
 
@@ -373,10 +373,26 @@ fn upload_template_tsv_format() {
     assert!(header.contains("mediatype"));
 }
 
-// ─── Import subcommand ───────────────────────────────────────────────────────
+// ─── Spreadsheet (batch upload) ──────────────────────────────────────────────
 
 #[test]
-fn upload_import_nonexistent_file() {
+fn upload_spreadsheet_nonexistent_file() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--spreadsheet",
+            "/tmp/ia-cli-test-nonexistent-spreadsheet.csv",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read spreadsheet"));
+}
+
+// ─── Deprecated import subcommand ────────────────────────────────────────────
+
+#[test]
+fn upload_deprecated_import_warns() {
     let cfg = empty_config();
     ia_with_config(&cfg)
         .args([
@@ -386,7 +402,8 @@ fn upload_import_nonexistent_file() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to read spreadsheet"));
+        .stderr(predicate::str::contains("'ia upload import' is deprecated"))
+        .stderr(predicate::str::contains("--spreadsheet"));
 }
 
 // ─── Cleanup subcommand ──────────────────────────────────────────────────────
@@ -401,10 +418,10 @@ fn upload_cleanup_requires_credentials() {
         .stderr(predicate::str::contains("credentials required"));
 }
 
-// ─── Import dry-run ──────────────────────────────────────────────────────────
+// ─── Spreadsheet dry-run ─────────────────────────────────────────────────────
 
 #[test]
-fn upload_import_csv_dry_run() {
+fn upload_spreadsheet_csv_dry_run() {
     let dir = TempDir::new().unwrap();
     let data_file = dir.path().join("hello.txt");
     fs::write(&data_file, "hello world").unwrap();
@@ -423,7 +440,7 @@ fn upload_import_csv_dry_run() {
     ia_with_config(&cfg)
         .args([
             "upload",
-            "import",
+            "--spreadsheet",
             csv_path.to_str().unwrap(),
             "--dry-run",
             "--no-collection-check",
@@ -462,12 +479,12 @@ fn upload_multipart_flag_accepted() {
 }
 
 #[test]
-fn upload_import_multipart_flag_accepted() {
+fn upload_spreadsheet_flag_shown_in_help() {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
-    cmd.args(["upload", "import", "--help"])
+    cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--multipart"));
+        .stdout(predicate::str::contains("--spreadsheet"));
 }
 
 #[test]
@@ -502,7 +519,7 @@ fn upload_help_shows_subcommands() {
     cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("import"))
+        .stdout(predicate::str::contains("--spreadsheet"))
         .stdout(predicate::str::contains("template"))
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--json"))
@@ -513,12 +530,12 @@ fn upload_help_shows_subcommands() {
 }
 
 #[test]
-fn upload_import_help_shows_options() {
+fn upload_help_shows_spreadsheet_options() {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
-    cmd.args(["upload", "import", "--help"])
+    cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("SPREADSHEET"))
+        .stdout(predicate::str::contains("--spreadsheet"))
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--json"))
         .stdout(predicate::str::contains("--test-item"));

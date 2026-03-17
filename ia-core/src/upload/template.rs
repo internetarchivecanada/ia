@@ -1,4 +1,5 @@
 use crate::error::{IaError, Result};
+use crate::identifier::generate_identifier;
 use std::path::Path;
 
 /// Options for template generation.
@@ -28,37 +29,6 @@ pub struct TemplateRow {
     pub language: String,
 }
 
-/// Sanitize a string into a valid IA identifier component.
-///
-/// - Lowercases ASCII alphanumeric characters
-/// - Replaces non-allowed characters with `-`
-/// - Strips leading non-alphanumeric characters
-/// - Returns empty string if result is less than 3 chars
-/// - Truncates to 100 chars
-fn sanitize_identifier(s: &str) -> String {
-    let sanitized: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // Ensure starts with alphanumeric
-    let sanitized = sanitized
-        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
-        .to_string();
-    if sanitized.len() < 3 {
-        String::new() // too short, leave for user to fill in
-    } else if sanitized.len() > 100 {
-        sanitized[..100].to_string()
-    } else {
-        sanitized
-    }
-}
-
 /// Generate template rows by walking a directory.
 ///
 /// Recursively finds all regular files (skipping dotfiles and symlinks),
@@ -71,7 +41,12 @@ pub fn generate_template(dir: &Path, opts: &TemplateOpts) -> Result<Vec<Template
     let rows = files
         .into_iter()
         .map(|path| {
-            let identifier = generate_identifier(&path, opts);
+            let identifier = generate_identifier(
+                &path,
+                opts.identifier_prefix.as_deref(),
+                opts.identifier_from_filename,
+                opts.identifier_from_dirname,
+            );
             TemplateRow {
                 identifier,
                 file: path.to_string_lossy().into_owned(),
@@ -120,36 +95,6 @@ fn walk_dir(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Generate an identifier for a file based on the template options.
-fn generate_identifier(path: &Path, opts: &TemplateOpts) -> String {
-    let raw = if opts.identifier_from_filename {
-        // Use filename without extension
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string()
-    } else if opts.identifier_from_dirname {
-        // Use parent directory name
-        path.parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        return String::new();
-    };
-
-    let sanitized = sanitize_identifier(&raw);
-    if sanitized.is_empty() {
-        return String::new();
-    }
-
-    match &opts.identifier_prefix {
-        Some(prefix) => format!("{prefix}-{sanitized}"),
-        None => sanitized,
-    }
 }
 
 /// Write template rows as CSV to a writer.
@@ -203,42 +148,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn sanitize_simple() {
-        assert_eq!(sanitize_identifier("Hello World"), "hello-world");
-    }
-
-    #[test]
-    fn sanitize_strips_leading_non_alnum() {
-        assert_eq!(sanitize_identifier("--my-file"), "my-file");
-    }
-
-    #[test]
-    fn sanitize_too_short() {
-        assert_eq!(sanitize_identifier("ab"), "");
-    }
-
-    #[test]
-    fn sanitize_truncates_long() {
-        let long = "a".repeat(150);
-        assert_eq!(sanitize_identifier(&long).len(), 100);
-    }
-
-    #[test]
-    fn sanitize_preserves_dots_and_underscores() {
-        assert_eq!(sanitize_identifier("my_file.v2"), "my_file.v2");
-    }
-
-    #[test]
-    fn sanitize_empty_input() {
-        assert_eq!(sanitize_identifier(""), "");
-    }
-
-    #[test]
-    fn sanitize_all_special_chars() {
-        assert_eq!(sanitize_identifier("@#$"), "");
-    }
 
     #[test]
     fn generate_template_empty_dir() {

@@ -207,8 +207,9 @@ async fn test_tasks_submit_json() {
             &host,
             "tasks",
             "submit",
-            "derive",
             "my-item",
+            "--cmd",
+            "derive",
             "--json",
         ])
         .env("IA_ACCESS_KEY_ID", "test_access")
@@ -435,6 +436,7 @@ async fn test_tasks_submit_batch_itemlist() {
             &host,
             "tasks",
             "submit",
+            "--cmd",
             "derive",
             "--itemlist",
             itemlist_path.to_str().unwrap(),
@@ -628,7 +630,14 @@ async fn test_tasks_rate_limit_human_output() {
 #[tokio::test]
 async fn test_tasks_retry_failed_requires_joblog() {
     let output = ia_cmd()
-        .args(["tasks", "submit", "derive", "my-item", "--retry-failed"])
+        .args([
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--retry-failed",
+        ])
         .env("IA_ACCESS_KEY_ID", "test_access")
         .env("IA_SECRET_ACCESS_KEY", "test_secret")
         .output()
@@ -678,8 +687,9 @@ async fn test_tasks_submit_wait() {
             &host,
             "tasks",
             "submit",
-            "derive",
             "my-item",
+            "--cmd",
+            "derive",
             "--wait",
             "--wait-interval",
             "1",
@@ -835,8 +845,9 @@ async fn test_tasks_submit_rate_limited_retry() {
             &host,
             "tasks",
             "submit",
-            "derive",
             "my-item",
+            "--cmd",
+            "derive",
             "--json",
         ])
         .env("IA_ACCESS_KEY_ID", "test_access")
@@ -945,8 +956,9 @@ async fn test_tasks_submit_malformed_args() {
         .args([
             "tasks",
             "submit",
-            "derive",
             "my-item",
+            "--cmd",
+            "derive",
             "--args",
             "remove_derived",
         ])
@@ -988,6 +1000,7 @@ async fn test_tasks_submit_wait_with_batch_errors() {
             &host,
             "tasks",
             "submit",
+            "--cmd",
             "derive",
             "--itemlist",
             itemlist_path.to_str().unwrap(),
@@ -1027,8 +1040,9 @@ async fn test_tasks_submit_with_args_and_comment() {
             &host,
             "tasks",
             "submit",
-            "derive",
             "my-item",
+            "--cmd",
+            "derive",
             "--args",
             "remove_derived=*.jpg",
             "--comment",
@@ -1182,5 +1196,186 @@ async fn test_tasks_completed_only_with_task_id() {
         output.status.success(),
         "--completed-only with --task-id should succeed, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn test_tasks_submit_spreadsheet_nonexistent() {
+    let output = ia_cmd()
+        .args(["tasks", "submit", "--spreadsheet", "/nonexistent/jobs.csv"])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read spreadsheet") || stderr.contains("No such file"),
+        "should report file error, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_tasks_rerun_auto_stdin() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "888": "item-z" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Create a temp file with task IDs to pipe via stdin
+    let dir = tempfile::tempdir().unwrap();
+    let ids_path = dir.path().join("ids.txt");
+    {
+        let mut f = std::fs::File::create(&ids_path).unwrap();
+        writeln!(f, "888").unwrap();
+        writeln!(f, "999").unwrap();
+    }
+
+    let host = mock_server.uri().replace("http://", "");
+    // No explicit `-` — stdin is auto-detected
+    let output = ia_cmd()
+        .args(["--insecure", "-H", &host, "tasks", "rerun", "--json"])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .pipe_stdin(&ids_path)
+        .unwrap()
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("\"task_id\":888"),
+        "should contain task_id 888, stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"task_id\":999"),
+        "should contain task_id 999, stdout: {stdout}"
+    );
+    // Should NOT contain deprecation warning (no `-` was used)
+    assert!(
+        !stderr.contains("deprecated"),
+        "should not show deprecation warning without explicit -, stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_tasks_rerun_deprecated_dash_warns() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "111": "item-a" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ids_path = dir.path().join("ids.txt");
+    {
+        let mut f = std::fs::File::create(&ids_path).unwrap();
+        writeln!(f, "111").unwrap();
+    }
+
+    let host = mock_server.uri().replace("http://", "");
+    // Explicit `-` should show deprecation warning
+    let output = ia_cmd()
+        .args(["--insecure", "-H", &host, "tasks", "rerun", "-", "--json"])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .pipe_stdin(&ids_path)
+        .unwrap()
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "should show deprecation warning for explicit '-', stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"task_id\":111"),
+        "should still work, stdout: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn test_tasks_submit_cmd_required_without_spreadsheet() {
+    // When no positional args and no --spreadsheet, should error about missing cmd
+    let output = ia_cmd()
+        .args(["tasks", "submit", "--itemlist", "/dev/null"])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--cmd") || stderr.contains("required"),
+        "should explain --cmd is required, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_tasks_submit_custom_cmd_with_itemlist() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "task_id": 1234, "log": "https://catalogd.archive.org/log/1234" }
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let itemlist_path = dir.path().join("items.txt");
+    std::fs::write(&itemlist_path, "item-one\nitem-two\n").unwrap();
+
+    let host = mock_server.uri().replace("http://", "");
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "--cmd",
+            "reduce_item",
+            "--itemlist",
+            itemlist_path.to_str().unwrap(),
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "custom command with --itemlist should work, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let success_count = stdout
+        .lines()
+        .filter(|l| l.contains("\"success\":true"))
+        .count();
+    assert_eq!(
+        success_count, 2,
+        "expected 2 successes, got stdout: {stdout}"
     );
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use color_print::cstr;
+use console::style;
 use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -13,6 +14,7 @@ use tokio::task::JoinSet;
 
 use comfy_table::{Cell, Color, Table};
 
+use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup,
@@ -140,12 +142,12 @@ pub enum MetadataCommand {
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Export from a CSV file</dim>\n  <bold>$ ia metadata export items.csv</bold>\
-             \n\n  <dim># Export from a plain text ID list</dim>\n  <bold>$ ia metadata export ids.txt</bold>\
+             \n\n  <dim># Export from a plain text ID list</dim>\n  <bold>$ ia metadata export --itemlist ids.txt</bold>\
              \n\n  <dim># Export search results as JSONL</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
              \n\n  <dim># Export to CSV file</dim>\n  <bold>$ ia metadata export items.csv -o data.csv</bold>\
              \n\n  <dim># Pipe identifiers from another command</dim>\n  <bold>$ ia search \"collection:nasa\" -f identifier | ia metadata export</bold>\
              \n\n  <dim># Export to XLSX for editing, then re-import</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.xlsx</bold>\
-             \n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\n"
+             \n  <bold>$ ia metadata --spreadsheet data.xlsx --dry-run</bold>\n"
         ),
     )]
     Export(ExportArgs),
@@ -218,30 +220,8 @@ pub enum MetadataCommand {
     )]
     Remove(WriteSubArgs),
 
-    /// Bulk write metadata from a spreadsheet or data file
-    #[command(
-        long_about = "Import metadata changes from a CSV, TSV, XLSX, ODS, or JSONL file. \
-            The file must have an 'identifier' column. All other columns are metadata fields.\n\n\
-            By default, columns are treated as modify (set/replace) operations. \
-            Use column prefixes for other operations:\n\
-            \x20 append:field       — append text to string field\n\
-            \x20 append-list:field  — append value to list field\n\
-            \x20 insert:field[N]    — insert at index N in list\n\
-            \x20 remove:field       — remove value from field\n\n\
-            Multi-value fields use indexed columns: subject[0], subject[1], etc. \
-            These are merged into an array and set as a whole (not per-index). \
-            A single indexed column (e.g. only subject[0]) is treated as a bare field. \
-            Use REMOVE_TAG as a value to delete entries or entire fields.\n\n\
-            Empty cells are skipped — they do not modify the field.",
-        after_long_help = cstr!(
-            "<bold><underline>Examples:</underline></bold>\n\
-             \n  <dim># Import from CSV</dim>\n  <bold>$ ia metadata import data.csv</bold>\
-             \n\n  <dim># Preview changes</dim>\n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\
-             \n\n  <dim># CSV with mixed operations</dim>\n  <bold>$ cat data.csv</bold>\
-             \n  <dim>identifier,title,append-list:subject,remove:subject</dim>\
-             \n  <dim>myitem,New Title,astronomy,old_tag</dim>\n"
-        ),
-    )]
+    /// Bulk write metadata from a spreadsheet (deprecated: use --spreadsheet)
+    #[command(hide = true)]
     Import(ImportArgs),
 
     /// Look up Internet Archive metadata field definitions
@@ -279,6 +259,10 @@ pub struct ExportArgs {
     /// Input files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line)
     #[arg()]
     pub files: Vec<PathBuf>,
+
+    /// Read identifiers from file (one per line)
+    #[arg(long)]
+    pub itemlist: Option<PathBuf>,
 
     /// Use search results as input
     #[arg(long)]
@@ -366,7 +350,8 @@ pub struct SchemaArgs {
 #[derive(Args)]
 #[command(
     long_about = "Read or modify Internet Archive item metadata. Shows metadata as JSON \
-        by default. Use subcommands for write operations, bulk export, or bulk import.\n\n\
+        by default. Use subcommands for write operations, bulk export, or batch import \
+        via --spreadsheet.\n\n\
         Chain multiple write operations with + for a single HTTP request:\n  \
         ia metadata modify ID -m field:val + remove -m field:val",
     after_long_help = cstr!(
@@ -377,13 +362,18 @@ pub struct SchemaArgs {
          \n\n  <dim># Compound operations (single request)</dim>\
          \n  <bold>$ ia metadata modify nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
          \n\n  <dim># Bulk export</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-         \n\n  <dim># Bulk import</dim>\n  <bold>$ ia metadata import data.csv</bold>\
+         \n\n  <dim># Batch import from spreadsheet</dim>\n  <bold>$ ia metadata --spreadsheet data.csv</bold>\
+         \n\n  <dim># Preview spreadsheet changes</dim>\n  <bold>$ ia metadata --spreadsheet data.xlsx --dry-run</bold>\
          \n\n  <dim># Browse metadata field definitions</dim>\n  <bold>$ ia metadata schema</bold>\
          \n  <bold>$ ia metadata schema title</bold>\n"
     ),
     subcommand_required = false,
 )]
 pub struct MetadataArgs {
+    /// Batch write metadata from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
+    #[arg(long, conflicts_with_all = ["identifiers", "exists", "formats"])]
+    pub spreadsheet: Option<PathBuf>,
+
     /// Item identifier(s)
     #[arg()]
     pub identifiers: Vec<String>,
@@ -403,6 +393,27 @@ pub struct MetadataArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    // ── Spreadsheet-mode options ──────────────────────────────────────────
+    /// Target: "metadata" (default) or "files/FILENAME"
+    #[arg(long, default_value = "metadata", requires = "spreadsheet")]
+    pub target: String,
+
+    /// Optimistic concurrency check (repeatable, field:expected_value)
+    #[arg(long, requires = "spreadsheet")]
+    pub expect: Vec<String>,
+
+    /// Task priority (default: -5 for batch)
+    #[arg(long, requires = "spreadsheet")]
+    pub priority: Option<i32>,
+
+    /// Accept reduced priority to reduce rate limiting
+    #[arg(long, requires = "spreadsheet")]
+    pub reduced_priority: bool,
+
+    /// Show changes without writing
+    #[arg(long, requires = "spreadsheet")]
+    pub dry_run: bool,
 
     #[command(subcommand)]
     pub command: Option<MetadataCommand>,
@@ -433,6 +444,35 @@ pub async fn run(
         jobs,
         joblog_path,
     };
+
+    // Deprecated `import` subcommand → redirect to --spreadsheet path
+    if let Some(MetadataCommand::Import(sub)) = args.command {
+        if continuations.is_some() {
+            bail!("compound operations (+) cannot be used with --spreadsheet");
+        }
+        eprintln!(
+            "{}: 'ia metadata import' is deprecated, use 'ia metadata --spreadsheet <FILE>' instead",
+            style("warning").yellow().bold(),
+        );
+        return run_import(client, sub, &ctx).await;
+    }
+
+    // --spreadsheet: batch metadata import
+    if args.spreadsheet.is_some() {
+        if continuations.is_some() {
+            bail!("compound operations (+) cannot be used with --spreadsheet");
+        }
+        let import_args = ImportArgs {
+            file: args.spreadsheet,
+            target: args.target,
+            expect: args.expect,
+            priority: args.priority,
+            reduced_priority: args.reduced_priority,
+            dry_run: args.dry_run,
+            json: args.json,
+        };
+        return run_import(client, import_args, &ctx).await;
+    }
 
     match args.command {
         Some(MetadataCommand::Export(sub)) => {
@@ -488,12 +528,7 @@ pub async fn run(
             )
             .await
         }
-        Some(MetadataCommand::Import(sub)) => {
-            if continuations.is_some() {
-                bail!("compound operations (+) cannot be used with import");
-            }
-            run_import(client, sub, &ctx).await
-        }
+        Some(MetadataCommand::Import(_)) => unreachable!("handled above"),
         Some(MetadataCommand::Schema(sub)) => {
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with schema");
@@ -800,6 +835,16 @@ async fn collect_identifiers_from_export(
         ids.extend(file_ids);
     }
 
+    // --itemlist: plain text file with one identifier per line
+    if let Some(ref itemlist_path) = args.itemlist {
+        let file_ids =
+            ia_core::spreadsheet::read_identifiers_from_file(itemlist_path).context(format!(
+                "failed to read identifiers from {}",
+                itemlist_path.display()
+            ))?;
+        ids.extend(file_ids);
+    }
+
     // Search
     if let Some(ref query) = args.search {
         let opts = SearchOpts::default();
@@ -810,9 +855,10 @@ async fn collect_identifiers_from_export(
         }
     }
 
-    // stdin fallback: when no files and no search, read from stdin if piped
+    // stdin fallback: when no files, no itemlist, and no search, read from stdin if piped
     if ids.is_empty()
         && args.files.is_empty()
+        && args.itemlist.is_none()
         && args.search.is_none()
         && !std::io::stdin().is_terminal()
     {
@@ -820,9 +866,8 @@ async fn collect_identifiers_from_export(
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let line = line.context("failed to read from stdin")?;
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed);
+            if let Some(id) = parse_identifier_line(&line) {
+                ids.push(id);
             }
         }
     }
@@ -1249,7 +1294,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
             }
             bail!(
                 "missing required argument: <FILE>\n\
-                 Usage: ia metadata import <FILE> [OPTIONS]\n\n\
+                 Usage: ia metadata --spreadsheet <FILE> [OPTIONS]\n\n\
                  To apply metadata to identifiers from stdin, use modify:\n  \
                  ... | ia metadata modify -m key:value"
             );
@@ -1569,9 +1614,8 @@ async fn collect_identifiers_from_batch(
         let content = std::fs::read_to_string(path)
             .context(format!("failed to read itemlist: {}", path.display()))?;
         for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed.to_string());
+            if let Some(id) = parse_identifier_line(line) {
+                ids.push(id);
             }
         }
     }
@@ -1595,9 +1639,8 @@ async fn collect_identifiers_from_batch(
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let line = line.context("failed to read from stdin")?;
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                ids.push(trimmed);
+            if let Some(id) = parse_identifier_line(&line) {
+                ids.push(id);
             }
         }
     }

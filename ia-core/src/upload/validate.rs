@@ -2,60 +2,6 @@ use crate::error::IaError;
 use crate::IaClient;
 use std::path::Path;
 
-/// Validate an IA identifier.
-///
-/// Rules: 3-100 chars, `[a-zA-Z0-9._-@]`, must start with alphanumeric or `@`.
-///
-/// # Examples
-///
-/// ```
-/// use ia_core::upload::validate::validate_identifier;
-///
-/// assert!(validate_identifier("nasa").is_ok());
-/// assert!(validate_identifier("@username").is_ok());
-/// assert!(validate_identifier("ab").is_err()); // too short
-/// assert!(validate_identifier("has space").is_err()); // invalid char
-/// ```
-pub fn validate_identifier(id: &str) -> Result<(), IaError> {
-    if id.is_empty() || id.len() < 3 {
-        return Err(IaError::InvalidIdentifier {
-            identifier: id.to_string(),
-            reason: "must be at least 3 characters".into(),
-        });
-    }
-    if id.len() > 100 {
-        return Err(IaError::InvalidIdentifier {
-            identifier: id.to_string(),
-            reason: "must be at most 100 characters".into(),
-        });
-    }
-
-    let Some(first) = id.chars().next() else {
-        return Err(IaError::InvalidIdentifier {
-            identifier: id.to_string(),
-            reason: "identifier is empty".into(),
-        });
-    };
-    if !first.is_ascii_alphanumeric() && first != '@' {
-        return Err(IaError::InvalidIdentifier {
-            identifier: id.to_string(),
-            reason: format!("must start with alphanumeric or '@', got '{first}'"),
-        });
-    }
-
-    if let Some(bad) = id
-        .chars()
-        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' | '@'))
-    {
-        return Err(IaError::InvalidIdentifier {
-            identifier: id.to_string(),
-            reason: format!("contains invalid character '{bad}'"),
-        });
-    }
-
-    Ok(())
-}
-
 /// Validate that required metadata fields are present.
 ///
 /// Required fields: `mediatype`, `collection`. Values must be non-empty.
@@ -134,50 +80,6 @@ pub fn validate_file(path: &Path) -> Result<(), IaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- validate_identifier tests --
-
-    #[test]
-    fn valid_identifiers() {
-        assert!(validate_identifier("nasa").is_ok());
-        assert!(validate_identifier("my-item-123").is_ok());
-        assert!(validate_identifier("test.item").is_ok());
-        assert!(validate_identifier("a_b_c").is_ok());
-        assert!(validate_identifier("abc").is_ok());
-        assert!(validate_identifier("@username").is_ok());
-    }
-
-    #[test]
-    fn invalid_identifier_too_short() {
-        assert!(validate_identifier("ab").is_err());
-        assert!(validate_identifier("").is_err());
-    }
-
-    #[test]
-    fn invalid_identifier_too_long() {
-        let long = "a".repeat(101);
-        assert!(validate_identifier(&long).is_err());
-    }
-
-    #[test]
-    fn invalid_identifier_bad_chars() {
-        assert!(validate_identifier("has space").is_err());
-        assert!(validate_identifier("has!bang").is_err());
-        assert!(validate_identifier("has#hash").is_err());
-    }
-
-    #[test]
-    fn invalid_identifier_bad_start() {
-        assert!(validate_identifier(".dotstart").is_err());
-        assert!(validate_identifier("_understart").is_err());
-        assert!(validate_identifier("-dashstart").is_err());
-    }
-
-    #[test]
-    fn valid_identifier_at_max_length() {
-        let exactly_100 = "a".repeat(100);
-        assert!(validate_identifier(&exactly_100).is_ok());
-    }
 
     // -- validate_required_metadata tests --
 

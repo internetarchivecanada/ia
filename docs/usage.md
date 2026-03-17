@@ -345,13 +345,13 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 #### Subcommands
 
-**`ia upload import <SPREADSHEET>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
+**`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
 Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--skip-existing`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
 
-**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload import`.
+**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
 
 | Flag | Description |
 |------|-------------|
@@ -391,12 +391,12 @@ ia upload my-item big-video.mp4 --multipart
 ia upload my-item ./files/ --skip-existing
 
 # Batch upload from a spreadsheet
-ia upload import batch.csv
+ia upload --spreadsheet batch.csv
 
 # Generate a template, edit it, then batch upload
 ia upload template ./files/ -o template.csv
 # ... edit template.csv to add metadata columns ...
-ia upload import template.csv
+ia upload --spreadsheet template.csv
 
 # Abort stale multipart uploads
 ia upload cleanup my-item
@@ -470,13 +470,13 @@ ia tasks --json
 Submit a new task to the Tasks API.
 
 ```sh
-ia tasks submit <CMD> [IDENTIFIER] [OPTIONS]
+ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `<CMD>` | Task command (e.g. `derive`, auto-appends `.php` if needed) |
 | `[IDENTIFIER]` | Item identifier (omit for batch mode) |
+| `--cmd <CMD>` | Task command (e.g. `derive`, auto-appends `.php` if needed). Required unless `--spreadsheet` is used. |
 | `--args <K=V>` | Task arguments (repeatable) |
 | `--comment <TEXT>` | Explanation for why the task is being submitted |
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
@@ -486,28 +486,32 @@ ia tasks submit <CMD> [IDENTIFIER] [OPTIONS]
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
+| `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). |
 | `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
 | `--dry-run` | Print what would be submitted without sending |
 | `--json` | Output as JSON |
 
 ```sh
 # Submit a derive task
-ia tasks submit derive my-item
+ia tasks submit my-item --cmd derive
 
 # Submit with a comment
-ia tasks submit make_dark my-item --comment "curation request"
+ia tasks submit my-item --cmd make_dark --comment "curation request"
 
 # Submit to multiple items from a file
-ia tasks submit derive --itemlist items.txt --comment "re-derive"
+ia tasks submit --cmd derive --itemlist items.txt --comment "re-derive"
 
 # Submit to items from a search query
-ia tasks submit derive --search "collection:nasa" --comment "re-derive all"
+ia tasks submit --cmd derive --search "collection:nasa" --comment "re-derive all"
 
 # Submit with custom args
-ia tasks submit derive my-item --args remove_derived="*.jpg"
+ia tasks submit my-item --cmd derive --args remove_derived="*.jpg"
 
 # Submit and wait for completion
-ia tasks submit derive my-item --wait
+ia tasks submit my-item --cmd derive --wait
+
+# Batch submit from a spreadsheet
+ia tasks submit --spreadsheet jobs.csv
 ```
 
 #### `ia tasks log`
@@ -563,7 +567,7 @@ ia tasks rerun 1234567 1234568 1234569
 ia tasks rerun --cmd derive.php
 
 # Rerun from a pipeline
-ia tasks --cmd derive.php --color red --json | ia tasks rerun -
+ia tasks --cmd derive.php --color red --json | ia tasks rerun
 ```
 
 #### `ia tasks rate-limit`

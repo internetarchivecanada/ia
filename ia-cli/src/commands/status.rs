@@ -26,7 +26,7 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
-pub async fn run(args: StatusArgs) -> Result<()> {
+pub async fn run(args: StatusArgs, quiet: u8) -> Result<()> {
     let path = &args.joblog;
 
     if !path.exists() {
@@ -82,6 +82,9 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             })
         );
         if summary.failed > 0 {
+            // Intentional: exit with code 1 after clean JSON output.
+            // Using bail!() would cause anyhow to print an extra error line
+            // after the JSON, breaking machine-readable output.
             std::process::exit(1);
         }
         return Ok(());
@@ -106,99 +109,105 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    println!(
-        "Job log: {} (last updated {})\n",
-        style(path.display()).bold(),
-        mtime_str
-    );
-
-    println!("  Total files:      {:>6}", summary.total);
-
-    if summary.succeeded > 0 {
-        let pct = 100.0 * summary.succeeded as f64 / summary.total as f64;
+    if quiet == 0 {
         println!(
-            "  {} Succeeded:      {:>6} ({:.1}%)",
-            style("✓").green(),
-            summary.succeeded,
-            pct
+            "Job log: {} (last updated {})\n",
+            style(path.display()).bold(),
+            mtime_str
         );
+
+        println!("  Total files:      {:>6}", summary.total);
+
+        if summary.succeeded > 0 {
+            let pct = 100.0 * summary.succeeded as f64 / summary.total as f64;
+            println!(
+                "  {} Succeeded:      {:>6} ({:.1}%)",
+                style("✓").green(),
+                summary.succeeded,
+                pct
+            );
+        }
+
+        if summary.failed > 0 {
+            let pct = 100.0 * summary.failed as f64 / summary.total as f64;
+            println!(
+                "  {} Failed:         {:>6} ({:.1}%)",
+                style("✗").red(),
+                summary.failed,
+                pct
+            );
+        }
+
+        if summary.skipped > 0 {
+            let pct = 100.0 * summary.skipped as f64 / summary.total as f64;
+            println!(
+                "  {} Skipped:        {:>6} ({:.1}%)",
+                style("○").yellow(),
+                summary.skipped,
+                pct
+            );
+        }
+
+        // Show failed items
+        let failed = joblog::failed_files(&entries);
+        if !failed.is_empty() {
+            println!("\n  Failed files:");
+            for (item, file) in &failed {
+                let error_msg = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.item == *item && e.file == *file && e.status == "error")
+                    .and_then(|e| e.error.clone())
+                    .unwrap_or_else(|| "unknown error".to_string());
+
+                println!("    {}/{}", style(item).dim(), file);
+                println!("      {}", style(&error_msg).red());
+            }
+
+            // Detect operation type for the retry hint
+            let has_uploads = entries.iter().any(|e| e.op == "upload");
+            let retry_cmd = if has_uploads {
+                "ia upload --spreadsheet <file> --retry-failed --joblog <file>"
+            } else {
+                "ia download --retry-failed --joblog <file>"
+            };
+            println!("\n  Run {} to retry failures.", style(retry_cmd).cyan());
+        }
+
+        // Show AI section if present
+        if let Some(ai) = joblog::ai_summarize(&entries) {
+            println!("\n  {}", style("AI Operations").bold().underlined());
+            println!("  Items analyzed:     {:>6}", ai.items_analyzed);
+            if ai.items_with_changes > 0 {
+                println!("  Items with changes: {:>6}", ai.items_with_changes);
+            }
+            if ai.changes_applied > 0 {
+                println!("  Changes applied:    {:>6}", ai.changes_applied);
+            }
+            if ai.items_errored > 0 {
+                println!("  Items errored:      {:>6}", style(ai.items_errored).red());
+            }
+            if ai.items_skipped > 0 {
+                println!("  Items skipped:      {:>6}", ai.items_skipped);
+            }
+            if ai.prompt_tokens > 0 || ai.completion_tokens > 0 {
+                let total_tokens = ai.prompt_tokens + ai.completion_tokens;
+                println!(
+                    "  Tokens used:        {:>6} ({} prompt + {} completion)",
+                    total_tokens, ai.prompt_tokens, ai.completion_tokens
+                );
+            }
+            if ai.undos > 0 {
+                println!(
+                    "  Undo operations:    {:>6} ({} changes reversed)",
+                    ai.undos, ai.changes_reversed
+                );
+            }
+        }
     }
 
     if summary.failed > 0 {
-        let pct = 100.0 * summary.failed as f64 / summary.total as f64;
-        println!(
-            "  {} Failed:         {:>6} ({:.1}%)",
-            style("✗").red(),
-            summary.failed,
-            pct
-        );
-    }
-
-    if summary.skipped > 0 {
-        let pct = 100.0 * summary.skipped as f64 / summary.total as f64;
-        println!(
-            "  {} Skipped:        {:>6} ({:.1}%)",
-            style("○").yellow(),
-            summary.skipped,
-            pct
-        );
-    }
-
-    // Show failed items
-    let failed = joblog::failed_files(&entries);
-    if !failed.is_empty() {
-        println!("\n  Failed files:");
-        for (item, file) in &failed {
-            let error_msg = entries
-                .iter()
-                .rev()
-                .find(|e| e.item == *item && e.file == *file && e.status == "error")
-                .and_then(|e| e.error.clone())
-                .unwrap_or_else(|| "unknown error".to_string());
-
-            println!("    {}/{}", style(item).dim(), file);
-            println!("      {}", style(&error_msg).red());
-        }
-
-        // Detect operation type for the retry hint
-        let has_uploads = entries.iter().any(|e| e.op == "upload");
-        let retry_cmd = if has_uploads {
-            "ia upload import <spreadsheet> --retry-failed --joblog <file>"
-        } else {
-            "ia download --retry-failed --joblog <file>"
-        };
-        println!("\n  Run {} to retry failures.", style(retry_cmd).cyan());
-    }
-
-    // Show AI section if present
-    if let Some(ai) = joblog::ai_summarize(&entries) {
-        println!("\n  {}", style("AI Operations").bold().underlined());
-        println!("  Items analyzed:     {:>6}", ai.items_analyzed);
-        if ai.items_with_changes > 0 {
-            println!("  Items with changes: {:>6}", ai.items_with_changes);
-        }
-        if ai.changes_applied > 0 {
-            println!("  Changes applied:    {:>6}", ai.changes_applied);
-        }
-        if ai.items_errored > 0 {
-            println!("  Items errored:      {:>6}", style(ai.items_errored).red());
-        }
-        if ai.items_skipped > 0 {
-            println!("  Items skipped:      {:>6}", ai.items_skipped);
-        }
-        if ai.prompt_tokens > 0 || ai.completion_tokens > 0 {
-            let total_tokens = ai.prompt_tokens + ai.completion_tokens;
-            println!(
-                "  Tokens used:        {:>6} ({} prompt + {} completion)",
-                total_tokens, ai.prompt_tokens, ai.completion_tokens
-            );
-        }
-        if ai.undos > 0 {
-            println!(
-                "  Undo operations:    {:>6} ({} changes reversed)",
-                ai.undos, ai.changes_reversed
-            );
-        }
+        std::process::exit(1);
     }
 
     Ok(())

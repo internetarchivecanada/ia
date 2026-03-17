@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::error::{IaError, Result};
+use crate::identifier::validate_identifier;
 use crate::upload::single::upload_file;
 use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
-use crate::upload::validate::{validate_file, validate_identifier, validate_required_metadata};
+use crate::upload::validate::{validate_file, validate_required_metadata};
 use crate::IaClient;
 
 /// Upload multiple files to a single IA item.
