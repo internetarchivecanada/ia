@@ -130,15 +130,20 @@ pub struct BatchInput {
 pub enum MetadataCommand {
     /// Bulk export metadata to stdout or file
     #[command(
-        long_about = "Export metadata for multiple items. Outputs JSONL to stdout by default, \
-            or writes to a file in CSV, TSV, XLSX, or JSONL format (inferred from extension).\n\n\
-            In file mode, multi-value fields are expanded into indexed columns: \
-            subject[0], subject[1], etc. Single-element arrays use a bare column name. \
-            These columns round-trip correctly with 'ia metadata import'.",
+        long_about = "Export metadata for multiple items. Reads identifiers from files \
+            (CSV, TSV, XLSX, ODS, JSONL, or plain text), search results, or stdin.\n\n\
+            For spreadsheet files, the 'identifier' column is extracted. Plain text files \
+            and stdin are read as one identifier per line.\n\n\
+            Outputs JSONL to stdout by default, or writes to a file in CSV, TSV, XLSX, \
+            or JSONL format (inferred from extension). In file mode, multi-value fields \
+            are expanded into indexed columns: subject[0], subject[1], etc.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
-             \n  <dim># Export search results as JSONL</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-             \n\n  <dim># Export to CSV file</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.csv</bold>\
+             \n  <dim># Export from a CSV file</dim>\n  <bold>$ ia metadata export items.csv</bold>\
+             \n\n  <dim># Export from a plain text ID list</dim>\n  <bold>$ ia metadata export ids.txt</bold>\
+             \n\n  <dim># Export search results as JSONL</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
+             \n\n  <dim># Export to CSV file</dim>\n  <bold>$ ia metadata export items.csv -o data.csv</bold>\
+             \n\n  <dim># Pipe identifiers from another command</dim>\n  <bold>$ ia search \"collection:nasa\" -f identifier | ia metadata export</bold>\
              \n\n  <dim># Export to XLSX for editing, then re-import</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.xlsx</bold>\
              \n  <bold>$ ia metadata import data.xlsx --dry-run</bold>\n"
         ),
@@ -271,8 +276,13 @@ pub struct WriteSubArgs {
 
 #[derive(Debug, Args)]
 pub struct ExportArgs {
-    #[command(flatten)]
-    pub input: BatchInput,
+    /// Input files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line)
+    #[arg()]
+    pub files: Vec<PathBuf>,
+
+    /// Use search results as input
+    #[arg(long)]
+    pub search: Option<String>,
 
     /// Output file (format inferred from extension: .csv, .tsv, .xlsx, .jsonl)
     #[arg(short = 'o', long)]
@@ -290,7 +300,7 @@ pub struct ExportArgs {
 #[derive(Debug, Args)]
 pub struct ImportArgs {
     /// Path to spreadsheet or data file (CSV, TSV, XLSX, ODS, JSONL)
-    pub file: PathBuf,
+    pub file: Option<PathBuf>,
 
     /// Target: "metadata" (default) or "files/FILENAME"
     #[arg(long, default_value = "metadata")]
@@ -374,9 +384,9 @@ pub struct SchemaArgs {
     subcommand_required = false,
 )]
 pub struct MetadataArgs {
-    /// Item identifier
+    /// Item identifier(s)
     #[arg()]
-    pub identifier: Option<String>,
+    pub identifiers: Vec<String>,
 
     /// Check if item exists (exit code 0/1)
     #[arg(short = 'e', long)]
@@ -429,7 +439,7 @@ pub async fn run(
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with export");
             }
-            run_export(client, sub, ctx.quiet).await
+            run_export(client, sub, ctx.quiet, ctx.jobs).await
         }
         Some(MetadataCommand::Modify(sub)) => {
             run_write(
@@ -494,19 +504,46 @@ pub async fn run(
             if continuations.is_some() {
                 bail!("compound operations (+) require a write subcommand (modify, append, etc.)");
             }
-            // Bare read mode
-            let identifier = args.identifier.ok_or_else(|| {
-                anyhow::anyhow!("identifier required. Run 'ia metadata --help' for usage.")
-            })?;
-            run_read(
-                client,
-                &identifier,
-                args.exists,
-                args.formats,
-                args.pretty,
-                args.json,
-            )
-            .await
+            if args.identifiers.is_empty() {
+                bail!("identifier required. Run 'ia metadata --help' for usage.");
+            }
+            if args.identifiers.len() > 1 && (args.exists || args.formats) {
+                let flag = if args.exists { "--exists" } else { "--formats" };
+                bail!("{flag} can only be used with a single identifier");
+            }
+            // Hint: if the single identifier looks like an existing file, suggest export
+            if args.identifiers.len() == 1 {
+                let path = std::path::Path::new(&args.identifiers[0]);
+                if path.exists() && path.is_file() {
+                    bail!(
+                        "\"{}\" appears to be a file. To export metadata from a file, use:\n  \
+                         ia metadata export {}",
+                        args.identifiers[0],
+                        args.identifiers[0],
+                    );
+                }
+            }
+            if args.identifiers.len() == 1 {
+                run_read(
+                    client,
+                    &args.identifiers[0],
+                    args.exists,
+                    args.formats,
+                    args.pretty,
+                    args.json,
+                )
+                .await
+            } else {
+                run_read_multi(
+                    client,
+                    &args.identifiers,
+                    args.pretty,
+                    args.json,
+                    ctx.quiet,
+                    ctx.jobs,
+                )
+                .await
+            }
         }
     }
 }
@@ -565,6 +602,50 @@ async fn run_read(
         serde_json::to_string(&item)?
     };
     println!("{output}");
+
+    Ok(())
+}
+
+async fn run_read_multi(
+    client: &IaClient,
+    identifiers: &[String],
+    pretty: bool,
+    _json: bool,
+    _quiet: u8,
+    jobs: usize,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let client = Arc::new(client.clone());
+    let mut set = JoinSet::new();
+
+    for (idx, id) in identifiers.iter().enumerate() {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await?;
+            let item = client
+                .get_item(&id)
+                .await
+                .context(format!("failed to fetch metadata for {id}"))?;
+            Ok::<_, anyhow::Error>((idx, item))
+        });
+    }
+
+    let mut results: Vec<(usize, ia_core::types::ItemMetadata)> = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result??);
+    }
+    results.sort_by_key(|(idx, _)| *idx);
+
+    for (_, item) in &results {
+        let output = if pretty {
+            serde_json::to_string_pretty(item)?
+        } else {
+            serde_json::to_string(item)?
+        };
+        println!("{output}");
+    }
 
     Ok(())
 }
@@ -702,25 +783,105 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
 
 // ─── Export ──────────────────────────────────────────────────────────────────
 
-async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()> {
-    let identifiers = collect_identifiers_from_batch(&args.input, client).await?;
-    if identifiers.is_empty() {
-        bail!("no identifiers to export");
+/// Collect identifiers from export sources (files, --search, stdin).
+/// Positional args are always files. stdin is line-per-ID.
+async fn collect_identifiers_from_export(
+    args: &ExportArgs,
+    client: &IaClient,
+) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+
+    // Read identifiers from each file
+    for path in &args.files {
+        let file_ids = ia_core::spreadsheet::read_identifiers_from_file(path).context(format!(
+            "failed to read identifiers from {}",
+            path.display()
+        ))?;
+        ids.extend(file_ids);
     }
+
+    // Search
+    if let Some(ref query) = args.search {
+        let opts = SearchOpts::default();
+        let mut stream = ia_core::search::scrape(client, query, &opts);
+        while let Some(result) = stream.next().await {
+            let item = result.context("search failed")?;
+            ids.push(item.identifier);
+        }
+    }
+
+    // stdin fallback: when no files and no search, read from stdin if piped
+    if ids.is_empty()
+        && args.files.is_empty()
+        && args.search.is_none()
+        && !std::io::stdin().is_terminal()
+    {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let line = line.context("failed to read from stdin")?;
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                ids.push(trimmed);
+            }
+        }
+    }
+
+    // Deduplicate preserving order
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+
+    // Better error when no input at all
+    if ids.is_empty() {
+        bail!(
+            "No input provided. Pass files, --search, or pipe identifiers via stdin.\n\
+             Examples:\n  \
+             ia metadata export items.csv\n  \
+             ia metadata export --search \"collection:nasa\"\n  \
+             echo id1 | ia metadata export"
+        );
+    }
+
+    Ok(ids)
+}
+
+async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8, jobs: usize) -> Result<()> {
+    let identifiers = collect_identifiers_from_export(&args, client).await?;
+
+    // Fetch all items concurrently with semaphore-bounded parallelism.
+    // Results are collected and sorted by original index for deterministic output.
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let client = Arc::new(client.clone());
+    let mut set = JoinSet::new();
+
+    for (idx, id) in identifiers.iter().enumerate() {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await?;
+            let item = client
+                .get_item(&id)
+                .await
+                .context(format!("failed to fetch metadata for {id}"))?;
+            Ok::<_, anyhow::Error>((idx, id, item))
+        });
+    }
+
+    let mut results: Vec<(usize, String, ia_core::types::ItemMetadata)> = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result??);
+    }
+    results.sort_by_key(|(idx, _, _)| *idx);
 
     // When writing to a file (-o), we collect all records into memory first so we can
     // compute a unified column set across all items. For large exports this may use
-    // significant memory; stdout mode streams items one at a time.
+    // significant memory; stdout mode outputs items one at a time.
     let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
-    for identifier in &identifiers {
-        let item = client
-            .get_item(identifier)
-            .await
-            .context(format!("failed to fetch metadata for {identifier}"))?;
-
+    for (_, identifier, item) in &results {
         if args.output.is_none() {
-            // Stdout mode: output immediately (streaming)
+            // Stdout mode: output immediately
             let output = if args.pretty {
                 serde_json::to_string_pretty(&item)?
             } else {
@@ -789,8 +950,6 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8) -> Result<()
         if quiet < 2 {
             eprintln!("{} item(s) exported to {}", records.len(), path.display());
         }
-    } else if quiet < 2 && !args.json && !args.pretty {
-        eprintln!("{} item(s) exported", identifiers.len());
     }
 
     Ok(())
@@ -1078,10 +1237,27 @@ fn parse_column_op(column_name: &str) -> Result<(MetadataOp, String)> {
 async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> Result<()> {
     let json = args.json;
 
-    let records = ia_core::spreadsheet::read_spreadsheet(&args.file).context(format!(
-        "failed to read spreadsheet: {}",
-        args.file.display()
-    ))?;
+    let file = match args.file {
+        Some(f) => f,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "import reads metadata changes from a spreadsheet file, not stdin.\n\
+                     To apply metadata to piped identifiers, use modify:\n  \
+                     ... | ia metadata modify -m key:value"
+                );
+            }
+            bail!(
+                "missing required argument: <FILE>\n\
+                 Usage: ia metadata import <FILE> [OPTIONS]\n\n\
+                 To apply metadata to identifiers from stdin, use modify:\n  \
+                 ... | ia metadata modify -m key:value"
+            );
+        }
+    };
+
+    let records = ia_core::spreadsheet::read_spreadsheet(&file)
+        .context(format!("failed to read spreadsheet: {}", file.display()))?;
 
     let priority = args.priority.unwrap_or(-5);
 

@@ -759,6 +759,142 @@ fn metadata_import_indexed_columns_accepted() {
         .stderr(predicate::str::contains("parse").not());
 }
 
+// --- metadata export redesign ---
+
+#[test]
+fn metadata_export_accepts_file_positional_arg() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("items.csv");
+    std::fs::write(&csv_path, "identifier,title\ntest-item-nonexistent,Test\n").unwrap();
+
+    // Should succeed (reads identifier from CSV, fetches metadata)
+    // Not fail with "unknown argument" or "unexpected argument"
+    ia().args(["metadata", "export", csv_path.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn metadata_export_file_not_found_error() {
+    ia().args(["metadata", "export", "/nonexistent/file.csv"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No such file")));
+}
+
+#[test]
+fn metadata_export_no_input_shows_help() {
+    // No files, no search, terminal stdin → helpful error
+    ia().args(["metadata", "export"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No input").or(predicate::str::contains("no input")));
+}
+
+#[test]
+fn metadata_export_plain_text_itemlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ids.txt");
+    std::fs::write(&path, "test-nonexistent-id\n").unwrap();
+
+    // Should succeed (reads identifiers from plain text, fetches metadata)
+    ia().args(["metadata", "export", path.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn metadata_export_multiple_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv1 = dir.path().join("a.csv");
+    let csv2 = dir.path().join("b.csv");
+    std::fs::write(&csv1, "identifier\nid1\n").unwrap();
+    std::fs::write(&csv2, "identifier\nid2\n").unwrap();
+
+    // Should succeed with 2 items from 2 files
+    ia().args([
+        "metadata",
+        "export",
+        csv1.to_str().unwrap(),
+        csv2.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+}
+
+#[test]
+fn metadata_export_help_shows_file_input() {
+    ia().args(["metadata", "export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("items.csv"));
+}
+
+// --- multi-ID bare mode ---
+
+#[test]
+fn metadata_bare_multiple_ids_accepted() {
+    // Multiple positional IDs should be accepted and produce JSONL output
+    ia().args(["metadata", "id1", "id2", "id3"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn metadata_bare_exists_rejects_multiple_ids() {
+    ia().args(["metadata", "id1", "id2", "--exists"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("single identifier"));
+}
+
+#[test]
+fn metadata_bare_formats_rejects_multiple_ids() {
+    ia().args(["metadata", "id1", "id2", "--formats"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("single identifier"));
+}
+
+// --- import stdin hint ---
+
+#[test]
+fn metadata_import_no_file_suggests_modify() {
+    // No file arg, no stdin → should suggest modify
+    ia().args(["metadata", "import"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ia metadata modify"));
+}
+
+#[test]
+fn metadata_import_stdin_suggests_modify() {
+    // Piped stdin without a file → should suggest modify
+    ia().args(["metadata", "import"])
+        .write_stdin("some-identifier\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ia metadata modify"));
+}
+
+// --- file-like identifier hint ---
+
+#[test]
+fn metadata_bare_file_like_identifier_hints_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("items.csv");
+    std::fs::write(&csv_path, "identifier\nnasa\n").unwrap();
+
+    // Running bare mode with a file path should hint at export
+    ia().args(["metadata", csv_path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("ia metadata export")
+                .or(predicate::str::contains("ia md export")),
+        );
+}
+
 #[test]
 fn search_advanced_help_has_rows() {
     ia().args(["search", "advanced", "--help"])

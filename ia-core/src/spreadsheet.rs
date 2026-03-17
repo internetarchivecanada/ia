@@ -242,6 +242,42 @@ pub fn merge_indexed_columns(fields: &HashMap<String, String>) -> Vec<(String, s
     resolved
 }
 
+/// File extensions recognized as structured spreadsheet formats.
+const SPREADSHEET_EXTENSIONS: &[&str] = &["csv", "tsv", "xlsx", "ods", "xls", "jsonl", "ndjson"];
+
+/// Read identifiers from a file. Spreadsheet formats (.csv, .tsv, .xlsx, .ods,
+/// .jsonl) are parsed and the `identifier` column is extracted. Unrecognized
+/// extensions (including no extension) are read as plain text — one identifier
+/// per line, skipping blanks and `#` comments. Duplicate identifiers are removed
+/// (preserving first occurrence order).
+pub fn read_identifiers_from_file(path: &Path) -> Result<Vec<String>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let ids: Vec<String> = if SPREADSHEET_EXTENSIONS.contains(&ext.as_str()) {
+        let records = read_spreadsheet(path)?;
+        records.into_iter().map(|(id, _)| id).collect()
+    } else {
+        // Plain text: one identifier per line
+        let content = std::fs::read_to_string(path)?;
+        content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    };
+
+    // Deduplicate preserving order
+    let mut seen = std::collections::HashSet::new();
+    Ok(ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
 /// Write records to a spreadsheet file.
 /// Format auto-detected by file extension: .csv, .tsv, .xlsx, .jsonl
 pub fn write_spreadsheet(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
@@ -708,5 +744,77 @@ mod tests {
             merged[0],
             ("subject".into(), serde_json::json!("REMOVE_TAG"))
         );
+    }
+
+    // -- read_identifiers_from_file tests --
+
+    #[test]
+    fn read_identifiers_from_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("items.csv");
+        std::fs::write(&path, "identifier,title\nnasa,NASA\nmars,Mars\n").unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa", "mars"]);
+    }
+
+    #[test]
+    fn read_identifiers_from_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("items.jsonl");
+        std::fs::write(
+            &path,
+            "{\"identifier\":\"nasa\"}\n{\"identifier\":\"mars\"}\n",
+        )
+        .unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa", "mars"]);
+    }
+
+    #[test]
+    fn read_identifiers_from_plain_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.txt");
+        std::fs::write(&path, "nasa\nmars\n# comment\n\napollo\n").unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa", "mars", "apollo"]);
+    }
+
+    #[test]
+    fn read_identifiers_from_extensionless_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("myids");
+        std::fs::write(&path, "nasa\nmars\n").unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa", "mars"]);
+    }
+
+    #[test]
+    fn read_identifiers_from_tsv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("items.tsv");
+        std::fs::write(&path, "identifier\ttitle\nnasa\tNASA\n").unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa"]);
+    }
+
+    #[test]
+    fn read_identifiers_file_not_found() {
+        let path = std::path::Path::new("/nonexistent/file.csv");
+        assert!(read_identifiers_from_file(path).is_err());
+    }
+
+    #[test]
+    fn read_identifiers_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dupes.txt");
+        std::fs::write(&path, "nasa\nmars\nnasa\n").unwrap();
+
+        let ids = read_identifiers_from_file(&path).unwrap();
+        assert_eq!(ids, vec!["nasa", "mars"]);
     }
 }
