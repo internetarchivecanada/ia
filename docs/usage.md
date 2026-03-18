@@ -408,6 +408,28 @@ ia upload my-item file.pdf --dry-run
 ia upload my-item ./files/ --dashboard
 ```
 
+#### Resuming Uploads
+
+When `--joblog` is provided, uploads automatically resume from where they left off. Files that were successfully uploaded in a previous run (recorded in the joblog) are skipped, so you can safely re-run the same command after an interruption.
+
+```sh
+# First run — uploads all files, logs results
+ia upload --spreadsheet batch.csv --joblog upload.jsonl
+
+# Interrupted! Re-run the same command — completed files are skipped
+ia upload --spreadsheet batch.csv --joblog upload.jsonl
+
+# Force re-upload everything (ignore previous successes)
+ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume
+
+# Single-item resume works the same way
+ia upload my-item ./files/ --joblog upload.jsonl
+```
+
+The resume mechanism reads the joblog at startup and builds a set of `(identifier, filename)` pairs that completed successfully. Any file matching a pair in the set is skipped with a `Resumed` status. The `--no-resume` flag disables this behavior, forcing all files to be re-uploaded.
+
+Use `ia status --joblog upload.jsonl` to see a summary of completed, failed, and skipped files.
+
 ### `ia tasks`
 
 Manage Internet Archive catalog tasks: list, submit, view logs, rerun failed tasks, and check rate limits. Alias: `ia ta`.
@@ -854,8 +876,9 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file |
+| `--joblog <PATH>` | Write operation results to a JSONL log file (enables auto-resume for uploads) |
 | `--retry-failed` | Retry failed operations from a job log |
+| `--no-resume` | Don't resume from joblog — upload all files fresh |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
 | `-d, --debug` | Enable debug output |

@@ -59,13 +59,17 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     user_agent_suffix: Option<String>,
 
-    /// Path to job log file
+    /// Write operation results to a JSONL log file (enables auto-resume for uploads)
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
     /// Retry failed operations from job log
     #[arg(long, global = true, help_heading = "Global Options")]
     retry_failed: bool,
+
+    /// Don't resume from joblog — upload all files fresh
+    #[arg(long, global = true, help_heading = "Global Options")]
+    no_resume: bool,
 
     /// Concurrent operations
     #[arg(
@@ -271,6 +275,7 @@ async fn main() -> Result<()> {
                 cli.jobs,
                 cli.joblog,
                 cli.retry_failed,
+                cli.no_resume,
             )
             .await?
         }

@@ -232,7 +232,7 @@ impl UploadTuiState {
                         }
                     }
                 }
-                UploadProgressStatus::Skipped => {
+                UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                     item.files_skipped += 1;
                     if item.files_total > 0
                         && item.files_completed + item.files_skipped + item.files_failed
@@ -312,7 +312,7 @@ impl UploadTuiState {
                     self.completed_files.pop_front();
                 }
             }
-            UploadProgressStatus::Skipped => {
+            UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                 self.active_files.remove(&fk);
                 self.files_skipped += 1;
             }
@@ -489,7 +489,8 @@ async fn run_dashboard_and_summarize(
                             total_uploaded += 1;
                             total_bytes += r.bytes;
                         }
-                        ia_core::upload::UploadStatus::Skipped => {
+                        ia_core::upload::UploadStatus::Skipped
+                        | ia_core::upload::UploadStatus::Resumed => {
                             total_skipped += 1;
                         }
                         ia_core::upload::UploadStatus::Failed(_) => {
@@ -594,6 +595,7 @@ pub async fn run_upload_tui(
     files_per_item: Vec<Vec<std::path::PathBuf>>,
     opts: ia_core::upload::UploadOpts,
     concurrency: usize,
+    skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
 ) -> anyhow::Result<()> {
     // Set up terminal — the guard ensures cleanup even on panic.
     let (terminal, _guard) = super::framework::setup_terminal()?;
@@ -613,6 +615,7 @@ pub async fn run_upload_tui(
         let sem = Arc::clone(&semaphore);
         let progress_state = Arc::clone(&state);
         let cleanup_state = Arc::clone(&state);
+        let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
@@ -622,8 +625,16 @@ pub async fn run_upload_tui(
                         s.update(p);
                     }
                 });
-            let result =
-                ia_core::upload::upload_item(&client, &id, &files, &opts, Some(progress_fn)).await;
+            let result = ia_core::upload::upload_item(
+                &client,
+                &id,
+                &files,
+                &opts,
+                Some(progress_fn),
+                skip.as_deref(),
+                None,
+            )
+            .await;
 
             finalize_item(&cleanup_state, &id, &result);
             result
@@ -647,6 +658,7 @@ pub async fn run_upload_batch_tui(
     records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
     opts: ia_core::upload::UploadOpts,
     jobs: usize,
+    skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
 ) -> anyhow::Result<()> {
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
@@ -679,6 +691,7 @@ pub async fn run_upload_batch_tui(
         let sem = Arc::clone(&semaphore);
         let progress_state = Arc::clone(&state);
         let cleanup_state = Arc::clone(&state);
+        let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
@@ -691,9 +704,16 @@ pub async fn run_upload_batch_tui(
                         s.update(p);
                     }
                 });
-            let result =
-                ia_core::upload::upload_item(&client, &id, &files, &item_opts, Some(progress_fn))
-                    .await;
+            let result = ia_core::upload::upload_item(
+                &client,
+                &id,
+                &files,
+                &item_opts,
+                Some(progress_fn),
+                skip.as_deref(),
+                None,
+            )
+            .await;
 
             finalize_item(&cleanup_state, &id, &result);
             result

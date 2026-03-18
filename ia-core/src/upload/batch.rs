@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,6 +12,9 @@ use crate::upload::item::upload_item;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
 use crate::upload::validate::validate_file;
 use crate::IaClient;
+
+/// Callback invoked after each file result is produced (for streaming joblog writes).
+type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 
 /// A group of files and metadata for a single IA item.
 #[derive(Debug)]
@@ -42,6 +45,8 @@ pub async fn upload_batch(
     opts: &UploadOpts,
     concurrency: usize,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
+    skip_set: Option<Arc<HashSet<(String, String)>>>,
+    on_result: Option<OnResultCallback>,
 ) -> Result<Vec<UploadResult>> {
     if records.is_empty() {
         return Err(IaError::EmptyUpload);
@@ -58,6 +63,8 @@ pub async fn upload_batch(
     let results: Vec<(String, Result<Vec<UploadResult>>)> = stream::iter(groups)
         .map(|group| {
             let progress = progress.clone();
+            let skip = skip_set.clone();
+            let on_res = on_result.clone();
             async move {
                 let id = group.identifier.clone();
                 // Build per-item opts: spreadsheet metadata overrides CLI metadata for same keys
@@ -76,6 +83,8 @@ pub async fn upload_batch(
                     &group.files,
                     &item_opts,
                     progress,
+                    skip.as_deref(),
+                    on_res,
                 )
                 .await;
                 (id, result)

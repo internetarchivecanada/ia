@@ -536,7 +536,7 @@ impl UploadDisplay {
                 self.bar
                     .set_message(format!("{processed}/{files_total} files"));
             }
-            UploadProgressStatus::Skipped => {
+            UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                 *self.files_skipped.lock().unwrap() += 1;
                 let mut processed = self.files_processed.lock().unwrap();
                 *processed += 1;
@@ -631,21 +631,22 @@ struct UploadItemBars {
 }
 
 impl UploadBatchDisplay {
-    pub fn new(items_total: usize, jobs: usize, retry_mode: bool) -> Self {
+    pub fn new(items_total: usize, _jobs: usize) -> Self {
         let multi = MultiProgress::new();
 
-        let verb = if retry_mode { "Retrying" } else { "Uploading" };
-        let _ = multi.println(format!(
-            "{verb} {} items ({} workers)...",
-            style(items_total).bold(),
-            jobs,
-        ));
+        // Primary status line — bright, the thing your eye should land on
         let batch_header = multi.add(ProgressBar::new_spinner());
-        batch_header
-            .set_style(ProgressStyle::with_template("{spinner:.cyan} {prefix}  {msg}").unwrap());
-        batch_header.set_prefix(verb.to_string());
-        batch_header.set_message(format!("0/{items_total} items  0 B uploaded"));
+        batch_header.set_style(ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap());
+        batch_header.set_message(format!(
+            "Uploading  0/{} items  0 B uploaded",
+            style(items_total).bold(),
+        ));
         batch_header.enable_steady_tick(Duration::from_millis(80));
+
+        // Blank line separating summary from per-item detail
+        let spacer = multi.add(ProgressBar::new_spinner());
+        spacer.set_style(ProgressStyle::with_template(" ").unwrap());
+        spacer.finish();
 
         let bottom_sentinel = multi.add(ProgressBar::new_spinner());
         bottom_sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
@@ -688,8 +689,8 @@ impl UploadBatchDisplay {
                 header.set_style(ProgressStyle::with_template("{msg}").unwrap());
                 header.set_message(format!(
                     "{} {}",
-                    style(ICON_HEADER).cyan(),
-                    style(identifier).bold(),
+                    style(ICON_HEADER).dim().cyan(),
+                    style(identifier).dim().bold(),
                 ));
 
                 let bar = self
@@ -697,7 +698,7 @@ impl UploadBatchDisplay {
                     .insert_before(&self.bottom_sentinel, ProgressBar::new(bytes_total));
                 bar.set_style(
                     ProgressStyle::with_template(&format!(
-                        "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes}}/{{total_bytes}} {{bytes_per_sec:.dim}}  ({{msg}})"
+                        "  {{bar:{BAR_WIDTH}.cyan/dim}} {{bytes:.dim}}/{{total_bytes:.dim}} {{bytes_per_sec:.dim}}  ({{msg:.dim}})"
                     ))
                     .unwrap()
                     .progress_chars(PROGRESS_CHARS),
@@ -766,7 +767,7 @@ impl UploadBatchDisplay {
                     self.maybe_finish_item(identifier);
                 }
             }
-            UploadProgressStatus::Skipped => {
+            UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                 let should_finish = {
                     let mut items = self.active_items.lock().unwrap();
                     if let Some(item) = items.get_mut(identifier) {
@@ -848,9 +849,9 @@ impl UploadBatchDisplay {
             String::new()
         };
         self.batch_header.set_message(format!(
-            "{}/{} items  {} uploaded{}",
+            "Uploading  {}/{} items  {} uploaded{}",
             completed,
-            self.items_total,
+            style(self.items_total).bold(),
             format_bytes(bytes),
             style(&speed).dim(),
         ));
@@ -948,7 +949,7 @@ impl UploadBatchDisplay {
                 UploadStatus::Uploaded => {
                     bytes_total += r.bytes;
                 }
-                UploadStatus::Skipped => {
+                UploadStatus::Skipped | UploadStatus::Resumed => {
                     files_skipped += 1;
                 }
                 UploadStatus::Failed(_) => {

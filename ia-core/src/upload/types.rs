@@ -253,6 +253,7 @@ pub struct UploadResult {
 pub enum UploadStatus {
     Uploaded,
     Skipped,
+    Resumed,
     Failed(String),
     DryRun,
 }
@@ -292,6 +293,7 @@ pub enum UploadProgressStatus {
     WaitingRateLimit,
     Complete,
     Skipped,
+    Resumed,
     Failed,
 }
 

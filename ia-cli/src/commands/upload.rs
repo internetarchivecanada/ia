@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +16,44 @@ use ia_core::upload::{
     UploadProgress, UploadResult, UploadStatus,
 };
 use ia_core::IaClient;
+
+/// Set of (item, file) pairs for auto-resume skip checking.
+type SkipSet = std::collections::HashSet<(String, String)>;
+
+/// Callback invoked after each file result is produced (for streaming joblog writes).
+type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
+
+/// Build the auto-resume skip set from an existing joblog.
+fn build_skip_set(
+    joblog_path: &Option<PathBuf>,
+    no_resume: bool,
+    quiet: u8,
+) -> Result<Option<Arc<SkipSet>>> {
+    if no_resume {
+        return Ok(None);
+    }
+    let path = match joblog_path {
+        Some(p) if p.exists() => p,
+        _ => return Ok(None),
+    };
+    let entries = ia_core::joblog::read(path).context(format!(
+        "failed to read joblog for resume: {}",
+        path.display()
+    ))?;
+    let set = ia_core::joblog::successful_files(&entries, "upload");
+    if set.is_empty() {
+        return Ok(None);
+    }
+    if quiet == 0 {
+        eprintln!(
+            "{} Resuming: {} files already uploaded (from {})",
+            style("▸").cyan(),
+            set.len(),
+            path.display(),
+        );
+    }
+    Ok(Some(Arc::new(set)))
+}
 
 // ─── CLI args ────────────────────────────────────────────────────────────────
 
@@ -36,7 +75,12 @@ use ia_core::IaClient;
          \n\n  <dim># Generate a template spreadsheet from a directory</dim>\
          \n  <bold>$ ia upload template ./files/ -o template.csv</bold>\
          \n\n  <dim># Dry run — validate without uploading</dim>\
-         \n  <bold>$ ia upload my-item file.pdf --dry-run</bold>\n"
+         \n  <bold>$ ia upload my-item file.pdf --dry-run</bold>\
+         \n\n  <dim># Resume interrupted uploads (automatic with --joblog)</dim>\
+         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl</bold>\
+         \n  <dim># (re-run same command — already-uploaded files are skipped)</dim>\
+         \n\n  <dim># Force re-upload everything</dim>\
+         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -327,6 +371,7 @@ pub async fn run(
     jobs: usize,
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
+    no_resume: bool,
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
@@ -358,13 +403,11 @@ pub async fn run(
         );
     }
 
-    // --retry-failed is only supported for spreadsheet (batch) uploads
-    let is_batch =
-        args.spreadsheet.is_some() || matches!(args.command, Some(UploadCommand::Import(_)));
-    if retry_failed && !is_batch {
+    if retry_failed {
         bail!(
-            "--retry-failed is only supported with 'ia upload --spreadsheet'.\n\
-             For single-item uploads, re-run the same upload command."
+            "--retry-failed is no longer needed for uploads.\n\
+             Resume is automatic when --joblog is provided. Re-run the same command to resume.\n\
+             Use --no-resume to upload all files fresh."
         );
     }
 
@@ -403,18 +446,18 @@ pub async fn run(
             dashboard: args.dashboard,
             command: None,
         };
-        return run_import(client, &merged, quiet, jobs, joblog_path, retry_failed).await;
+        return run_import(client, &merged, quiet, jobs, joblog_path, no_resume).await;
     }
 
     if args.spreadsheet.is_some() {
-        return run_import(client, &args, quiet, jobs, joblog_path, retry_failed).await;
+        return run_import(client, &args, quiet, jobs, joblog_path, no_resume).await;
     }
 
     match args.command {
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         Some(UploadCommand::Import(_)) => unreachable!("handled above"),
-        None => run_bare_upload(client, args, quiet, joblog_path).await,
+        None => run_bare_upload(client, args, quiet, joblog_path, no_resume).await,
     }
 }
 
@@ -425,6 +468,7 @@ async fn run_bare_upload(
     args: UploadArgs,
     quiet: u8,
     joblog_path: Option<PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     let identifier = args
         .identifier
@@ -482,9 +526,12 @@ async fn run_bare_upload(
         dry_run: args.dry_run,
     };
 
+    // Build auto-resume skip set from joblog (if available)
+    let skip_set = build_skip_set(&joblog_path, no_resume, quiet)?;
+
     // Dry run (interactive): validate and print what would be uploaded
     if opts.dry_run && !args.json {
-        let results = upload_item(client, identifier, &files, &opts, None)
+        let results = upload_item(client, identifier, &files, &opts, None, None, None)
             .await
             .context(format!("failed to validate upload to {identifier}"))?;
         print_dry_run_results(identifier, &results, &opts.metadata);
@@ -500,6 +547,7 @@ async fn run_bare_upload(
             vec![files.clone()],
             opts,
             1,
+            skip_set,
         )
         .await;
     }
@@ -512,46 +560,63 @@ async fn run_bare_upload(
         .context("failed to open joblog")?;
 
     // Set up progress display
-    let display: Option<std::sync::Arc<crate::output::UploadDisplay>> = if !args.json && quiet == 0
-    {
-        Some(std::sync::Arc::new(crate::output::UploadDisplay::new(
+    let display: Option<Arc<crate::output::UploadDisplay>> = if !args.json && quiet == 0 {
+        Some(Arc::new(crate::output::UploadDisplay::new(
             identifier,
             opts.dry_run,
         )))
     } else {
         None
     };
-    let progress_ref: Option<std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>> =
+    let progress_ref: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>> =
         display.as_ref().map(|d| {
-            let d = std::sync::Arc::clone(d);
-            std::sync::Arc::new(move |p: UploadProgress| {
+            let d = Arc::clone(d);
+            Arc::new(move |p: UploadProgress| {
                 d.update(p);
-            }) as std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>
+            }) as Arc<dyn Fn(UploadProgress) + Send + Sync>
         });
 
-    let results = upload_item(client, identifier, &files, &opts, progress_ref)
-        .await
-        .context(format!("failed to upload to {identifier}"))?;
+    // Stream results to joblog as each file completes (not after item finishes).
+    let on_result: Option<OnResultCallback> = joblog.as_ref().map(|jl| {
+        let jl = jl.clone();
+        Arc::new(move |r: &ia_core::upload::UploadResult| {
+            write_upload_result(&jl, r);
+        }) as Arc<dyn Fn(&ia_core::upload::UploadResult) + Send + Sync>
+    });
+
+    let results = upload_item(
+        client,
+        identifier,
+        &files,
+        &opts,
+        progress_ref,
+        skip_set.as_deref(),
+        on_result,
+    )
+    .await
+    .context(format!("failed to upload to {identifier}"))?;
 
     // Finish display (prints summary)
     if let Some(d) = &display {
         d.finish();
     }
 
-    // Handle results: JSON output, joblog, failure detection
+    // Handle results: JSON output, failure detection
+    // (joblog already written per-file via on_result callback)
     let had_failure = if args.json {
-        output_results(&results, true, quiet, joblog.as_ref())?
+        output_results(&results, true, quiet, None)?
     } else {
-        let failure = check_failures_and_log(&results, joblog.as_ref());
+        let failure = check_failures_and_log(&results, None);
         // quiet==1 summary (display handles quiet==0)
         if quiet == 1 {
-            let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
+            let (uploaded, skipped, resumed, failed, total_bytes) = summarize_results(&results);
             let total_ms: u64 = results.iter().map(|r| r.elapsed_ms).max().unwrap_or(0);
             eprintln!(
-                "{}  {} uploaded, {} skipped, {} failed ({}) in {:.1}s",
+                "{}  {} uploaded, {} skipped, {} resumed, {} failed ({}) in {:.1}s",
                 identifier,
                 uploaded,
                 skipped,
+                resumed,
                 failed,
                 crate::output::format_bytes(total_bytes),
                 total_ms as f64 / 1000.0,
@@ -595,7 +660,7 @@ async fn run_import(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
+    no_resume: bool,
 ) -> Result<()> {
     let spreadsheet = args
         .spreadsheet
@@ -610,32 +675,8 @@ async fn run_import(
         bail!("spreadsheet is empty — no records to upload");
     }
 
-    // --retry-failed: filter to only items that failed in a previous run
-    let records = if retry_failed {
-        let jl_path = joblog_path.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("--retry-failed requires --joblog <path> so we know which items failed")
-        })?;
-        let entries = ia_core::joblog::read(jl_path)
-            .context(format!("failed to read joblog: {}", jl_path.display()))?;
-        let failed = ia_core::joblog::failed_items(&entries);
-        if failed.is_empty() {
-            eprintln!("No failed items found in joblog — nothing to retry.");
-            return Ok(());
-        }
-        let failed_set: std::collections::HashSet<&str> =
-            failed.iter().map(|s| s.as_str()).collect();
-        let filtered: Vec<_> = records
-            .into_iter()
-            .filter(|(id, _)| failed_set.contains(id.as_str()))
-            .collect();
-        if filtered.is_empty() {
-            eprintln!("No matching records found in spreadsheet for failed items.");
-            return Ok(());
-        }
-        filtered
-    } else {
-        records
-    };
+    // Build auto-resume skip set from joblog (if available)
+    let skip_set = build_skip_set(&joblog_path, no_resume, quiet)?;
 
     // Parse extra -m metadata and --header
     let extra_metadata = parse_key_values(&args.metadata)?;
@@ -684,7 +725,7 @@ async fn run_import(
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_upload_batch_tui(client, records, opts, jobs).await;
+        return crate::tui::run_upload_batch_tui(client, records, opts, jobs, skip_set).await;
     }
     #[cfg(not(feature = "tui"))]
     let _ = args.dashboard;
@@ -710,10 +751,8 @@ async fn run_import(
     // Set up batch progress display
     let batch_display: Option<std::sync::Arc<crate::output::UploadBatchDisplay>> =
         if !json_mode && quiet == 0 {
-            Some(std::sync::Arc::new(crate::output::UploadBatchDisplay::new(
-                item_count,
-                jobs,
-                retry_failed,
+            Some(Arc::new(crate::output::UploadBatchDisplay::new(
+                item_count, jobs,
             )))
         } else {
             None
@@ -726,10 +765,27 @@ async fn run_import(
             }) as std::sync::Arc<dyn Fn(UploadProgress) + Send + Sync>
         });
 
+    // Stream results to joblog as each file completes (not after batch finishes).
+    // This ensures Ctrl-C doesn't lose progress.
+    let on_result: Option<OnResultCallback> = joblog.as_ref().map(|jl| {
+        let jl = jl.clone();
+        Arc::new(move |r: &ia_core::upload::UploadResult| {
+            write_upload_result(&jl, r);
+        }) as Arc<dyn Fn(&ia_core::upload::UploadResult) + Send + Sync>
+    });
+
     let start = std::time::Instant::now();
-    let results = upload_batch(client, records, &opts, jobs, progress_ref)
-        .await
-        .context("batch upload failed")?;
+    let results = upload_batch(
+        client,
+        records,
+        &opts,
+        jobs,
+        progress_ref,
+        skip_set,
+        on_result,
+    )
+    .await
+    .context("batch upload failed")?;
     let elapsed = start.elapsed();
 
     // Finish batch display (prints summary)
@@ -737,16 +793,17 @@ async fn run_import(
         bd.finish(&results, elapsed);
     }
 
-    // Handle results: JSON output, joblog, failure detection
+    // Handle results: JSON output, failure detection
+    // (joblog already written per-file via on_result callback)
     let had_failure = if json_mode {
-        output_results(&results, true, quiet, joblog.as_ref())?
+        output_results(&results, true, quiet, None)?
     } else {
-        let failure = check_failures_and_log(&results, joblog.as_ref());
+        let failure = check_failures_and_log(&results, None);
         // quiet==1 summary (batch display handles quiet==0)
         if quiet == 1 {
-            let (uploaded, skipped, failed, total_bytes) = summarize_results(&results);
+            let (uploaded, skipped, resumed, failed, total_bytes) = summarize_results(&results);
             eprintln!(
-                "{} {} uploaded, {} skipped, {} failed ({})",
+                "{} {} uploaded, {} skipped, {} resumed, {} failed ({})",
                 if failure {
                     style("done").red().bold().to_string()
                 } else {
@@ -754,6 +811,7 @@ async fn run_import(
                 },
                 uploaded,
                 skipped,
+                resumed,
                 failed,
                 crate::output::format_bytes(total_bytes),
             );
@@ -1172,7 +1230,7 @@ fn output_results(
 }
 
 /// Compute summary counts from upload results.
-fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
+fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, usize, u64) {
     let uploaded = results
         .iter()
         .filter(|r| matches!(r.status, UploadStatus::Uploaded))
@@ -1180,6 +1238,10 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
     let skipped = results
         .iter()
         .filter(|r| matches!(r.status, UploadStatus::Skipped))
+        .count();
+    let resumed = results
+        .iter()
+        .filter(|r| matches!(r.status, UploadStatus::Resumed))
         .count();
     let failed = results
         .iter()
@@ -1190,7 +1252,7 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, u64) {
         .filter(|r| matches!(r.status, UploadStatus::Uploaded))
         .map(|r| r.bytes)
         .sum();
-    (uploaded, skipped, failed, total_bytes)
+    (uploaded, skipped, resumed, failed, total_bytes)
 }
 
 /// Load and parse a checksums file (one `MD5  filename` per line).
@@ -1275,6 +1337,14 @@ fn print_result_line(r: &UploadResult) {
                 r.key,
             );
         }
+        UploadStatus::Resumed => {
+            eprintln!(
+                " {} {}/{} (resumed, already uploaded)",
+                style("–").dim(),
+                r.identifier,
+                r.key,
+            );
+        }
         UploadStatus::Failed(msg) => {
             eprintln!(" {} {}/{}: {}", style("✗").red(), r.identifier, r.key, msg,);
         }
@@ -1296,6 +1366,7 @@ fn write_upload_result(jl: &JoblogWriter, r: &UploadResult) {
     let entry = match &r.status {
         UploadStatus::Uploaded => entry.ok(r.bytes, r.elapsed_ms),
         UploadStatus::Skipped => entry.skipped(),
+        UploadStatus::Resumed => return, // don't write resumed files to joblog
         UploadStatus::Failed(msg) => entry.error(msg, r.retries as usize),
         UploadStatus::DryRun => entry.skipped(), // dry runs logged as skipped
     };

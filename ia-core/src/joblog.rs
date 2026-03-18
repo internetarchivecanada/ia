@@ -228,6 +228,32 @@ pub fn failed_items(entries: &[JoblogEntry]) -> Vec<String> {
     items
 }
 
+/// Get (item, file) pairs that succeeded, for auto-resume.
+///
+/// Scans entries filtered by `op`, keeps latest status per `(item, file)`,
+/// returns pairs where latest status is `"ok"`. Used to skip already-uploaded
+/// files when resuming a batch upload.
+pub fn successful_files(
+    entries: &[JoblogEntry],
+    op: &str,
+) -> std::collections::HashSet<(String, String)> {
+    use std::collections::HashMap;
+
+    let mut latest: HashMap<(String, String), &str> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.op == op) {
+        latest.insert(
+            (entry.item.clone(), entry.file.clone()),
+            entry.status.as_str(),
+        );
+    }
+
+    latest
+        .into_iter()
+        .filter(|(_, status)| *status == "ok")
+        .map(|((item, file), _)| (item, file))
+        .collect()
+}
+
 /// Summary statistics from a joblog.
 #[derive(Debug, Default)]
 pub struct JoblogSummary {
@@ -788,5 +814,180 @@ mod tests {
         assert_eq!(summary.items_analyzed, 1);
         assert_eq!(summary.changes_applied, 1);
         assert_eq!(summary.prompt_tokens, 1200);
+    }
+
+    // --- successful_files tests (upload auto-resume) ---
+
+    #[test]
+    fn successful_files_empty() {
+        let set = successful_files(&[], "upload");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn successful_files_basic() {
+        let entries = vec![
+            JoblogEntry {
+                ts: "2026-01-01T00:00:00Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-a.txt".into(),
+                status: "ok".into(),
+                bytes: Some(100),
+                elapsed_ms: Some(50),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+            JoblogEntry {
+                ts: "2026-01-01T00:00:01Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-b.txt".into(),
+                status: "error".into(),
+                bytes: None,
+                elapsed_ms: Some(10),
+                error: Some("timeout".into()),
+                retries: Some(3),
+                changes: None,
+                tokens: None,
+            },
+            JoblogEntry {
+                ts: "2026-01-01T00:00:02Z".into(),
+                op: "upload".into(),
+                item: "item-2".into(),
+                file: "file-c.txt".into(),
+                status: "skipped".into(),
+                bytes: None,
+                elapsed_ms: Some(5),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+        ];
+        let set = successful_files(&entries, "upload");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&("item-1".into(), "file-a.txt".into())));
+        assert!(!set.contains(&("item-1".into(), "file-b.txt".into())));
+        assert!(!set.contains(&("item-2".into(), "file-c.txt".into())));
+    }
+
+    #[test]
+    fn successful_files_latest_wins() {
+        let entries = vec![
+            // file-a: failed first, then succeeded → should be in set
+            JoblogEntry {
+                ts: "2026-01-01T00:00:00Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-a.txt".into(),
+                status: "error".into(),
+                bytes: None,
+                elapsed_ms: Some(10),
+                error: Some("timeout".into()),
+                retries: Some(1),
+                changes: None,
+                tokens: None,
+            },
+            JoblogEntry {
+                ts: "2026-01-01T00:00:01Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-a.txt".into(),
+                status: "ok".into(),
+                bytes: Some(100),
+                elapsed_ms: Some(50),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+            // file-b: succeeded first, then failed → should NOT be in set
+            JoblogEntry {
+                ts: "2026-01-01T00:00:02Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-b.txt".into(),
+                status: "ok".into(),
+                bytes: Some(200),
+                elapsed_ms: Some(30),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+            JoblogEntry {
+                ts: "2026-01-01T00:00:03Z".into(),
+                op: "upload".into(),
+                item: "item-1".into(),
+                file: "file-b.txt".into(),
+                status: "error".into(),
+                bytes: None,
+                elapsed_ms: Some(10),
+                error: Some("server error".into()),
+                retries: Some(2),
+                changes: None,
+                tokens: None,
+            },
+        ];
+        let set = successful_files(&entries, "upload");
+        assert!(set.contains(&("item-1".into(), "file-a.txt".into())));
+        assert!(!set.contains(&("item-1".into(), "file-b.txt".into())));
+    }
+
+    #[test]
+    fn successful_files_skipped_not_included() {
+        let entries = vec![JoblogEntry {
+            ts: "2026-01-01T00:00:00Z".into(),
+            op: "upload".into(),
+            item: "item-1".into(),
+            file: "file-a.txt".into(),
+            status: "skipped".into(),
+            bytes: None,
+            elapsed_ms: Some(5),
+            error: None,
+            retries: None,
+            changes: None,
+            tokens: None,
+        }];
+        let set = successful_files(&entries, "upload");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn successful_files_filters_by_op() {
+        let entries = vec![
+            JoblogEntry {
+                ts: "2026-01-01T00:00:00Z".into(),
+                op: "download".into(),
+                item: "item-1".into(),
+                file: "file-a.txt".into(),
+                status: "ok".into(),
+                bytes: Some(100),
+                elapsed_ms: Some(50),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+            JoblogEntry {
+                ts: "2026-01-01T00:00:01Z".into(),
+                op: "upload".into(),
+                item: "item-2".into(),
+                file: "file-b.txt".into(),
+                status: "ok".into(),
+                bytes: Some(200),
+                elapsed_ms: Some(30),
+                error: None,
+                retries: None,
+                changes: None,
+                tokens: None,
+            },
+        ];
+        let set = successful_files(&entries, "upload");
+        assert!(!set.contains(&("item-1".into(), "file-a.txt".into())));
+        assert!(set.contains(&("item-2".into(), "file-b.txt".into())));
     }
 }

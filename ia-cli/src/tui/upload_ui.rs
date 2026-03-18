@@ -241,7 +241,9 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &UploadTuiState) {
             UploadProgressStatus::WaitingRateLimit => ("\u{23f8}", Color::Yellow),
             UploadProgressStatus::Retrying => ("\u{21bb}", Color::Yellow),
             UploadProgressStatus::Complete => ("\u{2713}", Color::Green),
-            UploadProgressStatus::Skipped => ("\u{2013}", Color::DarkGray),
+            UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
+                ("\u{2013}", Color::DarkGray)
+            }
             UploadProgressStatus::Failed => ("\u{2717}", Color::Red),
         };
 

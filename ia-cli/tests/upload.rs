@@ -575,3 +575,34 @@ fn upload_help_shows_cleanup_subcommand() {
         .success()
         .stdout(predicate::str::contains("cleanup"));
 }
+
+// ─── Auto-resume ─────────────────────────────────────────────────────────────
+
+#[test]
+fn upload_retry_failed_shows_error() {
+    let config = empty_config();
+    ia_with_config(&config)
+        .args([
+            "upload",
+            "test-id",
+            "file.txt",
+            "--retry-failed",
+            "--joblog",
+            "/dev/null",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--retry-failed is no longer needed for uploads",
+        ));
+}
+
+#[test]
+fn upload_no_resume_flag_accepted() {
+    let config = empty_config();
+    ia_with_config(&config)
+        .args(["upload", "test-id", "nonexistent.txt", "--no-resume"])
+        .assert()
+        .failure();
+    // It fails for missing file, but --no-resume is accepted as valid flag
+}

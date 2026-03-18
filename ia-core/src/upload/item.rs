@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,6 +11,9 @@ use crate::upload::types::{
 };
 use crate::upload::validate::{validate_file, validate_required_metadata};
 use crate::IaClient;
+
+/// Callback invoked after each file result is produced (for streaming joblog writes).
+type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 
 /// Upload multiple files to a single IA item.
 ///
@@ -36,6 +40,8 @@ pub async fn upload_item(
     files: &[PathBuf],
     opts: &UploadOpts,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
+    skip_set: Option<&HashSet<(String, String)>>,
+    on_result: Option<OnResultCallback>,
 ) -> Result<Vec<UploadResult>> {
     // 1. Validate identifier
     validate_identifier(identifier)?;
@@ -126,17 +132,77 @@ pub async fn upload_item(
         });
     }
 
-    // 10. Upload sequentially (track start for error elapsed_ms)
+    // 10. Pre-compute owned identifier for skip-set lookups (avoids repeated
+    //     allocations inside the file loop).
+    let id_owned = identifier.to_string();
+
+    // 11. Compute the index of the last file that will actually be uploaded
+    //     (i.e. not in the skip set). This determines which file triggers derive.
+    let last_upload_idx = if let Some(skip) = skip_set {
+        expanded
+            .iter()
+            .zip(keys.iter())
+            .enumerate()
+            .rev()
+            .find(|(_, (_, key))| !skip.contains(&(id_owned.clone(), key.to_string())))
+            .map(|(i, _)| i)
+    } else if file_count > 0 {
+        Some(file_count - 1)
+    } else {
+        None
+    };
+
+    // 12. Upload sequentially (track start for error elapsed_ms)
     let start = Instant::now();
     let mut results = Vec::with_capacity(file_count);
     let mut first_file_succeeded = false;
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {
-        let is_first = i == 0 || !first_file_succeeded;
-        let is_last = i == file_count - 1;
+        // Resume: skip files already successfully uploaded in a previous run
+        if let Some(skip) = skip_set {
+            if skip.contains(&(id_owned.clone(), key.clone())) {
+                let file_size = tokio::fs::metadata(file).await.map_err(|e| {
+                    IaError::Io(std::io::Error::other(format!(
+                        "failed to stat resumed file {}: {e}",
+                        file.display()
+                    )))
+                })?;
+                let file_size = file_size.len();
+                if let Some(ref cb) = progress {
+                    cb(UploadProgress {
+                        identifier: id_owned.clone(),
+                        key: key.clone(),
+                        bytes_sent: file_size,
+                        total_bytes: file_size,
+                        status: UploadProgressStatus::Resumed,
+                    });
+                }
+                let result = UploadResult {
+                    identifier: id_owned.clone(),
+                    key: key.clone(),
+                    status: UploadStatus::Resumed,
+                    bytes: file_size,
+                    md5: None,
+                    elapsed_ms: 0,
+                    retries: 0,
+                };
+                if let Some(ref cb) = on_result {
+                    cb(&result);
+                }
+                results.push(result);
+                continue;
+            }
+        }
 
-        // Size hint only on first file
-        let hint = if i == 0 { size_hint } else { None };
+        let is_first = i == 0 || !first_file_succeeded;
+        let is_last = Some(i) == last_upload_idx;
+
+        // Size hint only on the first file that actually uploads
+        let hint = if !first_file_succeeded {
+            size_hint
+        } else {
+            None
+        };
 
         match upload_file(
             client,
@@ -154,6 +220,9 @@ pub async fn upload_item(
             Ok(result) => {
                 if matches!(result.status, UploadStatus::Uploaded) {
                     first_file_succeeded = true;
+                }
+                if let Some(ref cb) = on_result {
+                    cb(&result);
                 }
                 results.push(result);
             }
@@ -185,7 +254,7 @@ pub async fn upload_item(
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
-                results.push(UploadResult {
+                let result = UploadResult {
                     identifier: identifier.to_string(),
                     key: key.to_string(),
                     status: UploadStatus::Failed(err_msg),
@@ -193,7 +262,11 @@ pub async fn upload_item(
                     md5: None,
                     elapsed_ms: start.elapsed().as_millis() as u64,
                     retries: 0,
-                });
+                };
+                if let Some(ref cb) = on_result {
+                    cb(&result);
+                }
+                results.push(result);
             }
         }
     }
@@ -296,8 +369,23 @@ fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Create a default client suitable for dry-run tests (no HTTP needed).
+    fn dry_run_client() -> crate::IaClient {
+        crate::IaClient::from_config(crate::IaConfig::default()).unwrap()
+    }
+
+    /// Build opts for resume tests: dry_run + no_collection_check to avoid HTTP.
+    fn resume_test_opts() -> UploadOpts {
+        UploadOpts {
+            dry_run: true,
+            no_collection_check: true,
+            ..Default::default()
+        }
+    }
 
     // -- expand_files tests --
 
@@ -405,5 +493,208 @@ mod tests {
         };
         let keys = compute_keys(&files, &opts).unwrap();
         assert_eq!(keys, vec!["prefix/dir/file.txt"]);
+    }
+
+    // -- upload_item resume (skip_set) tests --
+
+    #[tokio::test]
+    async fn upload_item_skips_resumed_files() {
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        fs::write(&f1, "hello").unwrap();
+        fs::write(&f2, "world").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // Mark a.txt as already uploaded
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "a.txt".to_string()));
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            matches!(results[0].status, UploadStatus::Resumed),
+            "a.txt should be Resumed, got {:?}",
+            results[0].status
+        );
+        assert_eq!(results[0].key, "a.txt");
+        assert_eq!(results[0].bytes, 5); // "hello" = 5 bytes
+        assert!(
+            matches!(results[1].status, UploadStatus::DryRun),
+            "b.txt should be DryRun, got {:?}",
+            results[1].status
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_item_all_resumed_no_uploads() {
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "a.txt".to_string()));
+        skip.insert(("test-item".to_string(), "b.txt".to_string()));
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.status, UploadStatus::Resumed)));
+    }
+
+    #[tokio::test]
+    async fn upload_item_is_first_after_resume() {
+        // When file 0 is resumed, file 1 should be treated as is_first=true
+        // (gets metadata headers). With dry_run, we just verify no panic and correct results.
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        let f3 = dir.path().join("c.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+        fs::write(&f3, "ccc").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // Skip only the first file
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "a.txt".to_string()));
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2, f3],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].status, UploadStatus::Resumed));
+        // b.txt and c.txt should be DryRun (they actually get processed)
+        assert!(matches!(results[1].status, UploadStatus::DryRun));
+        assert!(matches!(results[2].status, UploadStatus::DryRun));
+    }
+
+    #[tokio::test]
+    async fn upload_item_is_last_correct_with_resume() {
+        // When the last file is in the skip set, derive should trigger on the
+        // last non-resumed file. With dry_run we can't directly observe is_last,
+        // but we verify the function completes correctly and produces the right statuses.
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        let f3 = dir.path().join("c.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+        fs::write(&f3, "ccc").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // Skip only the last file
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "c.txt".to_string()));
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2, f3],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0].status, UploadStatus::DryRun));
+        assert!(matches!(results[1].status, UploadStatus::DryRun));
+        assert!(matches!(results[2].status, UploadStatus::Resumed));
+        assert_eq!(results[2].key, "c.txt");
+    }
+
+    #[tokio::test]
+    async fn upload_item_different_key_not_resumed() {
+        // skip_set has a different key — the file should upload normally
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "hello").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // Skip set has a different filename for the same item
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "other.txt".to_string()));
+
+        let results = upload_item(&client, "test-item", &[f], &opts, None, Some(&skip), None)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].status, UploadStatus::DryRun),
+            "should not be resumed when key doesn't match"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_item_same_key_different_item() {
+        // skip_set has (other-item, a.txt) — should NOT resume for test-item
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "data").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        let mut skip = HashSet::new();
+        skip.insert(("other-item".to_string(), "a.txt".to_string()));
+
+        let results = upload_item(&client, "test-item", &[f], &opts, None, Some(&skip), None)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].status, UploadStatus::DryRun),
+            "should not be resumed when identifier doesn't match"
+        );
     }
 }

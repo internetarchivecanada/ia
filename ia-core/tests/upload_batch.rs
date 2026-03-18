@@ -61,7 +61,7 @@ async fn batch_upload_single_item() {
         ..Default::default()
     };
 
-    let results = upload::upload_batch(&client, records, &opts, 1, None)
+    let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
@@ -95,7 +95,7 @@ async fn batch_upload_multiple_items() {
         ..Default::default()
     };
 
-    let results = upload::upload_batch(&client, records, &opts, 2, None)
+    let results = upload::upload_batch(&client, records, &opts, 2, None, None, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
@@ -129,7 +129,7 @@ async fn batch_upload_grouped_by_identifier() {
         ..Default::default()
     };
 
-    let results = upload::upload_batch(&client, records, &opts, 1, None)
+    let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 2); // 2 files in 1 item
@@ -141,7 +141,7 @@ async fn batch_upload_empty_records() {
     let client = test_client(&server);
     let opts = UploadOpts::default();
 
-    let err = upload::upload_batch(&client, vec![], &opts, 1, None)
+    let err = upload::upload_batch(&client, vec![], &opts, 1, None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(err, ia_core::IaError::EmptyUpload));
@@ -161,7 +161,7 @@ async fn batch_upload_missing_file_field() {
     // No "file" field
     let records = vec![("item-1".into(), fields)];
 
-    let err = upload::upload_batch(&client, records, &opts, 1, None)
+    let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap_err();
     // Should error about missing file
@@ -184,7 +184,7 @@ async fn batch_upload_nonexistent_file() {
         "test_collection",
     )];
 
-    let err = upload::upload_batch(&client, records, &opts, 1, None)
+    let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap_err();
     // File validation should catch nonexistent files
@@ -211,7 +211,7 @@ async fn batch_upload_invalid_identifier() {
         ..Default::default()
     };
 
-    let err = upload::upload_batch(&client, records, &opts, 1, None)
+    let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(err, ia_core::IaError::Config(_)));
@@ -249,7 +249,7 @@ async fn batch_upload_merges_metadata_with_opts() {
         ..Default::default()
     };
 
-    let results = upload::upload_batch(&client, records, &opts, 1, None)
+    let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
@@ -279,7 +279,7 @@ async fn batch_upload_dry_run() {
         ..Default::default()
     };
 
-    let results = upload::upload_batch(&client, records, &opts, 1, None)
+    let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
