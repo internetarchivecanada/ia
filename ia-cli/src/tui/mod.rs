@@ -1,13 +1,18 @@
 pub mod ai;
 mod app;
+pub mod errors_tab;
 pub mod framework;
+pub mod help;
 pub mod joblog_state;
+pub mod log_tab;
 pub mod s3_state;
 pub mod search;
 pub mod tab;
+pub mod tasks_tab;
 pub mod theme;
 mod ui;
 pub mod upload_app;
+pub mod upload_tab;
 mod upload_ui;
 pub mod widgets;
 
