@@ -1,5 +1,6 @@
 pub mod ai;
 mod app;
+pub mod dashboard;
 pub mod errors_tab;
 pub mod framework;
 pub mod help;
