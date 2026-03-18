@@ -2,6 +2,7 @@ use console::{style, Color};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -611,6 +612,10 @@ pub struct UploadBatchDisplay {
     bottom_sentinel: ProgressBar,
     active_items: Mutex<HashMap<String, UploadItemBars>>,
     items_total: usize,
+    items_completed: AtomicUsize,
+    bytes_uploaded: AtomicU64,
+    started_at: Instant,
+    last_header_refresh: Mutex<Instant>,
 }
 
 struct UploadItemBars {
@@ -635,14 +640,12 @@ impl UploadBatchDisplay {
             style(items_total).bold(),
             jobs,
         ));
-        let batch_header = multi.add(ProgressBar::new(0));
-        batch_header.set_style(
-            ProgressStyle::with_template(
-                "  {bar:40.cyan/dim} {bytes}/{total_bytes}  {bytes_per_sec:.dim}",
-            )
-            .unwrap()
-            .progress_chars(PROGRESS_CHARS),
-        );
+        let batch_header = multi.add(ProgressBar::new_spinner());
+        batch_header
+            .set_style(ProgressStyle::with_template("{spinner:.cyan} {prefix}  {msg}").unwrap());
+        batch_header.set_prefix(verb.to_string());
+        batch_header.set_message(format!("0/{items_total} items  0 B uploaded"));
+        batch_header.enable_steady_tick(Duration::from_millis(80));
 
         let bottom_sentinel = multi.add(ProgressBar::new_spinner());
         bottom_sentinel.set_style(ProgressStyle::with_template("{msg}").unwrap());
@@ -655,6 +658,10 @@ impl UploadBatchDisplay {
             bottom_sentinel,
             active_items: Mutex::new(HashMap::new()),
             items_total,
+            items_completed: AtomicUsize::new(0),
+            bytes_uploaded: AtomicU64::new(0),
+            started_at: Instant::now(),
+            last_header_refresh: Mutex::new(Instant::now()),
         }
     }
 
@@ -672,10 +679,6 @@ impl UploadBatchDisplay {
                 if items.contains_key(identifier) {
                     return;
                 }
-
-                // Update aggregate batch progress bar total
-                self.batch_header
-                    .set_length(self.batch_header.length().unwrap_or(0) + bytes_total);
 
                 // Insert bare bars into MultiProgress THEN configure — configuring
                 // before insertion corrupts cursor tracking (indicatif #677).
@@ -717,36 +720,48 @@ impl UploadBatchDisplay {
                 );
             }
             UploadProgressStatus::Uploading => {
-                let mut items = self.active_items.lock().unwrap();
-                if let Some(item) = items.get_mut(identifier) {
-                    let prev: u64 = item.per_file_bytes.values().sum();
-                    item.per_file_bytes.insert(p.key.clone(), p.bytes_sent);
-                    let now: u64 = item.per_file_bytes.values().sum();
-                    item.bar.set_position(now);
-                    // Update aggregate batch bar
-                    let delta = now.saturating_sub(prev);
-                    if delta > 0 {
-                        self.batch_header.inc(delta);
+                let delta = {
+                    let mut items = self.active_items.lock().unwrap();
+                    if let Some(item) = items.get_mut(identifier) {
+                        let prev: u64 = item.per_file_bytes.values().sum();
+                        item.per_file_bytes.insert(p.key.clone(), p.bytes_sent);
+                        let now: u64 = item.per_file_bytes.values().sum();
+                        item.bar.set_position(now);
+                        now.saturating_sub(prev)
+                    } else {
+                        0
                     }
+                };
+                if delta > 0 {
+                    self.bytes_uploaded.fetch_add(delta, Ordering::Relaxed);
+                    self.refresh_header();
                 }
             }
             UploadProgressStatus::Complete => {
-                let should_finish = {
+                let (should_finish, byte_delta) = {
                     let mut items = self.active_items.lock().unwrap();
                     if let Some(item) = items.get_mut(identifier) {
+                        let prev: u64 = item.per_file_bytes.values().sum();
                         item.per_file_bytes.insert(p.key.clone(), p.total_bytes);
-                        let total: u64 = item.per_file_bytes.values().sum();
-                        item.bar.set_position(total);
+                        let now: u64 = item.per_file_bytes.values().sum();
+                        item.bar.set_position(now);
                         item.files_processed += 1;
                         item.bar.set_message(format!(
                             "{}/{} files",
                             item.files_processed, item.files_total
                         ));
-                        item.files_processed >= item.files_total
+                        (
+                            item.files_processed >= item.files_total,
+                            now.saturating_sub(prev),
+                        )
                     } else {
-                        false
+                        (false, 0)
                     }
                 };
+                if byte_delta > 0 {
+                    self.bytes_uploaded.fetch_add(byte_delta, Ordering::Relaxed);
+                    self.refresh_header();
+                }
                 if should_finish {
                     self.maybe_finish_item(identifier);
                 }
@@ -812,6 +827,35 @@ impl UploadBatchDisplay {
         }
     }
 
+    /// Update the batch header spinner with current item/byte counters.
+    fn refresh_header(&self) {
+        // Throttle: skip if <80ms since last refresh (matches spinner tick rate).
+        let now = Instant::now();
+        {
+            let mut last = self.last_header_refresh.lock().unwrap();
+            if now.duration_since(*last) < Duration::from_millis(80) {
+                return;
+            }
+            *last = now;
+        }
+
+        let completed = self.items_completed.load(Ordering::Relaxed);
+        let bytes = self.bytes_uploaded.load(Ordering::Relaxed);
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            format!("  {}/s", format_bytes((bytes as f64 / elapsed) as u64))
+        } else {
+            String::new()
+        };
+        self.batch_header.set_message(format!(
+            "{}/{} items  {} uploaded{}",
+            completed,
+            self.items_total,
+            format_bytes(bytes),
+            style(&speed).dim(),
+        ));
+    }
+
     /// Finalize an item when all its files are done.
     fn maybe_finish_item(&self, identifier: &str) {
         // Extract the item from the lock, then release the lock before
@@ -823,6 +867,9 @@ impl UploadBatchDisplay {
         };
 
         let Some(item) = item else { return };
+
+        self.items_completed.fetch_add(1, Ordering::Relaxed);
+        self.refresh_header();
 
         item.bar.finish_and_clear();
 
