@@ -6,11 +6,14 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 use ratatui::Frame;
+
+use super::tab::TabId;
+use super::theme::Theme;
 
 // ---------------------------------------------------------------------------
 // ThroughputTracker
@@ -265,6 +268,252 @@ pub fn draw_key_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard shared widgets
+// ---------------------------------------------------------------------------
+
+/// Build the decorative header line content.
+#[allow(dead_code)]
+pub fn build_header_line(
+    command: &str,
+    items: &str,
+    bytes: &str,
+    speed: &str,
+    eta: &str,
+) -> String {
+    format!(
+        "━━━ {} ━━━ {} ━━━ {} ━━━ {} ━━━ {} ━━━",
+        command, items, bytes, speed, eta
+    )
+}
+
+/// Build the S3 status text according to the spec:
+/// - Normal: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N"
+/// - Rate-limited, 0 errors: "⧖ Queued: N   ↻ Running: N   ⏸ rate-limited"
+/// - Rate-limited with errors: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N   ⏸ rate-limited"
+#[allow(dead_code)]
+pub fn build_s3_status_text(queued: u32, running: u32, errors: u32, rate_limited: bool) -> String {
+    let mut parts = vec![
+        format!("⧖ Queued: {}", queued),
+        format!("↻ Running: {}", running),
+    ];
+    if rate_limited && errors == 0 {
+        parts.push("⏸ rate-limited".to_string());
+    } else {
+        parts.push(format!("✗ Errors: {}", errors));
+        if rate_limited {
+            parts.push("⏸ rate-limited".to_string());
+        }
+    }
+    parts.join("   ")
+}
+
+/// Render the decorative header bar (centered ━━━ line with stats).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    command: &str,
+    items_done: usize,
+    items_total: usize,
+    bytes: &str,
+    speed: &str,
+    eta: &str,
+) {
+    use ratatui::layout::Alignment;
+
+    let items_str = format!("{}/{} items", items_done, items_total);
+    let spans = vec![
+        Span::styled("━━━ ", Style::default().fg(theme.maroon_bright)),
+        Span::styled(
+            command,
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
+        Span::styled(&items_str, Style::default().fg(theme.green)),
+        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
+        Span::styled(bytes, Style::default().fg(theme.text_secondary)),
+        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
+        Span::styled(speed, Style::default().fg(theme.maroon_bright)),
+        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
+        Span::styled(eta, Style::default().fg(theme.text_secondary)),
+        Span::styled(" ━━━", Style::default().fg(theme.maroon_bright)),
+    ];
+    let header = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    frame.render_widget(header, area);
+}
+
+/// Render the tab bar with active tab highlighted.
+#[allow(dead_code)]
+pub fn draw_tab_bar(frame: &mut Frame, area: Rect, theme: &Theme, active: TabId) {
+    use ratatui::layout::Alignment;
+
+    let mut spans = Vec::new();
+    for (i, tab) in TabId::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        if *tab == active {
+            spans.push(Span::styled(
+                format!(" {} ", tab.label()),
+                Style::default()
+                    .fg(theme.text)
+                    .bg(theme.maroon)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                tab.label(),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+    }
+    let bar = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    frame.render_widget(bar, area);
+}
+
+/// Render the S3 Tasks panel (used on Upload tab and Tasks tab).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn draw_s3_panel(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    queued: u32,
+    running: u32,
+    errors: u32,
+    global_count: u32,
+    rate_limited: bool,
+    seconds_ago: u64,
+) {
+    let title_line = Line::from(vec![Span::styled(
+        " S3 Tasks ",
+        Style::default().fg(theme.maroon_bright),
+    )]);
+    let global_line = Line::from(vec![Span::styled(
+        format!("Global: {} ", global_count),
+        Style::default().fg(theme.text_muted),
+    )]);
+    let bottom_line = Line::from(vec![Span::styled(
+        format!(" polled {}s ago ", seconds_ago),
+        Style::default().fg(theme.text_very_muted),
+    )]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title_top(title_line.left_aligned())
+        .title_top(global_line.right_aligned())
+        .title_bottom(bottom_line.left_aligned());
+
+    let mut spans = vec![
+        Span::styled("⧖ Queued: ", Style::default().fg(theme.text_secondary)),
+        Span::styled(
+            format!("{}", queued),
+            Style::default().fg(theme.gold).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("↻ Running: ", Style::default().fg(theme.text_secondary)),
+        Span::styled(
+            format!("{}", running),
+            Style::default().fg(theme.blue).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+    ];
+
+    if rate_limited && errors == 0 {
+        spans.push(Span::styled(
+            "⏸ rate-limited",
+            Style::default().fg(theme.gold),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "✗ Errors: ",
+            Style::default().fg(theme.text_secondary),
+        ));
+        spans.push(Span::styled(
+            format!("{}", errors),
+            Style::default().fg(if errors > 0 {
+                theme.red
+            } else {
+                theme.text_secondary
+            }),
+        ));
+        if rate_limited {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                "⏸ rate-limited",
+                Style::default().fg(theme.gold),
+            ));
+        }
+    }
+
+    let content = Paragraph::new(Line::from(spans)).block(block);
+    frame.render_widget(content, area);
+}
+
+/// Render context-sensitive key hints in the footer.
+#[allow(dead_code)]
+pub fn draw_footer(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    hints: &[(&str, &str)],
+    elapsed: &str,
+) {
+    use ratatui::layout::Alignment;
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", Style::default()));
+        }
+        spans.push(Span::styled(
+            format!("[{}]", key),
+            Style::default().fg(theme.maroon_bright),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", desc),
+            Style::default().fg(theme.text_muted),
+        ));
+    }
+
+    let keys = Paragraph::new(Line::from(spans));
+    let time = Paragraph::new(Line::from(vec![Span::styled(
+        elapsed,
+        Style::default().fg(theme.text_muted),
+    )]))
+    .alignment(Alignment::Right);
+
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)]).split(area);
+
+    frame.render_widget(keys, chunks[0]);
+    frame.render_widget(time, chunks[1]);
+}
+
+/// Render a themed sparkline throughput panel.
+#[allow(dead_code)]
+pub fn draw_themed_throughput_panel(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    history: &VecDeque<f64>,
+) {
+    let block = Block::default()
+        .title(" Throughput ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let data: Vec<u64> = history.iter().map(|v| *v as u64).collect();
+
+    let sparkline = Sparkline::default()
+        .block(block)
+        .data(&data)
+        .style(Style::default().fg(theme.text_very_muted));
+
+    frame.render_widget(sparkline, area);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -407,5 +656,37 @@ mod tests {
         assert!(result.starts_with('\u{2026}'));
         assert_eq!(result.chars().count(), 4);
         // Should not panic — this is the key property
+    }
+
+    // -- Dashboard shared widgets ---------------------------------------------
+
+    #[test]
+    fn test_build_header_line() {
+        let line = build_header_line("ia upload", "3/10 items", "4.2 GB", "12.5 MB/s", "ETA 28m");
+        assert!(line.contains("ia upload"));
+        assert!(line.contains("3/10 items"));
+    }
+
+    #[test]
+    fn test_build_s3_status_text_normal() {
+        let text = build_s3_status_text(23, 4, 0, false);
+        assert!(text.contains("23"));
+        assert!(text.contains("4"));
+        assert!(text.contains("Errors: 0"));
+        assert!(!text.contains("rate-limited"));
+    }
+
+    #[test]
+    fn test_build_s3_status_text_rate_limited_no_errors() {
+        let text = build_s3_status_text(23, 4, 0, true);
+        assert!(text.contains("rate-limited"));
+        assert!(!text.contains("Errors"));
+    }
+
+    #[test]
+    fn test_build_s3_status_text_rate_limited_with_errors() {
+        let text = build_s3_status_text(23, 4, 2, true);
+        assert!(text.contains("rate-limited"));
+        assert!(text.contains("Errors: 2"));
     }
 }

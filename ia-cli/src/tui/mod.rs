@@ -1,6 +1,11 @@
 pub mod ai;
 mod app;
 pub mod framework;
+pub mod joblog_state;
+pub mod s3_state;
+pub mod search;
+pub mod tab;
+pub mod theme;
 mod ui;
 pub mod upload_app;
 mod upload_ui;
