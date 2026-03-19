@@ -139,12 +139,17 @@ impl TabView for UploadTab {
                 true
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                match self.focused_panel {
-                    FocusPanel::Items => {
-                        self.items_scroll = self.items_scroll.saturating_add(1);
-                    }
-                    FocusPanel::Transfers => {
-                        self.transfers_scroll = self.transfers_scroll.saturating_add(1);
+                if let Ok(state) = self.upload_state.lock() {
+                    match self.focused_panel {
+                        FocusPanel::Items => {
+                            let max = state.items.len().saturating_sub(1);
+                            self.items_scroll = self.items_scroll.saturating_add(1).min(max);
+                        }
+                        FocusPanel::Transfers => {
+                            let max = state.active_files.len().saturating_sub(1);
+                            self.transfers_scroll =
+                                self.transfers_scroll.saturating_add(1).min(max);
+                        }
                     }
                 }
                 true
@@ -485,5 +490,17 @@ mod tests {
         assert!(hints.iter().any(|(k, _)| *k == "j/k"));
         assert!(hints.iter().any(|(k, _)| *k == "Tab"));
         assert!(hints.iter().any(|(k, _)| *k == "Enter"));
+    }
+
+    #[test]
+    fn test_items_scroll_clamped() {
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // State has 2 items (item-a, item-b), so max scroll = 1
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab.items_scroll, 1);
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab.items_scroll, 1); // clamped at len-1
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab.items_scroll, 1); // still clamped
     }
 }

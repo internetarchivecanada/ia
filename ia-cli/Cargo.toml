@@ -26,14 +26,13 @@ urlencoding = "2"
 chrono = "0.4"
 clap_complete = "4.5.66"
 color-print = "0.3"
-open = "5"
 rpassword = "5"
 tempfile = "3"
 rust_xlsxwriter = "0.79"
 
 [features]
 default = ["tui"]
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:open"]
 self-update = []
 
 [dependencies.ratatui]
@@ -42,6 +41,10 @@ optional = true
 
 [dependencies.crossterm]
 version = "0.28"
+optional = true
+
+[dependencies.open]
+version = "5"
 optional = true
 
 [dev-dependencies]
