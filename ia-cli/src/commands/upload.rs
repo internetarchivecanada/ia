@@ -548,6 +548,7 @@ async fn run_bare_upload(
             opts,
             1,
             skip_set,
+            joblog_path.as_deref(),
         )
         .await;
     }
@@ -725,7 +726,15 @@ async fn run_import(
     // Dashboard mode — hand off to the TUI and return early
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_upload_batch_tui(client, records, opts, jobs, skip_set).await;
+        return crate::tui::run_upload_batch_tui(
+            client,
+            records,
+            opts,
+            jobs,
+            skip_set,
+            joblog_path.as_deref(),
+        )
+        .await;
     }
     #[cfg(not(feature = "tui"))]
     let _ = args.dashboard;

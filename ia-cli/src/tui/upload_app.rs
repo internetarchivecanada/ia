@@ -103,12 +103,17 @@ pub struct UploadTuiState {
     pub completed_files: VecDeque<String>,
     pub failed_files: Vec<(String, String)>,
     pub throughput: ThroughputTracker,
+    #[allow(dead_code)] // Used by old UploadDashboard (to be removed in cleanup)
     pub scroll_offset: usize,
+    #[allow(dead_code)]
     pub quit_requested: bool,
     pub done: bool,
-    // S3 Tasks panel
+    // S3 Tasks panel (legacy — now in S3TaskState; to be removed in cleanup)
+    #[allow(dead_code)]
     pub tasks_queued: u32,
+    #[allow(dead_code)]
     pub tasks_running: u32,
+    #[allow(dead_code)]
     pub tasks_error: u32,
 }
 
@@ -332,6 +337,7 @@ impl UploadTuiState {
     ///
     /// Uses byte-level granularity: `bytes_uploaded / bytes_total`.
     #[must_use]
+    #[allow(dead_code)] // Used by old upload_ui.rs (to be removed in cleanup)
     pub fn overall_progress(&self) -> f64 {
         if self.bytes_total == 0 {
             return 0.0;
@@ -340,6 +346,7 @@ impl UploadTuiState {
     }
 
     /// Clamp scroll_offset so it doesn't scroll past the active file list.
+    #[allow(dead_code)] // Used by old UploadDashboard (to be removed in cleanup)
     pub fn clamp_scroll(&mut self) {
         let max = self.active_files.len().saturating_sub(1);
         self.scroll_offset = self.scroll_offset.min(max);
@@ -351,6 +358,9 @@ impl UploadTuiState {
 // ---------------------------------------------------------------------------
 
 /// Wrapper that implements [`Dashboard`] for the upload TUI.
+///
+/// **Deprecated**: Superseded by `MultiTabDashboard`. Retained for tests.
+#[allow(dead_code)]
 pub struct UploadDashboard {
     pub state: Arc<Mutex<UploadTuiState>>,
 }
@@ -416,19 +426,39 @@ async fn run_dashboard_and_summarize(
             std::result::Result<Vec<ia_core::upload::UploadResult>, ia_core::error::IaError>,
         >,
     >,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
-    // 1. Spawn S3 tasks polling loop (every 60s, single aggregate query).
+    use super::dashboard::MultiTabDashboard;
+    use super::joblog_state::JoblogState;
+    use super::s3_state::{S3TaskEntry, S3TaskState};
+
+    // Get submitter email from config cookies (no network call needed).
+    let email = client
+        .config()
+        .cookies
+        .get("logged-in-user")
+        .cloned()
+        .unwrap_or_default();
+
+    // Create shared state for the multi-tab dashboard.
+    let s3_state = Arc::new(Mutex::new(S3TaskState::new(email)));
+    let joblog_state = Arc::new(Mutex::new(match joblog_path {
+        Some(p) => JoblogState::open(p).unwrap_or_else(|_| JoblogState::empty()),
+        None => JoblogState::empty(),
+    }));
+
+    // 1. Spawn S3 tasks polling loop (every 15s, single aggregate query).
     //    Uses `args=*s3-put*&submitter={email}` instead of per-identifier
     //    queries — for a 500-item batch this reduces polling from 500
     //    requests/minute to 1.
-    let tasks_state = Arc::clone(&state);
+    let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
-    // Get submitter email from config cookies (no network call needed).
     let submitter = client.config().cookies.get("logged-in-user").cloned();
     let tasks_handle = tokio::spawn(async move {
         loop {
+            // User tasks query (with catalog entries for the Tasks tab).
             if let Ok(value) = ia_core::tasks::get_tasks(
                 &tasks_client,
                 &ia_core::tasks::TasksQuery {
@@ -441,25 +471,56 @@ async fn run_dashboard_and_summarize(
             )
             .await
             {
-                if let Ok(mut s) = tasks_state.lock() {
-                    s.tasks_queued = value.summary.queued;
-                    s.tasks_running = value.summary.running;
-                    s.tasks_error = value.summary.error;
+                if let Ok(mut s3) = poll_s3.lock() {
+                    s3.update_summary(
+                        value.summary.queued,
+                        value.summary.running,
+                        value.summary.error,
+                    );
+                    // Convert catalog entries to S3TaskEntry for display.
+                    // TaskEntry.color maps to display status: green=running,
+                    // blue=queued, red=error, brown=paused.
+                    let entries: Vec<S3TaskEntry> = value
+                        .catalog
+                        .iter()
+                        .map(|e| S3TaskEntry {
+                            identifier: e.identifier.clone(),
+                            cmd: e.cmd.clone(),
+                            status: match e.color.as_str() {
+                                "green" => "running".to_string(),
+                                "blue" => "queued".to_string(),
+                                "red" => "error".to_string(),
+                                "brown" => "paused".to_string(),
+                                other => other.to_string(),
+                            },
+                            submittime: e.submittime.clone(),
+                        })
+                        .collect();
+                    s3.update_tasks(entries);
+                    // Compute global count from summary.
+                    s3.update_global_count(
+                        value.summary.queued
+                            + value.summary.running
+                            + value.summary.error
+                            + value.summary.paused,
+                    );
+                    s3.mark_polled();
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
 
     // 2. Run the dashboard event loop on a blocking thread so the async
     //    upload tasks keep running on the tokio runtime.
-    let dashboard_state = Arc::clone(&state);
     let tick_rate = Duration::from_millis(100);
+    let dashboard_upload = Arc::clone(&state);
+    let dashboard_s3 = Arc::clone(&s3_state);
+    let dashboard_joblog = Arc::clone(&joblog_state);
     tokio::task::spawn_blocking(move || {
-        let mut dashboard = UploadDashboard {
-            state: dashboard_state,
-        };
+        let mut dashboard =
+            MultiTabDashboard::new(dashboard_upload, dashboard_s3, dashboard_joblog);
         super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
     })
     .await??;
@@ -596,6 +657,7 @@ pub async fn run_upload_tui(
     opts: ia_core::upload::UploadOpts,
     concurrency: usize,
     skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     // Set up terminal — the guard ensures cleanup even on panic.
     let (terminal, _guard) = super::framework::setup_terminal()?;
@@ -641,7 +703,7 @@ pub async fn run_upload_tui(
         }));
     }
 
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +721,7 @@ pub async fn run_upload_batch_tui(
     opts: ia_core::upload::UploadOpts,
     jobs: usize,
     skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
@@ -721,7 +784,7 @@ pub async fn run_upload_batch_tui(
     }
 
     // 5-7. Run dashboard lifecycle (tasks polling, event loop, summary).
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
 }
 
 // ---------------------------------------------------------------------------

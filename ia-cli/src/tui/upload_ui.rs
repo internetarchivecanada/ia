@@ -3,6 +3,11 @@
 //! Draws all panels for the upload TUI dashboard. Layout mirrors the download
 //! dashboard (`tui/ui.rs`) with upload-specific panels: S3 tasks, rate limits,
 //! and verification status.
+//!
+//! **Deprecated**: Superseded by `upload_tab.rs` in the multi-tab dashboard.
+//! Retained temporarily until Task 14 cleanup.
+
+#![allow(dead_code)]
 
 use ia_core::upload::UploadProgressStatus;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
