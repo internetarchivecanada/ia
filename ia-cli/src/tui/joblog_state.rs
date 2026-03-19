@@ -3,8 +3,6 @@
 //! Parses JSONL joblog entries into display-friendly [`LogEntry`] structs
 //! and tails the file for live updates.
 
-#![allow(dead_code)]
-
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,6 +25,7 @@ pub struct LogEntry {
     pub item: String,
     pub file: String,
     pub display_status: LogStatus,
+    #[allow(dead_code)] // Parsed from joblog, used in error display expansion
     pub error: Option<String>,
 }
 
@@ -66,6 +65,7 @@ impl LogEntry {
     }
 }
 
+#[derive(Debug)]
 pub struct JoblogState {
     pub entries: Vec<LogEntry>,
     path: Option<PathBuf>,
@@ -144,6 +144,7 @@ impl JoblogState {
     }
 
     /// Filter entries by status. None means show all.
+    #[cfg(test)]
     pub fn filtered_entries(&self, filter: Option<LogStatus>) -> Vec<&LogEntry> {
         match filter {
             None => self.entries.iter().collect(),

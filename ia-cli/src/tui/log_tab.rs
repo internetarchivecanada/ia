@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
 //! Log tab for the multi-tab upload dashboard.
 //!
 //! Displays a live-tailing job log with vim-style navigation, search, and
 //! status filtering.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +20,7 @@ use super::tab::TabView;
 use super::theme::Theme;
 
 /// The Log tab: a tailable, searchable, filterable job log viewer.
+#[derive(Debug)]
 pub struct LogTab {
     joblog_state: Arc<Mutex<JoblogState>>,
     pub search: SearchState,
@@ -30,6 +30,9 @@ pub struct LogTab {
     scroll_offset: usize,
     pub pending_g: bool,
     pending_g_at: Instant,
+    /// Cached visible entry indices, recomputed only when dirty.
+    cached_visible: RefCell<Vec<usize>>,
+    cache_dirty: RefCell<bool>,
 }
 
 impl LogTab {
@@ -43,11 +46,18 @@ impl LogTab {
             scroll_offset: 0,
             pending_g: false,
             pending_g_at: Instant::now(),
+            cached_visible: RefCell::new(Vec::new()),
+            cache_dirty: RefCell::new(true),
         }
     }
 
+    /// Mark the visible entries cache as dirty (call when filter/search/entries change).
+    fn invalidate_cache(&self) {
+        *self.cache_dirty.borrow_mut() = true;
+    }
+
     /// Build the filtered + searched list of entry indices into the joblog entries vec.
-    fn visible_entries(&self, state: &JoblogState) -> Vec<usize> {
+    fn compute_visible(&self, state: &JoblogState) -> Vec<usize> {
         state
             .entries
             .iter()
@@ -66,29 +76,21 @@ impl LogTab {
             .collect()
     }
 
-    /// Ensure the scroll_offset keeps the cursor visible within the viewport.
-    fn adjust_scroll(&mut self, viewport_height: usize, total: usize) {
-        if total == 0 {
-            self.scroll_offset = 0;
-            return;
+    /// Get visible entries, recomputing from cache only when dirty.
+    fn visible_entries(&self, state: &JoblogState) -> std::cell::Ref<'_, Vec<usize>> {
+        if *self.cache_dirty.borrow() {
+            *self.cached_visible.borrow_mut() = self.compute_visible(state);
+            *self.cache_dirty.borrow_mut() = false;
         }
-        if self.cursor >= total {
-            self.cursor = total.saturating_sub(1);
-        }
-        if self.cursor < self.scroll_offset {
-            self.scroll_offset = self.cursor;
-        }
-        if self.cursor >= self.scroll_offset + viewport_height {
-            self.scroll_offset = self
-                .cursor
-                .saturating_sub(viewport_height.saturating_sub(1));
-        }
+        self.cached_visible.borrow()
     }
 }
 
 impl TabView for LogTab {
     fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let state = self.joblog_state.lock().unwrap();
+        let Ok(state) = self.joblog_state.lock() else {
+            return;
+        };
         let visible = self.visible_entries(&state);
         let total = visible.len();
 
@@ -226,10 +228,12 @@ impl TabView for LogTab {
             match code {
                 KeyCode::Char(c) => {
                     self.search.push(c);
+                    self.invalidate_cache();
                     return true;
                 }
                 KeyCode::Backspace => {
                     self.search.backspace();
+                    self.invalidate_cache();
                     return true;
                 }
                 KeyCode::Enter => {
@@ -238,6 +242,7 @@ impl TabView for LogTab {
                 }
                 KeyCode::Esc => {
                     self.search.cancel();
+                    self.invalidate_cache();
                     return true;
                 }
                 _ => return false,
@@ -246,7 +251,9 @@ impl TabView for LogTab {
 
         // Normal mode.
         let entry_count = {
-            let state = self.joblog_state.lock().unwrap();
+            let Ok(state) = self.joblog_state.lock() else {
+                return false;
+            };
             self.visible_entries(&state).len()
         };
 
@@ -299,6 +306,7 @@ impl TabView for LogTab {
                 };
                 // Reset cursor when filter changes.
                 self.cursor = 0;
+                self.invalidate_cache();
                 true
             }
             _ => {
@@ -309,11 +317,15 @@ impl TabView for LogTab {
     }
 
     fn tick(&mut self) {
-        let mut state = self.joblog_state.lock().unwrap();
-        if state.needs_tail() {
-            state.tail();
+        if let Ok(mut state) = self.joblog_state.lock() {
+            if state.needs_tail() {
+                let before = state.entries.len();
+                state.tail();
+                if state.entries.len() != before {
+                    self.invalidate_cache();
+                }
+            }
         }
-        drop(state);
 
         if self.pending_g && self.pending_g_at.elapsed() > Duration::from_millis(500) {
             self.pending_g = false;
@@ -408,5 +420,48 @@ mod tests {
         let mut tab = LogTab::new(state);
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         assert!(tab.search.is_active());
+    }
+
+    fn make_mixed_joblog() -> (Arc<Mutex<JoblogState>>, tempfile::TempPath) {
+        let mut f = NamedTempFile::new().unwrap();
+        // 3 uploaded, 2 skipped, 1 failed — "nasa" appears in items 0,1
+        writeln!(f, r#"{{"ts":"2026-03-18T14:00:00Z","op":"upload","item":"nasa-photos","file":"a.jpg","status":"ok"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-03-18T14:01:00Z","op":"upload","item":"nasa-data","file":"b.csv","status":"ok"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-03-18T14:02:00Z","op":"upload","item":"hubble","file":"c.fits","status":"ok"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-03-18T14:03:00Z","op":"upload","item":"nasa-photos","file":"d.jpg","status":"skipped"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-03-18T14:04:00Z","op":"upload","item":"hubble","file":"e.fits","status":"skipped"}}"#).unwrap();
+        writeln!(f, r#"{{"ts":"2026-03-18T14:05:00Z","op":"upload","item":"nasa-photos","file":"f.jpg","status":"error","error":"503"}}"#).unwrap();
+        f.flush().unwrap();
+        let state = JoblogState::open(f.path()).unwrap();
+        let path = f.into_temp_path();
+        (Arc::new(Mutex::new(state)), path)
+    }
+
+    #[test]
+    fn test_search_plus_filter_intersects() {
+        let (state, _path) = make_mixed_joblog();
+        let mut tab = LogTab::new(state.clone());
+
+        // Filter to "Uploaded" only (3 entries: nasa-photos, nasa-data, hubble)
+        tab.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(tab.status_filter, Some(LogStatus::Uploaded));
+        {
+            let s = state.lock().unwrap();
+            let visible = tab.visible_entries(&s);
+            assert_eq!(visible.len(), 3);
+        }
+
+        // Now search for "nasa" — should intersect: only 2 uploaded nasa items
+        tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        {
+            let s = state.lock().unwrap();
+            let visible = tab.visible_entries(&s);
+            assert_eq!(visible.len(), 2, "search + filter should intersect");
+        }
     }
 }

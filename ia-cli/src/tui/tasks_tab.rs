@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Tasks tab for the multi-tab dashboard.
 //!
 //! Displays S3 task status with a summary panel at top, a scrollable task
@@ -21,6 +20,7 @@ use super::widgets;
 
 /// Tasks tab — shows the S3 task queue with summary counts, a scrollable task
 /// table, and search/filter support.
+#[derive(Debug)]
 pub struct TasksTab {
     s3_state: Arc<Mutex<S3TaskState>>,
     pub search: SearchState,
@@ -40,7 +40,9 @@ impl TasksTab {
 
     /// Return the filtered task list length (for clamping cursor).
     fn task_count(&self) -> usize {
-        let state = self.s3_state.lock().unwrap();
+        let Ok(state) = self.s3_state.lock() else {
+            return 0;
+        };
         if self.search.query().is_empty() {
             state.tasks.len()
         } else {
@@ -55,7 +57,9 @@ impl TasksTab {
 
 impl TabView for TasksTab {
     fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let state = self.s3_state.lock().unwrap();
+        let Ok(state) = self.s3_state.lock() else {
+            return;
+        };
 
         // Layout: S3 summary panel (3 rows), task table (fill), optional search bar (1 row).
         let search_height = if self.search.is_active() { 1 } else { 0 };
@@ -72,12 +76,14 @@ impl TabView for TasksTab {
             frame,
             chunks[0],
             theme,
-            state.queued,
-            state.running,
-            state.errors,
-            state.global_count,
-            state.is_rate_limited,
-            state.seconds_since_poll(),
+            &widgets::S3PanelData {
+                queued: state.queued,
+                running: state.running,
+                errors: state.errors,
+                global_count: state.global_count,
+                rate_limited: state.is_rate_limited,
+                seconds_ago: state.seconds_since_poll(),
+            },
         );
         // Overlay the toggle indicator in the top-right area of the S3 panel.
         let toggle_text = format!("[{}] ", view_label);
@@ -205,9 +211,9 @@ impl TabView for TasksTab {
                 true
             }
             KeyCode::Char('u') => {
-                let mut state = self.s3_state.lock().unwrap();
-                state.toggle_view();
-                drop(state);
+                if let Ok(mut state) = self.s3_state.lock() {
+                    state.toggle_view();
+                }
                 self.cursor = 0;
                 self.scroll_offset = 0;
                 true
@@ -217,7 +223,20 @@ impl TabView for TasksTab {
                 true
             }
             KeyCode::Enter => {
-                // Browser open will be wired later.
+                // Open the selected task's item on archive.org.
+                if let Ok(state) = self.s3_state.lock() {
+                    let filtered: Vec<_> = state
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            self.search.matches(&t.identifier) || self.search.matches(&t.cmd)
+                        })
+                        .collect();
+                    if let Some(task) = filtered.get(self.cursor) {
+                        let url = format!("https://archive.org/history/{}", task.identifier);
+                        let _ = open::that(url);
+                    }
+                }
                 true
             }
             _ => false,
@@ -247,23 +266,26 @@ mod tests {
     use crossterm::event::KeyCode;
 
     fn make_s3_state() -> Arc<Mutex<S3TaskState>> {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         state.update_tasks(vec![
             S3TaskEntry {
                 identifier: "item-a".into(),
                 cmd: "s3-put".into(),
+                submitter: "test@example.com".into(),
                 status: "running".into(),
                 submittime: "14:01:23".into(),
             },
             S3TaskEntry {
                 identifier: "item-b".into(),
                 cmd: "s3-put".into(),
+                submitter: "test@example.com".into(),
                 status: "queued".into(),
                 submittime: "14:01:25".into(),
             },
             S3TaskEntry {
                 identifier: "item-c".into(),
                 cmd: "s3-put".into(),
+                submitter: "test@example.com".into(),
                 status: "queued".into(),
                 submittime: "14:01:30".into(),
             },

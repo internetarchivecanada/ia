@@ -3,8 +3,6 @@
 //! Defines the [`TabView`] trait that individual tabs implement, and the
 //! [`TabId`] enum identifying which tab is active.
 
-#![allow(dead_code)]
-
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -39,6 +37,7 @@ pub enum TabId {
 impl TabId {
     pub const ALL: [TabId; 4] = [TabId::Upload, TabId::Tasks, TabId::Log, TabId::Errors];
 
+    #[cfg(test)]
     pub fn from_index(i: usize) -> Option<Self> {
         match i {
             0 => Some(TabId::Upload),
@@ -49,6 +48,7 @@ impl TabId {
         }
     }
 
+    #[cfg(test)]
     pub fn index(self) -> usize {
         match self {
             TabId::Upload => 0,

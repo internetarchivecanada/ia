@@ -3,8 +3,6 @@
 //! Renders a centered popup showing context-sensitive keybindings for the
 //! currently active tab, plus global keys that apply everywhere.
 
-#![allow(dead_code)]
-
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};

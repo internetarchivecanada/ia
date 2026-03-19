@@ -3,8 +3,6 @@
 //! Implements the [`Dashboard`] trait from `framework.rs`, wrapping all four
 //! tabs and rendering the shared header, tab bar, and footer.
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -24,6 +22,7 @@ use super::upload_app::{UploadItemStatus, UploadTuiState};
 use super::upload_tab::UploadTab;
 use super::widgets;
 
+#[derive(Debug)]
 pub struct MultiTabDashboard {
     pub active_tab: TabId,
     pub show_help: bool,
@@ -101,19 +100,22 @@ impl Dashboard for MultiTabDashboard {
 
         // Propagate rate-limit status from upload items to S3TaskState
         {
-            let state = self.upload_state.lock().unwrap();
+            let Ok(state) = self.upload_state.lock() else {
+                return;
+            };
             let any_rate_limited = state
                 .items
                 .iter()
                 .any(|i| matches!(i.status, UploadItemStatus::RateLimited));
-            self.s3_state
-                .lock()
-                .unwrap()
-                .set_rate_limited(any_rate_limited);
+            if let Ok(mut s3) = self.s3_state.lock() {
+                s3.set_rate_limited(any_rate_limited);
+            }
         }
 
         // Draw header
-        let state = self.upload_state.lock().unwrap();
+        let Ok(state) = self.upload_state.lock() else {
+            return;
+        };
         let items_done = state
             .items
             .iter()
@@ -135,12 +137,14 @@ impl Dashboard for MultiTabDashboard {
             frame,
             chunks[0],
             &self.theme,
-            "ia upload",
-            items_done,
-            items_total,
-            &bytes,
-            &speed,
-            &eta,
+            &widgets::HeaderData {
+                command: "ia upload",
+                items_done,
+                items_total,
+                bytes: &bytes,
+                speed: &speed,
+                eta: &eta,
+            },
         );
         widgets::draw_tab_bar(frame, chunks[1], &self.theme, self.active_tab);
 
@@ -160,8 +164,10 @@ impl Dashboard for MultiTabDashboard {
             TabId::Log => self.log_tab.key_hints(),
             TabId::Errors => self.errors_tab.key_hints(),
         };
-        let elapsed =
-            widgets::format_elapsed(self.upload_state.lock().unwrap().throughput.elapsed());
+        let elapsed = self.upload_state.lock().map_or_else(
+            |_| String::from("0s"),
+            |s| widgets::format_elapsed(s.throughput.elapsed()),
+        );
         widgets::draw_footer(frame, chunks[4], &self.theme, &hints, &elapsed);
 
         // Help overlay on top
@@ -234,8 +240,9 @@ impl Dashboard for MultiTabDashboard {
     }
 
     fn is_done(&self) -> bool {
-        let state = self.upload_state.lock().unwrap();
-        state.done && state.active_files.is_empty()
+        self.upload_state
+            .lock()
+            .map_or(true, |state| state.done && state.active_files.is_empty())
     }
 
     fn quit_requested(&self) -> bool {
@@ -250,7 +257,7 @@ mod tests {
 
     fn make_dashboard() -> MultiTabDashboard {
         let upload_state = Arc::new(Mutex::new(UploadTuiState::new(&["test".to_string()])));
-        let s3_state = Arc::new(Mutex::new(S3TaskState::new("t@t.com".into())));
+        let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
         let joblog_state = Arc::new(Mutex::new(JoblogState::empty()));
         MultiTabDashboard::new(upload_state, s3_state, joblog_state)
     }
@@ -352,5 +359,21 @@ mod tests {
         let mut d = make_dashboard();
         // Ensure tick_all doesn't crash with empty state
         d.tick_all();
+    }
+
+    #[test]
+    fn test_render_does_not_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let d = make_dashboard();
+        terminal
+            .draw(|frame| {
+                d.draw(frame);
+            })
+            .unwrap();
+        // If we got here without panicking, the layout and rendering logic is sound.
     }
 }

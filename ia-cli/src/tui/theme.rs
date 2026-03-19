@@ -2,14 +2,13 @@
 //!
 //! Provides true-color and 256-color fallback based on `$COLORTERM` detection.
 
-#![allow(dead_code)]
-
 use ratatui::style::Color;
 
 /// Color theme for the dashboard TUI.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     // Background & text
+    #[allow(dead_code)] // Available for terminal background override
     pub bg: Color,
     pub text: Color,
     pub text_secondary: Color,

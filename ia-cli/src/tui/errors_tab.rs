@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Errors tab for the multi-tab upload dashboard.
 //!
 //! Displays upload failures in a scrollable table with inline expansion
@@ -20,6 +18,7 @@ use super::theme::Theme;
 use super::upload_app::UploadTuiState;
 
 /// The Errors tab: lists failed files with inline error expansion.
+#[derive(Debug)]
 pub struct ErrorsTab {
     upload_state: Arc<Mutex<UploadTuiState>>,
     s3_state: Arc<Mutex<S3TaskState>>,
@@ -94,8 +93,8 @@ impl TabView for ErrorsTab {
                 };
 
                 // Truncate error to fit in a single line (leave room for file column).
-                let summary = if error.len() > 60 {
-                    format!("{}...", &error[..57])
+                let summary = if error.chars().count() > 60 {
+                    format!("{}...", error.chars().take(57).collect::<String>())
                 } else {
                     error.clone()
                 };
@@ -218,7 +217,7 @@ mod tests {
     fn test_scroll() {
         let mut tab = ErrorsTab::new(
             make_state_with_errors(),
-            Arc::new(Mutex::new(S3TaskState::new("t@t.com".into()))),
+            Arc::new(Mutex::new(S3TaskState::new())),
         );
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(tab.cursor, 1);
@@ -228,7 +227,7 @@ mod tests {
     fn test_expand_collapse() {
         let mut tab = ErrorsTab::new(
             make_state_with_errors(),
-            Arc::new(Mutex::new(S3TaskState::new("t@t.com".into()))),
+            Arc::new(Mutex::new(S3TaskState::new())),
         );
         assert!(tab.expanded.is_none());
         tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
@@ -241,11 +240,48 @@ mod tests {
     fn test_escape_collapses() {
         let mut tab = ErrorsTab::new(
             make_state_with_errors(),
-            Arc::new(Mutex::new(S3TaskState::new("t@t.com".into()))),
+            Arc::new(Mutex::new(S3TaskState::new())),
         );
         tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(tab.expanded.is_some());
         tab.handle_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(tab.expanded.is_none());
+    }
+
+    #[test]
+    fn test_cursor_clamped_when_errors_shrink() {
+        let upload_state = make_state_with_errors();
+        let mut tab = ErrorsTab::new(
+            upload_state.clone(),
+            Arc::new(Mutex::new(S3TaskState::new())),
+        );
+
+        // Move cursor to last error (index 1)
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 1);
+
+        // Remove all errors — cursor should clamp to 0
+        upload_state.lock().unwrap().failed_files.clear();
+        let count = tab.error_count();
+        assert_eq!(count, 0);
+
+        // j should not advance cursor past empty list
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 1); // cursor doesn't advance past empty
+    }
+
+    #[test]
+    fn test_cursor_clamps_on_scroll_down() {
+        let mut tab = ErrorsTab::new(
+            make_state_with_errors(),
+            Arc::new(Mutex::new(S3TaskState::new())),
+        );
+
+        // Try scrolling past the end
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        // Should be clamped at len-1 = 1
+        assert_eq!(tab.cursor, 1);
     }
 }

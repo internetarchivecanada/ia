@@ -847,7 +847,9 @@ pub async fn run_tui(
 
         let handle = tokio::spawn(async move {
             // Wait for an item slot before starting this item's download
-            let _item_permit = isem.acquire().await.unwrap();
+            let _item_permit = isem.acquire().await.map_err(|e| {
+                ia_core::error::IaError::Config(format!("download semaphore closed: {e}"))
+            })?;
 
             let progress_state = download_state.clone();
             let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =

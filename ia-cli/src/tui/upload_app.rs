@@ -338,36 +338,27 @@ async fn run_dashboard_and_summarize(
     use super::joblog_state::JoblogState;
     use super::s3_state::{S3TaskEntry, S3TaskState};
 
-    // Get submitter email from config cookies (no network call needed).
-    let email = client
-        .config()
-        .cookies
-        .get("logged-in-user")
-        .cloned()
-        .unwrap_or_default();
-
     // Create shared state for the multi-tab dashboard.
-    let s3_state = Arc::new(Mutex::new(S3TaskState::new(email)));
+    let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
     let joblog_state = Arc::new(Mutex::new(match joblog_path {
         Some(p) => JoblogState::open(p).unwrap_or_else(|_| JoblogState::empty()),
         None => JoblogState::empty(),
     }));
 
     // 1. Spawn S3 tasks polling loop (every 15s, single aggregate query).
-    //    Uses `args=*s3-put*&submitter={email}` instead of per-identifier
-    //    queries — for a 500-item batch this reduces polling from 500
-    //    requests/minute to 1.
+    //    One query WITHOUT submitter filter gives true global counts.
+    //    We filter locally by submitter email for user-specific counts.
     let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
     let submitter = client.config().cookies.get("logged-in-user").cloned();
     let tasks_handle = tokio::spawn(async move {
         loop {
-            // User tasks query (with catalog entries for the Tasks tab).
+            // Global tasks query (no submitter filter) with catalog entries.
             if let Ok(value) = ia_core::tasks::get_tasks(
                 &tasks_client,
                 &ia_core::tasks::TasksQuery {
                     args: Some("*s3-put*".to_string()),
-                    submitter: submitter.clone(),
+                    submitter: None,
                     catalog: Some(true),
                     history: Some(false),
                     ..Default::default()
@@ -376,20 +367,24 @@ async fn run_dashboard_and_summarize(
             .await
             {
                 if let Ok(mut s3) = poll_s3.lock() {
-                    s3.update_summary(
-                        value.summary.queued,
-                        value.summary.running,
-                        value.summary.error,
+                    // Global count from the unfiltered summary.
+                    s3.update_global_count(
+                        value.summary.queued
+                            + value.summary.running
+                            + value.summary.error
+                            + value.summary.paused,
                     );
+
                     // Convert catalog entries to S3TaskEntry for display.
                     // TaskEntry.color maps to display status: green=running,
                     // blue=queued, red=error, brown=paused.
-                    let entries: Vec<S3TaskEntry> = value
+                    let all_entries: Vec<S3TaskEntry> = value
                         .catalog
                         .iter()
                         .map(|e| S3TaskEntry {
                             identifier: e.identifier.clone(),
                             cmd: e.cmd.clone(),
+                            submitter: e.submitter.clone(),
                             status: match e.color.as_str() {
                                 "green" => "running".to_string(),
                                 "blue" => "queued".to_string(),
@@ -400,14 +395,24 @@ async fn run_dashboard_and_summarize(
                             submittime: e.submittime.clone(),
                         })
                         .collect();
-                    s3.update_tasks(entries);
-                    // Compute global count from summary.
-                    s3.update_global_count(
-                        value.summary.queued
-                            + value.summary.running
-                            + value.summary.error
-                            + value.summary.paused,
-                    );
+
+                    // Filter for user-specific summary counts.
+                    let (mut user_queued, mut user_running, mut user_errors) = (0u32, 0u32, 0u32);
+                    for entry in &all_entries {
+                        let is_user = submitter
+                            .as_ref()
+                            .is_some_and(|email| entry.submitter == *email);
+                        if is_user {
+                            match entry.status.as_str() {
+                                "queued" => user_queued += 1,
+                                "running" => user_running += 1,
+                                "error" => user_errors += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    s3.update_summary(user_queued, user_running, user_errors);
+                    s3.update_tasks(all_entries);
                     s3.mark_polled();
                 }
             }
@@ -584,7 +589,11 @@ pub async fn run_upload_tui(
         let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
+            let Ok(_permit) = sem.acquire().await else {
+                return Err(ia_core::error::IaError::Config(
+                    "upload semaphore closed".into(),
+                ));
+            };
             let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
                 Arc::new(move |p: UploadProgress| {
                     if let Ok(mut s) = progress_state.lock() {
@@ -661,7 +670,11 @@ pub async fn run_upload_batch_tui(
         let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
+            let Ok(_permit) = sem.acquire().await else {
+                return Err(ia_core::error::IaError::Config(
+                    "upload semaphore closed".into(),
+                ));
+            };
             let id = group.identifier.clone();
             let files = group.files;
 

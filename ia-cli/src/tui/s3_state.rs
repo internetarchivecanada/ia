@@ -3,8 +3,6 @@
 //! Extracted from `upload_app.rs` so that the Upload tab, Tasks tab, and
 //! Errors tab can all access S3 task counts and the full task list.
 
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 /// Poll interval for S3 task queries.
@@ -15,6 +13,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(15);
 pub struct S3TaskEntry {
     pub identifier: String,
     pub cmd: String,
+    pub submitter: String,
     pub status: String,
     pub submittime: String,
 }
@@ -22,8 +21,6 @@ pub struct S3TaskEntry {
 /// Shared S3 task state used across all tabs.
 #[derive(Debug)]
 pub struct S3TaskState {
-    /// User's email for filtering.
-    pub email: String,
     /// Summary counts from the user's tasks.
     pub queued: u32,
     pub running: u32,
@@ -36,14 +33,13 @@ pub struct S3TaskState {
     pub tasks: Vec<S3TaskEntry>,
     /// Whether to show global tasks (true) or user tasks (false).
     pub show_global: bool,
-    /// When we last polled the API.
-    last_polled: Instant,
+    /// When we last polled the API. `None` means never polled — needs immediate poll.
+    last_polled: Option<Instant>,
 }
 
 impl S3TaskState {
-    pub fn new(email: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            email,
             queued: 0,
             running: 0,
             errors: 0,
@@ -51,7 +47,7 @@ impl S3TaskState {
             is_rate_limited: false,
             tasks: Vec::new(),
             show_global: false,
-            last_polled: Instant::now() - POLL_INTERVAL, // trigger immediate first poll
+            last_polled: None,
         }
     }
 
@@ -77,16 +73,18 @@ impl S3TaskState {
         self.is_rate_limited = limited;
     }
 
+    #[allow(dead_code)] // Called from dashboard polling loop in upload_app.rs
     pub fn needs_poll(&self) -> bool {
-        self.last_polled.elapsed() >= POLL_INTERVAL
+        self.last_polled
+            .is_none_or(|t| t.elapsed() >= POLL_INTERVAL)
     }
 
     pub fn mark_polled(&mut self) {
-        self.last_polled = Instant::now();
+        self.last_polled = Some(Instant::now());
     }
 
     pub fn seconds_since_poll(&self) -> u64 {
-        self.last_polled.elapsed().as_secs()
+        self.last_polled.map_or(0, |t| t.elapsed().as_secs())
     }
 }
 
@@ -96,7 +94,7 @@ mod tests {
 
     #[test]
     fn test_initial_state() {
-        let state = S3TaskState::new("test@example.com".to_string());
+        let state = S3TaskState::new();
         assert_eq!(state.queued, 0);
         assert_eq!(state.running, 0);
         assert_eq!(state.errors, 0);
@@ -108,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_toggle_view() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         assert!(!state.show_global);
         state.toggle_view();
         assert!(state.show_global);
@@ -118,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_update_from_summary() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         state.update_summary(23, 4, 1);
         assert_eq!(state.queued, 23);
         assert_eq!(state.running, 4);
@@ -127,17 +125,18 @@ mod tests {
 
     #[test]
     fn test_update_global_count() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         state.update_global_count(847);
         assert_eq!(state.global_count, 847);
     }
 
     #[test]
     fn test_update_tasks() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         let tasks = vec![S3TaskEntry {
             identifier: "test-item".to_string(),
             cmd: "s3-put".to_string(),
+            submitter: "test@example.com".to_string(),
             status: "queued".to_string(),
             submittime: "2026-03-18 14:00:00".to_string(),
         }];
@@ -148,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_set_rate_limited() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         state.set_rate_limited(true);
         assert!(state.is_rate_limited);
         state.set_rate_limited(false);
@@ -157,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_needs_poll_respects_interval() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         // Just created with backdated last_polled, should need poll
         assert!(state.needs_poll());
         // After marking polled, should not need poll
@@ -166,8 +165,23 @@ mod tests {
     }
 
     #[test]
+    fn test_needs_poll_after_construction() {
+        let state = S3TaskState::new();
+        // Freshly constructed with last_polled = None should need immediate poll
+        assert!(
+            state.needs_poll(),
+            "newly constructed S3TaskState should need immediate poll"
+        );
+        assert_eq!(
+            state.seconds_since_poll(),
+            0,
+            "never-polled state should report 0 seconds"
+        );
+    }
+
+    #[test]
     fn test_seconds_since_poll() {
-        let mut state = S3TaskState::new("test@example.com".to_string());
+        let mut state = S3TaskState::new();
         state.mark_polled();
         assert!(state.seconds_since_poll() < 2);
     }

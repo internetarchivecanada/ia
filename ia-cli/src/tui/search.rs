@@ -1,10 +1,11 @@
 //! Vim-style search input and filter cycling for TUI tabs.
 
-#![allow(dead_code)]
-
 /// Vim-style search input state.
+#[derive(Debug)]
 pub struct SearchState {
     query: String,
+    /// Cached lowercased version of `query` to avoid per-call allocation.
+    query_lower: String,
     active: bool,
 }
 
@@ -12,13 +13,16 @@ impl SearchState {
     pub fn new() -> Self {
         Self {
             query: String::new(),
+            query_lower: String::new(),
             active: false,
         }
     }
 
+    #[cfg(test)]
     pub fn with_query(q: &str) -> Self {
         Self {
             query: q.to_string(),
+            query_lower: q.to_lowercase(),
             active: false,
         }
     }
@@ -34,14 +38,17 @@ impl SearchState {
     pub fn activate(&mut self) {
         self.active = true;
         self.query.clear();
+        self.query_lower.clear();
     }
 
     pub fn push(&mut self, c: char) {
         self.query.push(c);
+        self.query_lower = self.query.to_lowercase();
     }
 
     pub fn backspace(&mut self) {
         self.query.pop();
+        self.query_lower = self.query.to_lowercase();
     }
 
     pub fn confirm(&mut self) {
@@ -52,21 +59,25 @@ impl SearchState {
     pub fn cancel(&mut self) {
         self.active = false;
         self.query.clear();
+        self.query_lower.clear();
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.query.clear();
+        self.query_lower.clear();
     }
 
     pub fn matches(&self, text: &str) -> bool {
         if self.query.is_empty() {
             return true;
         }
-        text.to_lowercase().contains(&self.query.to_lowercase())
+        text.to_lowercase().contains(&self.query_lower)
     }
 }
 
 /// Cycles through a fixed set of filter labels.
+#[derive(Debug)]
 pub struct FilterCycle {
     labels: Vec<&'static str>,
     index: usize,
@@ -74,6 +85,10 @@ pub struct FilterCycle {
 
 impl FilterCycle {
     pub fn new(labels: &[&'static str]) -> Self {
+        debug_assert!(
+            !labels.is_empty(),
+            "FilterCycle requires at least one label"
+        );
         Self {
             labels: labels.to_vec(),
             index: 0,
@@ -88,6 +103,7 @@ impl FilterCycle {
         self.index = (self.index + 1) % self.labels.len();
     }
 
+    #[cfg(test)]
     pub fn index(&self) -> usize {
         self.index
     }

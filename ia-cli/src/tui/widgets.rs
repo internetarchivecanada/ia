@@ -89,9 +89,9 @@ impl ThroughputTracker {
     /// Falls back to a lifetime average when fewer than two samples exist.
     #[must_use]
     pub fn throughput(&self) -> f64 {
-        if self.samples.len() >= 2 {
-            let (t_old, b_old) = self.samples.front().unwrap();
-            let (t_new, b_new) = self.samples.back().unwrap();
+        if let (Some((t_old, b_old)), Some((t_new, b_new))) =
+            (self.samples.front(), self.samples.back())
+        {
             let dt = t_new.duration_since(*t_old).as_secs_f64();
             if dt > 0.0 {
                 return b_new.saturating_sub(*b_old) as f64 / dt;
@@ -272,7 +272,7 @@ pub fn draw_key_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
 // ---------------------------------------------------------------------------
 
 /// Build the decorative header line content.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_header_line(
     command: &str,
     items: &str,
@@ -290,7 +290,7 @@ pub fn build_header_line(
 /// - Normal: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N"
 /// - Rate-limited, 0 errors: "⧖ Queued: N   ↻ Running: N   ⏸ rate-limited"
 /// - Rate-limited with errors: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N   ⏸ rate-limited"
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_s3_status_text(queued: u32, running: u32, errors: u32, rate_limited: bool) -> String {
     let mut parts = vec![
         format!("⧖ Queued: {}", queued),
@@ -307,36 +307,45 @@ pub fn build_s3_status_text(queued: u32, running: u32, errors: u32, rate_limited
     parts.join("   ")
 }
 
+/// Data needed to render the header bar.
+pub struct HeaderData<'a> {
+    pub command: &'a str,
+    pub items_done: usize,
+    pub items_total: usize,
+    pub bytes: &'a str,
+    pub speed: &'a str,
+    pub eta: &'a str,
+}
+
+/// Data needed to render the S3 tasks panel.
+pub struct S3PanelData {
+    pub queued: u32,
+    pub running: u32,
+    pub errors: u32,
+    pub global_count: u32,
+    pub rate_limited: bool,
+    pub seconds_ago: u64,
+}
+
 /// Render the decorative header bar (centered ━━━ line with stats).
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn draw_header(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    command: &str,
-    items_done: usize,
-    items_total: usize,
-    bytes: &str,
-    speed: &str,
-    eta: &str,
-) {
+pub fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme, data: &HeaderData<'_>) {
     use ratatui::layout::Alignment;
 
-    let items_str = format!("{}/{} items", items_done, items_total);
+    let items_str = format!("{}/{} items", data.items_done, data.items_total);
     let spans = vec![
         Span::styled("━━━ ", Style::default().fg(theme.maroon_bright)),
         Span::styled(
-            command,
+            data.command,
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
         Span::styled(&items_str, Style::default().fg(theme.green)),
         Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(bytes, Style::default().fg(theme.text_secondary)),
+        Span::styled(data.bytes, Style::default().fg(theme.text_secondary)),
         Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(speed, Style::default().fg(theme.maroon_bright)),
+        Span::styled(data.speed, Style::default().fg(theme.maroon_bright)),
         Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(eta, Style::default().fg(theme.text_secondary)),
+        Span::styled(data.eta, Style::default().fg(theme.text_secondary)),
         Span::styled(" ━━━", Style::default().fg(theme.maroon_bright)),
     ];
     let header = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
@@ -344,7 +353,6 @@ pub fn draw_header(
 }
 
 /// Render the tab bar with active tab highlighted.
-#[allow(dead_code)]
 pub fn draw_tab_bar(frame: &mut Frame, area: Rect, theme: &Theme, active: TabId) {
     use ratatui::layout::Alignment;
 
@@ -373,28 +381,17 @@ pub fn draw_tab_bar(frame: &mut Frame, area: Rect, theme: &Theme, active: TabId)
 }
 
 /// Render the S3 Tasks panel (used on Upload tab and Tasks tab).
-#[allow(dead_code, clippy::too_many_arguments)]
-pub fn draw_s3_panel(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    queued: u32,
-    running: u32,
-    errors: u32,
-    global_count: u32,
-    rate_limited: bool,
-    seconds_ago: u64,
-) {
+pub fn draw_s3_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &S3PanelData) {
     let title_line = Line::from(vec![Span::styled(
         " S3 Tasks ",
         Style::default().fg(theme.maroon_bright),
     )]);
     let global_line = Line::from(vec![Span::styled(
-        format!("Global: {} ", global_count),
+        format!("Global: {} ", data.global_count),
         Style::default().fg(theme.text_muted),
     )]);
     let bottom_line = Line::from(vec![Span::styled(
-        format!(" polled {}s ago ", seconds_ago),
+        format!(" polled {}s ago ", data.seconds_ago),
         Style::default().fg(theme.text_very_muted),
     )]);
     let block = Block::default()
@@ -407,19 +404,19 @@ pub fn draw_s3_panel(
     let mut spans = vec![
         Span::styled("⧖ Queued: ", Style::default().fg(theme.text_secondary)),
         Span::styled(
-            format!("{}", queued),
+            format!("{}", data.queued),
             Style::default().fg(theme.gold).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled("↻ Running: ", Style::default().fg(theme.text_secondary)),
         Span::styled(
-            format!("{}", running),
+            format!("{}", data.running),
             Style::default().fg(theme.blue).add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
     ];
 
-    if rate_limited && errors == 0 {
+    if data.rate_limited && data.errors == 0 {
         spans.push(Span::styled(
             "⏸ rate-limited",
             Style::default().fg(theme.gold),
@@ -430,14 +427,14 @@ pub fn draw_s3_panel(
             Style::default().fg(theme.text_secondary),
         ));
         spans.push(Span::styled(
-            format!("{}", errors),
-            Style::default().fg(if errors > 0 {
+            format!("{}", data.errors),
+            Style::default().fg(if data.errors > 0 {
                 theme.red
             } else {
                 theme.text_secondary
             }),
         ));
-        if rate_limited {
+        if data.rate_limited {
             spans.push(Span::raw("   "));
             spans.push(Span::styled(
                 "⏸ rate-limited",
@@ -451,7 +448,6 @@ pub fn draw_s3_panel(
 }
 
 /// Render context-sensitive key hints in the footer.
-#[allow(dead_code)]
 pub fn draw_footer(
     frame: &mut Frame,
     area: Rect,
@@ -491,7 +487,6 @@ pub fn draw_footer(
 }
 
 /// Render a themed sparkline throughput panel.
-#[allow(dead_code)]
 pub fn draw_themed_throughput_panel(
     frame: &mut Frame,
     area: Rect,

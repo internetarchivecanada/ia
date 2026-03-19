@@ -5,8 +5,6 @@
 //! throughput sparkline. Migrates the existing upload panel rendering to
 //! the new themed, tabbed layout.
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -41,6 +39,7 @@ pub enum FocusPanel {
 
 /// Upload tab state: wraps shared upload and S3 task state, plus local UI
 /// state for panel focus and scroll positions.
+#[derive(Debug)]
 pub struct UploadTab {
     upload_state: Arc<Mutex<UploadTuiState>>,
     s3_state: Arc<Mutex<S3TaskState>>,
@@ -94,12 +93,14 @@ impl TabView for UploadTab {
             frame,
             chunks[0],
             theme,
-            s3.queued,
-            s3.running,
-            s3.errors,
-            s3.global_count,
-            s3.is_rate_limited,
-            s3.seconds_since_poll(),
+            &widgets::S3PanelData {
+                queued: s3.queued,
+                running: s3.running,
+                errors: s3.errors,
+                global_count: s3.global_count,
+                rate_limited: s3.is_rate_limited,
+                seconds_ago: s3.seconds_since_poll(),
+            },
         );
 
         // ── Items + Transfers (horizontal 50/50) ────────────────────
@@ -160,8 +161,13 @@ impl TabView for UploadTab {
                 true
             }
             KeyCode::Enter => {
-                // TODO: open::that(url) — will be wired in during integration (Task 13).
-                // For now, just consume the key.
+                // Open the selected item on archive.org in the default browser.
+                if let Ok(state) = self.upload_state.lock() {
+                    if let Some(item) = state.items.get(self.items_scroll) {
+                        let url = format!("https://archive.org/details/{}", item.identifier);
+                        let _ = open::that(url);
+                    }
+                }
                 true
             }
             _ => false,
@@ -442,7 +448,7 @@ mod tests {
     }
 
     fn make_s3_state() -> Arc<Mutex<S3TaskState>> {
-        Arc::new(Mutex::new(S3TaskState::new("test@example.com".to_string())))
+        Arc::new(Mutex::new(S3TaskState::new()))
     }
 
     #[test]
