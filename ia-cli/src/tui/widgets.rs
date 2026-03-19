@@ -461,12 +461,16 @@ pub fn draw_s3_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &S3Pane
 }
 
 /// Render context-sensitive key hints in the footer.
+///
+/// When `status` is `Some`, a gold status message is shown in the center
+/// between the key hints and the elapsed time.
 pub fn draw_footer(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     hints: &[(&str, &str)],
     elapsed: &str,
+    status: Option<&str>,
 ) {
     use ratatui::layout::Alignment;
 
@@ -492,11 +496,27 @@ pub fn draw_footer(
     )]))
     .alignment(Alignment::Right);
 
-    let chunks =
-        Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)]).split(area);
-
-    frame.render_widget(keys, chunks[0]);
-    frame.render_widget(time, chunks[1]);
+    if let Some(text) = status {
+        let status_para = Paragraph::new(Line::from(vec![Span::styled(
+            text,
+            Style::default().fg(theme.gold),
+        )]))
+        .alignment(Alignment::Center);
+        let chunks = Layout::horizontal([
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+        frame.render_widget(keys, chunks[0]);
+        frame.render_widget(status_para, chunks[1]);
+        frame.render_widget(time, chunks[2]);
+    } else {
+        let chunks = Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)])
+            .split(area);
+        frame.render_widget(keys, chunks[0]);
+        frame.render_widget(time, chunks[1]);
+    }
 }
 
 /// Render a themed sparkline throughput panel.

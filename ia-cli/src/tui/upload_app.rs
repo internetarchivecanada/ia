@@ -337,6 +337,17 @@ impl UploadTuiState {
 }
 
 // ---------------------------------------------------------------------------
+// Pause support
+// ---------------------------------------------------------------------------
+
+/// Wait while uploads are paused, polling every 200ms.
+async fn wait_if_paused(paused: &std::sync::atomic::AtomicBool) {
+    while paused.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared dashboard lifecycle
 // ---------------------------------------------------------------------------
 
@@ -354,6 +365,7 @@ async fn run_dashboard_and_summarize(
         >,
     >,
     joblog_path: Option<&std::path::Path>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -376,6 +388,7 @@ async fn run_dashboard_and_summarize(
     let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
     let submitter = client.config().cookies.get("logged-in-user").cloned();
+    let submitter_for_dashboard = submitter.clone();
     let refresh_notify = Arc::new(tokio::sync::Notify::new());
     let poll_notify = Arc::clone(&refresh_notify);
     let tasks_handle = tokio::spawn(async move {
@@ -397,11 +410,6 @@ async fn run_dashboard_and_summarize(
             {
                 Ok((summary, catalog)) => {
                     if let Ok(mut s3) = poll_s3.lock() {
-                        // Global count from the unfiltered summary.
-                        s3.update_global_count(
-                            summary.queued + summary.running + summary.error + summary.paused,
-                        );
-
                         // Convert catalog entries to S3TaskEntry for display.
                         // TaskEntry.color maps to display status: green=running,
                         // blue=queued, red=error, brown=paused.
@@ -422,10 +430,19 @@ async fn run_dashboard_and_summarize(
                             })
                             .collect();
 
-                        // Filter for user-specific summary counts.
+                        // Compute counts from catalog entries (more reliable than
+                        // summary line which may not be present in JSONL).
+                        let (mut global_queued, mut global_running, mut global_errors) =
+                            (0u32, 0u32, 0u32);
                         let (mut user_queued, mut user_running, mut user_errors) =
                             (0u32, 0u32, 0u32);
                         for entry in &all_entries {
+                            match entry.status.as_str() {
+                                "queued" => global_queued += 1,
+                                "running" => global_running += 1,
+                                "error" => global_errors += 1,
+                                _ => {}
+                            }
                             let is_user = submitter
                                 .as_ref()
                                 .is_some_and(|email| entry.submitter == *email);
@@ -438,6 +455,12 @@ async fn run_dashboard_and_summarize(
                                 }
                             }
                         }
+
+                        // Use catalog-derived counts, with summary as fallback for global
+                        let global_from_summary =
+                            summary.queued + summary.running + summary.error + summary.paused;
+                        let global_from_catalog = global_queued + global_running + global_errors;
+                        s3.update_global_count(global_from_summary.max(global_from_catalog));
                         s3.update_summary(user_queued, user_running, user_errors);
                         s3.update_tasks(all_entries);
                         s3.mark_polled();
@@ -467,12 +490,15 @@ async fn run_dashboard_and_summarize(
     let dashboard_upload = Arc::clone(&state);
     let dashboard_s3 = Arc::clone(&s3_state);
     let dashboard_joblog = Arc::clone(&joblog_state);
+    let dashboard_paused = Arc::clone(&paused);
     tokio::task::spawn_blocking(move || {
         let mut dashboard = MultiTabDashboard::new(
             dashboard_upload,
             dashboard_s3,
             dashboard_joblog,
             refresh_notify,
+            submitter_for_dashboard,
+            dashboard_paused,
         );
         super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
     })
@@ -618,6 +644,7 @@ pub async fn run_upload_tui(
     let (terminal, _guard) = super::framework::setup_terminal()?;
 
     let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Semaphore to limit how many items upload concurrently
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
@@ -633,6 +660,7 @@ pub async fn run_upload_tui(
         let progress_state = Arc::clone(&state);
         let cleanup_state = Arc::clone(&state);
         let skip = skip_set.clone();
+        let task_paused = Arc::clone(&paused);
 
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
@@ -640,6 +668,8 @@ pub async fn run_upload_tui(
                     "upload semaphore closed".into(),
                 ));
             };
+            // Wait while paused before starting this item's upload.
+            wait_if_paused(&task_paused).await;
             let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
                 Arc::new(move |p: UploadProgress| {
                     if let Ok(mut s) = progress_state.lock() {
@@ -663,7 +693,16 @@ pub async fn run_upload_tui(
         }));
     }
 
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
+    run_dashboard_and_summarize(
+        client,
+        state,
+        terminal,
+        _guard,
+        handles,
+        joblog_path,
+        paused,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +732,7 @@ pub async fn run_upload_batch_tui(
     // 3. Set up terminal — the guard ensures cleanup even on panic.
     let (terminal, _guard) = super::framework::setup_terminal()?;
     let state = Arc::new(Mutex::new(UploadTuiState::new(&identifiers)));
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // 4. Spawn upload tasks (one per item group, with concurrency semaphore)
     let semaphore = Arc::new(tokio::sync::Semaphore::new(jobs));
@@ -715,6 +755,7 @@ pub async fn run_upload_batch_tui(
         let progress_state = Arc::clone(&state);
         let cleanup_state = Arc::clone(&state);
         let skip = skip_set.clone();
+        let task_paused = Arc::clone(&paused);
 
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
@@ -722,6 +763,8 @@ pub async fn run_upload_batch_tui(
                     "upload semaphore closed".into(),
                 ));
             };
+            // Wait while paused before starting this item's upload.
+            wait_if_paused(&task_paused).await;
             let id = group.identifier.clone();
             let files = group.files;
 
@@ -749,7 +792,16 @@ pub async fn run_upload_batch_tui(
     }
 
     // 5-7. Run dashboard lifecycle (tasks polling, event loop, summary).
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
+    run_dashboard_and_summarize(
+        client,
+        state,
+        terminal,
+        _guard,
+        handles,
+        joblog_path,
+        paused,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

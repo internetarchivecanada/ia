@@ -3,13 +3,11 @@
 //! Implements the [`Dashboard`] trait from `framework.rs`, wrapping all four
 //! tabs and rendering the shared header, tab bar, and footer.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::errors_tab::ErrorsTab;
@@ -38,6 +36,9 @@ pub struct MultiTabDashboard {
     /// Notify to trigger an immediate S3 tasks refresh (used by 'r' key).
     refresh_notify: Arc<tokio::sync::Notify>,
 
+    /// Shared pause flag — when true, upload tasks wait before starting new uploads.
+    paused: Arc<AtomicBool>,
+
     // Tabs
     upload_tab: UploadTab,
     tasks_tab: TasksTab,
@@ -51,6 +52,8 @@ impl MultiTabDashboard {
         s3_state: Arc<Mutex<S3TaskState>>,
         joblog_state: Arc<Mutex<JoblogState>>,
         refresh_notify: Arc<tokio::sync::Notify>,
+        submitter: Option<String>,
+        paused: Arc<AtomicBool>,
     ) -> Self {
         let theme = Theme::detect();
         Self {
@@ -61,8 +64,9 @@ impl MultiTabDashboard {
             upload_state: upload_state.clone(),
             s3_state: s3_state.clone(),
             refresh_notify,
+            paused,
             upload_tab: UploadTab::new(upload_state.clone(), s3_state.clone()),
-            tasks_tab: TasksTab::new(s3_state.clone()),
+            tasks_tab: TasksTab::new(s3_state.clone(), submitter),
             log_tab: LogTab::new(joblog_state),
             errors_tab: ErrorsTab::new(upload_state, s3_state),
         }
@@ -140,12 +144,18 @@ impl Dashboard for MultiTabDashboard {
         );
         drop(state);
 
+        let is_paused = self.paused.load(Ordering::Relaxed);
+        let command_label = if is_paused {
+            "ia upload \u{23f8} PAUSED"
+        } else {
+            "ia upload"
+        };
         widgets::draw_header(
             frame,
             chunks[0],
             &self.theme,
             &widgets::HeaderData {
-                command: "ia upload",
+                command: command_label,
                 items_done,
                 items_total,
                 bytes: &bytes,
@@ -164,7 +174,7 @@ impl Dashboard for MultiTabDashboard {
             TabId::Errors => self.errors_tab.draw(frame, chunks[3], &self.theme),
         }
 
-        // Draw footer with context-sensitive hints
+        // Draw footer with context-sensitive hints and optional status text
         let hints = match self.active_tab {
             TabId::Upload => self.upload_tab.key_hints(),
             TabId::Tasks => self.tasks_tab.key_hints(),
@@ -175,20 +185,13 @@ impl Dashboard for MultiTabDashboard {
             |_| String::from("0s"),
             |s| widgets::format_elapsed(s.throughput.elapsed()),
         );
-        widgets::draw_footer(frame, chunks[4], &self.theme, &hints, &elapsed);
-
-        // Overwrite footer with status text (e.g., URL opened via Enter) if present.
-        // This ensures URLs are visible on headless systems where open::that() fails silently.
         let status = match self.active_tab {
             TabId::Upload => self.upload_tab.status_text(),
             TabId::Tasks => self.tasks_tab.status_text(),
             TabId::Log => self.log_tab.status_text(),
             TabId::Errors => self.errors_tab.status_text(),
         };
-        if let Some(text) = status {
-            let line = Line::from(Span::styled(text, Style::default().fg(self.theme.gold)));
-            frame.render_widget(Paragraph::new(line), chunks[4]);
-        }
+        widgets::draw_footer(frame, chunks[4], &self.theme, &hints, &elapsed, status);
 
         // Help overlay on top
         if self.show_help {
@@ -232,6 +235,11 @@ impl Dashboard for MultiTabDashboard {
             }
             KeyCode::Char('r') => {
                 self.refresh_notify.notify_one();
+                return true;
+            }
+            KeyCode::Char('p') => {
+                let was_paused = self.paused.load(Ordering::Relaxed);
+                self.paused.store(!was_paused, Ordering::Relaxed);
                 return true;
             }
             KeyCode::Char('1') => {
@@ -284,7 +292,15 @@ mod tests {
         let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
         let joblog_state = Arc::new(Mutex::new(JoblogState::empty()));
         let refresh_notify = Arc::new(tokio::sync::Notify::new());
-        MultiTabDashboard::new(upload_state, s3_state, joblog_state, refresh_notify)
+        let paused = Arc::new(AtomicBool::new(false));
+        MultiTabDashboard::new(
+            upload_state,
+            s3_state,
+            joblog_state,
+            refresh_notify,
+            None,
+            paused,
+        )
     }
 
     #[test]
@@ -384,6 +400,28 @@ mod tests {
         let mut d = make_dashboard();
         // Ensure tick_all doesn't crash with empty state
         d.tick_all();
+    }
+
+    #[test]
+    fn test_pause_toggle() {
+        let upload_state = Arc::new(Mutex::new(UploadTuiState::new(&["test".to_string()])));
+        let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
+        let joblog_state = Arc::new(Mutex::new(JoblogState::empty()));
+        let refresh_notify = Arc::new(tokio::sync::Notify::new());
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut d = MultiTabDashboard::new(
+            upload_state,
+            s3_state,
+            joblog_state,
+            refresh_notify,
+            None,
+            paused.clone(),
+        );
+        assert!(!paused.load(Ordering::Relaxed));
+        d.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(paused.load(Ordering::Relaxed));
+        d.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(!paused.load(Ordering::Relaxed));
     }
 
     #[test]

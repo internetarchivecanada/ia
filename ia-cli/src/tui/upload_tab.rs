@@ -219,6 +219,7 @@ impl TabView for UploadTab {
             ("j/k", "scroll"),
             ("Tab", "panel"),
             ("Enter", "open"),
+            ("p", "pause"),
             ("r", "refresh"),
             ("?", "help"),
             ("q", "quit"),
