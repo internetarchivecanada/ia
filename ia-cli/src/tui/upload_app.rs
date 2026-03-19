@@ -1,19 +1,14 @@
 //! Upload dashboard state machine.
 //!
 //! Tracks per-item and per-file upload progress with byte-level granularity,
-//! rate limit status, throughput sampling, and S3 task counts. Implements the
-//! [`Dashboard`] trait via [`UploadDashboard`].
+//! rate limit status, and throughput sampling.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyModifiers};
-
 use ia_core::upload::{UploadProgress, UploadProgressStatus};
 
-use super::framework::Dashboard;
-use super::upload_ui;
 use super::widgets::ThroughputTracker;
 
 // ---------------------------------------------------------------------------
@@ -103,18 +98,7 @@ pub struct UploadTuiState {
     pub completed_files: VecDeque<String>,
     pub failed_files: Vec<(String, String)>,
     pub throughput: ThroughputTracker,
-    #[allow(dead_code)] // Used by old UploadDashboard (to be removed in cleanup)
-    pub scroll_offset: usize,
-    #[allow(dead_code)]
-    pub quit_requested: bool,
     pub done: bool,
-    // S3 Tasks panel (legacy — now in S3TaskState; to be removed in cleanup)
-    #[allow(dead_code)]
-    pub tasks_queued: u32,
-    #[allow(dead_code)]
-    pub tasks_running: u32,
-    #[allow(dead_code)]
-    pub tasks_error: u32,
 }
 
 impl UploadTuiState {
@@ -154,12 +138,7 @@ impl UploadTuiState {
             completed_files: VecDeque::new(),
             failed_files: Vec::new(),
             throughput: ThroughputTracker::new(),
-            scroll_offset: 0,
-            quit_requested: false,
             done: false,
-            tasks_queued: 0,
-            tasks_running: 0,
-            tasks_error: 0,
         }
     }
 
@@ -331,81 +310,6 @@ impl UploadTuiState {
         // Sample throughput
         self.throughput.set_bytes(self.bytes_uploaded);
         self.throughput.maybe_sample();
-    }
-
-    /// Overall progress as a fraction in `[0.0, 1.0]`.
-    ///
-    /// Uses byte-level granularity: `bytes_uploaded / bytes_total`.
-    #[must_use]
-    #[allow(dead_code)] // Used by old upload_ui.rs (to be removed in cleanup)
-    pub fn overall_progress(&self) -> f64 {
-        if self.bytes_total == 0 {
-            return 0.0;
-        }
-        (self.bytes_uploaded as f64 / self.bytes_total as f64).min(1.0)
-    }
-
-    /// Clamp scroll_offset so it doesn't scroll past the active file list.
-    #[allow(dead_code)] // Used by old UploadDashboard (to be removed in cleanup)
-    pub fn clamp_scroll(&mut self) {
-        let max = self.active_files.len().saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.min(max);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard wrapper
-// ---------------------------------------------------------------------------
-
-/// Wrapper that implements [`Dashboard`] for the upload TUI.
-///
-/// **Deprecated**: Superseded by `MultiTabDashboard`. Retained for tests.
-#[allow(dead_code)]
-pub struct UploadDashboard {
-    pub state: Arc<Mutex<UploadTuiState>>,
-}
-
-impl Dashboard for UploadDashboard {
-    fn draw(&self, frame: &mut ratatui::Frame) {
-        if let Ok(s) = self.state.lock() {
-            upload_ui::draw(frame, &s);
-        }
-    }
-
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        let Ok(mut s) = self.state.lock() else {
-            return false;
-        };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                s.quit_requested = true;
-                true
-            }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                s.quit_requested = true;
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                s.scroll_offset = s.scroll_offset.saturating_add(1);
-                s.clamp_scroll();
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                s.scroll_offset = s.scroll_offset.saturating_sub(1);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.state
-            .lock()
-            .map_or(true, |s| s.done && s.active_files.is_empty())
-    }
-
-    fn quit_requested(&self) -> bool {
-        self.state.lock().map_or(true, |s| s.quit_requested)
     }
 }
 
@@ -1097,42 +1001,6 @@ mod tests {
         assert!(matches!(state.items[0].status, UploadItemStatus::Failed(_)));
     }
 
-    // 6. Progress ratio calculation
-    #[test]
-    fn test_overall_progress() {
-        let mut state = UploadTuiState::new(&["item-a".to_string()]);
-
-        // No bytes total yet
-        assert_eq!(state.overall_progress(), 0.0);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            0,
-            1000,
-            UploadProgressStatus::Verifying,
-        ));
-        assert_eq!(state.overall_progress(), 0.0);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            500,
-            1000,
-            UploadProgressStatus::Uploading,
-        ));
-        assert!((state.overall_progress() - 0.5).abs() < 0.001);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            1000,
-            1000,
-            UploadProgressStatus::Complete,
-        ));
-        assert!((state.overall_progress() - 1.0).abs() < 0.001);
-    }
-
     // 7. Multiple Uploading events, verify cumulative bytes are correct (not double-counted)
     #[test]
     fn test_byte_delta_tracking() {
@@ -1194,119 +1062,7 @@ mod tests {
         assert_eq!(state.bytes_uploaded, state.bytes_total);
     }
 
-    // --- Dashboard trait tests ---
-
-    #[test]
-    fn test_dashboard_quit_on_q() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        assert!(!dash.quit_requested());
-        dash.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_quit_on_esc() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        dash.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_quit_on_ctrl_c() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        dash.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_scroll() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        // Add active files so scroll has room to move
-        {
-            let mut s = state.lock().unwrap();
-            for i in 0..5 {
-                s.update(progress(
-                    "x",
-                    &format!("file-{i}.txt"),
-                    0,
-                    100,
-                    UploadProgressStatus::Verifying,
-                ));
-            }
-        }
-
-        dash.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 1);
-        dash.handle_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 2);
-        dash.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 1);
-        dash.handle_key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 0);
-        // Scroll up at 0 stays at 0
-        dash.handle_key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 0);
-    }
-
-    #[test]
-    fn test_dashboard_is_done() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        // Not done initially
-        assert!(!dash.is_done());
-
-        // Mark done but leave an active file — should still not be done
-        {
-            let mut s = state.lock().unwrap();
-            s.done = true;
-            s.active_files.insert(
-                "x\0f.txt".to_string(),
-                UploadFileProgress {
-                    name: "f.txt".to_string(),
-                    identifier: "x".to_string(),
-                    bytes_sent: 0,
-                    total_bytes: 100,
-                    status: UploadProgressStatus::Uploading,
-                    started_at: Instant::now(),
-                },
-            );
-        }
-        assert!(!dash.is_done());
-
-        // Clear active files — now it should be done
-        state.lock().unwrap().active_files.clear();
-        assert!(dash.is_done());
-    }
-
-    #[test]
-    fn test_unhandled_key_returns_false() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-        assert!(!dash.handle_key(KeyCode::Char('z'), KeyModifiers::NONE));
-    }
-
-    // --- Bounded completed_files and scroll clamping ---
+    // --- Bounded completed_files ---
 
     #[test]
     fn completed_files_bounded() {
@@ -1329,27 +1085,5 @@ mod tests {
         }
         assert!(state.completed_files.len() <= 10);
         assert_eq!(state.completed_files.back().unwrap(), "file-19.txt");
-    }
-
-    #[test]
-    fn scroll_offset_clamped() {
-        let mut state = UploadTuiState::new(&["item-1".into()]);
-        state.update(progress(
-            "item-1",
-            "a.txt",
-            0,
-            100,
-            UploadProgressStatus::Verifying,
-        ));
-        state.update(progress(
-            "item-1",
-            "b.txt",
-            0,
-            100,
-            UploadProgressStatus::Verifying,
-        ));
-        state.scroll_offset = 100;
-        state.clamp_scroll();
-        assert!(state.scroll_offset <= 1);
     }
 }

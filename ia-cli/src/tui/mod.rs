@@ -14,7 +14,6 @@ pub mod theme;
 mod ui;
 pub mod upload_app;
 pub mod upload_tab;
-mod upload_ui;
 pub mod widgets;
 
 pub use app::run_tui;
