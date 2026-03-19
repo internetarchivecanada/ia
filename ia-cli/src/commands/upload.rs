@@ -457,7 +457,7 @@ pub async fn run(
         Some(UploadCommand::Template(sub)) => run_template(sub),
         Some(UploadCommand::Cleanup(sub)) => run_cleanup(client, sub).await,
         Some(UploadCommand::Import(_)) => unreachable!("handled above"),
-        None => run_bare_upload(client, args, quiet, joblog_path, no_resume).await,
+        None => run_bare_upload(client, args, quiet, jobs, joblog_path, no_resume).await,
     }
 }
 
@@ -467,6 +467,7 @@ async fn run_bare_upload(
     client: &IaClient,
     args: UploadArgs,
     quiet: u8,
+    jobs: usize,
     joblog_path: Option<PathBuf>,
     no_resume: bool,
 ) -> Result<()> {
@@ -531,7 +532,7 @@ async fn run_bare_upload(
 
     // Dry run (interactive): validate and print what would be uploaded
     if opts.dry_run && !args.json {
-        let results = upload_item(client, identifier, &files, &opts, None, None, None)
+        let results = upload_item(client, identifier, &files, &opts, None, None, None, 1)
             .await
             .context(format!("failed to validate upload to {identifier}"))?;
         print_dry_run_results(identifier, &results, &opts.metadata);
@@ -549,6 +550,7 @@ async fn run_bare_upload(
             1,
             skip_set,
             joblog_path.as_deref(),
+            jobs,
         )
         .await;
     }
@@ -593,6 +595,7 @@ async fn run_bare_upload(
         progress_ref,
         skip_set.as_deref(),
         on_result,
+        1, // sequential in non-dashboard mode
     )
     .await
     .context(format!("failed to upload to {identifier}"))?;

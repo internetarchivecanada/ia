@@ -565,6 +565,7 @@ fn finalize_item(
 /// update shared TUI state, optionally polls the S3 tasks API, and runs
 /// the dashboard event loop on a blocking thread. Prints a summary line
 /// after the dashboard exits.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_upload_tui(
     client: &ia_core::IaClient,
     identifiers: Vec<String>,
@@ -573,6 +574,7 @@ pub async fn run_upload_tui(
     concurrency: usize,
     skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
     joblog_path: Option<&std::path::Path>,
+    file_concurrency: usize,
 ) -> anyhow::Result<()> {
     // Set up terminal — the guard ensures cleanup even on panic.
     let (terminal, _guard) = super::framework::setup_terminal()?;
@@ -614,6 +616,7 @@ pub async fn run_upload_tui(
                 Some(progress_fn),
                 skip.as_deref(),
                 None,
+                file_concurrency,
             )
             .await;
 
@@ -698,6 +701,7 @@ pub async fn run_upload_batch_tui(
                 Some(progress_fn),
                 skip.as_deref(),
                 None,
+                1, // sequential within batch items; concurrency is across items
             )
             .await;
 
