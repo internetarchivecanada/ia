@@ -38,8 +38,7 @@ pub fn help_content(tab: TabId) -> String {
              Tasks:\n\
              \x20 j/k     Scroll task list\n\
              \x20 /       Search by identifier\n\
-             \x20 u       Toggle user/global tasks\n\
-             \x20 Enter   Open item history\n"
+             \x20 Enter   Open task log\n"
         }
         TabId::Log => {
             "\n\
@@ -206,8 +205,9 @@ mod tests {
     #[test]
     fn test_tasks_tab_hints() {
         let hints = help_content(TabId::Tasks);
-        assert!(hints.contains("u"));
-        assert!(hints.contains("user/global"));
+        assert!(hints.contains("/"));
+        assert!(hints.contains("Open task log"));
+        assert!(!hints.contains("user/global"));
     }
 
     #[test]

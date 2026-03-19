@@ -101,7 +101,7 @@ pub struct TaskEntry {
     /// Server executing the task (empty if queued).
     #[serde(default, deserialize_with = "nullable_string")]
     pub server: String,
-    /// Task state: `"green"` (running), `"blue"` (queued), `"red"` (error), `"brown"` (paused).
+    /// Task state: `"green"` (queued), `"blue"` (running), `"red"` (error), `"brown"` (paused).
     #[serde(default, deserialize_with = "nullable_string")]
     pub color: String,
     /// Execution priority (higher = sooner, negative = deprioritized).
