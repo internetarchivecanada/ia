@@ -41,6 +41,8 @@ pub struct UploadItemState {
     pub files_failed: usize,
     pub bytes_uploaded: u64,
     pub started_at: Instant,
+    /// True once an `Enumerated` event has set `files_total` authoritatively.
+    enumerated: bool,
 }
 
 impl UploadItemState {
@@ -115,6 +117,7 @@ impl UploadTuiState {
                 files_failed: 0,
                 bytes_uploaded: 0,
                 started_at: Instant::now(),
+                enumerated: false,
             })
             .collect();
 
@@ -156,17 +159,25 @@ impl UploadTuiState {
         if let Some(&idx) = self.item_index.get(&p.identifier) {
             let item = &mut self.items[idx];
             match p.status {
-                UploadProgressStatus::Enumerated { .. } => {
-                    // File list is now known — nothing to update in per-item
-                    // state here since Verifying events fill in the counts.
+                UploadProgressStatus::Enumerated {
+                    files_count,
+                    bytes_total,
+                } => {
+                    // Set the authoritative file count from the enumeration pass.
+                    // Verifying events also increment files_total, but resumed
+                    // files skip Verifying — so Enumerated is the reliable source.
+                    item.files_total = files_count;
+                    item.enumerated = true;
+                    let _ = bytes_total; // tracked globally, not per-item
                 }
                 UploadProgressStatus::Verifying => {
                     if item.status == UploadItemStatus::Pending {
                         item.status = UploadItemStatus::Verifying;
                         item.started_at = Instant::now();
                     }
-                    // Guard: only count a file once (prevents double-count on retry).
-                    if !self.active_files.contains_key(&fk) {
+                    // Only increment files_total from Verifying when no Enumerated
+                    // event was received (backwards compat with test helpers).
+                    if !item.enumerated && !self.active_files.contains_key(&fk) {
                         item.files_total += 1;
                     }
                 }
@@ -241,17 +252,30 @@ impl UploadTuiState {
 
         // ── Global state ────────────────────────────────────────────
         match p.status {
-            UploadProgressStatus::Enumerated { .. } => {
-                // File list and total size are known — the TUI derives these
-                // values incrementally via Verifying events, so nothing to do.
+            UploadProgressStatus::Enumerated {
+                files_count,
+                bytes_total,
+            } => {
+                // Authoritative totals from the enumeration pass.
+                self.files_total += files_count;
+                self.bytes_total += bytes_total;
             }
             UploadProgressStatus::Verifying => {
                 // Guard: only count a file once (prevents double-count on retry).
                 if self.active_files.contains_key(&fk) {
                     return;
                 }
-                self.files_total += 1;
-                self.bytes_total += p.total_bytes;
+                // Only increment global files_total from Verifying when this
+                // item's Enumerated event hasn't already set the count.
+                let item_enumerated = self
+                    .item_index
+                    .get(&p.identifier)
+                    .and_then(|&idx| self.items.get(idx))
+                    .is_some_and(|item| item.enumerated);
+                if !item_enumerated {
+                    self.files_total += 1;
+                    self.bytes_total += p.total_bytes;
+                }
                 self.active_files.insert(
                     fk,
                     UploadFileProgress {
@@ -344,16 +368,21 @@ async fn run_dashboard_and_summarize(
         None => JoblogState::empty(),
     }));
 
-    // 1. Spawn S3 tasks polling loop (every 15s, single aggregate query).
+    // 1. Spawn S3 tasks polling loop (every 15s, or on manual refresh).
+    //    Uses list_tasks (JSONL streaming with limit=0) which is the
+    //    reliable format for the IA Tasks API.
     //    One query WITHOUT submitter filter gives true global counts.
     //    We filter locally by submitter email for user-specific counts.
     let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
     let submitter = client.config().cookies.get("logged-in-user").cloned();
+    let refresh_notify = Arc::new(tokio::sync::Notify::new());
+    let poll_notify = Arc::clone(&refresh_notify);
     let tasks_handle = tokio::spawn(async move {
         loop {
             // Global tasks query (no submitter filter) with catalog entries.
-            match ia_core::tasks::get_tasks(
+            // Uses list_tasks which sends limit=0 for JSONL streaming.
+            match ia_core::tasks::list_tasks(
                 &tasks_client,
                 &ia_core::tasks::TasksQuery {
                     args: Some("*s3-put*".to_string()),
@@ -366,21 +395,17 @@ async fn run_dashboard_and_summarize(
             )
             .await
             {
-                Ok(value) => {
+                Ok((summary, catalog)) => {
                     if let Ok(mut s3) = poll_s3.lock() {
                         // Global count from the unfiltered summary.
                         s3.update_global_count(
-                            value.summary.queued
-                                + value.summary.running
-                                + value.summary.error
-                                + value.summary.paused,
+                            summary.queued + summary.running + summary.error + summary.paused,
                         );
 
                         // Convert catalog entries to S3TaskEntry for display.
                         // TaskEntry.color maps to display status: green=running,
                         // blue=queued, red=error, brown=paused.
-                        let all_entries: Vec<S3TaskEntry> = value
-                            .catalog
+                        let all_entries: Vec<S3TaskEntry> = catalog
                             .iter()
                             .map(|e| S3TaskEntry {
                                 identifier: e.identifier.clone(),
@@ -420,10 +445,19 @@ async fn run_dashboard_and_summarize(
                 }
                 Err(e) => {
                     tracing::debug!("S3 tasks poll failed: {e}");
+                    // Mark as polled even on failure so "polled Xs ago" shows
+                    // time since last attempt, not "0s ago" forever.
+                    if let Ok(mut s3) = poll_s3.lock() {
+                        s3.mark_polled();
+                    }
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Wait 15s or until manual refresh is requested.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                _ = poll_notify.notified() => {}
+            }
         }
     });
 
@@ -434,8 +468,12 @@ async fn run_dashboard_and_summarize(
     let dashboard_s3 = Arc::clone(&s3_state);
     let dashboard_joblog = Arc::clone(&joblog_state);
     tokio::task::spawn_blocking(move || {
-        let mut dashboard =
-            MultiTabDashboard::new(dashboard_upload, dashboard_s3, dashboard_joblog);
+        let mut dashboard = MultiTabDashboard::new(
+            dashboard_upload,
+            dashboard_s3,
+            dashboard_joblog,
+            refresh_notify,
+        );
         super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
     })
     .await??;

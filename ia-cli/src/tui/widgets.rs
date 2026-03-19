@@ -150,6 +150,19 @@ pub fn truncate_tail(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Truncate a string from the **end**, keeping the beginning and appending `…`.
+/// If `s` fits in `max_chars`, it is left-padded to `max_chars`.
+pub fn truncate_end(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len > max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let end: String = s.chars().take(keep).collect();
+        format!("{end}\u{2026}")
+    } else {
+        format!("{s:<max_chars$}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Format helpers
 // ---------------------------------------------------------------------------

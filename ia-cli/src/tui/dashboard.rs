@@ -25,7 +25,6 @@ use super::upload_app::{UploadItemStatus, UploadTuiState};
 use super::upload_tab::UploadTab;
 use super::widgets;
 
-#[derive(Debug)]
 pub struct MultiTabDashboard {
     pub active_tab: TabId,
     pub show_help: bool,
@@ -35,6 +34,9 @@ pub struct MultiTabDashboard {
     // Shared state
     upload_state: Arc<Mutex<UploadTuiState>>,
     s3_state: Arc<Mutex<S3TaskState>>,
+
+    /// Notify to trigger an immediate S3 tasks refresh (used by 'r' key).
+    refresh_notify: Arc<tokio::sync::Notify>,
 
     // Tabs
     upload_tab: UploadTab,
@@ -48,6 +50,7 @@ impl MultiTabDashboard {
         upload_state: Arc<Mutex<UploadTuiState>>,
         s3_state: Arc<Mutex<S3TaskState>>,
         joblog_state: Arc<Mutex<JoblogState>>,
+        refresh_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         let theme = Theme::detect();
         Self {
@@ -57,6 +60,7 @@ impl MultiTabDashboard {
             theme,
             upload_state: upload_state.clone(),
             s3_state: s3_state.clone(),
+            refresh_notify,
             upload_tab: UploadTab::new(upload_state.clone(), s3_state.clone()),
             tasks_tab: TasksTab::new(s3_state.clone()),
             log_tab: LogTab::new(joblog_state),
@@ -226,6 +230,10 @@ impl Dashboard for MultiTabDashboard {
                 self.show_help = true;
                 return true;
             }
+            KeyCode::Char('r') => {
+                self.refresh_notify.notify_one();
+                return true;
+            }
             KeyCode::Char('1') => {
                 self.active_tab = TabId::Upload;
                 return true;
@@ -275,7 +283,8 @@ mod tests {
         let upload_state = Arc::new(Mutex::new(UploadTuiState::new(&["test".to_string()])));
         let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
         let joblog_state = Arc::new(Mutex::new(JoblogState::empty()));
-        MultiTabDashboard::new(upload_state, s3_state, joblog_state)
+        let refresh_notify = Arc::new(tokio::sync::Notify::new());
+        MultiTabDashboard::new(upload_state, s3_state, joblog_state, refresh_notify)
     }
 
     #[test]

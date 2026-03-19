@@ -49,6 +49,8 @@ pub struct UploadTab {
     pub transfers_cursor: usize,
     /// A URL opened via Enter, shown in the footer for 5 seconds.
     status_message: Option<(String, Instant)>,
+    /// Full identifier of the item under the cursor (cached in tick()).
+    cursor_identifier: Option<String>,
 }
 
 impl UploadTab {
@@ -64,6 +66,7 @@ impl UploadTab {
             items_cursor: 0,
             transfers_cursor: 0,
             status_message: None,
+            cursor_identifier: None,
         }
     }
 }
@@ -193,17 +196,30 @@ impl TabView for UploadTab {
                 self.status_message = None;
             }
         }
+        // Cache the full identifier of the cursor item for status_text().
+        self.cursor_identifier = self
+            .upload_state
+            .lock()
+            .ok()
+            .and_then(|s| s.items.get(self.items_cursor).map(|i| i.identifier.clone()));
     }
 
     fn status_text(&self) -> Option<&str> {
-        self.status_message.as_ref().map(|(url, _)| url.as_str())
+        // URL message takes priority while active.
+        if let Some((url, _)) = &self.status_message {
+            return Some(url.as_str());
+        }
+        // Otherwise show the full identifier of the cursor item
+        // (cached in tick() since we can't hold the lock here).
+        self.cursor_identifier.as_deref()
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
         vec![
             ("j/k", "scroll"),
             ("Tab", "panel"),
-            ("Enter", "history"),
+            ("Enter", "open"),
+            ("r", "refresh"),
             ("?", "help"),
             ("q", "quit"),
         ]
@@ -240,6 +256,36 @@ fn draw_items_panel(
     let visible_height = inner.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
 
+    // Column header
+    if visible_height > 1 {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<25}", "IDENTIFIER"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>8}", "FILES"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>10}", "UPLOADED"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    let data_height = visible_height.saturating_sub(1); // minus header
+
     // Compute scroll offset so the cursor is always visible.
     let scroll = if state.items.is_empty() {
         0
@@ -253,7 +299,7 @@ fn draw_items_panel(
     };
 
     for (i, item) in state.items.iter().enumerate().skip(scroll) {
-        if lines.len() >= visible_height {
+        if lines.len() > data_height {
             break;
         }
 
@@ -293,7 +339,7 @@ fn draw_items_panel(
             "\u{2014}".to_string() // —
         };
 
-        let name = widgets::truncate_tail(&item.identifier, 25);
+        let name = widgets::truncate_end(&item.identifier, 25);
 
         // Cursor row: gold ▸ indicator + bold gold name.
         // Active (non-cursor) row: gold ┃ border.
@@ -582,8 +628,9 @@ mod tests {
             "https://archive.org/details/item-a".to_string(),
             Instant::now() - Duration::from_secs(6),
         ));
-        assert!(tab.status_text().is_some());
+        assert!(tab.status_text().unwrap().contains("archive.org/details"));
         tab.tick();
-        assert!(tab.status_text().is_none());
+        // After clearing URL message, status_text shows cursor identifier
+        assert!(tab.status_message.is_none());
     }
 }
