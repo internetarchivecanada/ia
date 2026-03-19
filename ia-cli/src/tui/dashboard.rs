@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::errors_tab::ErrorsTab;
@@ -169,6 +172,19 @@ impl Dashboard for MultiTabDashboard {
             |s| widgets::format_elapsed(s.throughput.elapsed()),
         );
         widgets::draw_footer(frame, chunks[4], &self.theme, &hints, &elapsed);
+
+        // Overwrite footer with status text (e.g., URL opened via Enter) if present.
+        // This ensures URLs are visible on headless systems where open::that() fails silently.
+        let status = match self.active_tab {
+            TabId::Upload => self.upload_tab.status_text(),
+            TabId::Tasks => self.tasks_tab.status_text(),
+            TabId::Log => self.log_tab.status_text(),
+            TabId::Errors => self.errors_tab.status_text(),
+        };
+        if let Some(text) = status {
+            let line = Line::from(Span::styled(text, Style::default().fg(self.theme.gold)));
+            frame.render_widget(Paragraph::new(line), chunks[4]);
+        }
 
         // Help overlay on top
         if self.show_help {

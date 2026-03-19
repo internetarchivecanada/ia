@@ -6,6 +6,7 @@
 //! the new themed, tabbed layout.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -46,6 +47,8 @@ pub struct UploadTab {
     pub focused_panel: FocusPanel,
     pub items_cursor: usize,
     pub transfers_cursor: usize,
+    /// A URL opened via Enter, shown in the footer for 5 seconds.
+    status_message: Option<(String, Instant)>,
 }
 
 impl UploadTab {
@@ -60,6 +63,7 @@ impl UploadTab {
             focused_panel: FocusPanel::Items,
             items_cursor: 0,
             transfers_cursor: 0,
+            status_message: None,
         }
     }
 }
@@ -167,10 +171,13 @@ impl TabView for UploadTab {
             }
             KeyCode::Enter => {
                 // Open the selected item on archive.org in the default browser.
+                // Also store the URL in status_message for 5 seconds so it's
+                // visible on headless systems where open::that() fails silently.
                 if let Ok(state) = self.upload_state.lock() {
                     if let Some(item) = state.items.get(self.items_cursor) {
                         let url = format!("https://archive.org/details/{}", item.identifier);
-                        let _ = open::that(url);
+                        let _ = open::that(&url);
+                        self.status_message = Some((url, Instant::now()));
                     }
                 }
                 true
@@ -180,7 +187,16 @@ impl TabView for UploadTab {
     }
 
     fn tick(&mut self) {
-        // No-op — upload state is updated externally via progress callbacks.
+        // Clear status message after 5 seconds.
+        if let Some((_, ts)) = &self.status_message {
+            if ts.elapsed().as_secs() >= 5 {
+                self.status_message = None;
+            }
+        }
+    }
+
+    fn status_text(&self) -> Option<&str> {
+        self.status_message.as_ref().map(|(url, _)| url.as_str())
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
@@ -541,5 +557,33 @@ mod tests {
             tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         }
         assert_eq!(tab.items_cursor, 1);
+    }
+
+    #[test]
+    fn test_enter_sets_status_message() {
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // No status message initially
+        assert!(tab.status_text().is_none());
+        // Press Enter — item-a is at cursor 0
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        // Status message should now be set
+        let text = tab.status_text();
+        assert!(text.is_some());
+        assert!(text.unwrap().contains("archive.org"));
+        assert!(text.unwrap().contains("item-a"));
+    }
+
+    #[test]
+    fn test_tick_clears_expired_status_message() {
+        use std::time::{Duration, Instant};
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // Manually inject an old status message (6 seconds ago)
+        tab.status_message = Some((
+            "https://archive.org/details/item-a".to_string(),
+            Instant::now() - Duration::from_secs(6),
+        ));
+        assert!(tab.status_text().is_some());
+        tab.tick();
+        assert!(tab.status_text().is_none());
     }
 }

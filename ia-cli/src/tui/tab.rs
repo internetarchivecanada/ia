@@ -23,6 +23,13 @@ pub trait TabView {
     /// Return key hints for the footer, specific to this tab.
     /// Each tuple is (key_label, description).
     fn key_hints(&self) -> Vec<(&str, &str)>;
+
+    /// Optional status text to display in the footer (e.g., a URL that was opened).
+    /// Implementations should return `Some` for a limited time after an action,
+    /// then `None` once the message has expired.
+    fn status_text(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Identifies which tab is active.
