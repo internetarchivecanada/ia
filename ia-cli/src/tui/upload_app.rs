@@ -354,66 +354,73 @@ async fn run_dashboard_and_summarize(
     let tasks_handle = tokio::spawn(async move {
         loop {
             // Global tasks query (no submitter filter) with catalog entries.
-            if let Ok(value) = ia_core::tasks::get_tasks(
+            match ia_core::tasks::get_tasks(
                 &tasks_client,
                 &ia_core::tasks::TasksQuery {
                     args: Some("*s3-put*".to_string()),
                     submitter: None,
                     catalog: Some(true),
                     history: Some(false),
+                    summary: Some(true),
                     ..Default::default()
                 },
             )
             .await
             {
-                if let Ok(mut s3) = poll_s3.lock() {
-                    // Global count from the unfiltered summary.
-                    s3.update_global_count(
-                        value.summary.queued
-                            + value.summary.running
-                            + value.summary.error
-                            + value.summary.paused,
-                    );
+                Ok(value) => {
+                    if let Ok(mut s3) = poll_s3.lock() {
+                        // Global count from the unfiltered summary.
+                        s3.update_global_count(
+                            value.summary.queued
+                                + value.summary.running
+                                + value.summary.error
+                                + value.summary.paused,
+                        );
 
-                    // Convert catalog entries to S3TaskEntry for display.
-                    // TaskEntry.color maps to display status: green=running,
-                    // blue=queued, red=error, brown=paused.
-                    let all_entries: Vec<S3TaskEntry> = value
-                        .catalog
-                        .iter()
-                        .map(|e| S3TaskEntry {
-                            identifier: e.identifier.clone(),
-                            cmd: e.cmd.clone(),
-                            submitter: e.submitter.clone(),
-                            status: match e.color.as_str() {
-                                "green" => "running".to_string(),
-                                "blue" => "queued".to_string(),
-                                "red" => "error".to_string(),
-                                "brown" => "paused".to_string(),
-                                other => other.to_string(),
-                            },
-                            submittime: e.submittime.clone(),
-                        })
-                        .collect();
+                        // Convert catalog entries to S3TaskEntry for display.
+                        // TaskEntry.color maps to display status: green=running,
+                        // blue=queued, red=error, brown=paused.
+                        let all_entries: Vec<S3TaskEntry> = value
+                            .catalog
+                            .iter()
+                            .map(|e| S3TaskEntry {
+                                identifier: e.identifier.clone(),
+                                cmd: e.cmd.clone(),
+                                submitter: e.submitter.clone(),
+                                status: match e.color.as_str() {
+                                    "green" => "running".to_string(),
+                                    "blue" => "queued".to_string(),
+                                    "red" => "error".to_string(),
+                                    "brown" => "paused".to_string(),
+                                    other => other.to_string(),
+                                },
+                                submittime: e.submittime.clone(),
+                            })
+                            .collect();
 
-                    // Filter for user-specific summary counts.
-                    let (mut user_queued, mut user_running, mut user_errors) = (0u32, 0u32, 0u32);
-                    for entry in &all_entries {
-                        let is_user = submitter
-                            .as_ref()
-                            .is_some_and(|email| entry.submitter == *email);
-                        if is_user {
-                            match entry.status.as_str() {
-                                "queued" => user_queued += 1,
-                                "running" => user_running += 1,
-                                "error" => user_errors += 1,
-                                _ => {}
+                        // Filter for user-specific summary counts.
+                        let (mut user_queued, mut user_running, mut user_errors) =
+                            (0u32, 0u32, 0u32);
+                        for entry in &all_entries {
+                            let is_user = submitter
+                                .as_ref()
+                                .is_some_and(|email| entry.submitter == *email);
+                            if is_user {
+                                match entry.status.as_str() {
+                                    "queued" => user_queued += 1,
+                                    "running" => user_running += 1,
+                                    "error" => user_errors += 1,
+                                    _ => {}
+                                }
                             }
                         }
+                        s3.update_summary(user_queued, user_running, user_errors);
+                        s3.update_tasks(all_entries);
+                        s3.mark_polled();
                     }
-                    s3.update_summary(user_queued, user_running, user_errors);
-                    s3.update_tasks(all_entries);
-                    s3.mark_polled();
+                }
+                Err(e) => {
+                    tracing::debug!("S3 tasks poll failed: {e}");
                 }
             }
 
