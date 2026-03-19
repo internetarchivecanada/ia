@@ -314,4 +314,43 @@ mod tests {
         let d = make_dashboard();
         assert!(!d.is_done());
     }
+
+    #[test]
+    fn test_help_blocks_tab_switch() {
+        let mut d = make_dashboard();
+        d.handle_key(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(d.show_help);
+        // '2' should dismiss help, not switch tabs
+        d.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(!d.show_help);
+        assert_eq!(d.active_tab, TabId::Upload);
+    }
+
+    #[test]
+    fn test_search_mode_blocks_global_keys() {
+        let mut d = make_dashboard();
+        // Switch to Tasks tab and activate search
+        d.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        d.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+
+        // '1' should go to search, not switch tabs
+        d.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(d.active_tab, TabId::Tasks);
+
+        // 'q' should go to search, not quit
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!d.quit_requested());
+
+        // Escape exits search, then q quits
+        d.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(d.quit_requested());
+    }
+
+    #[test]
+    fn test_tick_does_not_panic() {
+        let mut d = make_dashboard();
+        // Ensure tick_all doesn't crash with empty state
+        d.tick_all();
+    }
 }
