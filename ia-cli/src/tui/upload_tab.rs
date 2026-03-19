@@ -6,6 +6,7 @@
 //! the new themed, tabbed layout.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -38,14 +39,18 @@ pub enum FocusPanel {
 // ---------------------------------------------------------------------------
 
 /// Upload tab state: wraps shared upload and S3 task state, plus local UI
-/// state for panel focus and scroll positions.
+/// state for panel focus and cursor positions.
 #[derive(Debug)]
 pub struct UploadTab {
     upload_state: Arc<Mutex<UploadTuiState>>,
     s3_state: Arc<Mutex<S3TaskState>>,
     pub focused_panel: FocusPanel,
-    pub items_scroll: usize,
-    pub transfers_scroll: usize,
+    pub items_cursor: usize,
+    pub transfers_cursor: usize,
+    /// A URL opened via Enter, shown in the footer for 5 seconds.
+    status_message: Option<(String, Instant)>,
+    /// Full identifier of the item under the cursor (cached in tick()).
+    cursor_identifier: Option<String>,
 }
 
 impl UploadTab {
@@ -58,8 +63,10 @@ impl UploadTab {
             upload_state,
             s3_state,
             focused_panel: FocusPanel::Items,
-            items_scroll: 0,
-            transfers_scroll: 0,
+            items_cursor: 0,
+            transfers_cursor: 0,
+            status_message: None,
+            cursor_identifier: None,
         }
     }
 }
@@ -113,7 +120,7 @@ impl TabView for UploadTab {
             theme,
             &upload,
             self.focused_panel == FocusPanel::Items,
-            self.items_scroll,
+            self.items_cursor,
         );
         draw_transfers_panel(
             frame,
@@ -121,7 +128,7 @@ impl TabView for UploadTab {
             theme,
             &upload,
             self.focused_panel == FocusPanel::Transfers,
-            self.transfers_scroll,
+            self.transfers_cursor,
         );
 
         // ── Throughput sparkline ────────────────────────────────────
@@ -143,12 +150,12 @@ impl TabView for UploadTab {
                     match self.focused_panel {
                         FocusPanel::Items => {
                             let max = state.items.len().saturating_sub(1);
-                            self.items_scroll = self.items_scroll.saturating_add(1).min(max);
+                            self.items_cursor = self.items_cursor.saturating_add(1).min(max);
                         }
                         FocusPanel::Transfers => {
                             let max = state.active_files.len().saturating_sub(1);
-                            self.transfers_scroll =
-                                self.transfers_scroll.saturating_add(1).min(max);
+                            self.transfers_cursor =
+                                self.transfers_cursor.saturating_add(1).min(max);
                         }
                     }
                 }
@@ -157,20 +164,23 @@ impl TabView for UploadTab {
             KeyCode::Char('k') | KeyCode::Up => {
                 match self.focused_panel {
                     FocusPanel::Items => {
-                        self.items_scroll = self.items_scroll.saturating_sub(1);
+                        self.items_cursor = self.items_cursor.saturating_sub(1);
                     }
                     FocusPanel::Transfers => {
-                        self.transfers_scroll = self.transfers_scroll.saturating_sub(1);
+                        self.transfers_cursor = self.transfers_cursor.saturating_sub(1);
                     }
                 }
                 true
             }
             KeyCode::Enter => {
                 // Open the selected item on archive.org in the default browser.
+                // Also store the URL in status_message for 5 seconds so it's
+                // visible on headless systems where open::that() fails silently.
                 if let Ok(state) = self.upload_state.lock() {
-                    if let Some(item) = state.items.get(self.items_scroll) {
+                    if let Some(item) = state.items.get(self.items_cursor) {
                         let url = format!("https://archive.org/details/{}", item.identifier);
-                        let _ = open::that(url);
+                        let _ = open::that(&url);
+                        self.status_message = Some((url, Instant::now()));
                     }
                 }
                 true
@@ -180,14 +190,37 @@ impl TabView for UploadTab {
     }
 
     fn tick(&mut self) {
-        // No-op — upload state is updated externally via progress callbacks.
+        // Clear status message after 5 seconds.
+        if let Some((_, ts)) = &self.status_message {
+            if ts.elapsed().as_secs() >= 5 {
+                self.status_message = None;
+            }
+        }
+        // Cache the full identifier of the cursor item for status_text().
+        self.cursor_identifier = self
+            .upload_state
+            .lock()
+            .ok()
+            .and_then(|s| s.items.get(self.items_cursor).map(|i| i.identifier.clone()));
+    }
+
+    fn status_text(&self) -> Option<&str> {
+        // URL message takes priority while active.
+        if let Some((url, _)) = &self.status_message {
+            return Some(url.as_str());
+        }
+        // Otherwise show the full identifier of the cursor item
+        // (cached in tick() since we can't hold the lock here).
+        self.cursor_identifier.as_deref()
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
         vec![
             ("j/k", "scroll"),
             ("Tab", "panel"),
-            ("Enter", "history"),
+            ("Enter", "open"),
+            ("p", "pause"),
+            ("r", "refresh"),
             ("?", "help"),
             ("q", "quit"),
         ]
@@ -199,15 +232,15 @@ impl TabView for UploadTab {
 // ---------------------------------------------------------------------------
 
 /// Render the Items panel: per-item status list with completion icons,
-/// bytes uploaded, and file counts. The active (uploading) item gets a
-/// gold left border; completed items are green; failed items are red.
+/// bytes uploaded, and file counts. The cursor row is highlighted gold+bold.
+/// The viewport scrolls to keep the cursor visible.
 fn draw_items_panel(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
     state: &UploadTuiState,
     focused: bool,
-    scroll: usize,
+    cursor: usize,
 ) {
     let border_color = if focused { theme.gold } else { theme.border };
     let block = Block::default()
@@ -224,11 +257,54 @@ fn draw_items_panel(
     let visible_height = inner.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
 
-    for item in state.items.iter().skip(scroll) {
-        if lines.len() >= visible_height {
+    // Column header
+    if visible_height > 1 {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<25}", "IDENTIFIER"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>8}", "FILES"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>10}", "UPLOADED"),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    let data_height = visible_height.saturating_sub(1); // minus header
+
+    // Compute scroll offset so the cursor is always visible.
+    let scroll = if state.items.is_empty() {
+        0
+    } else {
+        let clamped_cursor = cursor.min(state.items.len().saturating_sub(1));
+        if clamped_cursor < visible_height {
+            0
+        } else {
+            clamped_cursor - visible_height + 1
+        }
+    };
+
+    for (i, item) in state.items.iter().enumerate().skip(scroll) {
+        if lines.len() > data_height {
             break;
         }
 
+        let is_cursor = i == cursor;
         let is_active = matches!(
             item.status,
             UploadItemStatus::Uploading
@@ -264,29 +340,41 @@ fn draw_items_panel(
             "\u{2014}".to_string() // —
         };
 
-        let name = widgets::truncate_tail(&item.identifier, 25);
+        let name = widgets::truncate_end(&item.identifier, 25);
 
-        // Active item gets gold left border indicator
-        let left_border = if is_active {
-            Span::styled("\u{2503} ", Style::default().fg(theme.gold)) // ┃
+        // Cursor row: gold ▸ indicator + bold gold name.
+        // Active (non-cursor) row: gold ┃ border.
+        // Otherwise: plain indent.
+        let (left_border, name_color, name_modifier) = if is_cursor {
+            (
+                Span::styled("\u{25b8} ", Style::default().fg(theme.gold)), // ▸
+                theme.gold,
+                Modifier::BOLD,
+            )
+        } else if is_active {
+            (
+                Span::styled("\u{2503} ", Style::default().fg(theme.gold)), // ┃
+                theme.gold,
+                Modifier::empty(),
+            )
         } else {
-            Span::raw("  ")
-        };
-
-        let name_color = if is_active {
-            theme.gold
-        } else if matches!(item.status, UploadItemStatus::Complete) {
-            theme.green
-        } else if matches!(item.status, UploadItemStatus::Failed(_)) {
-            theme.red
-        } else {
-            theme.text
+            let color = if matches!(item.status, UploadItemStatus::Complete) {
+                theme.green
+            } else if matches!(item.status, UploadItemStatus::Failed(_)) {
+                theme.red
+            } else {
+                theme.text
+            };
+            (Span::raw("  "), color, Modifier::empty())
         };
 
         lines.push(Line::from(vec![
             left_border,
             Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
-            Span::styled(name, Style::default().fg(name_color)),
+            Span::styled(
+                name,
+                Style::default().fg(name_color).add_modifier(name_modifier),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("{:>8}", files_info),
@@ -316,6 +404,8 @@ fn draw_items_panel(
 
 /// Render the Transfers panel: active file uploads with progress bars.
 /// Rate-limited files show `⏸ rate-limited` instead of a progress bar.
+/// File names are prefixed with the truncated item identifier so that
+/// concurrent batch uploads are distinguishable.
 /// Below a `──` divider, completed files are shown (up to 10).
 fn draw_transfers_panel(
     frame: &mut Frame,
@@ -340,16 +430,18 @@ fn draw_transfers_panel(
     let visible_height = inner.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
 
-    // Active file uploads, sorted by name.
+    // Active file uploads, sorted by identifier then name.
     let mut active: Vec<_> = state.active_files.values().collect();
-    active.sort_by(|a, b| a.name.cmp(&b.name));
+    active.sort_by(|a, b| a.identifier.cmp(&b.identifier).then(a.name.cmp(&b.name)));
 
     for fp in active.iter().skip(scroll) {
         if lines.len() >= visible_height {
             break;
         }
 
+        let item_prefix = widgets::truncate_tail(&fp.identifier, 12);
         let name = widgets::truncate_tail(&fp.name, 20);
+        let display = format!("{item_prefix}:{name}");
 
         if matches!(
             fp.status,
@@ -358,7 +450,7 @@ fn draw_transfers_panel(
             // Rate-limited: show pause icon instead of progress bar.
             lines.push(Line::from(vec![
                 Span::styled(" \u{23f8} ", Style::default().fg(theme.gold)),
-                Span::styled(name, Style::default().fg(theme.text)),
+                Span::styled(display, Style::default().fg(theme.text)),
                 Span::styled("  rate-limited", Style::default().fg(theme.gold)),
             ]));
         } else {
@@ -378,7 +470,7 @@ fn draw_transfers_panel(
                 Span::raw(" "),
                 Span::styled(bar, Style::default().fg(theme.green)),
                 Span::raw(format!(" {:>5.1}% ", progress * 100.0)),
-                Span::styled(name, Style::default().fg(theme.text)),
+                Span::styled(display, Style::default().fg(theme.text)),
             ]));
         }
     }
@@ -473,14 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn test_j_k_scrolls() {
+    fn test_j_k_moves_cursor() {
         let mut tab = UploadTab::new(make_state(), make_s3_state());
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 1);
+        assert_eq!(tab.items_cursor, 1);
         tab.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 0);
+        assert_eq!(tab.items_cursor, 0);
         tab.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 0);
+        assert_eq!(tab.items_cursor, 0);
     }
 
     #[test]
@@ -493,14 +585,53 @@ mod tests {
     }
 
     #[test]
-    fn test_items_scroll_clamped() {
+    fn test_items_cursor_clamped() {
         let mut tab = UploadTab::new(make_state(), make_s3_state());
-        // State has 2 items (item-a, item-b), so max scroll = 1
+        // State has 2 items (item-a, item-b), so max cursor = 1
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 1);
+        assert_eq!(tab.items_cursor, 1);
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 1); // clamped at len-1
+        assert_eq!(tab.items_cursor, 1); // clamped at len-1
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(tab.items_scroll, 1); // still clamped
+        assert_eq!(tab.items_cursor, 1); // still clamped
+    }
+
+    #[test]
+    fn test_cursor_clamped_to_items() {
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // State has 2 items, max cursor = 1
+        for _ in 0..5 {
+            tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        }
+        assert_eq!(tab.items_cursor, 1);
+    }
+
+    #[test]
+    fn test_enter_sets_status_message() {
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // No status message initially
+        assert!(tab.status_text().is_none());
+        // Press Enter — item-a is at cursor 0
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        // Status message should now be set
+        let text = tab.status_text();
+        assert!(text.is_some());
+        assert!(text.unwrap().contains("archive.org"));
+        assert!(text.unwrap().contains("item-a"));
+    }
+
+    #[test]
+    fn test_tick_clears_expired_status_message() {
+        use std::time::{Duration, Instant};
+        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        // Manually inject an old status message (6 seconds ago)
+        tab.status_message = Some((
+            "https://archive.org/details/item-a".to_string(),
+            Instant::now() - Duration::from_secs(6),
+        ));
+        assert!(tab.status_text().unwrap().contains("archive.org/details"));
+        tab.tick();
+        // After clearing URL message, status_text shows cursor identifier
+        assert!(tab.status_message.is_none());
     }
 }

@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
@@ -25,7 +28,12 @@ type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 /// - test_item: inject collection:test_collection
 /// - First file gets metadata headers + auto-make-bucket
 /// - Last file gets queue-derive
-/// - Sequential upload (files uploaded one at a time to avoid catalog congestion)
+/// - Sequential upload by default; concurrent middle files when `file_concurrency > 1`
+///
+/// When `file_concurrency > 1` and there are more than 2 files, the first and last
+/// files upload sequentially (for metadata/derive headers) while middle files upload
+/// concurrently via `buffer_unordered`. In this mode, results for middle files may
+/// be returned in completion order rather than file order.
 ///
 /// # Errors
 ///
@@ -34,6 +42,7 @@ type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 /// Returns `IaError::EmptyUpload` if no files remain after expansion and filtering.
 /// Returns `IaError::SymlinkSkipped` if a file is a symlink (during validation).
 /// Propagates any errors from individual `upload_file()` calls.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_item(
     client: &IaClient,
     identifier: &str,
@@ -42,6 +51,8 @@ pub async fn upload_item(
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
     skip_set: Option<&HashSet<(String, String)>>,
     on_result: Option<OnResultCallback>,
+    file_concurrency: usize,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<UploadResult>> {
     // 1. Validate identifier
     validate_identifier(identifier)?;
@@ -152,12 +163,133 @@ pub async fn upload_item(
         None
     };
 
-    // 12. Upload sequentially (track start for error elapsed_ms)
+    // 12. Upload files
     let start = Instant::now();
+
+    // Concurrent path: when file_concurrency > 1 and more than 2 files,
+    // upload the first file sequentially (metadata + bucket creation),
+    // middle files concurrently, and last file sequentially (queue-derive).
+    if file_concurrency > 1 && file_count > 2 {
+        let mut results = Vec::with_capacity(file_count);
+
+        // Phase 1: Upload first file sequentially
+        let (first_result, first_uploaded) = upload_one_file(
+            client,
+            identifier,
+            &expanded[0],
+            &keys[0],
+            &opts,
+            &id_owned,
+            skip_set,
+            0,
+            last_upload_idx,
+            false, // no previous file succeeded
+            size_hint,
+            progress.clone(),
+            on_result.clone(),
+            start,
+        )
+        .await?;
+        let first_uploaded =
+            first_uploaded || matches!(first_result.status, UploadStatus::Uploaded);
+        results.push(first_result);
+
+        // Phase 2: Upload middle files concurrently
+        let middle_range = 1..(file_count - 1);
+        let owned_skip = skip_set.cloned();
+
+        let middle_results: Vec<Result<(UploadResult, bool)>> = stream::iter(middle_range)
+            .map(|i| {
+                let client = client.clone();
+                let identifier = identifier.to_string();
+                let file = expanded[i].clone();
+                let key = keys[i].clone();
+                let opts = opts.clone();
+                let id_owned = id_owned.clone();
+                let skip_ref = owned_skip.clone();
+                let progress = progress.clone();
+                let on_result = on_result.clone();
+                let pause = pause_flag.clone();
+
+                async move {
+                    // Wait while paused before starting this file
+                    if let Some(ref flag) = pause {
+                        while flag.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+                    upload_one_file(
+                        &client,
+                        &identifier,
+                        &file,
+                        &key,
+                        &opts,
+                        &id_owned,
+                        skip_ref.as_ref(),
+                        i,
+                        last_upload_idx,
+                        true, // first file already handled
+                        None, // size_hint only on first file
+                        progress,
+                        on_result,
+                        start,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(file_concurrency)
+            .collect()
+            .await;
+
+        // Check for fatal errors and collect middle results
+        for r in middle_results {
+            let (result, _) = r?;
+            results.push(result);
+        }
+
+        // Wait while paused before starting last file
+        if let Some(ref flag) = pause_flag {
+            while flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        // Phase 3: Upload last file sequentially
+        let last_idx = file_count - 1;
+        let (last_result, _) = upload_one_file(
+            client,
+            identifier,
+            &expanded[last_idx],
+            &keys[last_idx],
+            &opts,
+            &id_owned,
+            skip_set,
+            last_idx,
+            last_upload_idx,
+            first_uploaded,
+            None, // size_hint only on first file
+            progress.clone(),
+            on_result.clone(),
+            start,
+        )
+        .await?;
+        results.push(last_result);
+
+        return Ok(results);
+    }
+
+    // Sequential path (file_concurrency <= 1, or <= 2 files)
     let mut results = Vec::with_capacity(file_count);
     let mut first_file_succeeded = false;
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {
+        // Wait while paused before starting next file
+        if let Some(ref flag) = pause_flag {
+            while flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
         // Resume: skip files already successfully uploaded in a previous run
         if let Some(skip) = skip_set {
             if skip.contains(&(id_owned.clone(), key.clone())) {
@@ -272,6 +404,138 @@ pub async fn upload_item(
     }
 
     Ok(results)
+}
+
+/// Upload a single file within an item, handling skip-set checks, error
+/// classification, and progress/result callbacks.
+///
+/// Returns `Ok((result, first_file_succeeded))` for uploaded/resumed/skipped/failed
+/// files, and `Err` only for fatal errors (Auth, Config, SpamDetected, CheckLimitFailed).
+#[allow(clippy::too_many_arguments)]
+async fn upload_one_file(
+    client: &IaClient,
+    identifier: &str,
+    file: &Path,
+    key: &str,
+    opts: &UploadOpts,
+    id_owned: &str,
+    skip_set: Option<&HashSet<(String, String)>>,
+    index: usize,
+    last_upload_idx: Option<usize>,
+    first_file_succeeded: bool,
+    size_hint: Option<u64>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
+    on_result: Option<OnResultCallback>,
+    start: Instant,
+) -> Result<(UploadResult, bool)> {
+    // Resume: skip files already successfully uploaded in a previous run
+    if let Some(skip) = skip_set {
+        if skip.contains(&(id_owned.to_string(), key.to_string())) {
+            let file_size = tokio::fs::metadata(file).await.map_err(|e| {
+                IaError::Io(std::io::Error::other(format!(
+                    "failed to stat resumed file {}: {e}",
+                    file.display()
+                )))
+            })?;
+            let file_size = file_size.len();
+            if let Some(ref cb) = progress {
+                cb(UploadProgress {
+                    identifier: id_owned.to_string(),
+                    key: key.to_string(),
+                    bytes_sent: file_size,
+                    total_bytes: file_size,
+                    status: UploadProgressStatus::Resumed,
+                });
+            }
+            let result = UploadResult {
+                identifier: id_owned.to_string(),
+                key: key.to_string(),
+                status: UploadStatus::Resumed,
+                bytes: file_size,
+                md5: None,
+                elapsed_ms: 0,
+                retries: 0,
+            };
+            if let Some(ref cb) = on_result {
+                cb(&result);
+            }
+            return Ok((result, first_file_succeeded));
+        }
+    }
+
+    let is_first = index == 0 || !first_file_succeeded;
+    let is_last = Some(index) == last_upload_idx;
+
+    // Size hint only on the first file that actually uploads
+    let hint = if !first_file_succeeded {
+        size_hint
+    } else {
+        None
+    };
+
+    match upload_file(
+        client,
+        identifier,
+        file,
+        key,
+        opts,
+        is_first,
+        is_last,
+        hint,
+        progress.clone(),
+    )
+    .await
+    {
+        Ok(result) => {
+            let uploaded = matches!(result.status, UploadStatus::Uploaded);
+            if let Some(ref cb) = on_result {
+                cb(&result);
+            }
+            Ok((result, first_file_succeeded || uploaded))
+        }
+        Err(
+            e @ (IaError::Auth(_)
+            | IaError::Config(_)
+            | IaError::SpamDetected { .. }
+            | IaError::CheckLimitFailed { .. }),
+        ) => {
+            // Fatal errors — bail immediately
+            Err(e)
+        }
+        Err(e) => {
+            // Non-fatal: record failure and continue
+            let err_msg = e.to_string();
+            tracing::warn!(identifier, key, "file upload failed, continuing: {err_msg}");
+
+            if let Some(ref cb) = progress {
+                cb(UploadProgress {
+                    identifier: identifier.to_string(),
+                    key: key.to_string(),
+                    bytes_sent: 0,
+                    total_bytes: 0,
+                    status: UploadProgressStatus::Failed,
+                });
+            }
+
+            let file_size = tokio::fs::metadata(file)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let result = UploadResult {
+                identifier: identifier.to_string(),
+                key: key.to_string(),
+                status: UploadStatus::Failed(err_msg),
+                bytes: file_size,
+                md5: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                retries: 0,
+            };
+            if let Some(ref cb) = on_result {
+                cb(&result);
+            }
+            Ok((result, first_file_succeeded))
+        }
+    }
 }
 
 /// Expand a list of paths, recursively walking directories.
@@ -520,6 +784,8 @@ mod tests {
             None,
             Some(&skip),
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -562,6 +828,8 @@ mod tests {
             None,
             Some(&skip),
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -598,6 +866,8 @@ mod tests {
             &opts,
             None,
             Some(&skip),
+            None,
+            1,
             None,
         )
         .await
@@ -638,6 +908,8 @@ mod tests {
             None,
             Some(&skip),
             None,
+            1,
+            None,
         )
         .await
         .unwrap();
@@ -663,9 +935,19 @@ mod tests {
         let mut skip = HashSet::new();
         skip.insert(("test-item".to_string(), "other.txt".to_string()));
 
-        let results = upload_item(&client, "test-item", &[f], &opts, None, Some(&skip), None)
-            .await
-            .unwrap();
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -687,14 +969,136 @@ mod tests {
         let mut skip = HashSet::new();
         skip.insert(("other-item".to_string(), "a.txt".to_string()));
 
-        let results = upload_item(&client, "test-item", &[f], &opts, None, Some(&skip), None)
-            .await
-            .unwrap();
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert!(
             matches!(results[0].status, UploadStatus::DryRun),
             "should not be resumed when identifier doesn't match"
+        );
+    }
+
+    // -- concurrent upload tests --
+
+    #[tokio::test]
+    async fn upload_item_concurrent_dry_run_all_files_reported() {
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        let f3 = dir.path().join("c.txt");
+        let f4 = dir.path().join("d.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+        fs::write(&f3, "ccc").unwrap();
+        fs::write(&f4, "ddd").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2, f3, f4],
+            &opts,
+            None,
+            None,
+            None,
+            2, // concurrent
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 4);
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.status, UploadStatus::DryRun)));
+    }
+
+    #[tokio::test]
+    async fn upload_item_concurrent_two_files_stays_sequential() {
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // file_concurrency=4, but only 2 files → falls through to sequential
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2],
+            &opts,
+            None,
+            None,
+            None,
+            4,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|r| matches!(r.status, UploadStatus::DryRun)));
+    }
+
+    #[tokio::test]
+    async fn upload_item_concurrent_with_skip_set() {
+        let dir = TempDir::new().unwrap();
+        let f1 = dir.path().join("a.txt");
+        let f2 = dir.path().join("b.txt");
+        let f3 = dir.path().join("c.txt");
+        let f4 = dir.path().join("d.txt");
+        fs::write(&f1, "aaa").unwrap();
+        fs::write(&f2, "bbb").unwrap();
+        fs::write(&f3, "ccc").unwrap();
+        fs::write(&f4, "ddd").unwrap();
+
+        let client = dry_run_client();
+        let opts = resume_test_opts();
+
+        // Mark b.txt as already uploaded (a middle file)
+        let mut skip = HashSet::new();
+        skip.insert(("test-item".to_string(), "b.txt".to_string()));
+
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2, f3, f4],
+            &opts,
+            None,
+            Some(&skip),
+            None,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 4);
+        // Find the b.txt result and verify it's resumed
+        let b_result = results.iter().find(|r| r.key == "b.txt").unwrap();
+        assert!(
+            matches!(b_result.status, UploadStatus::Resumed),
+            "b.txt should be Resumed, got {:?}",
+            b_result.status
         );
     }
 }

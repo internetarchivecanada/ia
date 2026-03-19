@@ -4,6 +4,7 @@
 //! table, and vim-style search filtering.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,15 +27,21 @@ pub struct TasksTab {
     pub search: SearchState,
     pub cursor: usize,
     scroll_offset: usize,
+    /// A URL opened via Enter, shown in the footer for 5 seconds.
+    status_message: Option<(String, Instant)>,
+    /// Current user's email for filtering tasks in user mode.
+    submitter: Option<String>,
 }
 
 impl TasksTab {
-    pub fn new(s3_state: Arc<Mutex<S3TaskState>>) -> Self {
+    pub fn new(s3_state: Arc<Mutex<S3TaskState>>, submitter: Option<String>) -> Self {
         Self {
             s3_state,
             search: SearchState::new(),
             cursor: 0,
             scroll_offset: 0,
+            status_message: None,
+            submitter,
         }
     }
 
@@ -43,15 +50,21 @@ impl TasksTab {
         let Ok(state) = self.s3_state.lock() else {
             return 0;
         };
-        if self.search.query().is_empty() {
-            state.tasks.len()
-        } else {
-            state
-                .tasks
-                .iter()
-                .filter(|t| self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
-                .count()
-        }
+        state
+            .tasks
+            .iter()
+            .filter(|t| {
+                let user_match = state.show_global
+                    || self
+                        .submitter
+                        .as_ref()
+                        .is_some_and(|email| t.submitter == *email);
+                user_match
+                    && (self.search.query().is_empty()
+                        || self.search.matches(&t.identifier)
+                        || self.search.matches(&t.cmd))
+            })
+            .count()
     }
 }
 
@@ -72,14 +85,23 @@ impl TabView for TasksTab {
 
         // -- S3 summary panel with user/global toggle indicator --
         let view_label = if state.show_global { "global" } else { "user" };
+        let (q, r, e) = if state.show_global {
+            (
+                state.global_queued,
+                state.global_running,
+                state.global_errors,
+            )
+        } else {
+            (state.queued, state.running, state.errors)
+        };
         widgets::draw_s3_panel(
             frame,
             chunks[0],
             theme,
             &widgets::S3PanelData {
-                queued: state.queued,
-                running: state.running,
-                errors: state.errors,
+                queued: q,
+                running: r,
+                errors: e,
                 global_count: state.global_count,
                 rate_limited: state.is_rate_limited,
                 seconds_ago: state.seconds_since_poll(),
@@ -103,7 +125,15 @@ impl TabView for TasksTab {
         let filtered_tasks: Vec<_> = state
             .tasks
             .iter()
-            .filter(|t| self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
+            .filter(|t| {
+                // In user mode, only show the user's tasks
+                let user_match = state.show_global
+                    || self
+                        .submitter
+                        .as_ref()
+                        .is_some_and(|email| t.submitter == *email);
+                user_match && (self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
+            })
             .collect();
 
         let header = Row::new(vec!["SUBMITTED", "IDENTIFIER", "CMD", "STATUS"]).style(
@@ -224,17 +254,27 @@ impl TabView for TasksTab {
             }
             KeyCode::Enter => {
                 // Open the selected task's item on archive.org.
+                // Also store the URL in status_message for 5 seconds so it's
+                // visible on headless systems where open::that() fails silently.
                 if let Ok(state) = self.s3_state.lock() {
                     let filtered: Vec<_> = state
                         .tasks
                         .iter()
                         .filter(|t| {
-                            self.search.matches(&t.identifier) || self.search.matches(&t.cmd)
+                            let user_match = state.show_global
+                                || self
+                                    .submitter
+                                    .as_ref()
+                                    .is_some_and(|email| t.submitter == *email);
+                            user_match
+                                && (self.search.matches(&t.identifier)
+                                    || self.search.matches(&t.cmd))
                         })
                         .collect();
                     if let Some(task) = filtered.get(self.cursor) {
                         let url = format!("https://archive.org/history/{}", task.identifier);
-                        let _ = open::that(url);
+                        let _ = open::that(&url);
+                        self.status_message = Some((url, Instant::now()));
                     }
                 }
                 true
@@ -244,7 +284,16 @@ impl TabView for TasksTab {
     }
 
     fn tick(&mut self) {
-        // No-op — polling is driven by the outer dashboard loop.
+        // Clear status message after 5 seconds.
+        if let Some((_, ts)) = &self.status_message {
+            if ts.elapsed().as_secs() >= 5 {
+                self.status_message = None;
+            }
+        }
+    }
+
+    fn status_text(&self) -> Option<&str> {
+        self.status_message.as_ref().map(|(url, _)| url.as_str())
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
@@ -296,7 +345,8 @@ mod tests {
 
     #[test]
     fn test_scroll_clamps() {
-        let mut tab = TasksTab::new(make_s3_state());
+        // Pass submitter so all tasks are visible in user mode.
+        let mut tab = TasksTab::new(make_s3_state(), Some("test@example.com".to_string()));
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(tab.cursor, 1);
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -308,7 +358,7 @@ mod tests {
     #[test]
     fn test_toggle_view() {
         let s3 = make_s3_state();
-        let mut tab = TasksTab::new(s3.clone());
+        let mut tab = TasksTab::new(s3.clone(), None);
         assert!(!s3.lock().unwrap().show_global);
         tab.handle_key(KeyCode::Char('u'), KeyModifiers::NONE);
         assert!(s3.lock().unwrap().show_global);
@@ -316,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_search_activation() {
-        let mut tab = TasksTab::new(make_s3_state());
+        let mut tab = TasksTab::new(make_s3_state(), None);
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         assert!(tab.search.is_active());
         tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -328,9 +378,66 @@ mod tests {
 
     #[test]
     fn test_key_hints() {
-        let tab = TasksTab::new(make_s3_state());
+        let tab = TasksTab::new(make_s3_state(), None);
         let hints = tab.key_hints();
         assert!(hints.iter().any(|(k, _)| *k == "u"));
         assert!(hints.iter().any(|(k, _)| *k == "Enter"));
+    }
+
+    #[test]
+    fn test_enter_sets_status_message() {
+        // Pass submitter so tasks are visible in default user mode.
+        let mut tab = TasksTab::new(make_s3_state(), Some("test@example.com".to_string()));
+        // No status message initially
+        assert!(tab.status_text().is_none());
+        // Press Enter — item-a is at cursor 0
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        // Status message should now be set
+        let text = tab.status_text();
+        assert!(text.is_some());
+        assert!(text.unwrap().contains("archive.org"));
+        assert!(text.unwrap().contains("item-a"));
+    }
+
+    #[test]
+    fn test_user_mode_filters_by_submitter() {
+        let s3 = make_s3_state();
+        // Add a task from a different submitter.
+        s3.lock().unwrap().update_tasks(vec![
+            S3TaskEntry {
+                identifier: "item-a".into(),
+                cmd: "s3-put".into(),
+                submitter: "test@example.com".into(),
+                status: "running".into(),
+                submittime: "14:01:23".into(),
+            },
+            S3TaskEntry {
+                identifier: "item-other".into(),
+                cmd: "s3-put".into(),
+                submitter: "other@example.com".into(),
+                status: "queued".into(),
+                submittime: "14:01:25".into(),
+            },
+        ]);
+        let tab = TasksTab::new(s3.clone(), Some("test@example.com".to_string()));
+        // In user mode (default), should only see 1 task.
+        assert_eq!(tab.task_count(), 1);
+        // Toggle to global mode — should see both.
+        s3.lock().unwrap().toggle_view();
+        assert_eq!(tab.task_count(), 2);
+    }
+
+    #[test]
+    fn test_tick_clears_expired_status_message() {
+        use std::time::{Duration, Instant};
+        let mut tab = TasksTab::new(make_s3_state(), None);
+        // Manually inject an old status message (6 seconds ago)
+        tab.status_message = Some((
+            "https://archive.org/history/item-a".to_string(),
+            Instant::now() - Duration::from_secs(6),
+        ));
+        assert!(tab.status_text().is_some());
+        tab.tick();
+        assert!(tab.status_text().is_none());
     }
 }

@@ -20,6 +20,8 @@ pub fn help_content(tab: TabId) -> String {
         "Global:\n\
          \x20 1-4     Switch tabs\n\
          \x20 Tab     Cycle panel focus\n\
+         \x20 p       Pause/resume uploads\n\
+         \x20 r       Refresh S3 tasks\n\
          \x20 ?       Toggle this help\n\
          \x20 q       Quit\n",
     );
