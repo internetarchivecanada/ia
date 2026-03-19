@@ -85,14 +85,23 @@ impl TabView for TasksTab {
 
         // -- S3 summary panel with user/global toggle indicator --
         let view_label = if state.show_global { "global" } else { "user" };
+        let (q, r, e) = if state.show_global {
+            (
+                state.global_queued,
+                state.global_running,
+                state.global_errors,
+            )
+        } else {
+            (state.queued, state.running, state.errors)
+        };
         widgets::draw_s3_panel(
             frame,
             chunks[0],
             theme,
             &widgets::S3PanelData {
-                queued: state.queued,
-                running: state.running,
-                errors: state.errors,
+                queued: q,
+                running: r,
+                errors: e,
                 global_count: state.global_count,
                 rate_limited: state.is_rate_limited,
                 seconds_ago: state.seconds_since_poll(),

@@ -27,6 +27,10 @@ pub struct S3TaskState {
     pub errors: u32,
     /// Total task count across all users.
     pub global_count: u32,
+    /// Breakdown of global task counts by status.
+    pub global_queued: u32,
+    pub global_running: u32,
+    pub global_errors: u32,
     /// Whether any item is currently rate-limited.
     pub is_rate_limited: bool,
     /// Full task list for the Tasks tab.
@@ -44,6 +48,9 @@ impl S3TaskState {
             running: 0,
             errors: 0,
             global_count: 0,
+            global_queued: 0,
+            global_running: 0,
+            global_errors: 0,
             is_rate_limited: false,
             tasks: Vec::new(),
             show_global: false,
@@ -59,6 +66,12 @@ impl S3TaskState {
 
     pub fn update_global_count(&mut self, count: u32) {
         self.global_count = count;
+    }
+
+    pub fn update_global_summary(&mut self, queued: u32, running: u32, errors: u32) {
+        self.global_queued = queued;
+        self.global_running = running;
+        self.global_errors = errors;
     }
 
     pub fn update_tasks(&mut self, tasks: Vec<S3TaskEntry>) {
@@ -99,6 +112,9 @@ mod tests {
         assert_eq!(state.running, 0);
         assert_eq!(state.errors, 0);
         assert_eq!(state.global_count, 0);
+        assert_eq!(state.global_queued, 0);
+        assert_eq!(state.global_running, 0);
+        assert_eq!(state.global_errors, 0);
         assert!(!state.is_rate_limited);
         assert!(state.tasks.is_empty());
         assert!(!state.show_global);
@@ -128,6 +144,15 @@ mod tests {
         let mut state = S3TaskState::new();
         state.update_global_count(847);
         assert_eq!(state.global_count, 847);
+    }
+
+    #[test]
+    fn test_update_global_summary() {
+        let mut state = S3TaskState::new();
+        state.update_global_summary(10, 5, 2);
+        assert_eq!(state.global_queued, 10);
+        assert_eq!(state.global_running, 5);
+        assert_eq!(state.global_errors, 2);
     }
 
     #[test]

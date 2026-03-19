@@ -377,7 +377,11 @@ async fn run_dashboard_and_summarize(
     //    We filter locally by submitter email for user-specific counts.
     let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
-    let submitter = client.config().cookies.get("logged-in-user").cloned();
+    let submitter = client.config().cookies.get("logged-in-user").map(|s| {
+        urlencoding::decode(s)
+            .unwrap_or(std::borrow::Cow::Borrowed(s))
+            .into_owned()
+    });
     let submitter_for_dashboard = submitter.clone();
     let refresh_notify = Arc::new(tokio::sync::Notify::new());
     let poll_notify = Arc::clone(&refresh_notify);
@@ -451,6 +455,7 @@ async fn run_dashboard_and_summarize(
                             summary.queued + summary.running + summary.error + summary.paused;
                         let global_from_catalog = global_queued + global_running + global_errors;
                         s3.update_global_count(global_from_summary.max(global_from_catalog));
+                        s3.update_global_summary(global_queued, global_running, global_errors);
                         s3.update_summary(user_queued, user_running, user_errors);
                         s3.update_tasks(all_entries);
                         s3.mark_polled();
