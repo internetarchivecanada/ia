@@ -1,19 +1,14 @@
 //! Upload dashboard state machine.
 //!
 //! Tracks per-item and per-file upload progress with byte-level granularity,
-//! rate limit status, throughput sampling, and S3 task counts. Implements the
-//! [`Dashboard`] trait via [`UploadDashboard`].
+//! rate limit status, and throughput sampling.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyModifiers};
-
 use ia_core::upload::{UploadProgress, UploadProgressStatus};
 
-use super::framework::Dashboard;
-use super::upload_ui;
 use super::widgets::ThroughputTracker;
 
 // ---------------------------------------------------------------------------
@@ -103,13 +98,7 @@ pub struct UploadTuiState {
     pub completed_files: VecDeque<String>,
     pub failed_files: Vec<(String, String)>,
     pub throughput: ThroughputTracker,
-    pub scroll_offset: usize,
-    pub quit_requested: bool,
     pub done: bool,
-    // S3 Tasks panel
-    pub tasks_queued: u32,
-    pub tasks_running: u32,
-    pub tasks_error: u32,
 }
 
 impl UploadTuiState {
@@ -149,12 +138,7 @@ impl UploadTuiState {
             completed_files: VecDeque::new(),
             failed_files: Vec::new(),
             throughput: ThroughputTracker::new(),
-            scroll_offset: 0,
-            quit_requested: false,
             done: false,
-            tasks_queued: 0,
-            tasks_running: 0,
-            tasks_error: 0,
         }
     }
 
@@ -327,76 +311,6 @@ impl UploadTuiState {
         self.throughput.set_bytes(self.bytes_uploaded);
         self.throughput.maybe_sample();
     }
-
-    /// Overall progress as a fraction in `[0.0, 1.0]`.
-    ///
-    /// Uses byte-level granularity: `bytes_uploaded / bytes_total`.
-    #[must_use]
-    pub fn overall_progress(&self) -> f64 {
-        if self.bytes_total == 0 {
-            return 0.0;
-        }
-        (self.bytes_uploaded as f64 / self.bytes_total as f64).min(1.0)
-    }
-
-    /// Clamp scroll_offset so it doesn't scroll past the active file list.
-    pub fn clamp_scroll(&mut self) {
-        let max = self.active_files.len().saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.min(max);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dashboard wrapper
-// ---------------------------------------------------------------------------
-
-/// Wrapper that implements [`Dashboard`] for the upload TUI.
-pub struct UploadDashboard {
-    pub state: Arc<Mutex<UploadTuiState>>,
-}
-
-impl Dashboard for UploadDashboard {
-    fn draw(&self, frame: &mut ratatui::Frame) {
-        if let Ok(s) = self.state.lock() {
-            upload_ui::draw(frame, &s);
-        }
-    }
-
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        let Ok(mut s) = self.state.lock() else {
-            return false;
-        };
-        match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                s.quit_requested = true;
-                true
-            }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                s.quit_requested = true;
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                s.scroll_offset = s.scroll_offset.saturating_add(1);
-                s.clamp_scroll();
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                s.scroll_offset = s.scroll_offset.saturating_sub(1);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        self.state
-            .lock()
-            .map_or(true, |s| s.done && s.active_files.is_empty())
-    }
-
-    fn quit_requested(&self) -> bool {
-        self.state.lock().map_or(true, |s| s.quit_requested)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,24 +330,35 @@ async fn run_dashboard_and_summarize(
             std::result::Result<Vec<ia_core::upload::UploadResult>, ia_core::error::IaError>,
         >,
     >,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
-    // 1. Spawn S3 tasks polling loop (every 60s, single aggregate query).
-    //    Uses `args=*s3-put*&submitter={email}` instead of per-identifier
-    //    queries — for a 500-item batch this reduces polling from 500
-    //    requests/minute to 1.
-    let tasks_state = Arc::clone(&state);
+    use super::dashboard::MultiTabDashboard;
+    use super::joblog_state::JoblogState;
+    use super::s3_state::{S3TaskEntry, S3TaskState};
+
+    // Create shared state for the multi-tab dashboard.
+    let s3_state = Arc::new(Mutex::new(S3TaskState::new()));
+    let joblog_state = Arc::new(Mutex::new(match joblog_path {
+        Some(p) => JoblogState::open(p).unwrap_or_else(|_| JoblogState::empty()),
+        None => JoblogState::empty(),
+    }));
+
+    // 1. Spawn S3 tasks polling loop (every 15s, single aggregate query).
+    //    One query WITHOUT submitter filter gives true global counts.
+    //    We filter locally by submitter email for user-specific counts.
+    let poll_s3 = Arc::clone(&s3_state);
     let tasks_client = client.clone();
-    // Get submitter email from config cookies (no network call needed).
     let submitter = client.config().cookies.get("logged-in-user").cloned();
     let tasks_handle = tokio::spawn(async move {
         loop {
+            // Global tasks query (no submitter filter) with catalog entries.
             if let Ok(value) = ia_core::tasks::get_tasks(
                 &tasks_client,
                 &ia_core::tasks::TasksQuery {
                     args: Some("*s3-put*".to_string()),
-                    submitter: submitter.clone(),
+                    submitter: None,
                     catalog: Some(true),
                     history: Some(false),
                     ..Default::default()
@@ -441,25 +366,70 @@ async fn run_dashboard_and_summarize(
             )
             .await
             {
-                if let Ok(mut s) = tasks_state.lock() {
-                    s.tasks_queued = value.summary.queued;
-                    s.tasks_running = value.summary.running;
-                    s.tasks_error = value.summary.error;
+                if let Ok(mut s3) = poll_s3.lock() {
+                    // Global count from the unfiltered summary.
+                    s3.update_global_count(
+                        value.summary.queued
+                            + value.summary.running
+                            + value.summary.error
+                            + value.summary.paused,
+                    );
+
+                    // Convert catalog entries to S3TaskEntry for display.
+                    // TaskEntry.color maps to display status: green=running,
+                    // blue=queued, red=error, brown=paused.
+                    let all_entries: Vec<S3TaskEntry> = value
+                        .catalog
+                        .iter()
+                        .map(|e| S3TaskEntry {
+                            identifier: e.identifier.clone(),
+                            cmd: e.cmd.clone(),
+                            submitter: e.submitter.clone(),
+                            status: match e.color.as_str() {
+                                "green" => "running".to_string(),
+                                "blue" => "queued".to_string(),
+                                "red" => "error".to_string(),
+                                "brown" => "paused".to_string(),
+                                other => other.to_string(),
+                            },
+                            submittime: e.submittime.clone(),
+                        })
+                        .collect();
+
+                    // Filter for user-specific summary counts.
+                    let (mut user_queued, mut user_running, mut user_errors) = (0u32, 0u32, 0u32);
+                    for entry in &all_entries {
+                        let is_user = submitter
+                            .as_ref()
+                            .is_some_and(|email| entry.submitter == *email);
+                        if is_user {
+                            match entry.status.as_str() {
+                                "queued" => user_queued += 1,
+                                "running" => user_running += 1,
+                                "error" => user_errors += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    s3.update_summary(user_queued, user_running, user_errors);
+                    s3.update_tasks(all_entries);
+                    s3.mark_polled();
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
 
     // 2. Run the dashboard event loop on a blocking thread so the async
     //    upload tasks keep running on the tokio runtime.
-    let dashboard_state = Arc::clone(&state);
     let tick_rate = Duration::from_millis(100);
+    let dashboard_upload = Arc::clone(&state);
+    let dashboard_s3 = Arc::clone(&s3_state);
+    let dashboard_joblog = Arc::clone(&joblog_state);
     tokio::task::spawn_blocking(move || {
-        let mut dashboard = UploadDashboard {
-            state: dashboard_state,
-        };
+        let mut dashboard =
+            MultiTabDashboard::new(dashboard_upload, dashboard_s3, dashboard_joblog);
         super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)
     })
     .await??;
@@ -596,6 +566,7 @@ pub async fn run_upload_tui(
     opts: ia_core::upload::UploadOpts,
     concurrency: usize,
     skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     // Set up terminal — the guard ensures cleanup even on panic.
     let (terminal, _guard) = super::framework::setup_terminal()?;
@@ -618,7 +589,11 @@ pub async fn run_upload_tui(
         let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
+            let Ok(_permit) = sem.acquire().await else {
+                return Err(ia_core::error::IaError::Config(
+                    "upload semaphore closed".into(),
+                ));
+            };
             let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
                 Arc::new(move |p: UploadProgress| {
                     if let Ok(mut s) = progress_state.lock() {
@@ -641,7 +616,7 @@ pub async fn run_upload_tui(
         }));
     }
 
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +634,7 @@ pub async fn run_upload_batch_tui(
     opts: ia_core::upload::UploadOpts,
     jobs: usize,
     skip_set: Option<Arc<std::collections::HashSet<(String, String)>>>,
+    joblog_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
@@ -694,7 +670,11 @@ pub async fn run_upload_batch_tui(
         let skip = skip_set.clone();
 
         handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("semaphore closed");
+            let Ok(_permit) = sem.acquire().await else {
+                return Err(ia_core::error::IaError::Config(
+                    "upload semaphore closed".into(),
+                ));
+            };
             let id = group.identifier.clone();
             let files = group.files;
 
@@ -721,7 +701,7 @@ pub async fn run_upload_batch_tui(
     }
 
     // 5-7. Run dashboard lifecycle (tasks polling, event loop, summary).
-    run_dashboard_and_summarize(client, state, terminal, _guard, handles).await
+    run_dashboard_and_summarize(client, state, terminal, _guard, handles, joblog_path).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,42 +1014,6 @@ mod tests {
         assert!(matches!(state.items[0].status, UploadItemStatus::Failed(_)));
     }
 
-    // 6. Progress ratio calculation
-    #[test]
-    fn test_overall_progress() {
-        let mut state = UploadTuiState::new(&["item-a".to_string()]);
-
-        // No bytes total yet
-        assert_eq!(state.overall_progress(), 0.0);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            0,
-            1000,
-            UploadProgressStatus::Verifying,
-        ));
-        assert_eq!(state.overall_progress(), 0.0);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            500,
-            1000,
-            UploadProgressStatus::Uploading,
-        ));
-        assert!((state.overall_progress() - 0.5).abs() < 0.001);
-
-        state.update(progress(
-            "item-a",
-            "f.txt",
-            1000,
-            1000,
-            UploadProgressStatus::Complete,
-        ));
-        assert!((state.overall_progress() - 1.0).abs() < 0.001);
-    }
-
     // 7. Multiple Uploading events, verify cumulative bytes are correct (not double-counted)
     #[test]
     fn test_byte_delta_tracking() {
@@ -1131,119 +1075,7 @@ mod tests {
         assert_eq!(state.bytes_uploaded, state.bytes_total);
     }
 
-    // --- Dashboard trait tests ---
-
-    #[test]
-    fn test_dashboard_quit_on_q() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        assert!(!dash.quit_requested());
-        dash.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_quit_on_esc() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        dash.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_quit_on_ctrl_c() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        dash.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(dash.quit_requested());
-    }
-
-    #[test]
-    fn test_dashboard_scroll() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        // Add active files so scroll has room to move
-        {
-            let mut s = state.lock().unwrap();
-            for i in 0..5 {
-                s.update(progress(
-                    "x",
-                    &format!("file-{i}.txt"),
-                    0,
-                    100,
-                    UploadProgressStatus::Verifying,
-                ));
-            }
-        }
-
-        dash.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 1);
-        dash.handle_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 2);
-        dash.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 1);
-        dash.handle_key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 0);
-        // Scroll up at 0 stays at 0
-        dash.handle_key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(state.lock().unwrap().scroll_offset, 0);
-    }
-
-    #[test]
-    fn test_dashboard_is_done() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-
-        // Not done initially
-        assert!(!dash.is_done());
-
-        // Mark done but leave an active file — should still not be done
-        {
-            let mut s = state.lock().unwrap();
-            s.done = true;
-            s.active_files.insert(
-                "x\0f.txt".to_string(),
-                UploadFileProgress {
-                    name: "f.txt".to_string(),
-                    identifier: "x".to_string(),
-                    bytes_sent: 0,
-                    total_bytes: 100,
-                    status: UploadProgressStatus::Uploading,
-                    started_at: Instant::now(),
-                },
-            );
-        }
-        assert!(!dash.is_done());
-
-        // Clear active files — now it should be done
-        state.lock().unwrap().active_files.clear();
-        assert!(dash.is_done());
-    }
-
-    #[test]
-    fn test_unhandled_key_returns_false() {
-        let state = Arc::new(Mutex::new(UploadTuiState::new(&["x".to_string()])));
-        let mut dash = UploadDashboard {
-            state: Arc::clone(&state),
-        };
-        assert!(!dash.handle_key(KeyCode::Char('z'), KeyModifiers::NONE));
-    }
-
-    // --- Bounded completed_files and scroll clamping ---
+    // --- Bounded completed_files ---
 
     #[test]
     fn completed_files_bounded() {
@@ -1266,27 +1098,5 @@ mod tests {
         }
         assert!(state.completed_files.len() <= 10);
         assert_eq!(state.completed_files.back().unwrap(), "file-19.txt");
-    }
-
-    #[test]
-    fn scroll_offset_clamped() {
-        let mut state = UploadTuiState::new(&["item-1".into()]);
-        state.update(progress(
-            "item-1",
-            "a.txt",
-            0,
-            100,
-            UploadProgressStatus::Verifying,
-        ));
-        state.update(progress(
-            "item-1",
-            "b.txt",
-            0,
-            100,
-            UploadProgressStatus::Verifying,
-        ));
-        state.scroll_offset = 100;
-        state.clamp_scroll();
-        assert!(state.scroll_offset <= 1);
     }
 }

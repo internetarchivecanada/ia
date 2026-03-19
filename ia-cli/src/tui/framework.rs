@@ -39,6 +39,10 @@ pub trait Dashboard {
     /// Handle a key event. Returns `true` if the key was consumed.
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool;
 
+    /// Called on each tick for periodic updates (polling, tailing, etc.).
+    /// Default is a no-op for backward compatibility.
+    fn tick(&mut self) {}
+
     /// Returns `true` when all background work is complete and the dashboard
     /// should exit after the final render.
     fn is_done(&self) -> bool;
@@ -88,6 +92,9 @@ pub fn run_dashboard_sync(
     let mut input_disabled = false;
 
     loop {
+        // Tick (periodic updates: polling, tailing, timeouts)
+        dashboard.tick();
+
         // Draw
         terminal.draw(|f| dashboard.draw(f))?;
 

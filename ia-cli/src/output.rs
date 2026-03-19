@@ -201,44 +201,68 @@ impl DownloadDisplay {
                 bytes_total,
             } => {
                 self.bar.set_length(*bytes_total);
-                *self.files_total.lock().unwrap() = *files_count;
+                if let Ok(mut ft) = self.files_total.lock() {
+                    *ft = *files_count;
+                }
                 self.bar.set_message(format!("0/{files_count} files"));
             }
             DownloadStatus::Starting | DownloadStatus::Downloading => {
-                let mut map = self.per_file_bytes.lock().unwrap();
-                map.insert(progress.file_name.clone(), progress.bytes_downloaded);
-                let total: u64 = map.values().sum();
-                self.bar.set_position(total);
-            }
-            DownloadStatus::Complete => {
-                if let Some(size) = progress.total_bytes {
-                    let mut map = self.per_file_bytes.lock().unwrap();
-                    map.insert(progress.file_name.clone(), size);
+                if let Ok(mut map) = self.per_file_bytes.lock() {
+                    map.insert(progress.file_name.clone(), progress.bytes_downloaded);
                     let total: u64 = map.values().sum();
                     self.bar.set_position(total);
                 }
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{total} files"));
+            }
+            DownloadStatus::Complete => {
+                if let Some(size) = progress.total_bytes {
+                    if let Ok(mut map) = self.per_file_bytes.lock() {
+                        map.insert(progress.file_name.clone(), size);
+                        let total: u64 = map.values().sum();
+                        self.bar.set_position(total);
+                    }
+                }
+                let msg = match (self.files_processed.lock(), self.files_total.lock()) {
+                    (Ok(mut processed), Ok(total)) => {
+                        *processed += 1;
+                        format!("{processed}/{total} files")
+                    }
+                    _ => String::new(),
+                };
+                if !msg.is_empty() {
+                    self.bar.set_message(msg);
+                }
             }
             DownloadStatus::Skipped(_) => {
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{total} files"));
+                let msg = match (self.files_processed.lock(), self.files_total.lock()) {
+                    (Ok(mut processed), Ok(total)) => {
+                        *processed += 1;
+                        format!("{processed}/{total} files")
+                    }
+                    _ => String::new(),
+                };
+                if !msg.is_empty() {
+                    self.bar.set_message(msg);
+                }
             }
             DownloadStatus::Failed(err) => {
-                self.errors.lock().unwrap().push(format!(
-                    "  {} {} {}",
-                    style(ICON_ERROR).red(),
-                    style(&progress.file_name).dim(),
-                    style(format!("— {err}")).red(),
-                ));
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let total = *self.files_total.lock().unwrap();
-                self.bar.set_message(format!("{processed}/{total} files"));
+                if let Ok(mut errors) = self.errors.lock() {
+                    errors.push(format!(
+                        "  {} {} {}",
+                        style(ICON_ERROR).red(),
+                        style(&progress.file_name).dim(),
+                        style(format!("— {err}")).red(),
+                    ));
+                }
+                let msg = match (self.files_processed.lock(), self.files_total.lock()) {
+                    (Ok(mut processed), Ok(total)) => {
+                        *processed += 1;
+                        format!("{processed}/{total} files")
+                    }
+                    _ => String::new(),
+                };
+                if !msg.is_empty() {
+                    self.bar.set_message(msg);
+                }
             }
             DownloadStatus::Verifying => {}
         }
@@ -248,9 +272,10 @@ impl DownloadDisplay {
         self.bar.finish_and_clear();
 
         // Print collected errors
-        let errors = self.errors.lock().unwrap();
-        for err in errors.iter() {
-            eprintln!("{err}");
+        if let Ok(errors) = self.errors.lock() {
+            for err in errors.iter() {
+                eprintln!("{err}");
+            }
         }
 
         print_item_finish(&ItemFinish {
@@ -345,22 +370,25 @@ impl BatchDisplay {
         );
         bar.set_message("starting...");
 
-        let mut items = self.active_item_bars.lock().unwrap();
-        items.insert(
-            identifier.to_string(),
-            ItemBars {
-                header: item_header,
-                bar,
-                per_file_bytes: HashMap::new(),
-                files_processed: 0,
-                files_total: 0,
-            },
-        );
+        if let Ok(mut items) = self.active_item_bars.lock() {
+            items.insert(
+                identifier.to_string(),
+                ItemBars {
+                    header: item_header,
+                    bar,
+                    per_file_bytes: HashMap::new(),
+                    files_processed: 0,
+                    files_total: 0,
+                },
+            );
+        }
     }
 
     pub fn on_progress(&self, progress: DownloadProgress) {
         let identifier = &progress.identifier;
-        let mut items = self.active_item_bars.lock().unwrap();
+        let Ok(mut items) = self.active_item_bars.lock() else {
+            return;
+        };
         let Some(item) = items.get_mut(identifier) else {
             return;
         };
@@ -412,7 +440,9 @@ impl BatchDisplay {
 
     pub fn on_item_complete(&self, result: &ia_core::download::ItemDownloadResult) {
         let identifier = &result.identifier;
-        let mut items = self.active_item_bars.lock().unwrap();
+        let Ok(mut items) = self.active_item_bars.lock() else {
+            return;
+        };
         if let Some(item) = items.remove(identifier) {
             item.bar.finish_and_clear();
 
@@ -510,52 +540,66 @@ impl UploadDisplay {
                 bytes_total,
             } => {
                 self.bar.set_length(bytes_total);
-                *self.files_total.lock().unwrap() = files_count;
-                *self.bytes_total.lock().unwrap() = bytes_total;
+                if let Ok(mut ft) = self.files_total.lock() {
+                    *ft = files_count;
+                }
+                if let Ok(mut bt) = self.bytes_total.lock() {
+                    *bt = bytes_total;
+                }
                 self.bar.set_message(format!("0/{files_count} files"));
             }
             UploadProgressStatus::Uploading => {
-                let mut map = self.per_file_bytes.lock().unwrap();
-                map.insert(p.key.clone(), p.bytes_sent);
-                let total: u64 = map.values().sum();
-                self.bar.set_position(total);
+                if let Ok(mut map) = self.per_file_bytes.lock() {
+                    map.insert(p.key.clone(), p.bytes_sent);
+                    let total: u64 = map.values().sum();
+                    self.bar.set_position(total);
+                }
             }
             UploadProgressStatus::Verifying => {
                 // Verifying doesn't change byte count
             }
             UploadProgressStatus::Complete => {
-                let mut map = self.per_file_bytes.lock().unwrap();
-                map.insert(p.key.clone(), p.total_bytes);
-                let total: u64 = map.values().sum();
-                self.bar.set_position(total);
-                drop(map);
-
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let files_total = *self.files_total.lock().unwrap();
-                self.bar
-                    .set_message(format!("{processed}/{files_total} files"));
+                if let Ok(mut map) = self.per_file_bytes.lock() {
+                    map.insert(p.key.clone(), p.total_bytes);
+                    let total: u64 = map.values().sum();
+                    self.bar.set_position(total);
+                }
+                if let (Ok(mut processed), Ok(files_total)) =
+                    (self.files_processed.lock(), self.files_total.lock())
+                {
+                    *processed += 1;
+                    self.bar
+                        .set_message(format!("{processed}/{files_total} files"));
+                }
             }
             UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
-                *self.files_skipped.lock().unwrap() += 1;
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let files_total = *self.files_total.lock().unwrap();
-                self.bar
-                    .set_message(format!("{processed}/{files_total} files"));
+                if let Ok(mut sk) = self.files_skipped.lock() {
+                    *sk += 1;
+                }
+                if let (Ok(mut processed), Ok(files_total)) =
+                    (self.files_processed.lock(), self.files_total.lock())
+                {
+                    *processed += 1;
+                    self.bar
+                        .set_message(format!("{processed}/{files_total} files"));
+                }
             }
             UploadProgressStatus::Failed => {
-                self.errors.lock().unwrap().push(format!(
-                    "  {} {} {}",
-                    style(ICON_ERROR).red(),
-                    style(&p.key).dim(),
-                    style("— upload failed").red(),
-                ));
-                let mut processed = self.files_processed.lock().unwrap();
-                *processed += 1;
-                let files_total = *self.files_total.lock().unwrap();
-                self.bar
-                    .set_message(format!("{processed}/{files_total} files"));
+                if let Ok(mut errors) = self.errors.lock() {
+                    errors.push(format!(
+                        "  {} {} {}",
+                        style(ICON_ERROR).red(),
+                        style(&p.key).dim(),
+                        style("— upload failed").red(),
+                    ));
+                }
+                if let (Ok(mut processed), Ok(files_total)) =
+                    (self.files_processed.lock(), self.files_total.lock())
+                {
+                    *processed += 1;
+                    self.bar
+                        .set_message(format!("{processed}/{files_total} files"));
+                }
             }
             UploadProgressStatus::WaitingRateLimit => {
                 self.bar.set_message("rate limited, waiting...");
@@ -570,21 +614,23 @@ impl UploadDisplay {
     pub fn finish(&self) {
         self.bar.finish_and_clear();
 
-        let errors = self.errors.lock().unwrap();
-        for err in errors.iter() {
-            eprintln!("{err}");
-        }
-        let files_failed = errors.len();
-        drop(errors);
+        let files_failed = if let Ok(errors) = self.errors.lock() {
+            for err in errors.iter() {
+                eprintln!("{err}");
+            }
+            errors.len()
+        } else {
+            0
+        };
 
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        let files_processed = *self.files_processed.lock().unwrap();
-        let files_skipped = *self.files_skipped.lock().unwrap();
+        let files_processed = self.files_processed.lock().map_or(0, |v| *v);
+        let files_skipped = self.files_skipped.lock().map_or(0, |v| *v);
         let files_uploaded = files_processed
             .saturating_sub(files_failed)
             .saturating_sub(files_skipped);
-        let bytes_total = *self.bytes_total.lock().unwrap();
-        let dry_run = *self.dry_run.lock().unwrap();
+        let bytes_total = self.bytes_total.lock().map_or(0, |v| *v);
+        let dry_run = self.dry_run.lock().is_ok_and(|v| *v);
 
         print_item_finish(&ItemFinish {
             identifier: &self.identifier,
@@ -676,7 +722,9 @@ impl UploadBatchDisplay {
                 bytes_total,
             } => {
                 // Guard: only create bars once per item (ignore duplicate Enumerated events)
-                let mut items = self.active_items.lock().unwrap();
+                let Ok(mut items) = self.active_items.lock() else {
+                    return;
+                };
                 if items.contains_key(identifier) {
                     return;
                 }
@@ -722,7 +770,9 @@ impl UploadBatchDisplay {
             }
             UploadProgressStatus::Uploading => {
                 let delta = {
-                    let mut items = self.active_items.lock().unwrap();
+                    let Ok(mut items) = self.active_items.lock() else {
+                        return;
+                    };
                     if let Some(item) = items.get_mut(identifier) {
                         let prev: u64 = item.per_file_bytes.values().sum();
                         item.per_file_bytes.insert(p.key.clone(), p.bytes_sent);
@@ -740,7 +790,9 @@ impl UploadBatchDisplay {
             }
             UploadProgressStatus::Complete => {
                 let (should_finish, byte_delta) = {
-                    let mut items = self.active_items.lock().unwrap();
+                    let Ok(mut items) = self.active_items.lock() else {
+                        return;
+                    };
                     if let Some(item) = items.get_mut(identifier) {
                         let prev: u64 = item.per_file_bytes.values().sum();
                         item.per_file_bytes.insert(p.key.clone(), p.total_bytes);
@@ -769,7 +821,9 @@ impl UploadBatchDisplay {
             }
             UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                 let should_finish = {
-                    let mut items = self.active_items.lock().unwrap();
+                    let Ok(mut items) = self.active_items.lock() else {
+                        return;
+                    };
                     if let Some(item) = items.get_mut(identifier) {
                         item.files_skipped += 1;
                         item.files_processed += 1;
@@ -788,7 +842,9 @@ impl UploadBatchDisplay {
             }
             UploadProgressStatus::Failed => {
                 let should_finish = {
-                    let mut items = self.active_items.lock().unwrap();
+                    let Ok(mut items) = self.active_items.lock() else {
+                        return;
+                    };
                     if let Some(item) = items.get_mut(identifier) {
                         item.errors.push(format!(
                             "  {} {} {}",
@@ -811,15 +867,17 @@ impl UploadBatchDisplay {
                 }
             }
             UploadProgressStatus::WaitingRateLimit => {
-                let mut items = self.active_items.lock().unwrap();
-                if let Some(item) = items.get_mut(identifier) {
-                    item.bar.set_message("rate limited, waiting...");
+                if let Ok(mut items) = self.active_items.lock() {
+                    if let Some(item) = items.get_mut(identifier) {
+                        item.bar.set_message("rate limited, waiting...");
+                    }
                 }
             }
             UploadProgressStatus::Retrying => {
-                let mut items = self.active_items.lock().unwrap();
-                if let Some(item) = items.get_mut(identifier) {
-                    item.bar.set_message("retrying...");
+                if let Ok(mut items) = self.active_items.lock() {
+                    if let Some(item) = items.get_mut(identifier) {
+                        item.bar.set_message("retrying...");
+                    }
                 }
             }
             UploadProgressStatus::Verifying => {
@@ -833,7 +891,9 @@ impl UploadBatchDisplay {
         // Throttle: skip if <80ms since last refresh (matches spinner tick rate).
         let now = Instant::now();
         {
-            let mut last = self.last_header_refresh.lock().unwrap();
+            let Ok(mut last) = self.last_header_refresh.lock() else {
+                return;
+            };
             if now.duration_since(*last) < Duration::from_millis(80) {
                 return;
             }
@@ -863,7 +923,9 @@ impl UploadBatchDisplay {
         // calling multi.println() (which must not be called while holding
         // the items mutex).
         let item = {
-            let mut items = self.active_items.lock().unwrap();
+            let Ok(mut items) = self.active_items.lock() else {
+                return;
+            };
             items.remove(identifier)
         };
 
