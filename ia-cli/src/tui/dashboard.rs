@@ -74,6 +74,7 @@ impl MultiTabDashboard {
     /// Check if the active tab is in a mode that consumes all input (e.g., search).
     fn is_tab_consuming_input(&self) -> bool {
         match self.active_tab {
+            TabId::Upload => self.upload_tab.search.is_active(),
             TabId::Tasks => self.tasks_tab.search.is_active(),
             TabId::Log => self.log_tab.search.is_active(),
             _ => false,
@@ -383,6 +384,28 @@ mod tests {
 
         // Escape exits search, then q quits
         d.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(d.quit_requested());
+    }
+
+    #[test]
+    fn test_upload_search_mode_blocks_global_keys() {
+        let mut d = make_dashboard();
+        // On Upload tab, activate search
+        assert_eq!(d.active_tab, TabId::Upload);
+        d.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+
+        // '2' should go to search input, not switch tabs
+        d.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(d.active_tab, TabId::Upload);
+
+        // 'q' should go to search, not quit
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!d.quit_requested());
+
+        // Escape exits search
+        d.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        // Now q should quit
         d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(d.quit_requested());
     }

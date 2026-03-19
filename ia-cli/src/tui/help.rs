@@ -19,7 +19,6 @@ pub fn help_content(tab: TabId) -> String {
     let mut text = String::from(
         "Global:\n\
          \x20 1-4     Switch tabs\n\
-         \x20 Tab     Cycle panel focus\n\
          \x20 p       Pause/resume uploads\n\
          \x20 r       Refresh S3 tasks\n\
          \x20 ?       Toggle this help\n\
@@ -30,8 +29,12 @@ pub fn help_content(tab: TabId) -> String {
         TabId::Upload => {
             "\n\
              Upload:\n\
-             \x20 j/k     Scroll focused panel\n\
-             \x20 Enter   Open item history\n"
+             \x20 j/k     Scroll items\n\
+             \x20 \u{2192}/l     Expand item files\n\
+             \x20 \u{2190}/h     Collapse item files\n\
+             \x20 /       Search by identifier\n\
+             \x20 n/N     Next/prev match\n\
+             \x20 Enter   Open item on archive.org\n"
         }
         TabId::Tasks => {
             "\n\
@@ -191,8 +194,9 @@ mod tests {
     fn test_global_hints_always_present() {
         let hints = help_content(TabId::Upload);
         assert!(hints.contains("1-4"));
-        assert!(hints.contains("Tab"));
         assert!(hints.contains("q"));
+        // Tab panel cycling was removed
+        assert!(!hints.contains("Tab"));
     }
 
     #[test]
@@ -200,6 +204,10 @@ mod tests {
         let hints = help_content(TabId::Upload);
         assert!(hints.contains("j/k"));
         assert!(hints.contains("Enter"));
+        assert!(hints.contains("/"));
+        assert!(hints.contains("n/N"));
+        assert!(hints.contains("Expand"));
+        assert!(hints.contains("Collapse"));
     }
 
     #[test]

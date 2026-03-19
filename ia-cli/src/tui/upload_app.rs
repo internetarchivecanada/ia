@@ -43,6 +43,14 @@ pub struct UploadItemState {
     pub started_at: Instant,
     /// True once an `Enumerated` event has set `files_total` authoritatively.
     enumerated: bool,
+    /// Completed files: (name, size).
+    pub completed_file_names: Vec<(String, u64)>,
+    /// Skipped files: (name, size).
+    pub skipped_file_names: Vec<(String, u64)>,
+    /// Failed files: (name, error).
+    pub failed_file_names: Vec<(String, String)>,
+    /// All files seen via Verifying events: (name, size).
+    pub known_file_names: Vec<(String, u64)>,
 }
 
 impl UploadItemState {
@@ -73,6 +81,32 @@ pub struct UploadFileProgress {
     pub status: UploadProgressStatus,
     #[allow(dead_code)] // Will be used for per-file ETA display
     pub started_at: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// File display types for tree view
+// ---------------------------------------------------------------------------
+
+/// Display status for a file in the tree view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDisplayStatus {
+    Active,
+    Completed,
+    Skipped,
+    Failed(String),
+    Pending,
+}
+
+/// Entry for rendering a file in the expandable item tree.
+#[derive(Debug, Clone)]
+pub struct FileDisplayEntry {
+    pub name: String,
+    pub size: u64,
+    pub status: FileDisplayStatus,
+    /// For active files: bytes sent so far.
+    pub bytes_sent: u64,
+    /// For active files: current upload status from core.
+    pub upload_status: Option<UploadProgressStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +152,10 @@ impl UploadTuiState {
                 bytes_uploaded: 0,
                 started_at: Instant::now(),
                 enumerated: false,
+                completed_file_names: Vec::new(),
+                skipped_file_names: Vec::new(),
+                failed_file_names: Vec::new(),
+                known_file_names: Vec::new(),
             })
             .collect();
 
@@ -180,6 +218,10 @@ impl UploadTuiState {
                     if !item.enumerated && !self.active_files.contains_key(&fk) {
                         item.files_total += 1;
                     }
+                    // Track known files (deduplicate on name).
+                    if !item.known_file_names.iter().any(|(n, _)| n == &p.key) {
+                        item.known_file_names.push((p.key.clone(), p.total_bytes));
+                    }
                 }
                 UploadProgressStatus::Uploading => {
                     if matches!(
@@ -204,6 +246,8 @@ impl UploadTuiState {
                 }
                 UploadProgressStatus::Complete => {
                     item.files_completed += 1;
+                    item.completed_file_names
+                        .push((p.key.clone(), p.total_bytes));
                     // Account for any remaining byte delta.
                     if let Some(fp) = self.active_files.get(&fk) {
                         let delta = p.bytes_sent.saturating_sub(fp.bytes_sent);
@@ -228,6 +272,7 @@ impl UploadTuiState {
                 }
                 UploadProgressStatus::Skipped | UploadProgressStatus::Resumed => {
                     item.files_skipped += 1;
+                    item.skipped_file_names.push((p.key.clone(), p.total_bytes));
                     if item.files_total > 0
                         && item.files_completed + item.files_skipped + item.files_failed
                             >= item.files_total
@@ -237,6 +282,8 @@ impl UploadTuiState {
                 }
                 UploadProgressStatus::Failed => {
                     item.files_failed += 1;
+                    item.failed_file_names
+                        .push((p.key.clone(), "upload failed".to_string()));
                     if item.files_total > 0
                         && item.files_completed + item.files_skipped + item.files_failed
                             >= item.files_total
@@ -333,6 +380,110 @@ impl UploadTuiState {
         // Sample throughput
         self.throughput.set_bytes(self.bytes_uploaded);
         self.throughput.maybe_sample();
+    }
+
+    /// Get all file display entries for a given identifier.
+    ///
+    /// Returns active files, completed, skipped, failed, and pending files.
+    /// Pending = known via Verifying but not in any terminal state or active.
+    #[must_use]
+    pub fn files_for_item(&self, identifier: &str) -> Vec<FileDisplayEntry> {
+        let mut entries = Vec::new();
+        let prefix = format!("{identifier}\0");
+
+        // Active files for this item.
+        // Files still in Verifying status are not truly active — they will be
+        // classified as Pending below via known_file_names instead.
+        for (key, fp) in &self.active_files {
+            if key.starts_with(&prefix) && fp.status != UploadProgressStatus::Verifying {
+                entries.push(FileDisplayEntry {
+                    name: fp.name.clone(),
+                    size: fp.total_bytes,
+                    status: FileDisplayStatus::Active,
+                    bytes_sent: fp.bytes_sent,
+                    upload_status: Some(fp.status.clone()),
+                });
+            }
+        }
+
+        // Get item state for completed/skipped/failed/known
+        if let Some(&idx) = self.item_index.get(identifier) {
+            let item = &self.items[idx];
+
+            for (name, size) in &item.completed_file_names {
+                entries.push(FileDisplayEntry {
+                    name: name.clone(),
+                    size: *size,
+                    status: FileDisplayStatus::Completed,
+                    bytes_sent: *size,
+                    upload_status: None,
+                });
+            }
+
+            for (name, size) in &item.skipped_file_names {
+                entries.push(FileDisplayEntry {
+                    name: name.clone(),
+                    size: *size,
+                    status: FileDisplayStatus::Skipped,
+                    bytes_sent: 0,
+                    upload_status: None,
+                });
+            }
+
+            for (name, error) in &item.failed_file_names {
+                entries.push(FileDisplayEntry {
+                    name: name.clone(),
+                    size: 0,
+                    status: FileDisplayStatus::Failed(error.clone()),
+                    bytes_sent: 0,
+                    upload_status: None,
+                });
+            }
+
+            // Pending: in known_file_names but not in any other category or active.
+            // Only count non-Verifying files as active (Verifying = not yet uploading).
+            let active_names: std::collections::HashSet<&str> = self
+                .active_files
+                .iter()
+                .filter(|(k, fp)| {
+                    k.starts_with(&prefix) && fp.status != UploadProgressStatus::Verifying
+                })
+                .map(|(_, fp)| fp.name.as_str())
+                .collect();
+            let completed_names: std::collections::HashSet<&str> = item
+                .completed_file_names
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            let skipped_names: std::collections::HashSet<&str> = item
+                .skipped_file_names
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            let failed_names: std::collections::HashSet<&str> = item
+                .failed_file_names
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+
+            for (name, size) in &item.known_file_names {
+                if !active_names.contains(name.as_str())
+                    && !completed_names.contains(name.as_str())
+                    && !skipped_names.contains(name.as_str())
+                    && !failed_names.contains(name.as_str())
+                {
+                    entries.push(FileDisplayEntry {
+                        name: name.clone(),
+                        size: *size,
+                        status: FileDisplayStatus::Pending,
+                        bytes_sent: 0,
+                        upload_status: None,
+                    });
+                }
+            }
+        }
+
+        entries
     }
 }
 
@@ -1206,5 +1357,199 @@ mod tests {
         }
         assert!(state.completed_files.len() <= 10);
         assert_eq!(state.completed_files.back().unwrap(), "file-19.txt");
+    }
+
+    #[test]
+    fn test_per_item_file_names_tracked() {
+        let mut state = UploadTuiState::new(&["item-a".to_string()]);
+
+        // Verifying — should add to known_file_names
+        state.update(progress(
+            "item-a",
+            "file1.txt",
+            0,
+            100,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "file2.txt",
+            0,
+            200,
+            UploadProgressStatus::Verifying,
+        ));
+
+        let item = &state.items[0];
+        assert_eq!(item.known_file_names.len(), 2);
+        assert_eq!(item.known_file_names[0], ("file1.txt".to_string(), 100));
+        assert_eq!(item.known_file_names[1], ("file2.txt".to_string(), 200));
+
+        // Complete file1
+        state.update(progress(
+            "item-a",
+            "file1.txt",
+            100,
+            100,
+            UploadProgressStatus::Complete,
+        ));
+        let item = &state.items[0];
+        assert_eq!(item.completed_file_names.len(), 1);
+        assert_eq!(item.completed_file_names[0], ("file1.txt".to_string(), 100));
+
+        // Skip file2
+        state.update(progress(
+            "item-a",
+            "file2.txt",
+            0,
+            200,
+            UploadProgressStatus::Skipped,
+        ));
+        let item = &state.items[0];
+        assert_eq!(item.skipped_file_names.len(), 1);
+        assert_eq!(item.skipped_file_names[0], ("file2.txt".to_string(), 200));
+    }
+
+    #[test]
+    fn test_files_for_item_returns_all_statuses() {
+        let mut state = UploadTuiState::new(&["item-a".to_string()]);
+
+        // Set up various file states
+        state.update(progress(
+            "item-a",
+            "active.txt",
+            0,
+            500,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "done.txt",
+            0,
+            100,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "skip.txt",
+            0,
+            200,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "fail.txt",
+            0,
+            300,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "pending.txt",
+            0,
+            400,
+            UploadProgressStatus::Verifying,
+        ));
+
+        // Move files to various states
+        state.update(progress(
+            "item-a",
+            "active.txt",
+            100,
+            500,
+            UploadProgressStatus::Uploading,
+        ));
+        state.update(progress(
+            "item-a",
+            "done.txt",
+            100,
+            100,
+            UploadProgressStatus::Complete,
+        ));
+        state.update(progress(
+            "item-a",
+            "skip.txt",
+            0,
+            200,
+            UploadProgressStatus::Skipped,
+        ));
+        state.update(progress(
+            "item-a",
+            "fail.txt",
+            0,
+            300,
+            UploadProgressStatus::Failed,
+        ));
+
+        let files = state.files_for_item("item-a");
+        assert_eq!(files.len(), 5);
+
+        // Check each status is represented
+        assert!(files
+            .iter()
+            .any(|f| f.name == "active.txt" && f.status == FileDisplayStatus::Active));
+        assert!(files
+            .iter()
+            .any(|f| f.name == "done.txt" && f.status == FileDisplayStatus::Completed));
+        assert!(files
+            .iter()
+            .any(|f| f.name == "skip.txt" && f.status == FileDisplayStatus::Skipped));
+        assert!(files
+            .iter()
+            .any(|f| matches!(&f.status, FileDisplayStatus::Failed(_)) && f.name == "fail.txt"));
+        assert!(files
+            .iter()
+            .any(|f| f.name == "pending.txt" && f.status == FileDisplayStatus::Pending));
+    }
+
+    #[test]
+    fn test_files_for_item_pending_derived() {
+        let mut state = UploadTuiState::new(&["item-a".to_string()]);
+
+        // Register 3 files as known
+        state.update(progress(
+            "item-a",
+            "a.txt",
+            0,
+            100,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "b.txt",
+            0,
+            200,
+            UploadProgressStatus::Verifying,
+        ));
+        state.update(progress(
+            "item-a",
+            "c.txt",
+            0,
+            300,
+            UploadProgressStatus::Verifying,
+        ));
+
+        // Complete only one
+        state.update(progress(
+            "item-a",
+            "a.txt",
+            100,
+            100,
+            UploadProgressStatus::Complete,
+        ));
+
+        let files = state.files_for_item("item-a");
+        // a.txt = completed, b.txt and c.txt are still in active_files with
+        // Verifying status — they should be classified as Pending (not yet
+        // actively uploading).
+        let pending: Vec<_> = files
+            .iter()
+            .filter(|f| f.status == FileDisplayStatus::Pending)
+            .collect();
+        assert_eq!(pending.len(), 2);
+        let active: Vec<_> = files
+            .iter()
+            .filter(|f| f.status == FileDisplayStatus::Active)
+            .collect();
+        assert_eq!(active.len(), 0);
     }
 }

@@ -152,6 +152,7 @@ pub fn truncate_tail(s: &str, max_chars: usize) -> String {
 
 /// Truncate a string from the **end**, keeping the beginning and appending `…`.
 /// If `s` fits in `max_chars`, it is left-padded to `max_chars`.
+#[allow(dead_code)] // Available for other dashboards
 pub fn truncate_end(s: &str, max_chars: usize) -> String {
     let len = s.chars().count();
     if len > max_chars {
@@ -520,6 +521,7 @@ pub fn draw_footer(
 }
 
 /// Render a themed sparkline throughput panel.
+#[allow(dead_code)] // Used by download dashboard
 pub fn draw_themed_throughput_panel(
     frame: &mut Frame,
     area: Rect,
@@ -539,6 +541,253 @@ pub fn draw_themed_throughput_panel(
         .style(Style::default().fg(theme.text_very_muted));
 
     frame.render_widget(sparkline, area);
+}
+
+// ---------------------------------------------------------------------------
+// Compact progress panel
+// ---------------------------------------------------------------------------
+
+/// Data needed to render the compact progress panel.
+pub struct ProgressPanelData {
+    pub items_done: usize,
+    pub items_total: usize,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_uploaded: u64,
+    pub eta: String,
+}
+
+/// Render a compact 2×2 progress panel (items/files on top, bytes/ETA on bottom).
+pub fn draw_progress_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &ProgressPanelData) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Progress ",
+            Style::default().fg(theme.maroon_bright),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+
+    // Top row: items + files
+    let items_str = format!("◫ {}/{} items", data.items_done, data.items_total);
+    let files_str = format!("  ≡ {}/{} files", data.files_done, data.files_total);
+    let top = Line::from(vec![
+        Span::styled(items_str, Style::default().fg(theme.green)),
+        Span::styled(files_str, Style::default().fg(theme.blue)),
+    ]);
+    frame.render_widget(Paragraph::new(top), rows[0]);
+
+    // Bottom row: bytes + ETA
+    let bytes_str = format!("↑ {}", format_bytes(data.bytes_uploaded));
+    let eta_str = if data.eta.is_empty() {
+        String::new()
+    } else {
+        format!("  ⧗ {}", data.eta)
+    };
+    let bottom = Line::from(vec![
+        Span::styled(bytes_str, Style::default().fg(theme.text)),
+        Span::styled(eta_str, Style::default().fg(theme.text_muted)),
+    ]);
+    frame.render_widget(Paragraph::new(bottom), rows[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Compact S3 panel
+// ---------------------------------------------------------------------------
+
+/// Render a compact S3 tasks panel with icons only (no labels).
+///
+/// Line 1: `⧖ N   ↻ N   ✗ N` (or `⏸ rate-limited`)
+/// Line 2: `⊕ N global  [Xs ago]` (dimmed)
+pub fn draw_compact_s3_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &S3PanelData) {
+    let block = Block::default()
+        .title(Span::styled(
+            " S3 Tasks ",
+            Style::default().fg(theme.maroon_bright),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+
+    // Line 1: icons + counts
+    let mut spans = vec![
+        Span::styled("⧖ ", Style::default().fg(theme.gold)),
+        Span::styled(
+            format!("{}", data.queued),
+            Style::default().fg(theme.gold).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("↻ ", Style::default().fg(theme.green)),
+        Span::styled(
+            format!("{}", data.running),
+            Style::default()
+                .fg(theme.green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+    ];
+
+    if data.rate_limited && data.errors == 0 {
+        spans.push(Span::styled(
+            "⏸ rate-limited",
+            Style::default().fg(theme.gold),
+        ));
+    } else {
+        spans.push(Span::styled("✗ ", Style::default().fg(theme.red)));
+        spans.push(Span::styled(
+            format!("{}", data.errors),
+            Style::default().fg(if data.errors > 0 {
+                theme.red
+            } else {
+                theme.text_muted
+            }),
+        ));
+        if data.rate_limited {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                "⏸ rate-limited",
+                Style::default().fg(theme.gold),
+            ));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+    // Line 2: global count + poll time
+    let global_line = Line::from(vec![
+        Span::styled(
+            format!("⊕ {} global", data.global_count),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!("  [{}s ago]", data.seconds_ago),
+            Style::default().fg(theme.text_very_muted),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(global_line), rows[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Split sparkline
+// ---------------------------------------------------------------------------
+
+/// Block characters for sparkline rendering, indexed 0-7.
+const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Map a value to a sparkline block character given the max value in the dataset.
+fn spark_char(value: f64, max: f64) -> char {
+    if max <= 0.0 || value <= 0.0 {
+        return SPARK_CHARS[0];
+    }
+    let idx = ((value / max) * 7.0).round() as usize;
+    SPARK_CHARS[idx.min(7)]
+}
+
+/// Render a split sparkline with a centered speed label.
+///
+/// The sparkline history is split into left and right halves around a centered
+/// speed string. Each half is rendered as block characters (`▁▂▃▄▅▆▇█`).
+///
+/// Layout: `▁▂▃▅▇█▇▅▃▂▁  12.4 MiB/s  ▅▃▂▁▂▃▅▇█▇▅▃▂`
+pub fn draw_split_sparkline(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    history: &VecDeque<f64>,
+    speed_label: &str,
+) {
+    use ratatui::layout::Alignment;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let total_width = area.width as usize;
+    let label_width = speed_label.len() + 4; // 2 spaces padding on each side
+
+    if total_width <= label_width {
+        // Not enough space — just show the label centered
+        let label = Line::from(Span::styled(
+            speed_label.to_string(),
+            Style::default()
+                .fg(theme.maroon_bright)
+                .add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), area);
+        return;
+    }
+
+    let bar_width = total_width.saturating_sub(label_width);
+    let left_width = bar_width / 2;
+    let right_width = bar_width - left_width;
+
+    // Find max for scaling
+    let max = history.iter().copied().fold(0.0_f64, f64::max);
+
+    // Build left and right bar strings from history
+    let hist: Vec<f64> = history.iter().copied().collect();
+    let hist_len = hist.len();
+
+    let left_chars: String = if hist_len >= left_width {
+        // Take the most recent `left_width + right_width` entries, split in half
+        let start = hist_len.saturating_sub(left_width + right_width);
+        hist[start..start + left_width]
+            .iter()
+            .map(|v| spark_char(*v, max))
+            .collect()
+    } else if hist_len > 0 {
+        let take = left_width.min(hist_len);
+        let pad = left_width - take;
+        let chars: String = hist[..take].iter().map(|v| spark_char(*v, max)).collect();
+        format!("{}{}", " ".repeat(pad), chars)
+    } else {
+        " ".repeat(left_width)
+    };
+
+    let right_chars: String = if hist_len >= left_width + right_width {
+        let start = hist_len.saturating_sub(right_width);
+        hist[start..].iter().map(|v| spark_char(*v, max)).collect()
+    } else if hist_len > left_width {
+        let start = left_width.min(hist_len);
+        hist[start..]
+            .iter()
+            .map(|v| spark_char(*v, max))
+            .collect::<String>()
+            + &" ".repeat(right_width.saturating_sub(hist_len - start))
+    } else {
+        " ".repeat(right_width)
+    };
+
+    let label_padded = format!("  {}  ", speed_label);
+
+    let line = Line::from(vec![
+        Span::styled(left_chars, Style::default().fg(theme.text_very_muted)),
+        Span::styled(
+            label_padded,
+            Style::default()
+                .fg(theme.maroon_bright)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(right_chars, Style::default().fg(theme.text_very_muted)),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -716,5 +965,35 @@ mod tests {
         let text = build_s3_status_text(23, 4, 2, true);
         assert!(text.contains("rate-limited"));
         assert!(text.contains("Errors: 2"));
+    }
+
+    // -- split sparkline ------------------------------------------------------
+
+    #[test]
+    fn test_split_sparkline_chars_mapping() {
+        // Test that spark_char maps correctly
+        assert_eq!(spark_char(0.0, 100.0), '▁');
+        assert_eq!(spark_char(100.0, 100.0), '█');
+        assert_eq!(spark_char(50.0, 100.0), '▅'); // 50/100 * 7 = 3.5 → rounds to 4 → '▅'
+        assert_eq!(spark_char(0.0, 0.0), '▁'); // edge case: zero max
+    }
+
+    #[test]
+    fn test_split_sparkline_empty_history() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(60, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::for_env("truecolor");
+        let history = VecDeque::new();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_split_sparkline(frame, area, &theme, &history, "0 B/s");
+            })
+            .unwrap();
+        // Should not panic with empty history
     }
 }
