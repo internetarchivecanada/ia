@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
@@ -71,6 +71,18 @@ pub struct TasksSummary {
     pub paused: u32,
 }
 
+/// Deserialize a JSON `null` or missing field as an empty `String`.
+///
+/// `#[serde(default)]` alone handles *missing* fields but not explicit `null` values.
+/// The IA Tasks API returns `"server": null` for queued tasks (and potentially other
+/// nullable string fields), so we need this to avoid skipping those entries.
+fn nullable_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
 /// A single task entry from the catalog or history.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TaskEntry {
@@ -81,16 +93,16 @@ pub struct TaskEntry {
     /// Task command (e.g. `"derive.php"`, `"fixer.php"`).
     pub cmd: String,
     /// Email of the user who submitted the task.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub submitter: String,
     /// When the task was submitted (ISO-8601 or epoch string).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub submittime: String,
     /// Server executing the task (empty if queued).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub server: String,
     /// Task state: `"green"` (running), `"blue"` (queued), `"red"` (error), `"brown"` (paused).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub color: String,
     /// Execution priority (higher = sooner, negative = deprioritized).
     #[serde(default)]

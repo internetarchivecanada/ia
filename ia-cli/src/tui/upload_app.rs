@@ -337,16 +337,6 @@ impl UploadTuiState {
 }
 
 // ---------------------------------------------------------------------------
-// Pause support
-// ---------------------------------------------------------------------------
-
-/// Wait while uploads are paused, polling every 200ms.
-async fn wait_if_paused(paused: &std::sync::atomic::AtomicBool) {
-    while paused.load(std::sync::atomic::Ordering::Relaxed) {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shared dashboard lifecycle
 // ---------------------------------------------------------------------------
@@ -668,8 +658,6 @@ pub async fn run_upload_tui(
                     "upload semaphore closed".into(),
                 ));
             };
-            // Wait while paused before starting this item's upload.
-            wait_if_paused(&task_paused).await;
             let progress_fn: Arc<dyn Fn(UploadProgress) + Send + Sync> =
                 Arc::new(move |p: UploadProgress| {
                     if let Ok(mut s) = progress_state.lock() {
@@ -685,6 +673,7 @@ pub async fn run_upload_tui(
                 skip.as_deref(),
                 None,
                 file_concurrency,
+                Some(task_paused),
             )
             .await;
 
@@ -763,8 +752,6 @@ pub async fn run_upload_batch_tui(
                     "upload semaphore closed".into(),
                 ));
             };
-            // Wait while paused before starting this item's upload.
-            wait_if_paused(&task_paused).await;
             let id = group.identifier.clone();
             let files = group.files;
 
@@ -783,6 +770,7 @@ pub async fn run_upload_batch_tui(
                 skip.as_deref(),
                 None,
                 1, // sequential within batch items; concurrency is across items
+                Some(task_paused),
             )
             .await;
 

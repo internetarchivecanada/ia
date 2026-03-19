@@ -532,7 +532,7 @@ async fn run_bare_upload(
 
     // Dry run (interactive): validate and print what would be uploaded
     if opts.dry_run && !args.json {
-        let results = upload_item(client, identifier, &files, &opts, None, None, None, 1)
+        let results = upload_item(client, identifier, &files, &opts, None, None, None, 1, None)
             .await
             .context(format!("failed to validate upload to {identifier}"))?;
         print_dry_run_results(identifier, &results, &opts.metadata);
@@ -596,6 +596,7 @@ async fn run_bare_upload(
         skip_set.as_deref(),
         on_result,
         1, // sequential in non-dashboard mode
+        None,
     )
     .await
     .context(format!("failed to upload to {identifier}"))?;

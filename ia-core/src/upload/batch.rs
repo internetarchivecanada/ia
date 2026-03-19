@@ -86,6 +86,7 @@ pub async fn upload_batch(
                     skip.as_deref(),
                     on_res,
                     1, // sequential within batch items; concurrency is across items
+                    None,
                 )
                 .await;
                 (id, result)

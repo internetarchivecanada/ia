@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -51,6 +52,7 @@ pub async fn upload_item(
     skip_set: Option<&HashSet<(String, String)>>,
     on_result: Option<OnResultCallback>,
     file_concurrency: usize,
+    pause_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<UploadResult>> {
     // 1. Validate identifier
     validate_identifier(identifier)?;
@@ -207,8 +209,15 @@ pub async fn upload_item(
                 let skip_ref = owned_skip.clone();
                 let progress = progress.clone();
                 let on_result = on_result.clone();
+                let pause = pause_flag.clone();
 
                 async move {
+                    // Wait while paused before starting this file
+                    if let Some(ref flag) = pause {
+                        while flag.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
                     upload_one_file(
                         &client,
                         &identifier,
@@ -236,6 +245,13 @@ pub async fn upload_item(
         for r in middle_results {
             let (result, _) = r?;
             results.push(result);
+        }
+
+        // Wait while paused before starting last file
+        if let Some(ref flag) = pause_flag {
+            while flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
         }
 
         // Phase 3: Upload last file sequentially
@@ -267,6 +283,13 @@ pub async fn upload_item(
     let mut first_file_succeeded = false;
 
     for (i, (file, key)) in expanded.iter().zip(keys.iter()).enumerate() {
+        // Wait while paused before starting next file
+        if let Some(ref flag) = pause_flag {
+            while flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
         // Resume: skip files already successfully uploaded in a previous run
         if let Some(skip) = skip_set {
             if skip.contains(&(id_owned.clone(), key.clone())) {
@@ -762,6 +785,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -805,6 +829,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -843,6 +868,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -883,6 +909,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -917,6 +944,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -950,6 +978,7 @@ mod tests {
             Some(&skip),
             None,
             1,
+            None,
         )
         .await
         .unwrap();
@@ -987,6 +1016,7 @@ mod tests {
             None,
             None,
             2, // concurrent
+            None,
         )
         .await
         .unwrap();
@@ -1009,9 +1039,19 @@ mod tests {
         let opts = resume_test_opts();
 
         // file_concurrency=4, but only 2 files → falls through to sequential
-        let results = upload_item(&client, "test-item", &[f1, f2], &opts, None, None, None, 4)
-            .await
-            .unwrap();
+        let results = upload_item(
+            &client,
+            "test-item",
+            &[f1, f2],
+            &opts,
+            None,
+            None,
+            None,
+            4,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(results
@@ -1047,6 +1087,7 @@ mod tests {
             Some(&skip),
             None,
             2,
+            None,
         )
         .await
         .unwrap();

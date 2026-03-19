@@ -48,7 +48,7 @@ async fn upload_item_single_file() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -98,9 +98,19 @@ async fn upload_item_multiple_files() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f1, f2], &opts, None, None, None, 1)
-        .await
-        .unwrap();
+    let results = upload::upload_item(
+        &client,
+        "test-item",
+        &[f1, f2],
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(results.len(), 2);
     assert!(matches!(results[0].status, UploadStatus::Uploaded));
@@ -145,6 +155,7 @@ async fn upload_item_expands_directory() {
         None,
         None,
         1,
+        None,
     )
     .await
     .unwrap();
@@ -168,7 +179,7 @@ async fn upload_item_empty_files_error() {
         ..Default::default()
     };
 
-    let err = upload::upload_item(&client, "test-item", &[], &opts, None, None, None, 1)
+    let err = upload::upload_item(&client, "test-item", &[], &opts, None, None, None, 1, None)
         .await
         .unwrap_err();
 
@@ -183,7 +194,7 @@ async fn upload_item_invalid_identifier() {
     let client = test_client(&server);
     let opts = UploadOpts::default();
 
-    let err = upload::upload_item(&client, "!!", &[], &opts, None, None, None, 1)
+    let err = upload::upload_item(&client, "!!", &[], &opts, None, None, None, 1, None)
         .await
         .unwrap_err();
 
@@ -217,7 +228,7 @@ async fn upload_item_test_item_injects_collection() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -254,7 +265,7 @@ async fn upload_item_with_remote_dir() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -284,7 +295,7 @@ async fn upload_item_dry_run() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -310,7 +321,7 @@ async fn upload_item_missing_metadata_error() {
         ..Default::default()
     };
 
-    let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap_err();
 
@@ -345,7 +356,7 @@ async fn upload_item_no_collection_check_skips_validation() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -381,7 +392,7 @@ async fn upload_item_checks_collection_exists() {
         ..Default::default()
     };
 
-    let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap_err();
     assert!(
@@ -426,7 +437,7 @@ async fn upload_item_collection_check_passes_when_exists() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
@@ -456,7 +467,7 @@ async fn upload_item_empty_metadata_skips_validation() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -505,6 +516,7 @@ async fn upload_item_keep_directories_preserves_path() {
         None,
         None,
         1,
+        None,
     )
     .await
     .unwrap();
@@ -554,7 +566,7 @@ async fn upload_item_remote_name_changes_put_path() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
 
@@ -593,7 +605,7 @@ async fn upload_item_test_item_replaces_existing_collection() {
         ..Default::default()
     };
 
-    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1)
+    let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
