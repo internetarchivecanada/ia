@@ -16,6 +16,7 @@ pub struct S3TaskEntry {
     pub submitter: String,
     pub status: String,
     pub submittime: String,
+    pub task_id: u64,
 }
 
 /// Shared S3 task state used across all tabs.
@@ -35,8 +36,6 @@ pub struct S3TaskState {
     pub is_rate_limited: bool,
     /// Full task list for the Tasks tab.
     pub tasks: Vec<S3TaskEntry>,
-    /// Whether to show global tasks (true) or user tasks (false).
-    pub show_global: bool,
     /// When we last polled the API. `None` means never polled — needs immediate poll.
     last_polled: Option<Instant>,
 }
@@ -53,7 +52,6 @@ impl S3TaskState {
             global_errors: 0,
             is_rate_limited: false,
             tasks: Vec::new(),
-            show_global: false,
             last_polled: None,
         }
     }
@@ -76,10 +74,6 @@ impl S3TaskState {
 
     pub fn update_tasks(&mut self, tasks: Vec<S3TaskEntry>) {
         self.tasks = tasks;
-    }
-
-    pub fn toggle_view(&mut self) {
-        self.show_global = !self.show_global;
     }
 
     pub fn set_rate_limited(&mut self, limited: bool) {
@@ -117,17 +111,6 @@ mod tests {
         assert_eq!(state.global_errors, 0);
         assert!(!state.is_rate_limited);
         assert!(state.tasks.is_empty());
-        assert!(!state.show_global);
-    }
-
-    #[test]
-    fn test_toggle_view() {
-        let mut state = S3TaskState::new();
-        assert!(!state.show_global);
-        state.toggle_view();
-        assert!(state.show_global);
-        state.toggle_view();
-        assert!(!state.show_global);
     }
 
     #[test]
@@ -164,6 +147,7 @@ mod tests {
             submitter: "test@example.com".to_string(),
             status: "queued".to_string(),
             submittime: "2026-03-18 14:00:00".to_string(),
+            task_id: 123456789,
         }];
         state.update_tasks(tasks);
         assert_eq!(state.tasks.len(), 1);

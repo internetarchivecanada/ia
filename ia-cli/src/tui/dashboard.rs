@@ -52,7 +52,6 @@ impl MultiTabDashboard {
         s3_state: Arc<Mutex<S3TaskState>>,
         joblog_state: Arc<Mutex<JoblogState>>,
         refresh_notify: Arc<tokio::sync::Notify>,
-        submitter: Option<String>,
         paused: Arc<AtomicBool>,
     ) -> Self {
         let theme = Theme::detect();
@@ -66,7 +65,7 @@ impl MultiTabDashboard {
             refresh_notify,
             paused,
             upload_tab: UploadTab::new(upload_state.clone(), s3_state.clone()),
-            tasks_tab: TasksTab::new(s3_state.clone(), submitter),
+            tasks_tab: TasksTab::new(s3_state.clone()),
             log_tab: LogTab::new(joblog_state),
             errors_tab: ErrorsTab::new(upload_state, s3_state),
         }
@@ -293,14 +292,7 @@ mod tests {
         let joblog_state = Arc::new(Mutex::new(JoblogState::empty()));
         let refresh_notify = Arc::new(tokio::sync::Notify::new());
         let paused = Arc::new(AtomicBool::new(false));
-        MultiTabDashboard::new(
-            upload_state,
-            s3_state,
-            joblog_state,
-            refresh_notify,
-            None,
-            paused,
-        )
+        MultiTabDashboard::new(upload_state, s3_state, joblog_state, refresh_notify, paused)
     }
 
     #[test]
@@ -414,7 +406,6 @@ mod tests {
             s3_state,
             joblog_state,
             refresh_notify,
-            None,
             paused.clone(),
         );
         assert!(!paused.load(Ordering::Relaxed));

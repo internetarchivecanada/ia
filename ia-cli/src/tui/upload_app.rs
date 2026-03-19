@@ -382,7 +382,6 @@ async fn run_dashboard_and_summarize(
             .unwrap_or(std::borrow::Cow::Borrowed(s))
             .into_owned()
     });
-    let submitter_for_dashboard = submitter.clone();
     let refresh_notify = Arc::new(tokio::sync::Notify::new());
     let poll_notify = Arc::clone(&refresh_notify);
     let tasks_handle = tokio::spawn(async move {
@@ -405,8 +404,8 @@ async fn run_dashboard_and_summarize(
                 Ok((summary, catalog)) => {
                     if let Ok(mut s3) = poll_s3.lock() {
                         // Convert catalog entries to S3TaskEntry for display.
-                        // TaskEntry.color maps to display status: green=running,
-                        // blue=queued, red=error, brown=paused.
+                        // TaskEntry.color maps to display status: green=queued,
+                        // blue=running, red=error, brown=paused.
                         let all_entries: Vec<S3TaskEntry> = catalog
                             .iter()
                             .map(|e| S3TaskEntry {
@@ -414,13 +413,14 @@ async fn run_dashboard_and_summarize(
                                 cmd: e.cmd.clone(),
                                 submitter: e.submitter.clone(),
                                 status: match e.color.as_str() {
-                                    "green" => "running".to_string(),
-                                    "blue" => "queued".to_string(),
+                                    "green" => "queued".to_string(),
+                                    "blue" => "running".to_string(),
                                     "red" => "error".to_string(),
                                     "brown" => "paused".to_string(),
                                     other => other.to_string(),
                                 },
                                 submittime: e.submittime.clone(),
+                                task_id: e.task_id,
                             })
                             .collect();
 
@@ -457,7 +457,23 @@ async fn run_dashboard_and_summarize(
                         s3.update_global_count(global_from_summary.max(global_from_catalog));
                         s3.update_global_summary(global_queued, global_running, global_errors);
                         s3.update_summary(user_queued, user_running, user_errors);
-                        s3.update_tasks(all_entries);
+
+                        // Filter to user's tasks only and sort by identifier
+                        // then submittime (most recent at bottom).
+                        let mut user_entries: Vec<_> = all_entries
+                            .into_iter()
+                            .filter(|e| {
+                                submitter
+                                    .as_ref()
+                                    .is_some_and(|email| e.submitter == *email)
+                            })
+                            .collect();
+                        user_entries.sort_by(|a, b| {
+                            a.identifier
+                                .cmp(&b.identifier)
+                                .then_with(|| a.submittime.cmp(&b.submittime))
+                        });
+                        s3.update_tasks(user_entries);
                         s3.mark_polled();
                     }
                 }
@@ -492,7 +508,6 @@ async fn run_dashboard_and_summarize(
             dashboard_s3,
             dashboard_joblog,
             refresh_notify,
-            submitter_for_dashboard,
             dashboard_paused,
         );
         super::framework::run_dashboard_sync(&mut terminal, &mut dashboard, tick_rate)

@@ -29,19 +29,16 @@ pub struct TasksTab {
     scroll_offset: usize,
     /// A URL opened via Enter, shown in the footer for 5 seconds.
     status_message: Option<(String, Instant)>,
-    /// Current user's email for filtering tasks in user mode.
-    submitter: Option<String>,
 }
 
 impl TasksTab {
-    pub fn new(s3_state: Arc<Mutex<S3TaskState>>, submitter: Option<String>) -> Self {
+    pub fn new(s3_state: Arc<Mutex<S3TaskState>>) -> Self {
         Self {
             s3_state,
             search: SearchState::new(),
             cursor: 0,
             scroll_offset: 0,
             status_message: None,
-            submitter,
         }
     }
 
@@ -50,21 +47,15 @@ impl TasksTab {
         let Ok(state) = self.s3_state.lock() else {
             return 0;
         };
-        state
-            .tasks
-            .iter()
-            .filter(|t| {
-                let user_match = state.show_global
-                    || self
-                        .submitter
-                        .as_ref()
-                        .is_some_and(|email| t.submitter == *email);
-                user_match
-                    && (self.search.query().is_empty()
-                        || self.search.matches(&t.identifier)
-                        || self.search.matches(&t.cmd))
-            })
-            .count()
+        if self.search.query().is_empty() {
+            state.tasks.len()
+        } else {
+            state
+                .tasks
+                .iter()
+                .filter(|t| self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
+                .count()
+        }
     }
 }
 
@@ -83,60 +74,29 @@ impl TabView for TasksTab {
         ])
         .split(area);
 
-        // -- S3 summary panel with user/global toggle indicator --
-        let view_label = if state.show_global { "global" } else { "user" };
-        let (q, r, e) = if state.show_global {
-            (
-                state.global_queued,
-                state.global_running,
-                state.global_errors,
-            )
-        } else {
-            (state.queued, state.running, state.errors)
-        };
+        // -- S3 summary panel --
         widgets::draw_s3_panel(
             frame,
             chunks[0],
             theme,
             &widgets::S3PanelData {
-                queued: q,
-                running: r,
-                errors: e,
+                queued: state.queued,
+                running: state.running,
+                errors: state.errors,
                 global_count: state.global_count,
                 rate_limited: state.is_rate_limited,
                 seconds_ago: state.seconds_since_poll(),
             },
         );
-        // Overlay the toggle indicator in the top-right area of the S3 panel.
-        let toggle_text = format!("[{}] ", view_label);
-        let toggle_span = Span::styled(&toggle_text, Style::default().fg(theme.text_muted));
-        let toggle_para = Paragraph::new(Line::from(toggle_span));
-        if chunks[0].width > toggle_text.len() as u16 + 2 {
-            let toggle_area = Rect {
-                x: chunks[0].x + chunks[0].width - toggle_text.len() as u16 - 1,
-                y: chunks[0].y + 1,
-                width: toggle_text.len() as u16,
-                height: 1,
-            };
-            frame.render_widget(toggle_para, toggle_area);
-        }
 
         // -- Task table --
         let filtered_tasks: Vec<_> = state
             .tasks
             .iter()
-            .filter(|t| {
-                // In user mode, only show the user's tasks
-                let user_match = state.show_global
-                    || self
-                        .submitter
-                        .as_ref()
-                        .is_some_and(|email| t.submitter == *email);
-                user_match && (self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
-            })
+            .filter(|t| self.search.matches(&t.identifier) || self.search.matches(&t.cmd))
             .collect();
 
-        let header = Row::new(vec!["SUBMITTED", "IDENTIFIER", "CMD", "STATUS"]).style(
+        let header = Row::new(vec!["IDENTIFIER", "TASK_ID", "SUBMITTIME", "STATUS"]).style(
             Style::default()
                 .fg(theme.text_secondary)
                 .add_modifier(Modifier::BOLD),
@@ -150,16 +110,20 @@ impl TabView for TasksTab {
             .take(visible_height)
             .map(|(i, task)| {
                 let status_style = match task.status.as_str() {
+                    "queued" => Style::default().fg(theme.green),
                     "running" => Style::default().fg(theme.blue),
-                    "queued" => Style::default().fg(theme.gold),
                     "error" => Style::default().fg(theme.red),
+                    "paused" => Style::default().fg(theme.gold),
                     _ => Style::default().fg(theme.text_secondary),
                 };
 
                 let row = Row::new(vec![
-                    Span::styled(&task.submittime, Style::default().fg(theme.text_secondary)),
                     Span::styled(&task.identifier, Style::default().fg(theme.text)),
-                    Span::styled(&task.cmd, Style::default().fg(theme.text_secondary)),
+                    Span::styled(
+                        task.task_id.to_string(),
+                        Style::default().fg(theme.text_secondary),
+                    ),
+                    Span::styled(&task.submittime, Style::default().fg(theme.text_secondary)),
                     Span::styled(&task.status, status_style),
                 ]);
 
@@ -174,9 +138,9 @@ impl TabView for TasksTab {
         let table = Table::new(
             rows,
             [
+                Constraint::Percentage(35),
                 Constraint::Length(12),
-                Constraint::Percentage(40),
-                Constraint::Percentage(20),
+                Constraint::Length(19),
                 Constraint::Percentage(15),
             ],
         )
@@ -240,20 +204,12 @@ impl TabView for TasksTab {
                 self.cursor = self.cursor.saturating_sub(1);
                 true
             }
-            KeyCode::Char('u') => {
-                if let Ok(mut state) = self.s3_state.lock() {
-                    state.toggle_view();
-                }
-                self.cursor = 0;
-                self.scroll_offset = 0;
-                true
-            }
             KeyCode::Char('/') => {
                 self.search.activate();
                 true
             }
             KeyCode::Enter => {
-                // Open the selected task's item on archive.org.
+                // Open the selected task's log on archive.org.
                 // Also store the URL in status_message for 5 seconds so it's
                 // visible on headless systems where open::that() fails silently.
                 if let Ok(state) = self.s3_state.lock() {
@@ -261,18 +217,11 @@ impl TabView for TasksTab {
                         .tasks
                         .iter()
                         .filter(|t| {
-                            let user_match = state.show_global
-                                || self
-                                    .submitter
-                                    .as_ref()
-                                    .is_some_and(|email| t.submitter == *email);
-                            user_match
-                                && (self.search.matches(&t.identifier)
-                                    || self.search.matches(&t.cmd))
+                            self.search.matches(&t.identifier) || self.search.matches(&t.cmd)
                         })
                         .collect();
                     if let Some(task) = filtered.get(self.cursor) {
-                        let url = format!("https://archive.org/history/{}", task.identifier);
+                        let url = format!("https://archive.org/{}", task.task_id);
                         let _ = open::that(&url);
                         self.status_message = Some((url, Instant::now()));
                     }
@@ -300,8 +249,7 @@ impl TabView for TasksTab {
         vec![
             ("j/k", "scroll"),
             ("/", "search"),
-            ("u", "user/global"),
-            ("Enter", "history"),
+            ("Enter", "task log"),
             ("?", "help"),
             ("q", "quit"),
         ]
@@ -322,21 +270,24 @@ mod tests {
                 cmd: "s3-put".into(),
                 submitter: "test@example.com".into(),
                 status: "running".into(),
-                submittime: "14:01:23".into(),
+                submittime: "2026-03-19 14:01:23".into(),
+                task_id: 100000001,
             },
             S3TaskEntry {
                 identifier: "item-b".into(),
                 cmd: "s3-put".into(),
                 submitter: "test@example.com".into(),
                 status: "queued".into(),
-                submittime: "14:01:25".into(),
+                submittime: "2026-03-19 14:01:25".into(),
+                task_id: 100000002,
             },
             S3TaskEntry {
                 identifier: "item-c".into(),
                 cmd: "s3-put".into(),
                 submitter: "test@example.com".into(),
                 status: "queued".into(),
-                submittime: "14:01:30".into(),
+                submittime: "2026-03-19 14:01:30".into(),
+                task_id: 100000003,
             },
         ]);
         state.update_summary(2, 1, 0);
@@ -345,8 +296,7 @@ mod tests {
 
     #[test]
     fn test_scroll_clamps() {
-        // Pass submitter so all tasks are visible in user mode.
-        let mut tab = TasksTab::new(make_s3_state(), Some("test@example.com".to_string()));
+        let mut tab = TasksTab::new(make_s3_state());
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(tab.cursor, 1);
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -356,17 +306,8 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_view() {
-        let s3 = make_s3_state();
-        let mut tab = TasksTab::new(s3.clone(), None);
-        assert!(!s3.lock().unwrap().show_global);
-        tab.handle_key(KeyCode::Char('u'), KeyModifiers::NONE);
-        assert!(s3.lock().unwrap().show_global);
-    }
-
-    #[test]
     fn test_search_activation() {
-        let mut tab = TasksTab::new(make_s3_state(), None);
+        let mut tab = TasksTab::new(make_s3_state());
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         assert!(tab.search.is_active());
         tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -378,62 +319,40 @@ mod tests {
 
     #[test]
     fn test_key_hints() {
-        let tab = TasksTab::new(make_s3_state(), None);
+        let tab = TasksTab::new(make_s3_state());
         let hints = tab.key_hints();
-        assert!(hints.iter().any(|(k, _)| *k == "u"));
-        assert!(hints.iter().any(|(k, _)| *k == "Enter"));
+        assert!(!hints.iter().any(|(k, _)| *k == "u"));
+        assert!(hints.iter().any(|(k, v)| *k == "Enter" && *v == "task log"));
     }
 
     #[test]
     fn test_enter_sets_status_message() {
-        // Pass submitter so tasks are visible in default user mode.
-        let mut tab = TasksTab::new(make_s3_state(), Some("test@example.com".to_string()));
+        let mut tab = TasksTab::new(make_s3_state());
         // No status message initially
         assert!(tab.status_text().is_none());
-        // Press Enter — item-a is at cursor 0
+        // Press Enter — item-a is at cursor 0, task_id 100000001
         tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        // Status message should now be set
+        // Status message should now be set with task_id URL
         let text = tab.status_text();
         assert!(text.is_some());
-        assert!(text.unwrap().contains("archive.org"));
-        assert!(text.unwrap().contains("item-a"));
+        assert!(text.unwrap().contains("archive.org/100000001"));
     }
 
     #[test]
-    fn test_user_mode_filters_by_submitter() {
+    fn test_all_tasks_visible_without_filter() {
         let s3 = make_s3_state();
-        // Add a task from a different submitter.
-        s3.lock().unwrap().update_tasks(vec![
-            S3TaskEntry {
-                identifier: "item-a".into(),
-                cmd: "s3-put".into(),
-                submitter: "test@example.com".into(),
-                status: "running".into(),
-                submittime: "14:01:23".into(),
-            },
-            S3TaskEntry {
-                identifier: "item-other".into(),
-                cmd: "s3-put".into(),
-                submitter: "other@example.com".into(),
-                status: "queued".into(),
-                submittime: "14:01:25".into(),
-            },
-        ]);
-        let tab = TasksTab::new(s3.clone(), Some("test@example.com".to_string()));
-        // In user mode (default), should only see 1 task.
-        assert_eq!(tab.task_count(), 1);
-        // Toggle to global mode — should see both.
-        s3.lock().unwrap().toggle_view();
-        assert_eq!(tab.task_count(), 2);
+        // All tasks should be visible — filtering is done in upload_app.rs now.
+        let tab = TasksTab::new(s3.clone());
+        assert_eq!(tab.task_count(), 3);
     }
 
     #[test]
     fn test_tick_clears_expired_status_message() {
         use std::time::{Duration, Instant};
-        let mut tab = TasksTab::new(make_s3_state(), None);
+        let mut tab = TasksTab::new(make_s3_state());
         // Manually inject an old status message (6 seconds ago)
         tab.status_message = Some((
-            "https://archive.org/history/item-a".to_string(),
+            "https://archive.org/100000001".to_string(),
             Instant::now() - Duration::from_secs(6),
         ));
         assert!(tab.status_text().is_some());
