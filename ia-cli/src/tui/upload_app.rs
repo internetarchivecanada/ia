@@ -65,7 +65,6 @@ impl UploadItemState {
 #[derive(Debug, Clone)]
 pub struct UploadFileProgress {
     pub name: String,
-    #[allow(dead_code)] // Used by batch dashboard (Task 9)
     pub identifier: String,
     pub bytes_sent: u64,
     pub total_bytes: u64,
