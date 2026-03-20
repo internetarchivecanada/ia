@@ -32,6 +32,7 @@ use super::widgets;
 #[derive(Debug)]
 pub struct UploadTab {
     upload_state: Arc<Mutex<UploadTuiState>>,
+    #[allow(dead_code)] // Retained for dashboard construction; S3 panes now rendered by dashboard.
     s3_state: Arc<Mutex<S3TaskState>>,
     /// Item-level cursor index (into the ordered items list).
     pub cursor: usize,
@@ -47,6 +48,13 @@ pub struct UploadTab {
     status_message: Option<(String, Instant)>,
     /// Full identifier of the item under the cursor (for reorder stability).
     cursor_identifier: Option<String>,
+    /// Items that were auto-expanded by tick (not manually). Prevents tick from
+    /// re-expanding items after the user manually collapses them.
+    auto_expanded: HashSet<String>,
+    /// First 'g' press for gg detection (jump to top).
+    pending_g: bool,
+    /// When the first 'g' was pressed (500ms timeout for gg).
+    pending_g_at: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +109,9 @@ impl UploadTab {
             search_match_cursor: 0,
             status_message: None,
             cursor_identifier: None,
+            auto_expanded: HashSet::new(),
+            pending_g: false,
+            pending_g_at: Instant::now(),
         }
     }
 
@@ -124,6 +135,16 @@ impl UploadTab {
             self.search_match_cursor = 0;
         }
         self.cursor = self.search_matches[self.search_match_cursor];
+    }
+
+    /// Sync `cursor_identifier` to match the current `cursor` position.
+    fn sync_cursor_identifier(&mut self) {
+        if let Ok(state) = self.upload_state.lock() {
+            let ord = ordered_items(&state);
+            if let Some(&item_idx) = ord.get(self.cursor) {
+                self.cursor_identifier = Some(state.items[item_idx].identifier.clone());
+            }
+        }
     }
 
     /// Jump cursor to the previous search match.
@@ -152,62 +173,13 @@ impl TabView for UploadTab {
             Ok(s) => s,
             Err(_) => return,
         };
-        let s3 = match self.s3_state.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
 
-        // Vertical layout: S3+Progress (4) | Items tree (fill) | Sparkline (2)
-        let chunks = Layout::vertical([
-            Constraint::Length(4),
-            Constraint::Min(8),
-            Constraint::Length(2),
-        ])
-        .split(area);
-
-        // ── Top panes: S3 Tasks (left 50%) + Progress (right 50%) ────
-        let top_chunks =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[0]);
-
-        widgets::draw_compact_s3_panel(
-            frame,
-            top_chunks[0],
-            theme,
-            &widgets::S3PanelData {
-                queued: s3.queued,
-                running: s3.running,
-                errors: s3.errors,
-                global_count: s3.global_count,
-                rate_limited: s3.is_rate_limited,
-                seconds_ago: s3.seconds_since_poll(),
-            },
-        );
-
-        let eta = widgets::format_eta(
-            upload.bytes_total.saturating_sub(upload.bytes_uploaded),
-            upload.throughput.throughput(),
-        );
-        widgets::draw_progress_panel(
-            frame,
-            top_chunks[1],
-            theme,
-            &widgets::ProgressPanelData {
-                items_done: upload
-                    .items
-                    .iter()
-                    .filter(|i| matches!(i.status, UploadItemStatus::Complete))
-                    .count(),
-                items_total: upload.items.len(),
-                files_done: upload.files_completed + upload.files_skipped,
-                files_total: upload.files_total,
-                bytes_uploaded: upload.bytes_uploaded,
-                eta,
-            },
-        );
+        // Vertical layout: Items tree (fill) | Sparkline (2)
+        // S3+Progress panes are rendered by dashboard.rs above this area.
+        let chunks = Layout::vertical([Constraint::Min(8), Constraint::Length(2)]).split(area);
 
         // ── Items tree ────────────────────────────────────────────────
-        draw_items_tree(frame, chunks[1], theme, &upload, self);
+        draw_items_tree(frame, chunks[0], theme, &upload, self);
 
         // ── Split sparkline ───────────────────────────────────────────
         let speed = format!(
@@ -217,7 +189,7 @@ impl TabView for UploadTab {
 
         // Use both lines of the sparkline area
         let spark_rows =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(chunks[2]);
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(chunks[1]);
         widgets::draw_split_sparkline(
             frame,
             spark_rows[0],
@@ -263,8 +235,6 @@ impl TabView for UploadTab {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        let _ = modifiers;
-
         // When search input is active, route chars there.
         if self.search.is_active() {
             match code {
@@ -297,6 +267,7 @@ impl TabView for UploadTab {
         // Normal mode key handling.
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
+                self.pending_g = false;
                 if let Ok(state) = self.upload_state.lock() {
                     let max = state.items.len().saturating_sub(1);
                     self.cursor = self.cursor.saturating_add(1).min(max);
@@ -308,6 +279,7 @@ impl TabView for UploadTab {
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
+                self.pending_g = false;
                 self.cursor = self.cursor.saturating_sub(1);
                 if let Ok(state) = self.upload_state.lock() {
                     let ord = ordered_items(&state);
@@ -317,44 +289,83 @@ impl TabView for UploadTab {
                 }
                 true
             }
+            KeyCode::Char('G') if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pending_g = false;
+                if let Ok(state) = self.upload_state.lock() {
+                    let max = state.items.len().saturating_sub(1);
+                    self.cursor = max;
+                    let ord = ordered_items(&state);
+                    if let Some(&item_idx) = ord.get(self.cursor) {
+                        self.cursor_identifier = Some(state.items[item_idx].identifier.clone());
+                    }
+                }
+                true
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g
+                    && self.pending_g_at.elapsed() < std::time::Duration::from_millis(500)
+                {
+                    // gg: jump to top
+                    self.cursor = 0;
+                    self.pending_g = false;
+                    self.sync_cursor_identifier();
+                } else {
+                    self.pending_g = true;
+                    self.pending_g_at = Instant::now();
+                }
+                true
+            }
             KeyCode::Right | KeyCode::Char('l') => {
+                self.pending_g = false;
                 if let Ok(state) = self.upload_state.lock() {
                     let ord = ordered_items(&state);
                     if let Some(&item_idx) = ord.get(self.cursor) {
-                        self.expanded
-                            .insert(state.items[item_idx].identifier.clone());
+                        let id = state.items[item_idx].identifier.clone();
+                        self.expanded.insert(id.clone());
+                        // Remove from auto_expanded so it's treated as manually expanded
+                        self.auto_expanded.remove(&id);
                     }
                 }
                 true
             }
             KeyCode::Left | KeyCode::Char('h') => {
+                self.pending_g = false;
                 if let Ok(state) = self.upload_state.lock() {
                     let ord = ordered_items(&state);
                     if let Some(&item_idx) = ord.get(self.cursor) {
-                        self.expanded.remove(&state.items[item_idx].identifier);
+                        let id = &state.items[item_idx].identifier;
+                        self.expanded.remove(id);
+                        // Remove from auto_expanded to prevent re-auto-expanding
+                        self.auto_expanded.remove(id);
                     }
                 }
                 true
             }
             KeyCode::Char('/') => {
+                self.pending_g = false;
                 self.search.activate();
                 true
             }
             KeyCode::Char('n') => {
+                self.pending_g = false;
                 if !self.search.query().is_empty() {
                     self.recompute_search();
                     self.jump_to_next_match();
+                    self.sync_cursor_identifier();
                 }
                 true
             }
             KeyCode::Char('N') => {
+                self.pending_g = false;
                 if !self.search.query().is_empty() {
                     self.recompute_search();
                     self.jump_to_prev_match();
+                    self.sync_cursor_identifier();
                 }
                 true
             }
             KeyCode::Esc => {
+                self.pending_g = false;
                 if !self.search.query().is_empty() {
                     self.search.cancel();
                     self.search_matches.clear();
@@ -364,6 +375,7 @@ impl TabView for UploadTab {
                 false
             }
             KeyCode::Enter => {
+                self.pending_g = false;
                 if let Ok(state) = self.upload_state.lock() {
                     let ord = ordered_items(&state);
                     if let Some(&item_idx) = ord.get(self.cursor) {
@@ -377,7 +389,10 @@ impl TabView for UploadTab {
                 }
                 true
             }
-            _ => false,
+            _ => {
+                self.pending_g = false;
+                false
+            }
         }
     }
 
@@ -387,6 +402,11 @@ impl TabView for UploadTab {
             if ts.elapsed().as_secs() >= 5 {
                 self.status_message = None;
             }
+        }
+
+        // Clear pending_g after 500ms timeout.
+        if self.pending_g && self.pending_g_at.elapsed() > std::time::Duration::from_millis(500) {
+            self.pending_g = false;
         }
 
         // Collect data from the lock, then mutate self outside the lock.
@@ -406,6 +426,19 @@ impl TabView for UploadTab {
                 .map(|item| item.identifier.clone())
                 .collect();
 
+            // Collect identifiers of completed items for auto-collapse.
+            let completed_ids: Vec<String> = state
+                .items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.status,
+                        UploadItemStatus::Complete | UploadItemStatus::Failed(_)
+                    )
+                })
+                .map(|item| item.identifier.clone())
+                .collect();
+
             // Resolve cursor position.
             let ord = ordered_items(&state);
             let resolved_cursor = if let Some(ref id) = self.cursor_identifier {
@@ -419,12 +452,22 @@ impl TabView for UploadTab {
                 .get(resolved_cursor.unwrap_or(self.cursor.min(max)))
                 .map(|&idx| state.items[idx].identifier.clone());
 
-            (active_ids, resolved_cursor, max, cursor_id)
+            (active_ids, completed_ids, resolved_cursor, max, cursor_id)
         });
 
-        if let Some((active_ids, resolved_cursor, max, cursor_id)) = tick_data {
-            for id in active_ids {
-                self.expanded.insert(id);
+        if let Some((active_ids, completed_ids, resolved_cursor, max, cursor_id)) = tick_data {
+            // Auto-expand newly active items (only if not already tracked).
+            for id in &active_ids {
+                if !self.auto_expanded.contains(id) {
+                    self.expanded.insert(id.clone());
+                    self.auto_expanded.insert(id.clone());
+                }
+            }
+            // Auto-collapse completed items that were auto-expanded.
+            for id in &completed_ids {
+                if self.auto_expanded.remove(id) {
+                    self.expanded.remove(id);
+                }
             }
             if let Some(pos) = resolved_cursor {
                 self.cursor = pos;
@@ -510,17 +553,28 @@ fn draw_items_tree(
                 | UploadItemStatus::RateLimited
         );
         let is_expanded = tab.expanded.contains(&item.identifier);
+        let is_manually_expanded = is_expanded && !tab.auto_expanded.contains(&item.identifier);
+        let is_auto_expanded = is_expanded && tab.auto_expanded.contains(&item.identifier);
         let is_match = has_search_query && tab.search.matches(&item.identifier);
         let is_dimmed = has_search_query && !is_match;
 
-        // Expand/collapse indicator
-        let arrow = if is_expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ or ▸
+        // Expand/collapse indicator:
+        // - Collapsed: ▸ (default color)
+        // - Auto-expanded: ▹ (hollow, gold) — partial view
+        // - Manually expanded: ▾ (default color) — full file list
+        let (arrow, arrow_color) = if is_manually_expanded {
+            ("\u{25be}", None) // ▾, use icon_color
+        } else if is_auto_expanded {
+            ("\u{25b9}", Some(theme.gold)) // ▹ (hollow), gold
+        } else {
+            ("\u{25b8}", None) // ▸, use icon_color
+        };
 
         // Status icon + color
         let (icon, icon_color) = match &item.status {
             UploadItemStatus::Pending => ("\u{00b7}", theme.text_muted),
-            UploadItemStatus::Verifying => (arrow, theme.gold),
-            UploadItemStatus::Uploading => (arrow, theme.gold),
+            UploadItemStatus::Verifying => (arrow, arrow_color.unwrap_or(theme.gold)),
+            UploadItemStatus::Uploading => (arrow, arrow_color.unwrap_or(theme.gold)),
             UploadItemStatus::RateLimited => ("\u{23f8}", theme.gold),
             UploadItemStatus::Complete => ("\u{2713}", theme.green),
             UploadItemStatus::Failed(_) => ("\u{2717}", theme.red),
@@ -610,14 +664,21 @@ fn draw_items_tree(
             files_info, skipped_info, bytes_info, elapsed_info, status_label
         );
 
-        let mut spans = vec![
-            cursor_span,
-            Span::styled(format!("{icon} "), icon_style),
-            Span::styled(
-                item.identifier.clone(),
-                Style::default().fg(name_color).add_modifier(name_mod),
-            ),
-        ];
+        let base_name_style = Style::default().fg(name_color).add_modifier(name_mod);
+        let mut spans = vec![cursor_span, Span::styled(format!("{icon} "), icon_style)];
+
+        // Highlight matching substring when searching
+        if has_search_query && is_match {
+            let match_style = base_name_style.add_modifier(Modifier::UNDERLINED);
+            spans.extend(highlight_match(
+                &item.identifier,
+                tab.search.query(),
+                base_name_style,
+                match_style,
+            ));
+        } else {
+            spans.push(Span::styled(item.identifier.clone(), base_name_style));
+        }
 
         if !summary.is_empty() {
             spans.push(Span::styled(
@@ -651,6 +712,14 @@ fn draw_items_tree(
         if show_files {
             let files = state.files_for_item(&item.identifier);
             for file in &files {
+                // Auto-expanded: only show active files (skip completed/skipped/pending)
+                if is_auto_expanded
+                    && !is_manually_expanded
+                    && !matches!(file.status, FileDisplayStatus::Active)
+                {
+                    continue;
+                }
+
                 let file_line = render_file_line(file, theme, is_dimmed);
                 all_rows.push((file_line, false));
 
@@ -703,6 +772,34 @@ fn draw_items_tree(
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
+/// Split `text` around the first case-insensitive match of `query`, applying
+/// `match_style` to the matched substring and `base_style` elsewhere.
+fn highlight_match(
+    text: &str,
+    query: &str,
+    base_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    let lower = text.to_lowercase();
+    let lower_q = query.to_lowercase();
+    if let Some(pos) = lower.find(&lower_q) {
+        let before = &text[..pos];
+        let matched = &text[pos..pos + query.len()];
+        let after = &text[pos + query.len()..];
+        let mut spans = Vec::new();
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), base_style));
+        }
+        spans.push(Span::styled(matched.to_string(), match_style));
+        if !after.is_empty() {
+            spans.push(Span::styled(after.to_string(), base_style));
+        }
+        spans
+    } else {
+        vec![Span::styled(text.to_string(), base_style)]
+    }
+}
+
 /// Render a single file line for the tree view.
 fn render_file_line(
     file: &super::upload_app::FileDisplayEntry,
@@ -726,7 +823,7 @@ fn render_file_line(
             }
         }
         FileDisplayStatus::Completed => ("\u{2713}", theme.green, theme.text_muted),
-        FileDisplayStatus::Skipped => ("\u{23eb}", theme.gold, theme.text_muted), // ⏫
+        FileDisplayStatus::Skipped => ("~", theme.text_muted, theme.text_muted),
         FileDisplayStatus::Failed(_) => ("\u{2717}", theme.red, theme.red),
         FileDisplayStatus::Pending => ("\u{00b7}", theme.text_very_muted, theme.text_muted),
     };
