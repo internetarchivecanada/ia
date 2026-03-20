@@ -378,7 +378,7 @@ pub async fn upload_item(
                         key: key.to_string(),
                         bytes_sent: 0,
                         total_bytes: 0,
-                        status: UploadProgressStatus::Failed,
+                        status: UploadProgressStatus::Failed(err_msg.clone()),
                     });
                 }
 
@@ -513,7 +513,7 @@ async fn upload_one_file(
                     key: key.to_string(),
                     bytes_sent: 0,
                     total_bytes: 0,
-                    status: UploadProgressStatus::Failed,
+                    status: UploadProgressStatus::Failed(err_msg.clone()),
                 });
             }
 

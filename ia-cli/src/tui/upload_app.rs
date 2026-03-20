@@ -329,11 +329,11 @@ impl UploadTuiState {
                         item.status = UploadItemStatus::Complete;
                     }
                 }
-                UploadProgressStatus::Failed => {
+                UploadProgressStatus::Failed(ref msg) => {
                     item.files_failed += 1;
                     item.last_error_flash = Some((p.key.clone(), Instant::now()));
                     item.failed_file_names
-                        .push((p.key.clone(), "upload failed".to_string()));
+                        .push((p.key.clone(), sanitize_error(msg)));
                     if item.files_total > 0
                         && item.files_completed + item.files_skipped + item.files_failed
                             >= item.files_total
@@ -420,14 +420,14 @@ impl UploadTuiState {
                 self.active_files.remove(&fk);
                 self.files_skipped += 1;
             }
-            UploadProgressStatus::Failed => {
+            UploadProgressStatus::Failed(msg) => {
                 self.active_files.remove(&fk);
                 self.files_failed += 1;
                 let now = Instant::now();
                 self.error_timestamps.push(now);
                 self.failed_files.push(ErrorEntry {
                     file: p.key,
-                    message: "upload failed".to_string(),
+                    message: sanitize_error(&msg),
                     timestamp: now,
                     resolved: false,
                 });
@@ -805,38 +805,19 @@ fn finalize_item(
         if let Some(&idx) = s.item_index.get(id) {
             match result {
                 Ok(results) => {
-                    // Backfill real error messages from UploadResults into the
-                    // per-file lists (which only had "upload failed" placeholders
-                    // from the progress callback). Also mark resolved errors.
+                    // Mark resolved errors: files that failed earlier but
+                    // succeeded on retry show as resolved in the errors tab.
                     for r in results {
-                        match &r.status {
-                            ia_core::upload::UploadStatus::Failed(msg) => {
-                                let clean = sanitize_error(msg);
-                                // Update per-item failed_file_names
-                                for (name, err) in &mut s.items[idx].failed_file_names {
-                                    if *name == r.key && err == "upload failed" {
-                                        *err = clean.clone();
-                                        break;
-                                    }
-                                }
-                                // Update global failed_files
-                                for entry in &mut s.failed_files {
-                                    if entry.file == r.key && entry.message == "upload failed" {
-                                        entry.message = clean.clone();
-                                        break;
-                                    }
-                                }
-                            }
+                        if matches!(
+                            &r.status,
                             ia_core::upload::UploadStatus::Uploaded
-                            | ia_core::upload::UploadStatus::Resumed => {
-                                // Mark any prior error for this file as resolved
-                                for entry in &mut s.failed_files {
-                                    if entry.file == r.key && !entry.resolved {
-                                        entry.resolved = true;
-                                    }
+                                | ia_core::upload::UploadStatus::Resumed
+                        ) {
+                            for entry in &mut s.failed_files {
+                                if entry.file == r.key && !entry.resolved {
+                                    entry.resolved = true;
                                 }
                             }
-                            _ => {}
                         }
                     }
 
@@ -1356,11 +1337,15 @@ mod tests {
             "bad.txt",
             0,
             100,
-            UploadProgressStatus::Failed,
+            UploadProgressStatus::Failed("503 after 10 retries: SlowDown".into()),
         ));
         assert_eq!(state.files_failed, 1);
         assert_eq!(state.failed_files.len(), 1);
         assert_eq!(state.failed_files[0].file, "bad.txt");
+        assert_eq!(
+            state.failed_files[0].message,
+            "503 after 10 retries: SlowDown"
+        );
         assert_eq!(state.items[0].files_failed, 1);
         assert!(state
             .active_files
@@ -1584,7 +1569,7 @@ mod tests {
             "fail.txt",
             0,
             300,
-            UploadProgressStatus::Failed,
+            UploadProgressStatus::Failed("upload error".into()),
         ));
 
         let files = state.files_for_item("item-a");

@@ -294,7 +294,8 @@ pub enum UploadProgressStatus {
     Complete,
     Skipped,
     Resumed,
-    Failed,
+    /// A file upload failed. Contains the sanitized error message.
+    Failed(String),
 }
 
 /// Progress callback type for upload operations.

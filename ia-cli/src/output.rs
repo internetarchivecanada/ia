@@ -584,13 +584,13 @@ impl UploadDisplay {
                         .set_message(format!("{processed}/{files_total} files"));
                 }
             }
-            UploadProgressStatus::Failed => {
+            UploadProgressStatus::Failed(ref msg) => {
                 if let Ok(mut errors) = self.errors.lock() {
                     errors.push(format!(
                         "  {} {} {}",
                         style(ICON_ERROR).red(),
                         style(&p.key).dim(),
-                        style("— upload failed").red(),
+                        style(format!("— {msg}")).red(),
                     ));
                 }
                 if let (Ok(mut processed), Ok(files_total)) =
@@ -840,7 +840,7 @@ impl UploadBatchDisplay {
                     self.maybe_finish_item(identifier);
                 }
             }
-            UploadProgressStatus::Failed => {
+            UploadProgressStatus::Failed(ref msg) => {
                 let should_finish = {
                     let Ok(mut items) = self.active_items.lock() else {
                         return;
@@ -850,7 +850,7 @@ impl UploadBatchDisplay {
                             "  {} {} {}",
                             style(ICON_ERROR).red(),
                             style(&p.key).dim(),
-                            style("— upload failed").red(),
+                            style(format!("— {msg}")).red(),
                         ));
                         item.files_processed += 1;
                         item.bar.set_message(format!(
