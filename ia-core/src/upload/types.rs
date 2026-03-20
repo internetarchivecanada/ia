@@ -17,9 +17,9 @@ pub struct UploadOpts {
     /// Send Content-MD5 header for server-side verification.
     pub verify: bool,
     /// Skip files whose MD5 matches the remote copy.
-    pub skip_existing: bool,
+    pub checksum: bool,
     /// Pre-computed MD5 checksums keyed by filename.
-    pub checksums: Option<HashMap<String, String>>,
+    pub checksum_file: Option<HashMap<String, String>>,
     /// Delete local file after verified upload.
     pub delete_after_upload: bool,
     /// Skip derivative generation (x-archive-queue-derive: 0 on all files).
@@ -54,8 +54,8 @@ impl Default for UploadOpts {
             remote_dir: None,
             keep_directories: false,
             verify: true,
-            skip_existing: false,
-            checksums: None,
+            checksum: false,
+            checksum_file: None,
             delete_after_upload: false,
             no_derive: false,
             no_backup: false,
@@ -131,14 +131,14 @@ impl UploadOptsBuilder {
     }
 
     /// Set whether to skip already-uploaded files.
-    pub fn skip_existing(mut self, skip: bool) -> Self {
-        self.opts.skip_existing = skip;
+    pub fn checksum(mut self, skip: bool) -> Self {
+        self.opts.checksum = skip;
         self
     }
 
     /// Set pre-computed MD5 checksums.
-    pub fn checksums(mut self, checksums: HashMap<String, String>) -> Self {
-        self.opts.checksums = Some(checksums);
+    pub fn checksum_file(mut self, checksums: HashMap<String, String>) -> Self {
+        self.opts.checksum_file = Some(checksums);
         self
     }
 
@@ -335,7 +335,7 @@ mod tests {
     fn upload_opts_defaults() {
         let opts = UploadOpts::default();
         assert!(opts.verify);
-        assert!(!opts.skip_existing);
+        assert!(!opts.checksum);
         assert!(!opts.no_derive);
         assert!(!opts.no_backup);
         assert_eq!(opts.retries, 10);
