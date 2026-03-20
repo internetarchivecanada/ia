@@ -1,3 +1,4 @@
+#[cfg(feature = "alpha")]
 pub mod ai;
 mod app;
 pub mod dashboard;

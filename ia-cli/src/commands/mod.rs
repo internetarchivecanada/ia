@@ -1,3 +1,4 @@
+#[cfg(feature = "alpha")]
 pub mod ai;
 pub mod collection;
 pub mod completions;

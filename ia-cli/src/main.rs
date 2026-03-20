@@ -91,6 +91,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(feature = "alpha")]
     /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
     /// Create and manage collections
@@ -227,6 +228,7 @@ async fn main() -> Result<()> {
     let client = ia_core::IaClient::from_config(config)?;
 
     match cli.command {
+        #[cfg(feature = "alpha")]
         Commands::Ai(args) => {
             commands::ai::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
         }
