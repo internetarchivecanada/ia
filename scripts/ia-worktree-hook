@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# WorktreeCreate hook for Claude Code.
+# Delegates to ia-worktree for new worktrees, or enters existing ones.
+# Reads JSON from stdin: {"name": "<slug>", ...}
+# Must output ONLY the absolute worktree path to stdout.
+set -euo pipefail
+
+NAME=$(jq -r .name)
+REPO_ROOT=$(git worktree list | head -1 | awk '{print $1}')
+WORKTREE_PATH="$(dirname "$REPO_ROOT")/worktrees/$NAME"
+
+# If worktree already exists, just return its path
+if [[ -d "$WORKTREE_PATH" ]]; then
+    echo "$WORKTREE_PATH"
+    exit 0
+fi
+
+# Create new worktree — default to feat/ branch type
+"$REPO_ROOT/scripts/ia-worktree" feat "$NAME" >&2
+
+echo "$WORKTREE_PATH"
