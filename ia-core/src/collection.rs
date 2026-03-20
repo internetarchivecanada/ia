@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
 use crate::upload::headers::encode_metadata_headers;
-use crate::upload::s3_error::parse_s3_error;
+use crate::upload::s3_error::{parse_s3_error, strip_xml};
 use crate::upload::{build_s3_item_url, upload_file, UploadOpts, UploadStatus};
 use crate::IaClient;
 
@@ -239,7 +239,7 @@ async fn create_without_image(
         let body_text = response.text().await.unwrap_or_default();
         let message = match parse_s3_error(&body_text) {
             Some(s3_err) => format!("{}: {}", s3_err.code, s3_err.message),
-            None => format!("HTTP {status}: {body_text}"),
+            None => format!("HTTP {status}: {}", strip_xml(&body_text)),
         };
         Err(IaError::UploadFailed {
             identifier: identifier.to_string(),

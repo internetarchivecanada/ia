@@ -192,7 +192,7 @@ pub async fn initiate_upload(
     if !status.is_success() {
         let msg = parse_s3_error(&body)
             .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: key.into(),
@@ -317,7 +317,7 @@ pub async fn complete_upload(
         let body = resp.text().await.unwrap_or_default();
         let msg = parse_s3_error(&body)
             .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: key.into(),
@@ -360,10 +360,13 @@ pub async fn abort_upload(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let msg = parse_s3_error(&body)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: key.into(),
-            message: format!("abort multipart failed: HTTP {status}: {body}"),
+            message: format!("abort multipart failed: {msg}"),
             status: Some(status.as_u16()),
         });
     }
@@ -393,10 +396,13 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        let msg = parse_s3_error(&body)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: String::new(),
-            message: format!("list multipart uploads: HTTP {status}: {body}"),
+            message: format!("list multipart uploads: {msg}"),
             status: Some(status.as_u16()),
         });
     }
@@ -436,10 +442,13 @@ pub async fn list_parts(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
+        let msg = parse_s3_error(&body)
+            .map(|e| format!("{}: {}", e.code, e.message))
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: key.into(),
-            message: format!("list parts: HTTP {status}: {body}"),
+            message: format!("list parts: {msg}"),
             status: Some(status.as_u16()),
         });
     }

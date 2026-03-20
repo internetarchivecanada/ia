@@ -870,7 +870,10 @@ fn finalize_item(
 
 /// Strip XML/HTML tags and collapse whitespace so raw S3 error bodies don't
 /// clutter the dashboard. Truncates to 200 chars.
-fn sanitize_error(msg: &str) -> String {
+///
+/// Used at the source (finalize_item) AND as a defense-in-depth safety net
+/// at the rendering layer (upload_tab, errors_tab).
+pub(crate) fn sanitize_error(msg: &str) -> String {
     let clean = ia_core::upload::s3_error::strip_xml(msg);
     if clean.len() > 200 {
         format!("{}...", &clean[..197])

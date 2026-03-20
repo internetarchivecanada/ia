@@ -18,7 +18,7 @@ use ratatui::Frame;
 use super::s3_state::S3TaskState;
 use super::tab::TabView;
 use super::theme::Theme;
-use super::upload_app::{error_category, UploadTuiState};
+use super::upload_app::{error_category, sanitize_error, UploadTuiState};
 
 /// The Errors tab: summary pane + scrollable error list.
 #[derive(Debug)]
@@ -406,11 +406,12 @@ fn draw_error_list(
             Span::raw("  ")
         };
 
-        // Truncate error to fit in a single line
-        let summary = if entry.message.chars().count() > 60 {
-            format!("{}...", entry.message.chars().take(57).collect::<String>())
+        // Defensive strip + truncate to fit in a single line
+        let clean_msg = sanitize_error(&entry.message);
+        let summary = if clean_msg.chars().count() > 60 {
+            format!("{}...", clean_msg.chars().take(57).collect::<String>())
         } else {
-            entry.message.clone()
+            clean_msg.clone()
         };
 
         // Relative timestamp
@@ -435,13 +436,13 @@ fn draw_error_list(
             ),
         ]));
 
-        // If this row is expanded, word-wrap the full error below.
+        // If this row is expanded, word-wrap the full (sanitized) error below.
         if tab.expanded == Some(i) {
             let wrap_width = inner.width.saturating_sub(6) as usize;
             let style = Style::default()
                 .fg(theme.text_secondary)
                 .add_modifier(Modifier::ITALIC);
-            for wrapped in word_wrap(&entry.message, wrap_width.max(20)) {
+            for wrapped in word_wrap(&clean_msg, wrap_width.max(20)) {
                 lines.push(Line::from(Span::styled(format!("      {wrapped}"), style)));
             }
         }

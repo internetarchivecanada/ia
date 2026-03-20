@@ -21,7 +21,7 @@ use super::s3_state::S3TaskState;
 use super::search::SearchState;
 use super::tab::TabView;
 use super::theme::Theme;
-use super::upload_app::{FileDisplayStatus, UploadItemStatus, UploadTuiState};
+use super::upload_app::{sanitize_error, FileDisplayStatus, UploadItemStatus, UploadTuiState};
 use super::widgets;
 
 // ---------------------------------------------------------------------------
@@ -709,10 +709,12 @@ fn draw_items_tree(
             ));
         }
 
-        // Failed items show the error inline
+        // Failed items show the error inline (defensive strip in case raw XML
+        // slips through a code path that doesn't sanitize at the source).
         if let UploadItemStatus::Failed(msg) = &item.status {
+            let clean = sanitize_error(msg);
             spans.push(Span::styled(
-                format!("  \u{2717} {msg}"),
+                format!("  \u{2717} {clean}"),
                 Style::default().fg(if is_dimmed {
                     theme.text_very_muted
                 } else {
@@ -973,19 +975,23 @@ fn render_file_line(
                 }),
             ),
         ]),
-        FileDisplayStatus::Failed(err) => Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled(format!("{icon} "), Style::default().fg(actual_icon_color)),
-            Span::styled(file.name.clone(), Style::default().fg(actual_name_color)),
-            Span::styled(
-                format!(" \u{00b7} {err}"),
-                Style::default().fg(if dimmed {
-                    theme.text_very_muted
-                } else {
-                    theme.red
-                }),
-            ),
-        ]),
+        FileDisplayStatus::Failed(err) => {
+            // Defensive strip: sanitize_error is a no-op on already-clean text
+            let clean = sanitize_error(err);
+            Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(format!("{icon} "), Style::default().fg(actual_icon_color)),
+                Span::styled(file.name.clone(), Style::default().fg(actual_name_color)),
+                Span::styled(
+                    format!(" \u{00b7} {clean}"),
+                    Style::default().fg(if dimmed {
+                        theme.text_very_muted
+                    } else {
+                        theme.red
+                    }),
+                ),
+            ])
+        }
         FileDisplayStatus::Pending => {
             let size = widgets::format_bytes(file.size);
             Line::from(vec![
