@@ -127,7 +127,7 @@ impl Dashboard for MultiTabDashboard {
         // Draw header — command label only (stats are in the Progress pane).
         let is_paused = self.paused.load(Ordering::Relaxed);
         let command_label = if is_paused {
-            "ia upload \u{23f8} PAUSED"
+            "ia upload \u{23f8}\u{fe0e} PAUSED"
         } else {
             "ia upload"
         };
@@ -183,7 +183,7 @@ impl Dashboard for MultiTabDashboard {
                             files_done: state.files_completed + state.files_skipped,
                             files_total: state.files_total,
                             files_failed: state.files_failed,
-                            bytes_uploaded: state.bytes_uploaded,
+                            bytes_uploaded: state.bytes_completed,
                             eta,
                         },
                     );

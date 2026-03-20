@@ -591,7 +591,7 @@ fn draw_items_tree(
         // Status icon + color
         let has_failures = item.files_failed > 0;
         let (icon, icon_color) = if is_drained_paused {
-            ("\u{23f8}", theme.gold) // ⏸ paused
+            ("\u{23f8}\u{fe0e}", theme.gold) // ⏸ paused
         } else {
             match &item.status {
                 UploadItemStatus::Pending => ("\u{00b7}", theme.text_muted),
@@ -605,7 +605,7 @@ fn draw_items_tree(
                 }
                 UploadItemStatus::RateLimited => {
                     let color = if has_failures { theme.red } else { theme.gold };
-                    ("\u{23f8}", color)
+                    ("\u{23f8}\u{fe0e}", color)
                 }
                 UploadItemStatus::Complete => ("\u{2713}", theme.green),
                 UploadItemStatus::Failed(_) => ("\u{2717}", theme.red),
@@ -912,7 +912,7 @@ fn render_file_line(
                     UploadProgressStatus::WaitingRateLimit | UploadProgressStatus::Retrying
                 )
             }) {
-                ("\u{23f8}", theme.gold, theme.gold) // ⏸
+                ("\u{23f8}\u{fe0e}", theme.gold, theme.gold) // ⏸
             } else {
                 ("", theme.green, theme.text) // no icon, show progress bar
             }

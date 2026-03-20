@@ -171,6 +171,8 @@ pub struct UploadTuiState {
     pub files_skipped: usize,
     pub files_failed: usize,
     pub bytes_uploaded: u64,
+    /// Bytes from successfully completed files only (excludes failed uploads).
+    pub bytes_completed: u64,
     pub bytes_total: u64,
     /// Active file uploads, keyed by `file_key(identifier, key)`.
     pub active_files: HashMap<String, UploadFileProgress>,
@@ -222,6 +224,7 @@ impl UploadTuiState {
             files_skipped: 0,
             files_failed: 0,
             bytes_uploaded: 0,
+            bytes_completed: 0,
             bytes_total: 0,
             active_files: HashMap::new(),
             completed_files: VecDeque::new(),
@@ -412,6 +415,7 @@ impl UploadTuiState {
                 } else {
                     self.bytes_uploaded += p.bytes_sent;
                 }
+                self.bytes_completed += p.total_bytes;
                 self.files_completed += 1;
                 self.completed_files.push_back(p.key);
                 if self.completed_files.len() > 10 {
