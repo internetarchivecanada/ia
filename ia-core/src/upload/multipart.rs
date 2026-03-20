@@ -9,7 +9,7 @@
 //! - Cleanup: GET /{id}?uploads (list all), then abort
 
 use crate::error::{IaError, Result};
-use crate::upload::s3_error::parse_s3_error;
+use crate::upload::s3_error::{parse_s3_error, strip_xml};
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
 
@@ -249,7 +249,7 @@ pub async fn upload_part(
         let body_text = resp.text().await.unwrap_or_default();
         let msg = parse_s3_error(&body_text)
             .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {body_text}"));
+            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body_text)));
         return Err(IaError::UploadFailed {
             identifier: identifier.into(),
             key: key.into(),

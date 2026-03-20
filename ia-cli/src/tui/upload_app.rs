@@ -869,32 +869,13 @@ fn finalize_item(
 }
 
 /// Strip XML/HTML tags and collapse whitespace so raw S3 error bodies don't
-/// clutter the dashboard. Returns the first meaningful line.
+/// clutter the dashboard. Truncates to 200 chars.
 fn sanitize_error(msg: &str) -> String {
-    // Strip XML/HTML tags
-    let mut out = String::with_capacity(msg.len());
-    let mut in_tag = false;
-    for ch in msg.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                // Add a space where a tag was, to separate adjacent text
-                if !out.ends_with(' ') {
-                    out.push(' ');
-                }
-            }
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    // Collapse whitespace and trim
-    let collapsed: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Truncate to something reasonable for a single-line display
-    if collapsed.len() > 200 {
-        format!("{}...", &collapsed[..197])
+    let clean = ia_core::upload::s3_error::strip_xml(msg);
+    if clean.len() > 200 {
+        format!("{}...", &clean[..197])
     } else {
-        collapsed
+        clean
     }
 }
 
