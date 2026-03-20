@@ -573,10 +573,10 @@ pub fn draw_compact_s3_panel(frame: &mut Frame, area: Rect, theme: &Theme, data:
 // ---------------------------------------------------------------------------
 
 /// Block characters for sparkline rendering, indexed 0-7.
-const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+pub(crate) const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Map a value to a sparkline block character given the max value in the dataset.
-fn spark_char(value: f64, max: f64) -> char {
+pub(crate) fn spark_char(value: f64, max: f64) -> char {
     if max <= 0.0 || value <= 0.0 {
         return SPARK_CHARS[0];
     }

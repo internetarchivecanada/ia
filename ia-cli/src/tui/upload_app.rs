@@ -879,8 +879,9 @@ fn finalize_item(
 /// at the rendering layer (upload_tab, errors_tab).
 pub(crate) fn sanitize_error(msg: &str) -> String {
     let clean = ia_core::upload::s3_error::strip_xml(msg);
-    if clean.len() > 200 {
-        format!("{}...", &clean[..197])
+    if clean.chars().count() > 200 {
+        let truncated: String = clean.chars().take(197).collect();
+        format!("{truncated}...")
     } else {
         clean
     }

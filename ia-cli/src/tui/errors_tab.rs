@@ -55,14 +55,14 @@ impl ErrorsTab {
 // Sparkline characters
 // ---------------------------------------------------------------------------
 
-const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
+/// Error sparkline variant: returns a blank space for zero values (unlike
+/// `widgets::spark_char` which returns ▁ as a baseline for throughput charts).
 fn spark_char(val: f64, max: f64) -> char {
     if max <= 0.0 || val <= 0.0 {
         return ' ';
     }
     let idx = ((val / max) * 7.0).round() as usize;
-    SPARK_CHARS[idx.min(7)]
+    super::widgets::SPARK_CHARS[idx.min(7)]
 }
 
 /// Build a per-minute error histogram from timestamps, returning counts for
@@ -448,19 +448,7 @@ fn draw_error_list(
         }
     }
 
-    // Scroll to keep cursor visible
     let visible_height = inner.height as usize;
-    let cursor_row = lines
-        .iter()
-        .scan(0usize, |file_idx, _| {
-            let current = *file_idx;
-            Some(current)
-        })
-        .enumerate()
-        .find(|(_, _)| false) // We need a different approach
-        .map_or(0, |(row, _)| row);
-    let _ = cursor_row; // Simple scroll: use tab.scroll_offset
-
     let visible: Vec<Line> = lines
         .into_iter()
         .skip(tab.scroll_offset)
