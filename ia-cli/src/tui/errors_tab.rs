@@ -493,12 +493,14 @@ mod tests {
     fn make_state_with_errors() -> Arc<Mutex<UploadTuiState>> {
         let mut state = UploadTuiState::new(&["item-a".to_string()]);
         state.failed_files.push(ErrorEntry {
+            identifier: "item-a".to_string(),
             file: "item-a/file1.jpg".to_string(),
             message: "SlowDown: Please slow down".to_string(),
             timestamp: Instant::now(),
             resolved: false,
         });
         state.failed_files.push(ErrorEntry {
+            identifier: "item-a".to_string(),
             file: "item-a/file2.jpg".to_string(),
             message: "Timeout after 30s".to_string(),
             timestamp: Instant::now(),

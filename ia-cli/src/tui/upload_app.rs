@@ -18,7 +18,9 @@ use super::widgets::ThroughputTracker;
 /// A single error event tracked by the dashboard.
 #[derive(Debug, Clone)]
 pub struct ErrorEntry {
-    /// File key (e.g., `item-a/file.txt`).
+    /// Item identifier this error belongs to.
+    pub identifier: String,
+    /// File key (e.g., `file.txt`).
     pub file: String,
     /// Human-readable error message (sanitized, no XML).
     pub message: String,
@@ -426,6 +428,7 @@ impl UploadTuiState {
                 let now = Instant::now();
                 self.error_timestamps.push(now);
                 self.failed_files.push(ErrorEntry {
+                    identifier: p.identifier,
                     file: p.key,
                     message: sanitize_error(&msg),
                     timestamp: now,
@@ -814,7 +817,8 @@ fn finalize_item(
                                 | ia_core::upload::UploadStatus::Resumed
                         ) {
                             for entry in &mut s.failed_files {
-                                if entry.file == r.key && !entry.resolved {
+                                if entry.identifier == id && entry.file == r.key && !entry.resolved
+                                {
                                     entry.resolved = true;
                                 }
                             }
