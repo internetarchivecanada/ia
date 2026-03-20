@@ -17,7 +17,6 @@ use super::s3_state::S3TaskState;
 use super::search::SearchState;
 use super::tab::TabView;
 use super::theme::Theme;
-use super::widgets;
 
 /// Tasks tab — shows the S3 task queue with summary counts, a scrollable task
 /// table, and search/filter support.
@@ -65,29 +64,11 @@ impl TabView for TasksTab {
             return;
         };
 
-        // Layout: S3 summary panel (3 rows), task table (fill), optional search bar (1 row).
+        // Layout: task table (fill), optional search bar (1 row).
+        // S3+Progress panes are rendered by dashboard.rs above this area.
         let search_height = if self.search.is_active() { 1 } else { 0 };
-        let chunks = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(search_height),
-        ])
-        .split(area);
-
-        // -- S3 summary panel --
-        widgets::draw_s3_panel(
-            frame,
-            chunks[0],
-            theme,
-            &widgets::S3PanelData {
-                queued: state.queued,
-                running: state.running,
-                errors: state.errors,
-                global_count: state.global_count,
-                rate_limited: state.is_rate_limited,
-                seconds_ago: state.seconds_since_poll(),
-            },
-        );
+        let chunks =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(search_height)]).split(area);
 
         // -- Task table --
         let filtered_tasks: Vec<_> = state
@@ -102,7 +83,7 @@ impl TabView for TasksTab {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let visible_height = chunks[1].height.saturating_sub(2) as usize; // borders
+        let visible_height = chunks[0].height.saturating_sub(2) as usize; // borders
         let rows: Vec<Row> = filtered_tasks
             .iter()
             .enumerate()
@@ -152,7 +133,7 @@ impl TabView for TasksTab {
                 .border_style(Style::default().fg(theme.border)),
         );
 
-        frame.render_widget(table, chunks[1]);
+        frame.render_widget(table, chunks[0]);
 
         // -- Search bar --
         if self.search.is_active() {
@@ -161,7 +142,7 @@ impl TabView for TasksTab {
                 Span::styled(self.search.query(), Style::default().fg(theme.text)),
             ]);
             let search_bar = Paragraph::new(search_line);
-            frame.render_widget(search_bar, chunks[2]);
+            frame.render_widget(search_bar, chunks[1]);
         }
     }
 
