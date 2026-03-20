@@ -34,6 +34,7 @@ rust_xlsxwriter = "0.79"
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:open"]
 self-update = []
+alpha = []
 
 [dependencies.ratatui]
 version = "0.29"

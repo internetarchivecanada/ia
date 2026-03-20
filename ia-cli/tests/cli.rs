@@ -723,6 +723,7 @@ fn metadata_import_requires_file() {
 
 // --- ia ai subcommand restructuring ---
 
+#[cfg(feature = "alpha")]
 #[test]
 fn ai_undo_subcommand_shown_in_help() {
     ia().args(["ai", "--help"])
@@ -731,6 +732,7 @@ fn ai_undo_subcommand_shown_in_help() {
         .stdout(predicate::str::contains("undo"));
 }
 
+#[cfg(feature = "alpha")]
 #[test]
 fn ai_undo_subcommand_requires_joblog() {
     ia().args(["ai", "undo"])
@@ -739,6 +741,7 @@ fn ai_undo_subcommand_requires_joblog() {
         .stderr(predicate::str::contains("JOBLOG").or(predicate::str::contains("joblog")));
 }
 
+#[cfg(feature = "alpha")]
 #[test]
 fn ai_bare_no_input_errors() {
     // Bare `ia ai` with no args should error about missing input, NOT about subcommands
@@ -748,6 +751,7 @@ fn ai_bare_no_input_errors() {
         .stderr(predicate::str::contains("no input specified"));
 }
 
+#[cfg(feature = "alpha")]
 #[test]
 fn ai_undo_help_has_dry_run_and_json() {
     ia().args(["ai", "undo", "--help"])
@@ -757,6 +761,7 @@ fn ai_undo_help_has_dry_run_and_json() {
         .stdout(predicate::str::contains("--json"));
 }
 
+#[cfg(feature = "alpha")]
 #[test]
 fn ai_undo_help_no_headless() {
     // Undo subcommand should NOT have --headless
