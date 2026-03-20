@@ -733,25 +733,37 @@ fn draw_items_tree(
 
         if show_files {
             let files = state.files_for_item(&item.identifier);
-            for file in &files {
-                // Auto-expanded: show active + completed/failed files (skip pending/skipped).
-                // Keeping completed files visible prevents row jumping when a file finishes
-                // and the next one starts.
-                if is_auto_expanded
-                    && matches!(
-                        file.status,
-                        FileDisplayStatus::Pending | FileDisplayStatus::Skipped
-                    )
-                {
-                    continue;
+
+            if is_auto_expanded {
+                // Auto-expanded: show only active files.
+                let mut showed_any = false;
+                for file in &files {
+                    if matches!(file.status, FileDisplayStatus::Active) {
+                        all_rows.push((render_file_line(file, theme, is_dimmed), false));
+                        showed_any = true;
+                    }
                 }
+                // If no active files but item is still going, show the next
+                // pending file as a placeholder so the row doesn't collapse
+                // and cause a visual jump.
+                if !showed_any && is_active {
+                    if let Some(next) = files
+                        .iter()
+                        .find(|f| matches!(f.status, FileDisplayStatus::Pending))
+                    {
+                        all_rows.push((render_file_line(next, theme, is_dimmed), false));
+                    }
+                }
+            } else {
+                for file in &files {
+                    let file_line = render_file_line(file, theme, is_dimmed);
+                    all_rows.push((file_line, false));
 
-                let file_line = render_file_line(file, theme, is_dimmed);
-                all_rows.push((file_line, false));
-
-                // For collapsed active items, only show the first active file.
-                if !is_expanded && is_active && matches!(file.status, FileDisplayStatus::Active) {
-                    break;
+                    // For collapsed active items, only show the first active file.
+                    if !is_expanded && is_active && matches!(file.status, FileDisplayStatus::Active)
+                    {
+                        break;
+                    }
                 }
             }
         }
