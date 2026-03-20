@@ -111,14 +111,15 @@ impl TabView for ErrorsTab {
                     ),
                 ]));
 
-                // If this row is expanded, show the full error on the next line.
+                // If this row is expanded, word-wrap the full error below.
                 if self.expanded == Some(i) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {error}"),
-                        Style::default()
-                            .fg(theme.text_secondary)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                    let wrap_width = inner.width.saturating_sub(4) as usize;
+                    let style = Style::default()
+                        .fg(theme.text_secondary)
+                        .add_modifier(Modifier::ITALIC);
+                    for wrapped in word_wrap(error, wrap_width.max(20)) {
+                        lines.push(Line::from(Span::styled(format!("    {wrapped}"), style)));
+                    }
                 }
             }
 
@@ -193,6 +194,31 @@ impl TabView for ErrorsTab {
             ("q", "quit"),
         ]
     }
+}
+
+/// Simple word-wrap: break `text` into lines of at most `width` characters,
+/// splitting on whitespace boundaries.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 #[cfg(test)]

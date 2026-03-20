@@ -747,7 +747,30 @@ fn finalize_item(
 
         if let Some(&idx) = s.item_index.get(id) {
             match result {
-                Ok(_) => {
+                Ok(results) => {
+                    // Backfill real error messages from UploadResults into the
+                    // per-file lists (which only had "upload failed" placeholders
+                    // from the progress callback).
+                    for r in results {
+                        if let ia_core::upload::UploadStatus::Failed(msg) = &r.status {
+                            let clean = sanitize_error(msg);
+                            // Update per-item failed_file_names
+                            for (name, err) in &mut s.items[idx].failed_file_names {
+                                if *name == r.key && err == "upload failed" {
+                                    *err = clean.clone();
+                                    break;
+                                }
+                            }
+                            // Update global failed_files
+                            for (name, err) in &mut s.failed_files {
+                                if *name == r.key && err == "upload failed" {
+                                    *err = clean.clone();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     let item = &mut s.items[idx];
                     if !matches!(
                         item.status,
@@ -764,7 +787,7 @@ fn finalize_item(
                     }
                 }
                 Err(e) => {
-                    s.items[idx].status = UploadItemStatus::Failed(e.to_string());
+                    s.items[idx].status = UploadItemStatus::Failed(sanitize_error(&e.to_string()));
                 }
             }
         }
@@ -777,6 +800,36 @@ fn finalize_item(
         }) {
             s.done = true;
         }
+    }
+}
+
+/// Strip XML/HTML tags and collapse whitespace so raw S3 error bodies don't
+/// clutter the dashboard. Returns the first meaningful line.
+fn sanitize_error(msg: &str) -> String {
+    // Strip XML/HTML tags
+    let mut out = String::with_capacity(msg.len());
+    let mut in_tag = false;
+    for ch in msg.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                // Add a space where a tag was, to separate adjacent text
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    // Collapse whitespace and trim
+    let collapsed: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Truncate to something reasonable for a single-line display
+    if collapsed.len() > 200 {
+        format!("{}...", &collapsed[..197])
+    } else {
+        collapsed
     }
 }
 
