@@ -818,7 +818,7 @@ async fn upload_checksum_skip_when_md5_matches() {
     let f = temp_file(b"hello"); // MD5 = 5d41402abc4b2a76b9719d911017c592
     let client = test_client(&server);
     let opts = UploadOpts {
-        skip_existing: true,
+        checksum: true,
         verify: true,
         ..Default::default()
     };
@@ -863,7 +863,7 @@ async fn upload_checksum_no_skip_when_md5_differs() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        skip_existing: true,
+        checksum: true,
         verify: false,
         ..Default::default()
     };
@@ -908,7 +908,7 @@ async fn upload_checksum_no_skip_when_file_not_on_remote() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        skip_existing: true,
+        checksum: true,
         verify: false,
         ..Default::default()
     };
@@ -953,7 +953,7 @@ async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
     let f = temp_file(b"hello");
     let client = test_client(&server);
     let opts = UploadOpts {
-        skip_existing: true,
+        checksum: true,
         verify: false, // no Content-MD5 header, but still compute for skip
         ..Default::default()
     };
@@ -1028,12 +1028,12 @@ async fn upload_precomputed_checksum_used_for_content_md5() {
     let client = test_client(&server);
     let f = temp_file(b"hello");
 
-    let mut checksums = std::collections::HashMap::new();
-    checksums.insert("test.txt".into(), "5d41402abc4b2a76b9719d911017c592".into());
+    let mut checksum_file = std::collections::HashMap::new();
+    checksum_file.insert("test.txt".into(), "5d41402abc4b2a76b9719d911017c592".into());
 
     let opts = UploadOpts {
         verify: true,
-        checksums: Some(checksums),
+        checksum_file: Some(checksum_file),
         ..UploadOpts::default()
     };
 

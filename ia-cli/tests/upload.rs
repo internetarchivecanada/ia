@@ -452,21 +452,21 @@ fn upload_spreadsheet_csv_dry_run() {
 // ─── Flag acceptance ─────────────────────────────────────────────────────────
 
 #[test]
-fn upload_skip_existing_flag_accepted() {
+fn upload_checksum_flag_accepted() {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--skip-existing"));
+        .stdout(predicate::str::contains("--checksum"));
 }
 
 #[test]
-fn upload_checksums_flag_accepted() {
+fn upload_checksum_file_flag_accepted() {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--checksums"));
+        .stdout(predicate::str::contains("--checksum-file"));
 }
 
 #[test]
@@ -526,7 +526,7 @@ fn upload_help_shows_subcommands() {
         .stdout(predicate::str::contains("--test-item"))
         .stdout(predicate::str::contains("--no-verify"))
         .stdout(predicate::str::contains("--remote-name"))
-        .stdout(predicate::str::contains("--checksums"));
+        .stdout(predicate::str::contains("--checksum-file"));
 }
 
 #[test]

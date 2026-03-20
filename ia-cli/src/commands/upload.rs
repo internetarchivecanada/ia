@@ -60,7 +60,7 @@ fn build_skip_set(
 #[derive(Debug, Args)]
 #[command(
     long_about = "Upload files to the Internet Archive. Uploads one or more files to a single item, \
-        with options for metadata, checksums, directory structure, and retry logic. Supports batch \
+        with options for metadata, checksum verification, directory structure, and retry logic. Supports batch \
         uploads from spreadsheets and template generation for bulk workflows.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
@@ -142,12 +142,12 @@ pub struct UploadArgs {
     pub no_collection_check: bool,
 
     /// Path to pre-computed MD5 checksums file
-    #[arg(long)]
-    pub checksums: Option<PathBuf>,
+    #[arg(long = "checksum-file", alias = "checksums")]
+    pub checksum_file: Option<PathBuf>,
 
     /// Skip files already uploaded (MD5 match)
-    #[arg(long)]
-    pub skip_existing: bool,
+    #[arg(long, alias = "skip-existing")]
+    pub checksum: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -245,8 +245,8 @@ pub struct ImportArgs {
     pub header: Vec<String>,
 
     /// Path to pre-computed MD5 checksums file
-    #[arg(long)]
-    pub checksums: Option<PathBuf>,
+    #[arg(long = "checksum-file", alias = "checksums")]
+    pub checksum_file: Option<PathBuf>,
 
     /// Skip derivative generation
     #[arg(long)]
@@ -273,8 +273,8 @@ pub struct ImportArgs {
     pub no_collection_check: bool,
 
     /// Skip files already uploaded (MD5 match)
-    #[arg(long)]
-    pub skip_existing: bool,
+    #[arg(long, alias = "skip-existing")]
+    pub checksum: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -433,8 +433,8 @@ pub async fn run(
             no_verify: sub.no_verify,
             no_size_hint: sub.no_size_hint,
             no_collection_check: sub.no_collection_check,
-            checksums: sub.checksums,
-            skip_existing: sub.skip_existing,
+            checksum_file: sub.checksum_file,
+            checksum: sub.checksum,
             delete_after_upload: sub.delete_after_upload,
             test_item: sub.test_item,
             open_after_upload: false,
@@ -495,8 +495,8 @@ async fn run_bare_upload(
         );
     }
 
-    let checksums = args
-        .checksums
+    let checksum_file = args
+        .checksum_file
         .as_ref()
         .map(|p| load_checksums(p))
         .transpose()?;
@@ -511,8 +511,8 @@ async fn run_bare_upload(
         remote_dir: args.remote_dir.clone(),
         keep_directories: args.keep_directories,
         verify: !args.no_verify,
-        skip_existing: args.skip_existing,
-        checksums,
+        checksum: args.checksum,
+        checksum_file,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
         no_backup: args.no_backup,
@@ -696,8 +696,8 @@ async fn run_import(
         );
     }
 
-    let checksums = args
-        .checksums
+    let checksum_file = args
+        .checksum_file
         .as_ref()
         .map(|p| load_checksums(p))
         .transpose()?;
@@ -705,9 +705,9 @@ async fn run_import(
     let opts = UploadOpts {
         metadata: extra_metadata,
         headers,
-        checksums,
+        checksum_file,
         verify: !args.no_verify,
-        skip_existing: args.skip_existing,
+        checksum: args.checksum,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
         no_backup: args.no_backup,

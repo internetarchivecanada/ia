@@ -64,10 +64,10 @@ pub async fn upload_file(
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
-    // Compute local MD5 if needed for either skip-existing or verify
-    let needs_md5 = opts.skip_existing || opts.verify;
+    // Compute local MD5 if needed for either checksum-skip or verify
+    let needs_md5 = opts.checksum || opts.verify;
     let md5_hex = if needs_md5 {
-        if let Some(md5) = opts.checksums.as_ref().and_then(|cs| cs.get(key)) {
+        if let Some(md5) = opts.checksum_file.as_ref().and_then(|cs| cs.get(key)) {
             Some(md5.clone())
         } else {
             if let Some(ref cb) = progress {
@@ -85,10 +85,10 @@ pub async fn upload_file(
         None
     };
 
-    // Skip-existing: compare local MD5 with remote, skip if match
-    if opts.skip_existing {
+    // Checksum skip: compare local MD5 with remote, skip if match
+    if opts.checksum {
         let local_md5 = md5_hex.as_deref().ok_or_else(|| {
-            IaError::Config("internal error: MD5 not computed for skip_existing check".into())
+            IaError::Config("internal error: MD5 not computed for checksum skip".into())
         })?;
         match client.get_item(identifier).await {
             Ok(item) => {
