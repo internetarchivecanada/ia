@@ -325,7 +325,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--remote-name <NAME>` | Explicit remote filename (required for stdin) |
 | `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
 | `--keep-directories` | Preserve relative path structure |
-| `--skip-existing` | Skip files already uploaded (MD5 match) |
+| `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksums <PATH>` | Path to pre-computed MD5 checksums file |
 | `--delete-after-upload` | Delete local file after verified upload |
 | `--no-verify` | Skip Content-MD5 verification |
@@ -349,7 +349,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
-Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--skip-existing`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
 
 **`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
 
@@ -387,8 +387,8 @@ cat data.csv | ia upload my-item - --remote-name data.csv
 # Multipart upload for large files
 ia upload my-item big-video.mp4 --multipart
 
-# Skip files that already exist on the server
-ia upload my-item ./files/ --skip-existing
+# Force re-upload even if remote files match
+ia upload my-item ./files/ --clobber
 
 # Batch upload from a spreadsheet
 ia upload --spreadsheet batch.csv

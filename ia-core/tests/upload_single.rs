@@ -45,6 +45,7 @@ async fn upload_single_file_success() {
     let client = test_client(&server);
     let opts = UploadOpts {
         verify: false,
+        checksum: false,
         ..Default::default()
     };
 
@@ -67,7 +68,7 @@ async fn upload_single_file_success() {
     assert_eq!(result.retries, 0);
     assert_eq!(result.identifier, "test-item");
     assert_eq!(result.key, "hello.txt");
-    assert!(result.md5.is_none()); // verify=false
+    assert!(result.md5.is_none()); // verify=false, checksum=false
 }
 
 // -- Dry run --

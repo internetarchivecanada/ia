@@ -452,12 +452,12 @@ fn upload_spreadsheet_csv_dry_run() {
 // ─── Flag acceptance ─────────────────────────────────────────────────────────
 
 #[test]
-fn upload_checksum_flag_accepted() {
+fn upload_clobber_flag_accepted() {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--checksum"));
+        .stdout(predicate::str::contains("--clobber"));
 }
 
 #[test]

@@ -48,7 +48,7 @@ ia upload cleanup <id> [file]         # abort incomplete multipart (hidden)
 | `--no-size-hint` | off | Don't send x-archive-size-hint |
 | `--no-collection-check` | off | Skip collection existence check |
 | `--checksums FILE` | — | Pre-computed MD5 file (GNU md5sum or BSD md5 format) |
-| `--checksum` | off | Skip files already uploaded (MD5 match) |
+| `--clobber` | off | Force re-upload even when remote file has matching MD5 |
 | `--delete-after-upload` | off | Delete local file after verified upload |
 | `--test-item` | off | Upload to test_collection (real upload, auto-removed after 30 days) |
 | `--open-after-upload` | off | Open item in browser after upload |
@@ -109,7 +109,7 @@ pub struct UploadOpts {
     pub remote_dir: Option<String>,
     pub keep_directories: bool,
     pub verify: bool,           // default: true
-    pub checksum: bool,         // skip already-uploaded
+    pub checksum: bool,         // default: true (--clobber sets false)
     pub checksums: Option<HashMap<String, String>>,  // pre-computed MD5s
     pub delete_after_upload: bool,
     pub no_derive: bool,
@@ -223,7 +223,7 @@ pub fn validate_upload(
    - `--keep-directories`: relative path structure preserved
    - `--remote-name`: explicit name (required for stdin)
    - `--remote-dir`: prepend prefix (`scans/` + `file.pdf` → `scans/file.pdf`)
-3. If `--checksum`: compute local MD5, fetch remote metadata, compare. Skip if match AND no pending catalog tasks.
+3. By default: compute local MD5, fetch remote metadata, compare. Skip if match AND no pending catalog tasks. (`--clobber` disables this.)
 4. If verify (default): compute MD5 (or look up from `--checksums` file)
 5. Build URL: `PUT https://s3.us.archive.org/{identifier}/{url_encoded_key}`
 6. Build headers (delegates to `headers.rs`)
@@ -491,14 +491,14 @@ reqwest uses hyper internally. Three possible outcomes to verify during implemen
 - Catches corruption in transit
 - Cost: one full file read before upload (usually cached by OS page cache)
 
-**2. Checksum Skip (`--checksum`, off by default)**
+**2. Checksum Skip (on by default, `--clobber` to disable)**
 
 - Before uploading, compute local MD5
 - Fetch item metadata, find remote file's MD5
 - If match AND no pending catalog tasks → skip upload
 - If no remote file or mismatch → upload normally
 - Tasks check prevents skipping when item is in flux
-- Useful for idempotent re-runs; joblog + `--retry-failed` handles batch resume more efficiently
+- `--clobber` disables this: force re-upload even when remote MD5 matches
 
 **3. Pre-Computed Checksums (`--checksums FILE`)**
 
@@ -511,11 +511,11 @@ reqwest uses hyper internally. Three possible outcomes to verify during implemen
 
 | Flags | MD5 Computed? | Content-MD5 Header? | Skip Check? |
 |-------|--------------|---------------------|-------------|
-| (default: verify on) | Yes | Yes | No |
-| `--checksum` | Yes | Yes | Yes |
-| `--no-verify` | No | No | No |
-| `--no-verify --checksum` | Yes (for skip) | No | Yes |
-| `--checksums FILE` | From file | Yes | If `--checksum` |
+| (default) | Yes | Yes | Yes |
+| `--clobber` | Yes (for verify) | Yes | No |
+| `--no-verify` | Yes (for skip) | No | Yes |
+| `--clobber --no-verify` | No | No | No |
+| `--checksums FILE` | From file | Yes | Yes |
 
 ### `--delete-after-upload` Flow
 
@@ -833,7 +833,7 @@ Abort: DELETE /{identifier}/{key}?uploadId={ID}
 - `ia upload --json` — JSONL output format
 - `ia upload import` — reads spreadsheet, validates required fields
 - `ia upload template` — generates correct spreadsheet
-- Flag interactions: `--no-verify --checksum`, `--delete-after-upload` forces verify
+- Flag interactions: `--no-verify --clobber`, `--delete-after-upload` forces verify
 - Error cases: missing file, missing metadata, bad identifier, symlink skipped
 
 **4. Simulated Error Testing (manual, developer only)**

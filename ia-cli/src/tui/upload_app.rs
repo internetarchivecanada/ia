@@ -906,6 +906,17 @@ pub async fn run_upload_tui(
     // Semaphore to limit how many items upload concurrently
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
+    // Open joblog writer if a path was provided.
+    let on_result = if let Some(path) = joblog_path {
+        let jl = ia_core::joblog::JoblogWriter::open(path)?;
+        Some(Arc::new(move |r: &ia_core::upload::UploadResult| {
+            crate::commands::upload::write_upload_result(&jl, r);
+        })
+            as Arc<dyn Fn(&ia_core::upload::UploadResult) + Send + Sync>)
+    } else {
+        None
+    };
+
     // Spawn upload tasks (one per item)
     let mut handles = Vec::new();
     for (id, files) in identifiers.iter().zip(files_per_item.iter()) {
@@ -918,6 +929,7 @@ pub async fn run_upload_tui(
         let cleanup_state = Arc::clone(&state);
         let skip = skip_set.clone();
         let task_paused = Arc::clone(&paused);
+        let on_result = on_result.clone();
 
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
@@ -938,7 +950,7 @@ pub async fn run_upload_tui(
                 &opts,
                 Some(progress_fn),
                 skip.as_deref(),
-                None,
+                on_result,
                 file_concurrency,
                 Some(task_paused),
             )
@@ -994,6 +1006,17 @@ pub async fn run_upload_batch_tui(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(jobs));
     let mut handles = Vec::new();
 
+    // Open joblog writer if a path was provided.
+    let on_result = if let Some(path) = joblog_path {
+        let jl = ia_core::joblog::JoblogWriter::open(path)?;
+        Some(Arc::new(move |r: &ia_core::upload::UploadResult| {
+            crate::commands::upload::write_upload_result(&jl, r);
+        })
+            as Arc<dyn Fn(&ia_core::upload::UploadResult) + Send + Sync>)
+    } else {
+        None
+    };
+
     for group in groups {
         let client = client.clone();
         let mut item_opts = opts.clone();
@@ -1012,6 +1035,7 @@ pub async fn run_upload_batch_tui(
         let cleanup_state = Arc::clone(&state);
         let skip = skip_set.clone();
         let task_paused = Arc::clone(&paused);
+        let on_result = on_result.clone();
 
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = sem.acquire().await else {
@@ -1035,7 +1059,7 @@ pub async fn run_upload_batch_tui(
                 &item_opts,
                 Some(progress_fn),
                 skip.as_deref(),
-                None,
+                on_result,
                 1, // sequential within batch items; concurrency is across items
                 Some(task_paused),
             )

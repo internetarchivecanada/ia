@@ -63,7 +63,20 @@ fn build_skip_set(
         with options for metadata, checksum verification, directory structure, and retry logic. Supports batch \
         uploads from spreadsheets and template generation for bulk workflows.",
     after_long_help = cstr!(
-        "<bold><underline>Examples:</underline></bold>\n\
+        "<bold><underline>Integrity & Skip Behavior:</underline></bold>\n\
+         \n  By default, ia computes a local MD5 for each file and:\n\
+         \n    1. Skips the upload if the remote file already has the same MD5\
+         \n    2. Sends Content-MD5 so the server verifies integrity on receipt\n\
+         \n  <bold>--clobber</bold>         Force re-upload even if remote MD5 matches.\
+         \n                    Still sends Content-MD5 for integrity verification.\
+         \n  <bold>--no-verify</bold>       Skip Content-MD5 header (no server-side check).\
+         \n                    Still skips files matching remote MD5.\
+         \n  <bold>--clobber --no-verify</bold>  Skip all MD5 computation. Maximum speed\
+         \n                    for bulk uploads where integrity isn't a concern.\
+         \n  <bold>--joblog FILE</bold>     Separate resume mechanism — skips files logged\
+         \n                    as successful in previous runs. Works independently\
+         \n                    of checksum/verify. Disable with --no-resume.\n\
+         \n<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Upload a file to an existing or new item</dim>\
          \n  <bold>$ ia upload my-item file.pdf -m mediatype:texts -m collection:opensource</bold>\
          \n\n  <dim># Upload a directory, preserving structure</dim>\
@@ -79,7 +92,9 @@ fn build_skip_set(
          \n\n  <dim># Resume interrupted uploads (automatic with --joblog)</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl</bold>\
          \n  <dim># (re-run same command — already-uploaded files are skipped)</dim>\
-         \n\n  <dim># Force re-upload everything</dim>\
+         \n\n  <dim># Force re-upload everything (ignore remote MD5)</dim>\
+         \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
+         \n\n  <dim># Force re-upload ignoring joblog</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\n"
     ),
     subcommand_required = false,
@@ -145,9 +160,9 @@ pub struct UploadArgs {
     #[arg(long = "checksum-file", alias = "checksums")]
     pub checksum_file: Option<PathBuf>,
 
-    /// Skip files already uploaded (MD5 match)
-    #[arg(long, alias = "skip-existing")]
-    pub checksum: bool,
+    /// Force re-upload even when remote file has matching MD5
+    #[arg(long)]
+    pub clobber: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -272,9 +287,9 @@ pub struct ImportArgs {
     #[arg(long)]
     pub no_collection_check: bool,
 
-    /// Skip files already uploaded (MD5 match)
-    #[arg(long, alias = "skip-existing")]
-    pub checksum: bool,
+    /// Force re-upload even when remote file has matching MD5
+    #[arg(long)]
+    pub clobber: bool,
 
     /// Delete local file after verified upload
     #[arg(long)]
@@ -434,7 +449,7 @@ pub async fn run(
             no_size_hint: sub.no_size_hint,
             no_collection_check: sub.no_collection_check,
             checksum_file: sub.checksum_file,
-            checksum: sub.checksum,
+            clobber: sub.clobber,
             delete_after_upload: sub.delete_after_upload,
             test_item: sub.test_item,
             open_after_upload: false,
@@ -511,7 +526,7 @@ async fn run_bare_upload(
         remote_dir: args.remote_dir.clone(),
         keep_directories: args.keep_directories,
         verify: !args.no_verify,
-        checksum: args.checksum,
+        checksum: !args.clobber,
         checksum_file,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
@@ -707,7 +722,7 @@ async fn run_import(
         headers,
         checksum_file,
         verify: !args.no_verify,
-        checksum: args.checksum,
+        checksum: !args.clobber,
         delete_after_upload: args.delete_after_upload,
         no_derive: args.no_derive,
         no_backup: args.no_backup,
@@ -1374,7 +1389,7 @@ fn print_result_line(r: &UploadResult) {
 }
 
 /// Write an upload result to the joblog.
-fn write_upload_result(jl: &JoblogWriter, r: &UploadResult) {
+pub(crate) fn write_upload_result(jl: &JoblogWriter, r: &UploadResult) {
     let entry = JoblogEntry::new("upload", &r.identifier, &r.key);
     let entry = match &r.status {
         UploadStatus::Uploaded => entry.ok(r.bytes, r.elapsed_ms),

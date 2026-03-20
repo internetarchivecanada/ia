@@ -54,7 +54,7 @@ impl Default for UploadOpts {
             remote_dir: None,
             keep_directories: false,
             verify: true,
-            checksum: false,
+            checksum: true,
             checksum_file: None,
             delete_after_upload: false,
             no_derive: false,
@@ -335,7 +335,7 @@ mod tests {
     fn upload_opts_defaults() {
         let opts = UploadOpts::default();
         assert!(opts.verify);
-        assert!(!opts.checksum);
+        assert!(opts.checksum);
         assert!(!opts.no_derive);
         assert!(!opts.no_backup);
         assert_eq!(opts.retries, 10);
