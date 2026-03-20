@@ -4,6 +4,7 @@
 //! compact S3 + Progress top panes, a split sparkline, and `/` search.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -51,6 +52,11 @@ pub struct UploadTab {
     /// Items that were auto-expanded by tick (not manually). Prevents tick from
     /// re-expanding items after the user manually collapses them.
     auto_expanded: HashSet<String>,
+    /// Items the user explicitly expanded with →/l. Tick never touches this set,
+    /// so manual expansion persists until the user collapses with ←/h.
+    manually_expanded: HashSet<String>,
+    /// Shared pause flag from the dashboard.
+    paused: Arc<AtomicBool>,
     /// First 'g' press for gg detection (jump to top).
     pending_g: bool,
     /// When the first 'g' was pressed (500ms timeout for gg).
@@ -98,6 +104,7 @@ impl UploadTab {
     pub fn new(
         upload_state: Arc<Mutex<UploadTuiState>>,
         s3_state: Arc<Mutex<S3TaskState>>,
+        paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             upload_state,
@@ -110,6 +117,8 @@ impl UploadTab {
             status_message: None,
             cursor_identifier: None,
             auto_expanded: HashSet::new(),
+            manually_expanded: HashSet::new(),
+            paused,
             pending_g: false,
             pending_g_at: Instant::now(),
         }
@@ -322,8 +331,7 @@ impl TabView for UploadTab {
                     if let Some(&item_idx) = ord.get(self.cursor) {
                         let id = state.items[item_idx].identifier.clone();
                         self.expanded.insert(id.clone());
-                        // Remove from auto_expanded so it's treated as manually expanded
-                        self.auto_expanded.remove(&id);
+                        self.manually_expanded.insert(id);
                     }
                 }
                 true
@@ -335,6 +343,7 @@ impl TabView for UploadTab {
                     if let Some(&item_idx) = ord.get(self.cursor) {
                         let id = &state.items[item_idx].identifier;
                         self.expanded.remove(id);
+                        self.manually_expanded.remove(id);
                         // Remove from auto_expanded to prevent re-auto-expanding
                         self.auto_expanded.remove(id);
                     }
@@ -463,9 +472,9 @@ impl TabView for UploadTab {
                     self.auto_expanded.insert(id.clone());
                 }
             }
-            // Auto-collapse completed items that were auto-expanded.
+            // Auto-collapse completed items that were auto-expanded (not manually).
             for id in &completed_ids {
-                if self.auto_expanded.remove(id) {
+                if self.auto_expanded.remove(id) && !self.manually_expanded.contains(id) {
                     self.expanded.remove(id);
                 }
             }
@@ -553,8 +562,8 @@ fn draw_items_tree(
                 | UploadItemStatus::RateLimited
         );
         let is_expanded = tab.expanded.contains(&item.identifier);
-        let is_manually_expanded = is_expanded && !tab.auto_expanded.contains(&item.identifier);
-        let is_auto_expanded = is_expanded && tab.auto_expanded.contains(&item.identifier);
+        let is_manually_expanded = tab.manually_expanded.contains(&item.identifier);
+        let is_auto_expanded = is_expanded && !is_manually_expanded;
         let is_match = has_search_query && tab.search.matches(&item.identifier);
         let is_dimmed = has_search_query && !is_match;
 
@@ -570,14 +579,27 @@ fn draw_items_tree(
             ("\u{25b8}", None) // ▸, use icon_color
         };
 
+        // Check if this active item has drained (no files currently transferring)
+        // while globally paused — show ⏸ instead of the expand arrow.
+        let is_paused = tab.paused.load(Ordering::Relaxed);
+        let item_has_active_files = state
+            .active_files
+            .values()
+            .any(|f| f.identifier == item.identifier);
+        let is_drained_paused = is_paused && is_active && !item_has_active_files;
+
         // Status icon + color
-        let (icon, icon_color) = match &item.status {
-            UploadItemStatus::Pending => ("\u{00b7}", theme.text_muted),
-            UploadItemStatus::Verifying => (arrow, arrow_color.unwrap_or(theme.gold)),
-            UploadItemStatus::Uploading => (arrow, arrow_color.unwrap_or(theme.gold)),
-            UploadItemStatus::RateLimited => ("\u{23f8}", theme.gold),
-            UploadItemStatus::Complete => ("\u{2713}", theme.green),
-            UploadItemStatus::Failed(_) => ("\u{2717}", theme.red),
+        let (icon, icon_color) = if is_drained_paused {
+            ("\u{23f8}", theme.gold) // ⏸ paused
+        } else {
+            match &item.status {
+                UploadItemStatus::Pending => ("\u{00b7}", theme.text_muted),
+                UploadItemStatus::Verifying => (arrow, arrow_color.unwrap_or(theme.gold)),
+                UploadItemStatus::Uploading => (arrow, arrow_color.unwrap_or(theme.gold)),
+                UploadItemStatus::RateLimited => ("\u{23f8}", theme.gold),
+                UploadItemStatus::Complete => ("\u{2713}", theme.green),
+                UploadItemStatus::Failed(_) => ("\u{2717}", theme.red),
+            }
         };
 
         // File progress summary
@@ -713,10 +735,7 @@ fn draw_items_tree(
             let files = state.files_for_item(&item.identifier);
             for file in &files {
                 // Auto-expanded: only show active files (skip completed/skipped/pending)
-                if is_auto_expanded
-                    && !is_manually_expanded
-                    && !matches!(file.status, FileDisplayStatus::Active)
-                {
+                if is_auto_expanded && !matches!(file.status, FileDisplayStatus::Active) {
                     continue;
                 }
 
@@ -984,6 +1003,10 @@ mod tests {
         Arc::new(Mutex::new(S3TaskState::new()))
     }
 
+    fn make_paused() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     fn progress(
         id: &str,
         key: &str,
@@ -1002,7 +1025,7 @@ mod tests {
 
     #[test]
     fn test_initial_state() {
-        let tab = UploadTab::new(make_state(), make_s3_state());
+        let tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         assert_eq!(tab.cursor, 0);
         assert!(tab.expanded.is_empty());
         assert!(!tab.search.is_active());
@@ -1010,7 +1033,7 @@ mod tests {
 
     #[test]
     fn test_j_k_moves_cursor() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(tab.cursor, 1);
         tab.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);
@@ -1021,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_key_hints() {
-        let tab = UploadTab::new(make_state(), make_s3_state());
+        let tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         let hints = tab.key_hints();
         assert!(hints.iter().any(|(k, _)| *k == "j/k"));
         assert!(hints.iter().any(|(k, _)| *k == "/"));
@@ -1031,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_items_cursor_clamped() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         for _ in 0..5 {
             tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         }
@@ -1040,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_enter_sets_status_message() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         assert!(tab.status_text().is_none());
         tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         let text = tab.status_text();
@@ -1052,7 +1075,7 @@ mod tests {
     #[test]
     fn test_tick_clears_expired_status_message() {
         use std::time::Duration;
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         tab.status_message = Some((
             "https://archive.org/details/item-a".to_string(),
             Instant::now() - Duration::from_secs(6),
@@ -1064,7 +1087,7 @@ mod tests {
 
     #[test]
     fn test_expand_collapse() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         assert!(tab.expanded.is_empty());
 
         // Expand item-a (cursor at 0)
@@ -1084,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_search_activates_on_slash() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         assert!(!tab.search.is_active());
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         assert!(tab.search.is_active());
@@ -1092,7 +1115,7 @@ mod tests {
 
     #[test]
     fn test_search_esc_cancels() {
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         assert!(tab.search.is_active());
         tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -1109,7 +1132,7 @@ mod tests {
             "hubble-deep".to_string(),
             "nasa-data".to_string(),
         ])));
-        let mut tab = UploadTab::new(state, make_s3_state());
+        let mut tab = UploadTab::new(state, make_s3_state(), make_paused());
 
         // Search for "nasa"
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
@@ -1156,7 +1179,7 @@ mod tests {
             ));
         }
 
-        let _tab = UploadTab::new(state_inner.clone(), make_s3_state());
+        let _tab = UploadTab::new(state_inner.clone(), make_s3_state(), make_paused());
         let s = state_inner.lock().unwrap();
         let ord = ordered_items(&s);
 
@@ -1174,7 +1197,7 @@ mod tests {
             "item-c".to_string(),
         ])));
 
-        let mut tab = UploadTab::new(state_inner.clone(), make_s3_state());
+        let mut tab = UploadTab::new(state_inner.clone(), make_s3_state(), make_paused());
         // Position cursor on item-c (index 2)
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -1229,7 +1252,7 @@ mod tests {
             ));
         }
 
-        let mut tab = UploadTab::new(state, make_s3_state());
+        let mut tab = UploadTab::new(state, make_s3_state(), make_paused());
         tab.expanded.insert("item-a".to_string());
 
         let backend = TestBackend::new(80, 24);
@@ -1249,7 +1272,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut tab = UploadTab::new(make_state(), make_s3_state());
+        let mut tab = UploadTab::new(make_state(), make_s3_state(), make_paused());
         tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
         tab.handle_key(KeyCode::Char('t'), KeyModifiers::NONE);
 
