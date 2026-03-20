@@ -1,9 +1,12 @@
 //! Errors tab for the multi-tab upload dashboard.
 //!
-//! Displays upload failures in a scrollable table with inline expansion
-//! for full error details, plus an S3 task error summary panel.
+//! Displays an error summary pane with sparkline histogram, category
+//! breakdown, and resolved/active counts, plus a scrollable list of
+//! individual file errors with inline expansion.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -15,9 +18,9 @@ use ratatui::Frame;
 use super::s3_state::S3TaskState;
 use super::tab::TabView;
 use super::theme::Theme;
-use super::upload_app::UploadTuiState;
+use super::upload_app::{error_category, UploadTuiState};
 
-/// The Errors tab: lists failed files with inline error expansion.
+/// The Errors tab: summary pane + scrollable error list.
 #[derive(Debug)]
 pub struct ErrorsTab {
     upload_state: Arc<Mutex<UploadTuiState>>,
@@ -48,102 +51,102 @@ impl ErrorsTab {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Sparkline characters
+// ---------------------------------------------------------------------------
+
+const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+fn spark_char(val: f64, max: f64) -> char {
+    if max <= 0.0 || val <= 0.0 {
+        return ' ';
+    }
+    let idx = ((val / max) * 7.0).round() as usize;
+    SPARK_CHARS[idx.min(7)]
+}
+
+/// Build a per-minute error histogram from timestamps, returning counts for
+/// each minute bucket from session start to now.
+fn error_histogram(timestamps: &[Instant], session_start: Instant) -> Vec<f64> {
+    if timestamps.is_empty() {
+        return Vec::new();
+    }
+    let now = Instant::now();
+    let elapsed_secs = now.duration_since(session_start).as_secs();
+    let num_buckets = (elapsed_secs / 60 + 1) as usize;
+    let num_buckets = num_buckets.max(1);
+    let mut buckets = vec![0.0; num_buckets];
+    for ts in timestamps {
+        let offset = ts.duration_since(session_start).as_secs();
+        let bucket = (offset / 60) as usize;
+        if bucket < num_buckets {
+            buckets[bucket] += 1.0;
+        }
+    }
+    buckets
+}
+
 impl TabView for ErrorsTab {
     fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let s3_errors = self.s3_state.lock().map_or(0, |s| s.errors);
 
-        // Split area: upload errors panel takes most space, S3 panel only if errors > 0.
-        let chunks = if s3_errors > 0 {
-            Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(area)
-        } else {
-            Layout::vertical([Constraint::Min(5)]).split(area)
-        };
-
-        // -- Upload Errors panel --
-        let upload_area = chunks[0];
-        let failed_files: Vec<(String, String)> = self
+        // Grab error data under lock
+        let (total, active, resolved, categories, histogram, session_elapsed) = self
             .upload_state
             .lock()
-            .map_or_else(|_| Vec::new(), |s| s.failed_files.clone());
+            .map(|s| {
+                let total = s.failed_files.len();
+                let resolved = s.failed_files.iter().filter(|e| e.resolved).count();
+                let active = total - resolved;
 
-        let title = format!(" Upload Errors ({}) ", failed_files.len());
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.border));
-
-        let inner = block.inner(upload_area);
-        frame.render_widget(block, upload_area);
-
-        if failed_files.is_empty() {
-            let msg = Paragraph::new(Line::from(Span::styled(
-                "No errors",
-                Style::default().fg(theme.text_muted),
-            )));
-            frame.render_widget(msg, inner);
-        } else {
-            // Build lines for the visible rows.
-            let mut lines: Vec<Line> = Vec::new();
-            for (i, (file, error)) in failed_files.iter().enumerate() {
-                let is_cursor = i == self.cursor;
-                let style = if is_cursor {
-                    Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-
-                // Truncate error to fit in a single line (leave room for file column).
-                let summary = if error.chars().count() > 60 {
-                    format!("{}...", error.chars().take(57).collect::<String>())
-                } else {
-                    error.clone()
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:<40} ", file), style),
-                    Span::styled(
-                        summary,
-                        if is_cursor {
-                            style
-                        } else {
-                            Style::default().fg(theme.red)
-                        },
-                    ),
-                ]));
-
-                // If this row is expanded, word-wrap the full error below.
-                if self.expanded == Some(i) {
-                    let wrap_width = inner.width.saturating_sub(4) as usize;
-                    let style = Style::default()
-                        .fg(theme.text_secondary)
-                        .add_modifier(Modifier::ITALIC);
-                    for wrapped in word_wrap(error, wrap_width.max(20)) {
-                        lines.push(Line::from(Span::styled(format!("    {wrapped}"), style)));
-                    }
+                // Category counts
+                let mut cats: HashMap<&str, usize> = HashMap::new();
+                for entry in &s.failed_files {
+                    *cats.entry(error_category(&entry.message)).or_insert(0) += 1;
                 }
-            }
+                // Sort by count descending
+                let mut cat_vec: Vec<(String, usize)> =
+                    cats.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+                cat_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-            // Apply scroll offset.
-            let visible: Vec<Line> = lines
-                .into_iter()
-                .skip(self.scroll_offset)
-                .take(inner.height as usize)
-                .collect();
+                let hist = error_histogram(&s.error_timestamps, s.session_start);
+                let elapsed = s.session_start.elapsed();
 
-            let paragraph = Paragraph::new(visible);
-            frame.render_widget(paragraph, inner);
+                (total, active, resolved, cat_vec, hist, elapsed)
+            })
+            .unwrap_or_default();
+
+        // Layout: Summary (6-7) | Error list (fill) | S3 panel (3, if errors)
+        let mut constraints = vec![Constraint::Length(6), Constraint::Min(5)];
+        if s3_errors > 0 {
+            constraints.push(Constraint::Length(3));
         }
+        let chunks = Layout::vertical(constraints).split(area);
 
-        // -- S3 Task Errors panel (only if errors > 0) --
-        if s3_errors > 0 && chunks.len() > 1 {
-            let s3_area = chunks[1];
+        // ── Summary pane ──────────────────────────────────────────────
+        draw_summary_pane(
+            frame,
+            chunks[0],
+            theme,
+            total,
+            active,
+            resolved,
+            &categories,
+            &histogram,
+            session_elapsed,
+        );
+
+        // ── Error list ────────────────────────────────────────────────
+        draw_error_list(frame, chunks[1], theme, &self.upload_state, self);
+
+        // ── S3 Task Errors panel (only if errors > 0) ────────────────
+        if s3_errors > 0 && chunks.len() > 2 {
             let s3_block = Block::default()
                 .title(" S3 Task Errors ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.border));
-
-            let s3_inner = s3_block.inner(s3_area);
-            frame.render_widget(s3_block, s3_area);
+            let s3_inner = s3_block.inner(chunks[2]);
+            frame.render_widget(s3_block, chunks[2]);
 
             let s3_text = Paragraph::new(Line::from(Span::styled(
                 format!("{s3_errors} task(s) with errors"),
@@ -196,6 +199,277 @@ impl TabView for ErrorsTab {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Summary pane
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn draw_summary_pane(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    total: usize,
+    active: usize,
+    resolved: usize,
+    categories: &[(String, usize)],
+    histogram: &[f64],
+    elapsed: std::time::Duration,
+) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Error Summary ",
+            Style::default().fg(theme.maroon_bright),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Line 1: Counts
+    let total_span = Span::styled(
+        format!("Total: {total}"),
+        Style::default()
+            .fg(if total > 0 { theme.red } else { theme.green })
+            .add_modifier(Modifier::BOLD),
+    );
+    let resolved_span = if resolved > 0 {
+        Span::styled(
+            format!("   Resolved: {resolved}"),
+            Style::default().fg(theme.green),
+        )
+    } else {
+        Span::styled(
+            "   Resolved: 0".to_string(),
+            Style::default().fg(theme.text_muted),
+        )
+    };
+    let active_span = if active > 0 {
+        Span::styled(
+            format!("   Active: {active}"),
+            Style::default().fg(theme.red),
+        )
+    } else {
+        Span::styled(
+            "   Active: 0".to_string(),
+            Style::default().fg(theme.text_muted),
+        )
+    };
+    let elapsed_mins = elapsed.as_secs() / 60;
+    let elapsed_secs = elapsed.as_secs() % 60;
+    let elapsed_span = Span::styled(
+        format!("   Uptime: {elapsed_mins}m{elapsed_secs:02}s"),
+        Style::default().fg(theme.text_muted),
+    );
+    lines.push(Line::from(vec![
+        total_span,
+        resolved_span,
+        active_span,
+        elapsed_span,
+    ]));
+
+    // Line 2: Sparkline (errors/min)
+    let spark_width = inner.width.saturating_sub(14) as usize; // room for label
+    let max = histogram.iter().copied().fold(0.0_f64, f64::max);
+    let spark: String = if histogram.is_empty() {
+        " ".repeat(spark_width)
+    } else {
+        // Take the most recent buckets that fit
+        let take = spark_width.min(histogram.len());
+        let start = histogram.len().saturating_sub(take);
+        let pad = spark_width.saturating_sub(take);
+        let mut s = " ".repeat(pad);
+        for &v in &histogram[start..] {
+            s.push(spark_char(v, max));
+        }
+        s
+    };
+    lines.push(Line::from(vec![
+        Span::styled(spark, Style::default().fg(theme.red)),
+        Span::styled(
+            " errors/min".to_string(),
+            Style::default().fg(theme.text_muted),
+        ),
+    ]));
+
+    // Line 3: Categories
+    if categories.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "By type: (none)",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        let mut spans = vec![Span::styled(
+            "By type: ",
+            Style::default().fg(theme.text_muted),
+        )];
+        for (i, (cat, count)) in categories.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    " · ",
+                    Style::default().fg(theme.text_very_muted),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{cat}: {count}"),
+                Style::default().fg(theme.text),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Error list
+// ---------------------------------------------------------------------------
+
+fn draw_error_list(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    upload_state: &Arc<Mutex<UploadTuiState>>,
+    tab: &ErrorsTab,
+) {
+    let failed_files = upload_state
+        .lock()
+        .map(|s| s.failed_files.clone())
+        .unwrap_or_default();
+
+    let active_count = failed_files.iter().filter(|e| !e.resolved).count();
+    let title = if active_count > 0 && active_count < failed_files.len() {
+        format!(
+            " Errors ({} active, {} resolved) ",
+            active_count,
+            failed_files.len() - active_count
+        )
+    } else {
+        format!(" Errors ({}) ", failed_files.len())
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if failed_files.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            " No errors",
+            Style::default().fg(theme.green),
+        )));
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, entry) in failed_files.iter().enumerate() {
+        let is_cursor = i == tab.cursor;
+
+        // Resolved errors are dimmed with a ✓ prefix
+        let (icon, icon_color) = if entry.resolved {
+            ("\u{2713}", theme.green) // ✓
+        } else {
+            ("\u{2717}", theme.red) // ✗
+        };
+
+        let name_style = if is_cursor {
+            Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)
+        } else if entry.resolved {
+            Style::default().fg(theme.text_very_muted)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        let error_style = if is_cursor {
+            Style::default().fg(theme.gold)
+        } else if entry.resolved {
+            Style::default().fg(theme.text_very_muted)
+        } else {
+            Style::default().fg(theme.red)
+        };
+
+        // Cursor indicator
+        let cursor_span = if is_cursor {
+            Span::styled("\u{25b8} ", Style::default().fg(theme.gold))
+        } else {
+            Span::raw("  ")
+        };
+
+        // Truncate error to fit in a single line
+        let summary = if entry.message.chars().count() > 60 {
+            format!("{}...", entry.message.chars().take(57).collect::<String>())
+        } else {
+            entry.message.clone()
+        };
+
+        // Relative timestamp
+        let ago = entry.timestamp.elapsed().as_secs();
+        let ago_str = if ago < 60 {
+            format!("{ago}s ago")
+        } else {
+            format!("{}m ago", ago / 60)
+        };
+
+        lines.push(Line::from(vec![
+            cursor_span,
+            Span::styled(
+                format!("{icon} "),
+                Style::default().fg(if is_cursor { theme.gold } else { icon_color }),
+            ),
+            Span::styled(format!("{:<36} ", entry.file), name_style),
+            Span::styled(summary, error_style),
+            Span::styled(
+                format!("  {ago_str}"),
+                Style::default().fg(theme.text_very_muted),
+            ),
+        ]));
+
+        // If this row is expanded, word-wrap the full error below.
+        if tab.expanded == Some(i) {
+            let wrap_width = inner.width.saturating_sub(6) as usize;
+            let style = Style::default()
+                .fg(theme.text_secondary)
+                .add_modifier(Modifier::ITALIC);
+            for wrapped in word_wrap(&entry.message, wrap_width.max(20)) {
+                lines.push(Line::from(Span::styled(format!("      {wrapped}"), style)));
+            }
+        }
+    }
+
+    // Scroll to keep cursor visible
+    let visible_height = inner.height as usize;
+    let cursor_row = lines
+        .iter()
+        .scan(0usize, |file_idx, _| {
+            let current = *file_idx;
+            Some(current)
+        })
+        .enumerate()
+        .find(|(_, _)| false) // We need a different approach
+        .map_or(0, |(row, _)| row);
+    let _ = cursor_row; // Simple scroll: use tab.scroll_offset
+
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(tab.scroll_offset)
+        .take(visible_height)
+        .collect();
+
+    let paragraph = Paragraph::new(visible);
+    frame.render_widget(paragraph, inner);
+}
+
 /// Simple word-wrap: break `text` into lines of at most `width` characters,
 /// splitting on whitespace boundaries.
 fn word_wrap(text: &str, width: usize) -> Vec<String> {
@@ -224,18 +498,25 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::upload_app::ErrorEntry;
     use crossterm::event::KeyCode;
 
     fn make_state_with_errors() -> Arc<Mutex<UploadTuiState>> {
         let mut state = UploadTuiState::new(&["item-a".to_string()]);
-        state.failed_files.push((
-            "item-a/file1.jpg".to_string(),
-            "503 Service Unavailable".to_string(),
-        ));
-        state.failed_files.push((
-            "item-a/file2.jpg".to_string(),
-            "timeout after 30s".to_string(),
-        ));
+        state.failed_files.push(ErrorEntry {
+            file: "item-a/file1.jpg".to_string(),
+            message: "SlowDown: Please slow down".to_string(),
+            timestamp: Instant::now(),
+            resolved: false,
+        });
+        state.failed_files.push(ErrorEntry {
+            file: "item-a/file2.jpg".to_string(),
+            message: "Timeout after 30s".to_string(),
+            timestamp: Instant::now(),
+            resolved: false,
+        });
+        state.error_timestamps.push(Instant::now());
+        state.error_timestamps.push(Instant::now());
         Arc::new(Mutex::new(state))
     }
 
@@ -309,5 +590,46 @@ mod tests {
         tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         // Should be clamped at len-1 = 1
         assert_eq!(tab.cursor, 1);
+    }
+
+    #[test]
+    fn test_error_category_parsing() {
+        use super::super::upload_app::error_category;
+        assert_eq!(error_category("SlowDown: Please slow down"), "SlowDown");
+        assert_eq!(
+            error_category("AccessDenied: Access Denied"),
+            "AccessDenied"
+        );
+        assert_eq!(error_category("HTTP 500: internal"), "HTTP Error");
+        assert_eq!(error_category("timeout after 30s"), "Timeout");
+        assert_eq!(error_category("something weird"), "Other");
+    }
+
+    #[test]
+    fn test_error_histogram() {
+        let start = Instant::now() - std::time::Duration::from_secs(120);
+        let timestamps = vec![
+            start + std::time::Duration::from_secs(10),  // bucket 0
+            start + std::time::Duration::from_secs(30),  // bucket 0
+            start + std::time::Duration::from_secs(70),  // bucket 1
+            start + std::time::Duration::from_secs(130), // bucket 2
+        ];
+        let hist = error_histogram(&timestamps, start);
+        assert!(hist.len() >= 3);
+        assert_eq!(hist[0], 2.0);
+        assert_eq!(hist[1], 1.0);
+        assert_eq!(hist[2], 1.0);
+    }
+
+    #[test]
+    fn test_word_wrap() {
+        let lines = word_wrap("short", 40);
+        assert_eq!(lines, vec!["short"]);
+
+        let lines = word_wrap("this is a longer message that should wrap", 20);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.len() <= 20);
+        }
     }
 }

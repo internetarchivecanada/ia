@@ -12,6 +12,46 @@ use ia_core::upload::{UploadProgress, UploadProgressStatus};
 use super::widgets::ThroughputTracker;
 
 // ---------------------------------------------------------------------------
+// Error tracking
+// ---------------------------------------------------------------------------
+
+/// A single error event tracked by the dashboard.
+#[derive(Debug, Clone)]
+pub struct ErrorEntry {
+    /// File key (e.g., `item-a/file.txt`).
+    pub file: String,
+    /// Human-readable error message (sanitized, no XML).
+    pub message: String,
+    /// When this error occurred.
+    pub timestamp: Instant,
+    /// Whether this file was later uploaded successfully.
+    pub resolved: bool,
+}
+
+/// Extract an error category from the error message for grouping.
+/// Returns the S3 error code if present, or a generic label.
+pub fn error_category(message: &str) -> &str {
+    // S3 errors from single.rs are formatted as "Code: message"
+    if let Some(colon_pos) = message.find(':') {
+        let code = message[..colon_pos].trim();
+        // Only treat it as a code if it looks like a PascalCase identifier
+        if !code.is_empty()
+            && code.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && code.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return code;
+        }
+    }
+    if message.contains("timeout") || message.contains("Timeout") {
+        return "Timeout";
+    }
+    if message.starts_with("HTTP ") {
+        return "HTTP Error";
+    }
+    "Other"
+}
+
+// ---------------------------------------------------------------------------
 // Per-item status
 // ---------------------------------------------------------------------------
 
@@ -131,9 +171,13 @@ pub struct UploadTuiState {
     /// Active file uploads, keyed by `file_key(identifier, key)`.
     pub active_files: HashMap<String, UploadFileProgress>,
     pub completed_files: VecDeque<String>,
-    pub failed_files: Vec<(String, String)>,
+    pub failed_files: Vec<ErrorEntry>,
     pub throughput: ThroughputTracker,
     pub done: bool,
+    /// Error timestamps for the sparkline histogram (errors per minute).
+    pub error_timestamps: Vec<Instant>,
+    /// When the upload session started (for relative time axis).
+    pub session_start: Instant,
 }
 
 impl UploadTuiState {
@@ -179,6 +223,8 @@ impl UploadTuiState {
             failed_files: Vec::new(),
             throughput: ThroughputTracker::new(),
             done: false,
+            error_timestamps: Vec::new(),
+            session_start: Instant::now(),
         }
     }
 
@@ -373,7 +419,14 @@ impl UploadTuiState {
             UploadProgressStatus::Failed => {
                 self.active_files.remove(&fk);
                 self.files_failed += 1;
-                self.failed_files.push((p.key, "upload failed".to_string()));
+                let now = Instant::now();
+                self.error_timestamps.push(now);
+                self.failed_files.push(ErrorEntry {
+                    file: p.key,
+                    message: "upload failed".to_string(),
+                    timestamp: now,
+                    resolved: false,
+                });
             }
         }
 
@@ -750,24 +803,36 @@ fn finalize_item(
                 Ok(results) => {
                     // Backfill real error messages from UploadResults into the
                     // per-file lists (which only had "upload failed" placeholders
-                    // from the progress callback).
+                    // from the progress callback). Also mark resolved errors.
                     for r in results {
-                        if let ia_core::upload::UploadStatus::Failed(msg) = &r.status {
-                            let clean = sanitize_error(msg);
-                            // Update per-item failed_file_names
-                            for (name, err) in &mut s.items[idx].failed_file_names {
-                                if *name == r.key && err == "upload failed" {
-                                    *err = clean.clone();
-                                    break;
+                        match &r.status {
+                            ia_core::upload::UploadStatus::Failed(msg) => {
+                                let clean = sanitize_error(msg);
+                                // Update per-item failed_file_names
+                                for (name, err) in &mut s.items[idx].failed_file_names {
+                                    if *name == r.key && err == "upload failed" {
+                                        *err = clean.clone();
+                                        break;
+                                    }
+                                }
+                                // Update global failed_files
+                                for entry in &mut s.failed_files {
+                                    if entry.file == r.key && entry.message == "upload failed" {
+                                        entry.message = clean.clone();
+                                        break;
+                                    }
                                 }
                             }
-                            // Update global failed_files
-                            for (name, err) in &mut s.failed_files {
-                                if *name == r.key && err == "upload failed" {
-                                    *err = clean.clone();
-                                    break;
+                            ia_core::upload::UploadStatus::Uploaded
+                            | ia_core::upload::UploadStatus::Resumed => {
+                                // Mark any prior error for this file as resolved
+                                for entry in &mut s.failed_files {
+                                    if entry.file == r.key && !entry.resolved {
+                                        entry.resolved = true;
+                                    }
                                 }
                             }
+                            _ => {}
                         }
                     }
 
@@ -1306,7 +1371,7 @@ mod tests {
         ));
         assert_eq!(state.files_failed, 1);
         assert_eq!(state.failed_files.len(), 1);
-        assert_eq!(state.failed_files[0].0, "bad.txt");
+        assert_eq!(state.failed_files[0].file, "bad.txt");
         assert_eq!(state.items[0].files_failed, 1);
         assert!(state
             .active_files
