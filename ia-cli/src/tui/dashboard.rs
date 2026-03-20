@@ -182,6 +182,7 @@ impl Dashboard for MultiTabDashboard {
                             items_total: state.items.len(),
                             files_done: state.files_completed + state.files_skipped,
                             files_total: state.files_total,
+                            files_failed: state.files_failed,
                             bytes_uploaded: state.bytes_uploaded,
                             eta,
                         },

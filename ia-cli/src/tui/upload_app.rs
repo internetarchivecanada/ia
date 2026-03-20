@@ -91,6 +91,8 @@ pub struct UploadItemState {
     pub failed_file_names: Vec<(String, String)>,
     /// All files seen via Verifying events: (name, size).
     pub known_file_names: Vec<(String, u64)>,
+    /// Last file that failed: (name, timestamp) — for temporary flash display.
+    pub last_error_flash: Option<(String, Instant)>,
 }
 
 impl UploadItemState {
@@ -200,6 +202,7 @@ impl UploadTuiState {
                 skipped_file_names: Vec::new(),
                 failed_file_names: Vec::new(),
                 known_file_names: Vec::new(),
+                last_error_flash: None,
             })
             .collect();
 
@@ -328,6 +331,7 @@ impl UploadTuiState {
                 }
                 UploadProgressStatus::Failed => {
                     item.files_failed += 1;
+                    item.last_error_flash = Some((p.key.clone(), Instant::now()));
                     item.failed_file_names
                         .push((p.key.clone(), "upload failed".to_string()));
                     if item.files_total > 0

@@ -589,14 +589,24 @@ fn draw_items_tree(
         let is_drained_paused = is_paused && is_active && !item_has_active_files;
 
         // Status icon + color
+        let has_failures = item.files_failed > 0;
         let (icon, icon_color) = if is_drained_paused {
             ("\u{23f8}", theme.gold) // ⏸ paused
         } else {
             match &item.status {
                 UploadItemStatus::Pending => ("\u{00b7}", theme.text_muted),
-                UploadItemStatus::Verifying => (arrow, arrow_color.unwrap_or(theme.gold)),
-                UploadItemStatus::Uploading => (arrow, arrow_color.unwrap_or(theme.gold)),
-                UploadItemStatus::RateLimited => ("\u{23f8}", theme.gold),
+                UploadItemStatus::Verifying | UploadItemStatus::Uploading => {
+                    let color = if has_failures {
+                        theme.red
+                    } else {
+                        arrow_color.unwrap_or(theme.gold)
+                    };
+                    (arrow, color)
+                }
+                UploadItemStatus::RateLimited => {
+                    let color = if has_failures { theme.red } else { theme.gold };
+                    ("\u{23f8}", color)
+                }
                 UploadItemStatus::Complete => ("\u{2713}", theme.green),
                 UploadItemStatus::Failed(_) => ("\u{2717}", theme.red),
             }
@@ -606,6 +616,19 @@ fn draw_items_tree(
         let files_done = item.files_completed + item.files_skipped + item.files_failed;
         let files_info = if item.files_total > 0 {
             format!("{}/{} files", files_done, item.files_total)
+        } else {
+            String::new()
+        };
+
+        // Failed file count for active items
+        let failed_info = if has_failures
+            && matches!(
+                item.status,
+                UploadItemStatus::Uploading
+                    | UploadItemStatus::Verifying
+                    | UploadItemStatus::RateLimited
+            ) {
+            format!(" \u{00b7} {} failed", item.files_failed)
         } else {
             String::new()
         };
@@ -685,6 +708,7 @@ fn draw_items_tree(
             "{}{}{}{}{}",
             files_info, skipped_info, bytes_info, elapsed_info, status_label
         );
+        // failed_info rendered separately in red (not part of the muted summary)
 
         let base_name_style = Style::default().fg(name_color).add_modifier(name_mod);
         let mut spans = vec![cursor_span, Span::styled(format!("{icon} "), icon_style)];
@@ -702,11 +726,42 @@ fn draw_items_tree(
             spans.push(Span::styled(item.identifier.clone(), base_name_style));
         }
 
-        if !summary.is_empty() {
+        // Temporary error flash: show "✗ filename" in red for 5s after a
+        // file fails, replacing the normal stats to draw attention.
+        let flash_active = item
+            .last_error_flash
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed().as_secs() < 5)
+            && is_active;
+
+        if flash_active {
+            let (name, _) = item.last_error_flash.as_ref().unwrap();
             spans.push(Span::styled(
-                format!("  {summary}"),
-                Style::default().fg(meta_color),
+                format!("  \u{2717} {name}"),
+                Style::default().fg(if is_dimmed {
+                    theme.text_very_muted
+                } else {
+                    theme.red
+                }),
             ));
+        } else {
+            if !summary.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {summary}"),
+                    Style::default().fg(meta_color),
+                ));
+            }
+
+            if !failed_info.is_empty() {
+                spans.push(Span::styled(
+                    failed_info,
+                    Style::default().fg(if is_dimmed {
+                        theme.text_very_muted
+                    } else {
+                        theme.red
+                    }),
+                ));
+            }
         }
 
         // Failed items show the error inline (defensive strip in case raw XML

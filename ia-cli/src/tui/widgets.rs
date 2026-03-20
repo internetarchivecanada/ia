@@ -285,52 +285,6 @@ pub fn draw_key_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
 // Dashboard shared widgets
 // ---------------------------------------------------------------------------
 
-/// Build the decorative header line content.
-#[cfg(test)]
-pub fn build_header_line(
-    command: &str,
-    items: &str,
-    bytes: &str,
-    speed: &str,
-    eta: &str,
-) -> String {
-    format!(
-        "━━━ {} ━━━ {} ━━━ {} ━━━ {} ━━━ {} ━━━",
-        command, items, bytes, speed, eta
-    )
-}
-
-/// Build the S3 status text according to the spec:
-/// - Normal: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N"
-/// - Rate-limited, 0 errors: "⧖ Queued: N   ↻ Running: N   ⏸ rate-limited"
-/// - Rate-limited with errors: "⧖ Queued: N   ↻ Running: N   ✗ Errors: N   ⏸ rate-limited"
-#[cfg(test)]
-pub fn build_s3_status_text(queued: u32, running: u32, errors: u32, rate_limited: bool) -> String {
-    let mut parts = vec![
-        format!("⧖ Queued: {}", queued),
-        format!("↻ Running: {}", running),
-    ];
-    if rate_limited && errors == 0 {
-        parts.push("⏸ rate-limited".to_string());
-    } else {
-        parts.push(format!("✗ Errors: {}", errors));
-        if rate_limited {
-            parts.push("⏸ rate-limited".to_string());
-        }
-    }
-    parts.join("   ")
-}
-
-/// Data needed to render the header bar.
-pub struct HeaderData<'a> {
-    pub command: &'a str,
-    pub items_done: usize,
-    pub items_total: usize,
-    pub bytes: &'a str,
-    pub speed: &'a str,
-    pub eta: &'a str,
-}
-
 /// Data needed to render the S3 tasks panel.
 pub struct S3PanelData {
     pub queued: u32,
@@ -341,25 +295,16 @@ pub struct S3PanelData {
     pub seconds_ago: u64,
 }
 
-/// Render the decorative header bar (centered ━━━ line with stats).
-pub fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme, data: &HeaderData<'_>) {
+/// Render a simplified header bar with only the command label centered.
+pub fn draw_simple_header(frame: &mut Frame, area: Rect, theme: &Theme, command: &str) {
     use ratatui::layout::Alignment;
 
-    let items_str = format!("{}/{} items", data.items_done, data.items_total);
     let spans = vec![
         Span::styled("━━━ ", Style::default().fg(theme.maroon_bright)),
         Span::styled(
-            data.command,
+            command,
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(&items_str, Style::default().fg(theme.green)),
-        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(data.bytes, Style::default().fg(theme.text_secondary)),
-        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(data.speed, Style::default().fg(theme.maroon_bright)),
-        Span::styled(" ━━━ ", Style::default().fg(theme.maroon_bright)),
-        Span::styled(data.eta, Style::default().fg(theme.text_secondary)),
         Span::styled(" ━━━", Style::default().fg(theme.maroon_bright)),
     ];
     let header = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
@@ -392,73 +337,6 @@ pub fn draw_tab_bar(frame: &mut Frame, area: Rect, theme: &Theme, active: TabId)
     }
     let bar = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     frame.render_widget(bar, area);
-}
-
-/// Render the S3 Tasks panel (used on Upload tab and Tasks tab).
-pub fn draw_s3_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &S3PanelData) {
-    let title_line = Line::from(vec![Span::styled(
-        " S3 Tasks ",
-        Style::default().fg(theme.maroon_bright),
-    )]);
-    let global_line = Line::from(vec![Span::styled(
-        format!("Global: {} ", data.global_count),
-        Style::default().fg(theme.text_muted),
-    )]);
-    let bottom_line = Line::from(vec![Span::styled(
-        format!(" polled {}s ago ", data.seconds_ago),
-        Style::default().fg(theme.text_very_muted),
-    )]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .title_top(title_line.left_aligned())
-        .title_top(global_line.right_aligned())
-        .title_bottom(bottom_line.left_aligned());
-
-    let mut spans = vec![
-        Span::styled("⧖ Queued: ", Style::default().fg(theme.text_secondary)),
-        Span::styled(
-            format!("{}", data.queued),
-            Style::default().fg(theme.gold).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled("↻ Running: ", Style::default().fg(theme.text_secondary)),
-        Span::styled(
-            format!("{}", data.running),
-            Style::default().fg(theme.blue).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-    ];
-
-    if data.rate_limited && data.errors == 0 {
-        spans.push(Span::styled(
-            "⏸ rate-limited",
-            Style::default().fg(theme.gold),
-        ));
-    } else {
-        spans.push(Span::styled(
-            "✗ Errors: ",
-            Style::default().fg(theme.text_secondary),
-        ));
-        spans.push(Span::styled(
-            format!("{}", data.errors),
-            Style::default().fg(if data.errors > 0 {
-                theme.red
-            } else {
-                theme.text_secondary
-            }),
-        ));
-        if data.rate_limited {
-            spans.push(Span::raw("   "));
-            spans.push(Span::styled(
-                "⏸ rate-limited",
-                Style::default().fg(theme.gold),
-            ));
-        }
-    }
-
-    let content = Paragraph::new(Line::from(spans)).block(block);
-    frame.render_widget(content, area);
 }
 
 /// Render context-sensitive key hints in the footer.
@@ -553,6 +431,7 @@ pub struct ProgressPanelData {
     pub items_total: usize,
     pub files_done: usize,
     pub files_total: usize,
+    pub files_failed: usize,
     pub bytes_uploaded: u64,
     pub eta: String,
 }
@@ -576,14 +455,20 @@ pub fn draw_progress_panel(frame: &mut Frame, area: Rect, theme: &Theme, data: &
 
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
-    // Top row: items + files
+    // Top row: items + files + failed
     let items_str = format!("◫ {}/{} items", data.items_done, data.items_total);
     let files_str = format!("  ≡ {}/{} files", data.files_done, data.files_total);
-    let top = Line::from(vec![
+    let mut top_spans = vec![
         Span::styled(items_str, Style::default().fg(theme.green)),
         Span::styled(files_str, Style::default().fg(theme.blue)),
-    ]);
-    frame.render_widget(Paragraph::new(top), rows[0]);
+    ];
+    if data.files_failed > 0 {
+        top_spans.push(Span::styled(
+            format!("  \u{2717} {} failed", data.files_failed),
+            Style::default().fg(theme.red),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(top_spans)), rows[0]);
 
     // Bottom row: bytes + ETA
     let bytes_str = format!("↑ {}", format_bytes(data.bytes_uploaded));
@@ -736,43 +621,25 @@ pub fn draw_split_sparkline(
     let bar_width = total_width.saturating_sub(label_width);
     let left_width = bar_width / 2;
     let right_width = bar_width - left_width;
+    let total_bars = left_width + right_width;
 
     // Find max for scaling
     let max = history.iter().copied().fold(0.0_f64, f64::max);
 
-    // Build left and right bar strings from history
+    // Take the most recent entries that fit, pad left with spaces so data
+    // appears at the right edge first and fills leftward as history grows.
     let hist: Vec<f64> = history.iter().copied().collect();
-    let hist_len = hist.len();
+    let take = total_bars.min(hist.len());
+    let pad = total_bars.saturating_sub(take);
 
-    let left_chars: String = if hist_len >= left_width {
-        // Take the most recent `left_width + right_width` entries, split in half
-        let start = hist_len.saturating_sub(left_width + right_width);
-        hist[start..start + left_width]
-            .iter()
-            .map(|v| spark_char(*v, max))
-            .collect()
-    } else if hist_len > 0 {
-        let take = left_width.min(hist_len);
-        let pad = left_width - take;
-        let chars: String = hist[..take].iter().map(|v| spark_char(*v, max)).collect();
-        format!("{}{}", " ".repeat(pad), chars)
-    } else {
-        " ".repeat(left_width)
-    };
+    let mut all_chars: String = " ".repeat(pad);
+    let start = hist.len().saturating_sub(take);
+    for v in &hist[start..] {
+        all_chars.push(spark_char(*v, max));
+    }
 
-    let right_chars: String = if hist_len >= left_width + right_width {
-        let start = hist_len.saturating_sub(right_width);
-        hist[start..].iter().map(|v| spark_char(*v, max)).collect()
-    } else if hist_len > left_width {
-        let start = left_width.min(hist_len);
-        hist[start..]
-            .iter()
-            .map(|v| spark_char(*v, max))
-            .collect::<String>()
-            + &" ".repeat(right_width.saturating_sub(hist_len - start))
-    } else {
-        " ".repeat(right_width)
-    };
+    let left_chars: String = all_chars.chars().take(left_width).collect();
+    let right_chars: String = all_chars.chars().skip(left_width).collect();
 
     let label_padded = format!("  {}  ", speed_label);
 
@@ -936,36 +803,6 @@ mod tests {
     }
 
     // -- Dashboard shared widgets ---------------------------------------------
-
-    #[test]
-    fn test_build_header_line() {
-        let line = build_header_line("ia upload", "3/10 items", "4.2 GB", "12.5 MB/s", "ETA 28m");
-        assert!(line.contains("ia upload"));
-        assert!(line.contains("3/10 items"));
-    }
-
-    #[test]
-    fn test_build_s3_status_text_normal() {
-        let text = build_s3_status_text(23, 4, 0, false);
-        assert!(text.contains("23"));
-        assert!(text.contains("4"));
-        assert!(text.contains("Errors: 0"));
-        assert!(!text.contains("rate-limited"));
-    }
-
-    #[test]
-    fn test_build_s3_status_text_rate_limited_no_errors() {
-        let text = build_s3_status_text(23, 4, 0, true);
-        assert!(text.contains("rate-limited"));
-        assert!(!text.contains("Errors"));
-    }
-
-    #[test]
-    fn test_build_s3_status_text_rate_limited_with_errors() {
-        let text = build_s3_status_text(23, 4, 2, true);
-        assert!(text.contains("rate-limited"));
-        assert!(text.contains("Errors: 2"));
-    }
 
     // -- split sparkline ------------------------------------------------------
 
