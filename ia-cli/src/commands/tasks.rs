@@ -360,13 +360,20 @@ async fn run_list(client: &IaClient, args: &TasksArgs, quiet: u8) -> Result<()> 
         extra_params,
     };
 
-    // If bare `ia tasks` (no identifier, no submitter override), get user email
-    // Auto-fill submitter when bare `ia tasks` (no identifier, no task_id)
+    // If bare `ia tasks` (no identifier, no submitter override), get user email from config
     let query = if !has_identifier && query.task_id.is_none() && query.submitter.is_none() {
-        let account = ia_core::auth::whoami(client).await?;
-        TasksQuery {
-            submitter: Some(account.email),
-            ..query
+        let email = client
+            .config()
+            .cookies
+            .get("logged-in-user")
+            .map(|e| urlencoding::decode(e).unwrap_or_default().into_owned())
+            .filter(|e| !e.is_empty());
+        match email {
+            Some(email) => TasksQuery {
+                submitter: Some(email),
+                ..query
+            },
+            None => bail!("could not determine your email address; run `ia config login` to configure authentication"),
         }
     } else {
         query
