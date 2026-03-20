@@ -186,7 +186,8 @@ async fn main() -> Result<()> {
     // Initialize logging
     // Suppress tracing output during dashboard mode to prevent stderr writes
     // from interfering with the raw-mode TUI (causes diagonal scrolling text).
-    let dashboard_active = matches!(&cli.command, Commands::Download(ref args) if args.dashboard);
+    let dashboard_active = matches!(&cli.command, Commands::Download(ref args) if args.dashboard)
+        || matches!(&cli.command, Commands::Upload(ref args) if args.dashboard);
     let log_level = if dashboard_active {
         "off"
     } else if cli.debug {

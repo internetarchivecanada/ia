@@ -55,6 +55,7 @@ impl MultiTabDashboard {
         paused: Arc<AtomicBool>,
     ) -> Self {
         let theme = Theme::detect();
+        let upload_tab = UploadTab::new(upload_state.clone(), s3_state.clone(), paused.clone());
         Self {
             active_tab: TabId::Upload,
             show_help: false,
@@ -64,7 +65,7 @@ impl MultiTabDashboard {
             s3_state: s3_state.clone(),
             refresh_notify,
             paused,
-            upload_tab: UploadTab::new(upload_state.clone(), s3_state.clone()),
+            upload_tab,
             tasks_tab: TasksTab::new(s3_state.clone()),
             log_tab: LogTab::new(joblog_state),
             errors_tab: ErrorsTab::new(upload_state, s3_state),
@@ -74,6 +75,7 @@ impl MultiTabDashboard {
     /// Check if the active tab is in a mode that consumes all input (e.g., search).
     fn is_tab_consuming_input(&self) -> bool {
         match self.active_tab {
+            TabId::Upload => self.upload_tab.search.is_active(),
             TabId::Tasks => self.tasks_tab.search.is_active(),
             TabId::Log => self.log_tab.search.is_active(),
             _ => false,
@@ -122,53 +124,78 @@ impl Dashboard for MultiTabDashboard {
             }
         }
 
-        // Draw header
-        let Ok(state) = self.upload_state.lock() else {
-            return;
-        };
-        let items_done = state
-            .items
-            .iter()
-            .filter(|i| matches!(i.status, UploadItemStatus::Complete))
-            .count();
-        let items_total = state.items.len();
-        let bytes = widgets::format_bytes(state.bytes_uploaded);
-        let speed = format!(
-            "{}/s",
-            widgets::format_bytes(state.throughput.throughput() as u64)
-        );
-        let eta = widgets::format_eta(
-            state.bytes_total.saturating_sub(state.bytes_uploaded),
-            state.throughput.throughput(),
-        );
-        drop(state);
-
+        // Draw header — command label only (stats are in the Progress pane).
         let is_paused = self.paused.load(Ordering::Relaxed);
         let command_label = if is_paused {
             "ia upload \u{23f8} PAUSED"
         } else {
             "ia upload"
         };
-        widgets::draw_header(
-            frame,
-            chunks[0],
-            &self.theme,
-            &widgets::HeaderData {
-                command: command_label,
-                items_done,
-                items_total,
-                bytes: &bytes,
-                speed: &speed,
-                eta: &eta,
-            },
-        );
+        widgets::draw_simple_header(frame, chunks[0], &self.theme, command_label);
         widgets::draw_tab_bar(frame, chunks[1], &self.theme, self.active_tab);
 
-        // Draw active tab content
+        // Draw active tab content.
+        // Upload and Tasks tabs get shared S3+Progress panes above their content.
         use super::tab::TabView;
         match self.active_tab {
-            TabId::Upload => self.upload_tab.draw(frame, chunks[3], &self.theme),
-            TabId::Tasks => self.tasks_tab.draw(frame, chunks[3], &self.theme),
+            TabId::Upload | TabId::Tasks => {
+                // Split content area: top panes (4 rows) + tab content (fill).
+                let content_chunks =
+                    Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(chunks[3]);
+
+                // S3 Tasks (left 50%) + Progress (right 50%)
+                let top_panes =
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(content_chunks[0]);
+
+                if let Ok(s3) = self.s3_state.lock() {
+                    widgets::draw_compact_s3_panel(
+                        frame,
+                        top_panes[0],
+                        &self.theme,
+                        &widgets::S3PanelData {
+                            queued: s3.queued,
+                            running: s3.running,
+                            errors: s3.errors,
+                            global_count: s3.global_count,
+                            rate_limited: s3.is_rate_limited,
+                            seconds_ago: s3.seconds_since_poll(),
+                        },
+                    );
+                }
+
+                if let Ok(state) = self.upload_state.lock() {
+                    let eta = widgets::format_eta(
+                        state.bytes_total.saturating_sub(state.bytes_uploaded),
+                        state.throughput.throughput(),
+                    );
+                    widgets::draw_progress_panel(
+                        frame,
+                        top_panes[1],
+                        &self.theme,
+                        &widgets::ProgressPanelData {
+                            items_done: state
+                                .items
+                                .iter()
+                                .filter(|i| matches!(i.status, UploadItemStatus::Complete))
+                                .count(),
+                            items_total: state.items.len(),
+                            files_done: state.files_completed + state.files_skipped,
+                            files_total: state.files_total,
+                            files_failed: state.files_failed,
+                            bytes_uploaded: state.bytes_uploaded,
+                            eta,
+                        },
+                    );
+                }
+
+                // Pass remaining area to the tab.
+                match self.active_tab {
+                    TabId::Upload => self.upload_tab.draw(frame, content_chunks[1], &self.theme),
+                    TabId::Tasks => self.tasks_tab.draw(frame, content_chunks[1], &self.theme),
+                    _ => unreachable!(),
+                }
+            }
             TabId::Log => self.log_tab.draw(frame, chunks[3], &self.theme),
             TabId::Errors => self.errors_tab.draw(frame, chunks[3], &self.theme),
         }
@@ -383,6 +410,28 @@ mod tests {
 
         // Escape exits search, then q quits
         d.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(d.quit_requested());
+    }
+
+    #[test]
+    fn test_upload_search_mode_blocks_global_keys() {
+        let mut d = make_dashboard();
+        // On Upload tab, activate search
+        assert_eq!(d.active_tab, TabId::Upload);
+        d.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+
+        // '2' should go to search input, not switch tabs
+        d.handle_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(d.active_tab, TabId::Upload);
+
+        // 'q' should go to search, not quit
+        d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!d.quit_requested());
+
+        // Escape exits search
+        d.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        // Now q should quit
         d.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(d.quit_requested());
     }

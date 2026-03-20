@@ -57,6 +57,34 @@ impl S3Error {
     }
 }
 
+/// Strip XML/HTML tags and collapse whitespace so raw S3 response bodies
+/// don't leak through to user-facing error messages.
+///
+/// ```
+/// use ia_core::upload::s3_error::strip_xml;
+/// assert_eq!(strip_xml("<Error><Code>Oops</Code></Error>"), "Oops");
+/// assert_eq!(strip_xml("plain text"), "plain text");
+/// ```
+#[must_use]
+pub fn strip_xml(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +193,25 @@ mod tests {
             };
             assert!(!err.is_retryable(), "{code} should NOT be retryable");
         }
+    }
+
+    #[test]
+    fn strip_xml_removes_tags() {
+        let xml = r#"<?xml version='1.0'?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"#;
+        assert_eq!(strip_xml(xml), "AccessDenied Access Denied");
+    }
+
+    #[test]
+    fn strip_xml_plain_text_unchanged() {
+        assert_eq!(strip_xml("plain text"), "plain text");
+        assert_eq!(
+            strip_xml("HTTP 500: server error"),
+            "HTTP 500: server error"
+        );
+    }
+
+    #[test]
+    fn strip_xml_collapses_whitespace() {
+        assert_eq!(strip_xml("  lots   of   space  "), "lots of space");
     }
 }
