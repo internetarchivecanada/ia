@@ -40,7 +40,10 @@ pub fn help_content(tab: TabId) -> String {
             "\n\
              Tasks:\n\
              \x20 j/k     Scroll task list\n\
+             \x20 G       Jump to end\n\
+             \x20 gg      Jump to top\n\
              \x20 /       Search by identifier\n\
+             \x20 Esc     Clear search\n\
              \x20 Enter   Open task log\n"
         }
         TabId::Log => {
@@ -50,12 +53,15 @@ pub fn help_content(tab: TabId) -> String {
              \x20 G       Jump to end\n\
              \x20 gg      Jump to top\n\
              \x20 /       Search\n\
+             \x20 Esc     Clear search\n\
              \x20 f       Filter by status\n"
         }
         TabId::Errors => {
             "\n\
              Errors:\n\
              \x20 j/k     Scroll errors\n\
+             \x20 G       Jump to end\n\
+             \x20 gg      Jump to top\n\
              \x20 Enter   Expand/collapse detail\n"
         }
     };

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -29,6 +29,8 @@ pub struct ErrorsTab {
     /// Which error row is expanded inline to show full error text.
     pub expanded: Option<usize>,
     scroll_offset: usize,
+    pub pending_g: bool,
+    pending_g_at: Instant,
 }
 
 impl ErrorsTab {
@@ -42,6 +44,8 @@ impl ErrorsTab {
             cursor: 0,
             expanded: None,
             scroll_offset: 0,
+            pending_g: false,
+            pending_g_at: Instant::now(),
         }
     }
 
@@ -156,20 +160,42 @@ impl TabView for ErrorsTab {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) -> bool {
+    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         let count = self.error_count();
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
+                self.pending_g = false;
                 if count > 0 {
                     self.cursor = (self.cursor + 1).min(count.saturating_sub(1));
                 }
                 true
             }
             KeyCode::Char('k') | KeyCode::Up => {
+                self.pending_g = false;
                 self.cursor = self.cursor.saturating_sub(1);
                 true
             }
+            KeyCode::Char('G') if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pending_g = false;
+                if count > 0 {
+                    self.cursor = count - 1;
+                }
+                true
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g && self.pending_g_at.elapsed() < Duration::from_millis(500) {
+                    // gg: jump to top
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
+                    self.pending_g = false;
+                } else {
+                    self.pending_g = true;
+                    self.pending_g_at = Instant::now();
+                }
+                true
+            }
             KeyCode::Enter => {
+                self.pending_g = false;
                 if self.expanded == Some(self.cursor) {
                     self.expanded = None;
                 } else {
@@ -178,20 +204,28 @@ impl TabView for ErrorsTab {
                 true
             }
             KeyCode::Esc => {
+                self.pending_g = false;
                 self.expanded = None;
                 true
             }
-            _ => false,
+            _ => {
+                self.pending_g = false;
+                false
+            }
         }
     }
 
     fn tick(&mut self) {
-        // No-op: errors are updated via shared state from the upload workers.
+        if self.pending_g && self.pending_g_at.elapsed() > Duration::from_millis(500) {
+            self.pending_g = false;
+        }
     }
 
     fn key_hints(&self) -> Vec<(&str, &str)> {
         vec![
             ("j/k", "scroll"),
+            ("G", "end"),
+            ("gg", "top"),
             ("Enter", "expand"),
             ("?", "help"),
             ("q", "quit"),
@@ -622,5 +656,30 @@ mod tests {
         for line in &lines {
             assert!(line.len() <= 20);
         }
+    }
+
+    #[test]
+    fn test_jump_to_end() {
+        let mut tab = ErrorsTab::new(
+            make_state_with_errors(),
+            Arc::new(Mutex::new(S3TaskState::new())),
+        );
+        tab.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(tab.cursor, 1);
+    }
+
+    #[test]
+    fn test_gg_jump_to_top() {
+        let mut tab = ErrorsTab::new(
+            make_state_with_errors(),
+            Arc::new(Mutex::new(S3TaskState::new())),
+        );
+        tab.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(tab.cursor, 1);
+        tab.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert!(tab.pending_g);
+        tab.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 0);
+        assert!(!tab.pending_g);
     }
 }

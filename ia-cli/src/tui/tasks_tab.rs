@@ -4,7 +4,7 @@
 //! table, and vim-style search filtering.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,6 +26,8 @@ pub struct TasksTab {
     pub search: SearchState,
     pub cursor: usize,
     scroll_offset: usize,
+    pub pending_g: bool,
+    pending_g_at: Instant,
     /// A URL opened via Enter, shown in the footer for 5 seconds.
     status_message: Option<(String, Instant)>,
 }
@@ -37,6 +39,8 @@ impl TasksTab {
             search: SearchState::new(),
             cursor: 0,
             scroll_offset: 0,
+            pending_g: false,
+            pending_g_at: Instant::now(),
             status_message: None,
         }
     }
@@ -172,24 +176,58 @@ impl TabView for TasksTab {
         }
 
         // Normal mode.
-        let _ = modifiers; // reserved for future shift/ctrl combos
         match code {
-            KeyCode::Char('j') => {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.pending_g = false;
                 let len = self.task_count();
                 if len > 0 && self.cursor < len - 1 {
                     self.cursor += 1;
                 }
                 true
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.pending_g = false;
                 self.cursor = self.cursor.saturating_sub(1);
                 true
             }
+            KeyCode::Char('G') if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pending_g = false;
+                let len = self.task_count();
+                if len > 0 {
+                    self.cursor = len - 1;
+                }
+                true
+            }
+            KeyCode::Char('g') => {
+                if self.pending_g && self.pending_g_at.elapsed() < Duration::from_millis(500) {
+                    // gg: jump to top
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
+                    self.pending_g = false;
+                } else {
+                    self.pending_g = true;
+                    self.pending_g_at = Instant::now();
+                }
+                true
+            }
             KeyCode::Char('/') => {
+                self.pending_g = false;
                 self.search.activate();
                 true
             }
+            KeyCode::Esc => {
+                self.pending_g = false;
+                // Clear confirmed search filter.
+                if !self.search.query().is_empty() {
+                    self.search.cancel();
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
+                    return true;
+                }
+                false
+            }
             KeyCode::Enter => {
+                self.pending_g = false;
                 // Open the selected task's log on archive.org.
                 // Also store the URL in status_message for 5 seconds so it's
                 // visible on headless systems where open::that() fails silently.
@@ -209,7 +247,10 @@ impl TabView for TasksTab {
                 }
                 true
             }
-            _ => false,
+            _ => {
+                self.pending_g = false;
+                false
+            }
         }
     }
 
@@ -220,6 +261,10 @@ impl TabView for TasksTab {
                 self.status_message = None;
             }
         }
+
+        if self.pending_g && self.pending_g_at.elapsed() > Duration::from_millis(500) {
+            self.pending_g = false;
+        }
     }
 
     fn status_text(&self) -> Option<&str> {
@@ -229,6 +274,8 @@ impl TabView for TasksTab {
     fn key_hints(&self) -> Vec<(&str, &str)> {
         vec![
             ("j/k", "scroll"),
+            ("G", "end"),
+            ("gg", "top"),
             ("/", "search"),
             ("Enter", "task log"),
             ("?", "help"),
@@ -339,5 +386,49 @@ mod tests {
         assert!(tab.status_text().is_some());
         tab.tick();
         assert!(tab.status_text().is_none());
+    }
+
+    #[test]
+    fn test_jump_to_end() {
+        let mut tab = TasksTab::new(make_s3_state());
+        tab.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(tab.cursor, 2);
+    }
+
+    #[test]
+    fn test_gg_jump_to_top() {
+        let mut tab = TasksTab::new(make_s3_state());
+        // Move to end first
+        tab.handle_key(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(tab.cursor, 2);
+        // gg to top
+        tab.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert!(tab.pending_g);
+        tab.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 0);
+        assert!(!tab.pending_g);
+    }
+
+    #[test]
+    fn test_esc_clears_confirmed_search() {
+        let mut tab = TasksTab::new(make_s3_state());
+        // Activate search, type, confirm
+        tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!tab.search.is_active());
+        assert_eq!(tab.search.query(), "a");
+        // Esc in normal mode clears the confirmed search
+        tab.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(tab.search.query().is_empty());
+    }
+
+    #[test]
+    fn test_arrow_keys() {
+        let mut tab = TasksTab::new(make_s3_state());
+        tab.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 1);
+        tab.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 0);
     }
 }

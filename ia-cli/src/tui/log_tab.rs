@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -106,27 +106,39 @@ impl TabView for LogTab {
             " Job Log ".to_string()
         };
 
-        // Reserve 1 line for header, 1 for search input (if active), 1 for borders top, 1 for borders bottom.
+        // Layout: log table (fill), optional search bar (1 row).
+        let show_search = self.search.is_active() || !self.search.query().is_empty();
+        let search_height = if show_search { 1 } else { 0 };
+        let chunks =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(search_height)]).split(area);
+
+        // Reserve lines for borders + header inside the block.
         let border_lines = 2; // top + bottom border
         let header_lines = 1;
-        let search_lines = if self.search.is_active() { 1 } else { 0 };
-        let viewport_height = (area.height as usize)
+        let viewport_height = (chunks[0].height as usize)
             .saturating_sub(border_lines)
-            .saturating_sub(header_lines)
-            .saturating_sub(search_lines);
+            .saturating_sub(header_lines);
+
+        // Clamp cursor to visible range before computing scroll.
+        let clamped_cursor = if total == 0 {
+            0
+        } else {
+            self.cursor.min(total - 1)
+        };
 
         // Compute scroll window.
-        let scroll_offset = if self.cursor < self.scroll_offset {
-            self.cursor
-        } else if self.cursor >= self.scroll_offset + viewport_height {
-            self.cursor
-                .saturating_sub(viewport_height.saturating_sub(1))
+        let scroll_offset = if viewport_height == 0 {
+            0
+        } else if clamped_cursor < self.scroll_offset {
+            clamped_cursor
+        } else if clamped_cursor >= self.scroll_offset + viewport_height {
+            clamped_cursor.saturating_sub(viewport_height - 1)
         } else {
             self.scroll_offset
         };
 
         let end = (scroll_offset + viewport_height).min(total);
-        let start = scroll_offset;
+        let start = scroll_offset.min(end);
 
         // Build lines.
         let mut lines = Vec::new();
@@ -162,7 +174,7 @@ impl TabView for LogTab {
         // Data rows.
         for (idx, &entry_idx) in visible.iter().enumerate().skip(start).take(end - start) {
             let entry = &state.entries[entry_idx];
-            let is_cursor = idx == self.cursor;
+            let is_cursor = idx == clamped_cursor;
 
             let (status_text, status_color) = match entry.display_status {
                 LogStatus::Uploaded => ("\u{2713} uploaded", theme.green),
@@ -193,18 +205,6 @@ impl TabView for LogTab {
             ]));
         }
 
-        // Search input line.
-        if self.search.is_active() {
-            lines.push(Line::from(vec![
-                Span::styled("/", Style::default().fg(theme.gold)),
-                Span::styled(
-                    self.search.query().to_string(),
-                    Style::default().fg(theme.text),
-                ),
-                Span::styled("\u{2588}", Style::default().fg(theme.gold)),
-            ]));
-        }
-
         // Bottom border content: entry count + position indicator.
         let position_info = if total > 0 {
             format!(" {} entries \u{2502} showing {}-{} ", total, start + 1, end)
@@ -219,7 +219,33 @@ impl TabView for LogTab {
             .border_style(Style::default().fg(theme.border));
 
         let paragraph = Paragraph::new(lines).block(block);
-        frame.render_widget(paragraph, area);
+        frame.render_widget(paragraph, chunks[0]);
+
+        // Search bar rendered in its own area (separate from the Paragraph).
+        if self.search.is_active() {
+            let search_line = Line::from(vec![
+                Span::styled("/", Style::default().fg(theme.gold)),
+                Span::styled(
+                    self.search.query().to_string(),
+                    Style::default().fg(theme.text),
+                ),
+                Span::styled("\u{2588}", Style::default().fg(theme.gold)),
+            ]);
+            frame.render_widget(Paragraph::new(search_line), chunks[1]);
+        } else if !self.search.query().is_empty() {
+            let search_line = Line::from(vec![
+                Span::styled("/", Style::default().fg(theme.text_muted)),
+                Span::styled(
+                    self.search.query().to_string(),
+                    Style::default().fg(theme.text_muted),
+                ),
+                Span::styled(
+                    format!("  ({} matches)", total),
+                    Style::default().fg(theme.text_very_muted),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(search_line), chunks[1]);
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -228,20 +254,28 @@ impl TabView for LogTab {
             match code {
                 KeyCode::Char(c) => {
                     self.search.push(c);
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
                     self.invalidate_cache();
                     return true;
                 }
                 KeyCode::Backspace => {
                     self.search.backspace();
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
                     self.invalidate_cache();
                     return true;
                 }
                 KeyCode::Enter => {
                     self.search.confirm();
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
                     return true;
                 }
                 KeyCode::Esc => {
                     self.search.cancel();
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
                     self.invalidate_cache();
                     return true;
                 }
@@ -258,14 +292,14 @@ impl TabView for LogTab {
         };
 
         match code {
-            KeyCode::Char('j') => {
+            KeyCode::Char('j') | KeyCode::Down => {
                 self.pending_g = false;
                 if entry_count > 0 && self.cursor < entry_count - 1 {
                     self.cursor += 1;
                 }
                 true
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('k') | KeyCode::Up => {
                 self.pending_g = false;
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -283,6 +317,7 @@ impl TabView for LogTab {
                 if self.pending_g && self.pending_g_at.elapsed() < Duration::from_millis(500) {
                     // gg: jump to top
                     self.cursor = 0;
+                    self.scroll_offset = 0;
                     self.pending_g = false;
                 } else {
                     self.pending_g = true;
@@ -293,6 +328,7 @@ impl TabView for LogTab {
             KeyCode::Char('/') => {
                 self.pending_g = false;
                 self.search.activate();
+                self.invalidate_cache();
                 true
             }
             KeyCode::Char('f') => {
@@ -306,8 +342,20 @@ impl TabView for LogTab {
                 };
                 // Reset cursor when filter changes.
                 self.cursor = 0;
+                self.scroll_offset = 0;
                 self.invalidate_cache();
                 true
+            }
+            KeyCode::Esc => {
+                // Clear confirmed search filter.
+                if !self.search.query().is_empty() {
+                    self.search.cancel();
+                    self.cursor = 0;
+                    self.scroll_offset = 0;
+                    self.invalidate_cache();
+                    return true;
+                }
+                false
             }
             _ => {
                 self.pending_g = false;
@@ -463,5 +511,53 @@ mod tests {
             let visible = tab.visible_entries(&s);
             assert_eq!(visible.len(), 2, "search + filter should intersect");
         }
+    }
+
+    #[test]
+    fn test_search_resets_cursor() {
+        let (state, _path) = make_joblog_state();
+        let mut tab = LogTab::new(state);
+        // Move cursor down
+        for _ in 0..5 {
+            tab.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        }
+        assert_eq!(tab.cursor, 5);
+        // Start search — cursor should reset when typing
+        tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 0);
+    }
+
+    #[test]
+    fn test_esc_clears_confirmed_search() {
+        let (state, _path) = make_mixed_joblog();
+        let mut tab = LogTab::new(state.clone());
+        // Search and confirm
+        tab.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        tab.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(tab.search.query(), "nasa");
+        // Esc in normal mode should clear the search
+        tab.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(tab.search.query().is_empty());
+        // All entries should be visible again
+        {
+            let s = state.lock().unwrap();
+            let visible = tab.visible_entries(&s);
+            assert_eq!(visible.len(), 6);
+        }
+    }
+
+    #[test]
+    fn test_arrow_keys() {
+        let (state, _path) = make_joblog_state();
+        let mut tab = LogTab::new(state);
+        tab.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 1);
+        tab.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(tab.cursor, 0);
     }
 }
