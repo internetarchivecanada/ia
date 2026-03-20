@@ -734,8 +734,15 @@ fn draw_items_tree(
         if show_files {
             let files = state.files_for_item(&item.identifier);
             for file in &files {
-                // Auto-expanded: only show active files (skip completed/skipped/pending)
-                if is_auto_expanded && !matches!(file.status, FileDisplayStatus::Active) {
+                // Auto-expanded: show active + completed/failed files (skip pending/skipped).
+                // Keeping completed files visible prevents row jumping when a file finishes
+                // and the next one starts.
+                if is_auto_expanded
+                    && matches!(
+                        file.status,
+                        FileDisplayStatus::Pending | FileDisplayStatus::Skipped
+                    )
+                {
                     continue;
                 }
 
