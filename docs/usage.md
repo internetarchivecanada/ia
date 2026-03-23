@@ -430,6 +430,63 @@ The resume mechanism reads the joblog at startup and builds a set of `(identifie
 
 Use `ia status --joblog upload.jsonl` to see a summary of completed, failed, and skipped files.
 
+### `ia verify`
+
+Verify that local files exist on archive.org with matching checksums. Exits non-zero if any file can't be verified. Alias: `ia ve`.
+
+```bash
+# Verify specific files
+ia verify my-item file1.pdf file2.pdf
+
+# Verify a directory
+ia verify my-item ./local-files/
+
+# Verify using pre-computed checksums (no local files needed)
+ia verify my-item --checksum-file md5sums.txt
+
+# Use SHA-1 instead of MD5
+ia verify my-item ./files/ --checksum-type sha1
+
+# Require exact filename match (default: hash-only)
+ia verify my-item ./files/ --match-names
+
+# Filter remote files to match against
+ia verify my-item ./files/ --glob '*.pdf'
+ia verify my-item ./files/ --source original
+
+# Batch verify from upload spreadsheet
+ia verify --spreadsheet upload.csv
+
+# Gate a script on verification
+ia verify my-item ./files/ -q && ./post-upload.sh
+```
+
+#### Verification modes
+
+**Hash-only (default):** For each local file, computes its hash and searches for *any* remote file with a matching hash. Reports the matched remote filename if it differs from the local name. This mode answers "is my content on archive.org?"
+
+**Match-names (`--match-names`):** Finds the remote file by name, then compares hashes. Reports `mismatch` if the name matches but hashes differ, `missing` if no remote file has that name. Use this when filename accuracy matters.
+
+#### Hash algorithms
+
+Supports `md5` (default), `sha1`, and `crc32` via `--checksum-type`. When using `--checksum-file`, the algorithm is auto-detected from hash length (32 chars = MD5, 40 chars = SHA-1). CRC32 in GNU format requires explicit `--checksum-type crc32` due to length ambiguity.
+
+Checksum files support both GNU (`hash  filename`) and BSD (`ALG (filename) = hash`) formats.
+
+#### Spreadsheet mode
+
+`--spreadsheet` accepts the same CSV/TSV/XLSX/ODS/JSONL format as `ia upload import`. Requires `identifier` and `file` columns. Optional hash columns (`md5`, `sha1`, `crc32`) skip local file hashing. Other columns are ignored.
+
+```bash
+# Same spreadsheet used for upload works for verification
+ia upload import upload.csv
+ia verify --spreadsheet upload.csv
+```
+
+#### Output modes
+
+Console (default) shows per-file status with icons, JSON (`--json`) outputs JSONL, and quiet (`-q`) suppresses output for scripting. Exit code is always 0 (all verified) or 1 (any failure).
+
 ### `ia tasks`
 
 Manage Internet Archive catalog tasks: list, submit, view logs, rerun failed tasks, and check rate limits. Alias: `ia ta`.

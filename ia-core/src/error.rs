@@ -1,28 +1,7 @@
 use serde::Serialize;
 use std::path::PathBuf;
 
-/// Format a byte count as a human-readable string (e.g., `"1.5 MiB"`).
-///
-/// Used in error messages so users see friendly sizes instead of raw bytes.
-fn format_human_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
-
-    let b = bytes as f64;
-    if b < KIB {
-        format!("{bytes} B")
-    } else if b < MIB {
-        format!("{:.1} KiB", b / KIB)
-    } else if b < GIB {
-        format!("{:.1} MiB", b / MIB)
-    } else if b < TIB {
-        format!("{:.2} GiB", b / GIB)
-    } else {
-        format!("{:.2} TiB", b / TIB)
-    }
-}
+use crate::format::format_bytes;
 
 /// Structured error wrapper for `--json` mode output on stderr.
 ///
@@ -61,7 +40,7 @@ pub enum IaError {
     #[error("disk full: {}", path.display())]
     DiskFull { path: PathBuf },
 
-    #[error("no disk in pool has {} free", format_human_bytes(*needed))]
+    #[error("no disk in pool has {} free", format_bytes(*needed))]
     NoDiskSpace { needed: u64 },
 
     #[error("download resume failed for {file}: {reason}")]
@@ -131,7 +110,7 @@ pub enum IaError {
     #[error("check_limit request failed for {identifier}")]
     CheckLimitFailed { identifier: String },
 
-    #[error("file too large: {} ({})", path.display(), format_human_bytes(*size))]
+    #[error("file too large: {} ({})", path.display(), format_bytes(*size))]
     FileTooLarge { path: PathBuf, size: u64 },
 
     #[error(

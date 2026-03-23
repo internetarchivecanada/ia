@@ -34,9 +34,7 @@ pub struct TemplateRow {
 /// Recursively finds all regular files (skipping dotfiles and symlinks),
 /// and creates one row per file with generated or empty identifiers.
 pub fn generate_template(dir: &Path, opts: &TemplateOpts) -> Result<Vec<TemplateRow>> {
-    let mut files = Vec::new();
-    walk_dir(dir, &mut files)?;
-    files.sort();
+    let files = crate::fs_util::expand_files(&[dir.to_path_buf()])?;
 
     let rows = files
         .into_iter()
@@ -64,37 +62,6 @@ pub fn generate_template(dir: &Path, opts: &TemplateOpts) -> Result<Vec<Template
         .collect();
 
     Ok(rows)
-}
-
-/// Recursively walk a directory, collecting regular files.
-/// Skips dotfiles (names starting with `.`) and symlinks.
-fn walk_dir(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    let entries = std::fs::read_dir(dir)?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip dotfiles
-        if name_str.starts_with('.') {
-            continue;
-        }
-
-        let file_type = entry.file_type()?;
-
-        // Skip symlinks
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        let path = entry.path();
-        if file_type.is_dir() {
-            walk_dir(&path, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Write template rows as CSV to a writer.

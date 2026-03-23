@@ -117,6 +117,9 @@ enum Commands {
     /// Upload files to the Internet Archive
     #[command(visible_alias = "up")]
     Upload(commands::upload::UploadArgs),
+    /// Verify local files exist on archive.org with matching checksums
+    #[command(visible_alias = "ve")]
+    Verify(commands::verify::VerifyArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
     /// Configure credentials and settings
@@ -282,6 +285,7 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Commands::Verify(args) => commands::verify::run(&client, args, cli.quiet, cli.jobs).await?,
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]

@@ -138,7 +138,7 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
             .iter()
             .map(|col| match *col {
                 "name" => f.name.clone(),
-                "size" => f.size.map(format_size).unwrap_or_default(),
+                "size" => f.size.map(crate::output::format_bytes).unwrap_or_default(),
                 "format" => f.format.clone().unwrap_or_default(),
                 "source" => f.source.clone().unwrap_or_default(),
                 "md5" => f.md5.clone().unwrap_or_default(),
@@ -170,23 +170,11 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
             "\n{}  {} files ({})",
             style(&args.identifier).bold(),
             file_list.len(),
-            format_size(total),
+            crate::output::format_bytes(total),
         );
     }
 
     Ok(())
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
 }
 
 #[cfg(test)]

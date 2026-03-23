@@ -12,3 +12,4 @@ pub mod tasks;
 #[cfg(feature = "self-update")]
 pub mod update;
 pub mod upload;
+pub mod verify;
