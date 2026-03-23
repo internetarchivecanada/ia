@@ -21,12 +21,13 @@ async fn handle_num_found(
     client: &IaClient,
     query: &str,
     backend: NumFoundBackend,
+    params: &[(String, String)],
     json: bool,
 ) -> Result<()> {
     let count = match backend {
-        NumFoundBackend::Scrape => search::num_found(client, query).await?,
-        NumFoundBackend::Advanced => search::advanced_num_found(client, query).await?,
-        NumFoundBackend::Fts { dsl } => search::fts_num_found(client, query, dsl).await?,
+        NumFoundBackend::Scrape => search::num_found(client, query, params).await?,
+        NumFoundBackend::Advanced => search::advanced_num_found(client, query, params).await?,
+        NumFoundBackend::Fts { dsl } => search::fts_num_found(client, query, dsl, params).await?,
     };
     if json {
         println!("{}", serde_json::json!({"num_found": count}));
@@ -51,7 +52,7 @@ pub struct SharedSearchArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Extra parameters (key=value, repeatable)
+    /// Extra parameters (key:value or key=value, repeatable)
     #[arg(short = 'p', long)]
     pub parameters: Vec<String>,
 
@@ -205,7 +206,7 @@ pub struct SearchArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Extra parameters (key=value, repeatable)
+    /// Extra parameters (key:value or key=value, repeatable)
     #[arg(short = 'p', long)]
     pub parameters: Vec<String>,
 
@@ -254,11 +255,20 @@ async fn run_scrape(
     shared: SharedSearchArgs,
     quiet: u8,
 ) -> Result<()> {
+    let extra_params = parse_extra_params(&shared.parameters)?;
+
     if shared.num_found {
-        return handle_num_found(client, &query, NumFoundBackend::Scrape, shared.json).await;
+        return handle_num_found(
+            client,
+            &query,
+            NumFoundBackend::Scrape,
+            &extra_params,
+            shared.json,
+        )
+        .await;
     }
 
-    let opts = build_search_opts(&field, &sort, &shared);
+    let opts = build_search_opts(&field, &sort, &shared)?;
     let stream = ia_core::search::scrape(client, &query, &opts);
     run_output(stream, &shared, &field, &query, quiet).await
 }
@@ -272,11 +282,20 @@ async fn run_advanced(
     shared: SharedSearchArgs,
     quiet: u8,
 ) -> Result<()> {
+    let extra_params = parse_extra_params(&shared.parameters)?;
+
     if shared.num_found {
-        return handle_num_found(client, &query, NumFoundBackend::Advanced, shared.json).await;
+        return handle_num_found(
+            client,
+            &query,
+            NumFoundBackend::Advanced,
+            &extra_params,
+            shared.json,
+        )
+        .await;
     }
 
-    let mut opts = build_search_opts(&field, &sort, &shared);
+    let mut opts = build_search_opts(&field, &sort, &shared)?;
     opts.rows = rows;
     // Single page only: limit result count to one page worth of rows.
     if opts.count == 0 {
@@ -287,17 +306,18 @@ async fn run_advanced(
 }
 
 async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
+    let extra_params = parse_extra_params(&args.shared.parameters)?;
+
     if args.shared.num_found {
         return handle_num_found(
             client,
             &args.query,
             NumFoundBackend::Fts { dsl: args.dsl },
+            &extra_params,
             args.shared.json,
         )
         .await;
     }
-
-    let extra_params = parse_extra_params(&args.shared.parameters);
 
     // Add FTS-specific params
     let mut params = extra_params;
@@ -325,7 +345,11 @@ async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
     run_output(stream, &args.shared, &[], &args.query, quiet).await
 }
 
-fn build_search_opts(field: &[String], sort: &[String], shared: &SharedSearchArgs) -> SearchOpts {
+fn build_search_opts(
+    field: &[String],
+    sort: &[String],
+    shared: &SharedSearchArgs,
+) -> Result<SearchOpts> {
     // In non-JSON mode with no explicit fields, request only identifiers
     let fields = if !field.is_empty() {
         field.to_vec()
@@ -335,9 +359,9 @@ fn build_search_opts(field: &[String], sort: &[String], shared: &SharedSearchArg
         vec![]
     };
 
-    let extra_params = parse_extra_params(&shared.parameters);
+    let extra_params = parse_extra_params(&shared.parameters)?;
 
-    SearchOpts {
+    Ok(SearchOpts {
         fields,
         sorts: sort.to_vec(),
         count: 0,
@@ -345,15 +369,22 @@ fn build_search_opts(field: &[String], sort: &[String], shared: &SharedSearchArg
         timeout: shared.timeout,
         params: extra_params,
         dsl: false,
-    }
+    })
 }
 
-fn parse_extra_params(parameters: &[String]) -> Vec<(String, String)> {
+fn parse_extra_params(parameters: &[String]) -> Result<Vec<(String, String)>> {
     parameters
         .iter()
-        .filter_map(|p| {
-            let (k, v) = p.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
+        .map(|p| {
+            let (k, v) = p
+                .split_once('=')
+                .or_else(|| p.split_once(':'))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid --parameters value (expected KEY=VALUE or KEY:VALUE): {p}"
+                    )
+                })?;
+            Ok((k.to_string(), v.to_string()))
         })
         .collect()
 }

@@ -226,7 +226,7 @@ impl IaClient {
     }
 
     pub async fn search_count(&self, query: &str) -> Result<u64> {
-        crate::search::num_found(self, query).await
+        crate::search::num_found(self, query, &[]).await
     }
 
     /// Get S3 credentials, or error if not configured.

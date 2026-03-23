@@ -69,12 +69,15 @@ struct ScrapeResponse {
 /// Count total results matching a scrape query without fetching items.
 ///
 /// Uses POST (matching Python `internetarchive` behavior — GET returns wrong totals).
-pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
+pub async fn num_found(client: &IaClient, query: &str, params: &[(String, String)]) -> Result<u64> {
     let url = client.url("/services/search/v1/scrape");
-    let req = client
+    let mut req = client
         .http()
         .post(&url)
         .query(&[("q", query), ("total_only", "true")]);
+    for (k, v) in params {
+        req = req.query(&[(k.as_str(), v.as_str())]);
+    }
     let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
@@ -91,12 +94,19 @@ pub async fn num_found(client: &IaClient, query: &str) -> Result<u64> {
 /// Count total results matching an advanced search query without fetching items.
 ///
 /// Uses GET to `/advancedsearch.php` and reads `response.numFound`.
-pub async fn advanced_num_found(client: &IaClient, query: &str) -> Result<u64> {
+pub async fn advanced_num_found(
+    client: &IaClient,
+    query: &str,
+    params: &[(String, String)],
+) -> Result<u64> {
     let url = client.url("/advancedsearch.php");
-    let req = client
+    let mut req = client
         .http()
         .get(&url)
         .query(&[("q", query), ("output", "json"), ("rows", "0")]);
+    for (k, v) in params {
+        req = req.query(&[(k.as_str(), v.as_str())]);
+    }
     let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
@@ -115,7 +125,12 @@ pub async fn advanced_num_found(client: &IaClient, query: &str) -> Result<u64> {
 ///
 /// Uses GET to the FTS endpoint (matching Python `internetarchive` behavior).
 /// Reads `hits.total` from the response.
-pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<u64> {
+pub async fn fts_num_found(
+    client: &IaClient,
+    query: &str,
+    dsl: bool,
+    params: &[(String, String)],
+) -> Result<u64> {
     let base_url = client.fts_base_url();
     let q = if dsl {
         query.to_string()
@@ -123,7 +138,10 @@ pub async fn fts_num_found(client: &IaClient, query: &str, dsl: bool) -> Result<
         format!("!L {query}")
     };
 
-    let req = client.http().get(&base_url).query(&[("q", &q)]);
+    let mut req = client.http().get(&base_url).query(&[("q", &q)]);
+    for (k, v) in params {
+        req = req.query(&[(k.as_str(), v.as_str())]);
+    }
     let resp = with_s3_auth(req, client).send().await?;
 
     if !resp.status().is_success() {
@@ -577,7 +595,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = num_found(&client, "collection:test").await.unwrap();
+        let count = num_found(&client, "collection:test", &[]).await.unwrap();
         assert_eq!(count, 42);
     }
 
@@ -696,7 +714,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = fts_num_found(&client, "test query", false).await.unwrap();
+        let count = fts_num_found(&client, "test query", false, &[])
+            .await
+            .unwrap();
         assert_eq!(count, 1234);
     }
 
@@ -717,7 +737,9 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = fts_num_found(&client, "raw dsl query", true).await.unwrap();
+        let count = fts_num_found(&client, "raw dsl query", true, &[])
+            .await
+            .unwrap();
         assert_eq!(count, 42);
     }
 
@@ -815,7 +837,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = advanced_num_found(&client, "collection:test")
+        let count = advanced_num_found(&client, "collection:test", &[])
             .await
             .unwrap();
         assert_eq!(count, 11234);
@@ -838,7 +860,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
-        let count = num_found(&client, "test").await.unwrap();
+        let count = num_found(&client, "test", &[]).await.unwrap();
         assert_eq!(count, 42);
     }
 
@@ -860,7 +882,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
-        let count = advanced_num_found(&client, "test").await.unwrap();
+        let count = advanced_num_found(&client, "test", &[]).await.unwrap();
         assert_eq!(count, 99);
     }
 
@@ -881,7 +903,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
-        let count = fts_num_found(&client, "test", false).await.unwrap();
+        let count = fts_num_found(&client, "test", false, &[]).await.unwrap();
         assert_eq!(count, 500);
     }
 
@@ -977,7 +999,7 @@ mod tests {
 
         // mock_config does NOT set s3_access/s3_secret
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let count = num_found(&client, "test").await.unwrap();
+        let count = num_found(&client, "test", &[]).await.unwrap();
         assert_eq!(count, 10);
 
         let requests = mock_server.received_requests().await.unwrap();
