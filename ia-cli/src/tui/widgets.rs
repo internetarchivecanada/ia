@@ -621,25 +621,34 @@ pub fn draw_split_sparkline(
     let bar_width = total_width.saturating_sub(label_width);
     let left_width = bar_width / 2;
     let right_width = bar_width - left_width;
-    let total_bars = left_width + right_width;
 
     // Find max for scaling
     let max = history.iter().copied().fold(0.0_f64, f64::max);
 
-    // Take the most recent entries that fit, pad left with spaces so data
-    // appears at the right edge first and fills leftward as history grows.
+    // Position data near the center label so the sparkline appears to flow
+    // through it:
+    //   - Right half: left-aligned (newest data hugs the label, grows rightward)
+    //   - Left half: right-aligned (older data hugs the label, grows leftward)
     let hist: Vec<f64> = history.iter().copied().collect();
-    let take = total_bars.min(hist.len());
-    let pad = total_bars.saturating_sub(take);
 
-    let mut all_chars: String = " ".repeat(pad);
-    let start = hist.len().saturating_sub(take);
-    for v in &hist[start..] {
-        all_chars.push(spark_char(*v, max));
-    }
+    // Right half: most recent entries, left-aligned near center label.
+    let right_take = right_width.min(hist.len());
+    let right_start = hist.len().saturating_sub(right_take);
+    let right_data: String = hist[right_start..]
+        .iter()
+        .map(|v| spark_char(*v, max))
+        .collect();
+    let right_chars = format!("{}{}", right_data, " ".repeat(right_width - right_take));
 
-    let left_chars: String = all_chars.chars().take(left_width).collect();
-    let right_chars: String = all_chars.chars().skip(left_width).collect();
+    // Left half: older entries (before the right half), right-aligned near
+    // center label.
+    let left_available = hist.len().saturating_sub(right_take);
+    let left_take = left_width.min(left_available);
+    let left_data: String = hist[left_available - left_take..left_available]
+        .iter()
+        .map(|v| spark_char(*v, max))
+        .collect();
+    let left_chars = format!("{}{}", " ".repeat(left_width - left_take), left_data);
 
     let label_padded = format!("  {}  ", speed_label);
 
