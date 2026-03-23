@@ -392,6 +392,7 @@ impl TabView for UploadTab {
                             "https://archive.org/details/{}",
                             state.items[item_idx].identifier
                         );
+                        #[cfg(not(test))]
                         let _ = open::that(&url);
                         self.status_message = Some((url, Instant::now()));
                     }

@@ -241,6 +241,7 @@ impl TabView for TasksTab {
                         .collect();
                     if let Some(task) = filtered.get(self.cursor) {
                         let url = format!("https://archive.org/{}", task.task_id);
+                        #[cfg(not(test))]
                         let _ = open::that(&url);
                         self.status_message = Some((url, Instant::now()));
                     }

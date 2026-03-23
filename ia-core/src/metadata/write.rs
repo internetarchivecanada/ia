@@ -357,9 +357,8 @@ pub async fn modify_compound(
     // 4. Compute compound patch
     let patch_ops = compute_compound_patch(&source, &req.groups, req.expect.as_ref(), identifier)?;
     if patch_ops.is_empty() {
-        return Err(IaError::MetadataWrite {
+        return Err(IaError::NoChanges {
             identifier: identifier.to_string(),
-            message: "no changes computed (values already match current metadata)".into(),
         });
     }
 
@@ -1066,7 +1065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modify_no_changes_returns_error() {
+    async fn modify_no_changes_returns_no_changes_error() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -1090,14 +1089,10 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            IaError::MetadataWrite {
-                identifier,
-                message,
-            } => {
+            IaError::NoChanges { identifier } => {
                 assert_eq!(identifier, "test-item");
-                assert!(message.contains("no changes"));
             }
-            other => panic!("unexpected error: {other}"),
+            other => panic!("expected NoChanges, got: {other}"),
         }
     }
 

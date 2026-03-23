@@ -1201,14 +1201,15 @@ async fn run_write_inner(
             let outcome = loop {
                 rl.wait_if_paused().await;
                 match ia_core::metadata::modify_compound(&client, &compound_req).await {
-                    Ok(resp) => break Ok(resp.task_id),
+                    Ok(resp) => break ModifyOutcome::Success(resp.task_id),
                     Err(IaError::RateLimited { retry_after }) => {
                         rl.pause_for(retry_after, |secs| {
                             eprintln!("Rate limited. Pausing all workers for {secs}s...");
                         })
                         .await;
                     }
-                    Err(e) => break Err(e.to_string()),
+                    Err(IaError::NoChanges { .. }) => break ModifyOutcome::NoChanges,
+                    Err(e) => break ModifyOutcome::Error(e.to_string()),
                 }
             };
 
@@ -1218,10 +1219,11 @@ async fn run_write_inner(
     }
 
     let mut error_count = 0usize;
+    let mut skip_count = 0usize;
     while let Some(result) = set.join_next().await {
         let (identifier, outcome, elapsed_ms) = result.context("task panicked")?;
 
-        if record_modify_outcome(
+        match record_modify_outcome(
             &identifier,
             &outcome,
             elapsed_ms,
@@ -1230,13 +1232,24 @@ async fn run_write_inner(
             joblog.as_ref(),
             json,
         ) {
-            error_count += 1;
+            OutcomeKind::Error => error_count += 1,
+            OutcomeKind::NoChanges => skip_count += 1,
+            OutcomeKind::Success => {}
         }
+    }
+
+    if skip_count > 0 && error_count == 0 && !json && ctx.quiet == 0 {
+        eprintln!(
+            "warning: {skip_count} of {total_count} item(s) already matched (no changes applied)"
+        );
     }
 
     if error_count > 0 {
         if json {
             std::process::exit(1);
+        }
+        if skip_count > 0 {
+            bail!("{error_count} of {total_count} item(s) failed ({skip_count} already matched)");
         }
         bail!("{error_count} of {total_count} item(s) failed");
     }
@@ -1421,14 +1434,15 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
             let outcome = loop {
                 rl.wait_if_paused().await;
                 match ia_core::metadata::modify_compound(&client, &compound_req).await {
-                    Ok(resp) => break Ok(resp.task_id),
+                    Ok(resp) => break ModifyOutcome::Success(resp.task_id),
                     Err(IaError::RateLimited { retry_after }) => {
                         rl.pause_for(retry_after, |secs| {
                             eprintln!("Rate limited. Pausing all workers for {secs}s...");
                         })
                         .await;
                     }
-                    Err(e) => break Err(e.to_string()),
+                    Err(IaError::NoChanges { .. }) => break ModifyOutcome::NoChanges,
+                    Err(e) => break ModifyOutcome::Error(e.to_string()),
                 }
             };
 
@@ -1438,10 +1452,11 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
     }
 
     let mut error_count = 0usize;
+    let mut skip_count = 0usize;
     while let Some(result) = set.join_next().await {
         let (identifier, outcome, elapsed_ms) = result.context("task panicked")?;
 
-        if record_modify_outcome(
+        match record_modify_outcome(
             &identifier,
             &outcome,
             elapsed_ms,
@@ -1450,13 +1465,24 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
             joblog.as_ref(),
             json,
         ) {
-            error_count += 1;
+            OutcomeKind::Error => error_count += 1,
+            OutcomeKind::NoChanges => skip_count += 1,
+            OutcomeKind::Success => {}
         }
+    }
+
+    if skip_count > 0 && error_count == 0 && !json && ctx.quiet == 0 {
+        eprintln!(
+            "warning: {skip_count} of {item_count} item(s) already matched (no changes applied)"
+        );
     }
 
     if error_count > 0 {
         if json {
             std::process::exit(1);
+        }
+        if skip_count > 0 {
+            bail!("{error_count} of {item_count} item(s) failed ({skip_count} already matched)");
         }
         bail!("{error_count} of {item_count} item(s) failed");
     }
@@ -1550,17 +1576,31 @@ async fn run_dry_run_compound(
 
 /// Record the outcome of a modify() call: print output and write joblog entry.
 /// Returns `true` if the outcome was an error.
+/// Result of processing a single modify item.
+enum ModifyOutcome {
+    Success(Option<u64>),
+    NoChanges,
+    Error(String),
+}
+
+/// Classification returned by `record_modify_outcome` for counting.
+enum OutcomeKind {
+    Success,
+    NoChanges,
+    Error,
+}
+
 fn record_modify_outcome(
     identifier: &str,
-    outcome: &Result<Option<u64>, String>,
+    outcome: &ModifyOutcome,
     elapsed_ms: u64,
     file_target: &str,
     quiet: u8,
     joblog: Option<&JoblogWriter>,
     json: bool,
-) -> bool {
+) -> OutcomeKind {
     match outcome {
-        Ok(task_id) => {
+        ModifyOutcome::Success(task_id) => {
             if json {
                 println!(
                     "{}",
@@ -1578,9 +1618,28 @@ fn record_modify_outcome(
                 let entry = JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
                 jl.write(&entry);
             }
-            false
+            OutcomeKind::Success
         }
-        Err(e) => {
+        ModifyOutcome::NoChanges => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "item": identifier,
+                        "status": "no_changes",
+                        "elapsed_ms": elapsed_ms,
+                    })
+                );
+            } else if quiet < 2 {
+                eprintln!("warning: {identifier}: no changes (values already match)");
+            }
+            if let Some(jl) = joblog {
+                let entry = JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
+                jl.write(&entry);
+            }
+            OutcomeKind::NoChanges
+        }
+        ModifyOutcome::Error(e) => {
             if json {
                 println!(
                     "{}",
@@ -1598,7 +1657,7 @@ fn record_modify_outcome(
                 let entry = JoblogEntry::new("modify", identifier, file_target).error(e, 0);
                 jl.write(&entry);
             }
-            true
+            OutcomeKind::Error
         }
     }
 }

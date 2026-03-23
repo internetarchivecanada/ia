@@ -883,14 +883,10 @@ async fn zero_change_patch_returns_error() {
     .await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        ia_core::IaError::MetadataWrite {
-            identifier,
-            message,
-        } => {
+        ia_core::IaError::NoChanges { identifier } => {
             assert_eq!(identifier, "clean-item");
-            assert!(message.contains("no changes"));
         }
-        other => panic!("expected MetadataWrite error, got: {other}"),
+        other => panic!("expected NoChanges error, got: {other}"),
     }
 }
 

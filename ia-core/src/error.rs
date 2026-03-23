@@ -76,6 +76,9 @@ pub enum IaError {
     #[error("metadata write failed for {identifier}: {message}")]
     MetadataWrite { identifier: String, message: String },
 
+    #[error("no changes for {identifier}: values already match current metadata")]
+    NoChanges { identifier: String },
+
     #[error("LLM API error ({status}): {message}")]
     LlmApi { status: u16, message: String },
 
@@ -225,6 +228,7 @@ impl IaError {
             IaError::DiskFull { .. } => false,
             IaError::NoDiskSpace { .. } => false,
             IaError::MetadataWrite { .. } => false,
+            IaError::NoChanges { .. } => false,
             IaError::Json(_) => false,
         }
     }
@@ -273,6 +277,10 @@ impl IaError {
             IaError::MetadataWrite { identifier, .. } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 "metadata_write"
+            }
+            IaError::NoChanges { identifier } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                "no_changes"
             }
             IaError::LlmApi { status, .. } => {
                 extra.insert("status".into(), (*status).into());
