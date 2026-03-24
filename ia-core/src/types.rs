@@ -33,6 +33,11 @@ pub struct ItemMetadata {
     /// Whether the item is "dark" (hidden).
     #[serde(default)]
     pub is_dark: bool,
+
+    /// All other top-level fields not captured above (e.g., extracted_metadata,
+    /// reviews, speech_vs_music_asr, etc.).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Item-level metadata fields.
@@ -261,5 +266,53 @@ mod tests {
         let json = r#"{"collection": ["nasa", "images"]}"#;
         let m: MetadataFields = serde_json::from_str(json).unwrap();
         assert_eq!(m.collection.unwrap().to_vec(), vec!["nasa", "images"]);
+    }
+
+    #[test]
+    fn unknown_top_level_fields_preserved() {
+        let json = r#"{
+            "metadata": {"identifier": "test-item"},
+            "files": [],
+            "server": "ia802304.us.archive.org",
+            "extracted_metadata": {
+                "_ai_request_info": {
+                    "model": "gpt-5-nano-2025-08-07",
+                    "total_tokens": 21509
+                },
+                "metadata": {
+                    "title": "Essays & Addresses",
+                    "creator": ["Friedrich Von Hügel"]
+                }
+            },
+            "speech_vs_music_asr": {"some_key": "some_value"},
+            "reviews": [{"stars": 5, "reviewer": "someone"}]
+        }"#;
+
+        let item: ItemMetadata = serde_json::from_str(json).unwrap();
+
+        // extracted_metadata must survive deserialization
+        let extracted = item
+            .extra
+            .get("extracted_metadata")
+            .expect("extracted_metadata must be preserved in ItemMetadata.extra");
+        assert_eq!(
+            extracted["metadata"]["title"],
+            serde_json::json!("Essays & Addresses")
+        );
+        assert_eq!(
+            extracted["_ai_request_info"]["model"],
+            serde_json::json!("gpt-5-nano-2025-08-07")
+        );
+
+        // other unknown fields too
+        assert!(item.extra.contains_key("speech_vs_music_asr"));
+        assert!(item.extra.contains_key("reviews"));
+
+        // round-trip: serialize back to JSON and verify fields survive
+        let reserialized: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert!(reserialized.get("extracted_metadata").is_some());
+        assert!(reserialized.get("speech_vs_music_asr").is_some());
+        assert!(reserialized.get("reviews").is_some());
     }
 }

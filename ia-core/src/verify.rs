@@ -350,6 +350,7 @@ mod tests {
             files_count: None,
             item_size: None,
             is_dark: false,
+            extra: HashMap::new(),
         }
     }
 
