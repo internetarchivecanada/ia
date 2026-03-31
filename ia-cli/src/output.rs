@@ -317,6 +317,7 @@ struct ItemBars {
     per_file_bytes: HashMap<String, u64>,
     files_processed: usize,
     files_total: usize,
+    errors: Vec<String>,
 }
 
 impl BatchDisplay {
@@ -380,6 +381,7 @@ impl BatchDisplay {
                     per_file_bytes: HashMap::new(),
                     files_processed: 0,
                     files_total: 0,
+                    errors: Vec::new(),
                 },
             );
         }
@@ -428,7 +430,13 @@ impl BatchDisplay {
                     item.files_processed, item.files_total
                 ));
             }
-            DownloadStatus::Failed(_) => {
+            DownloadStatus::Failed(err) => {
+                item.errors.push(format!(
+                    "  {} {} {}",
+                    style(ICON_ERROR).red(),
+                    style(&progress.file_name).dim(),
+                    style(format!("— {err}")).red(),
+                ));
                 item.files_processed += 1;
                 item.bar.set_message(format!(
                     "{}/{} files",
@@ -447,8 +455,19 @@ impl BatchDisplay {
         if let Some(item) = items.remove(identifier) {
             item.bar.finish_and_clear();
 
+            // Print collected per-file errors
+            for err_line in &item.errors {
+                eprintln!("{err_line}");
+            }
+
             let elapsed = result.elapsed.as_secs_f64();
             let speed = format_speed(result.bytes_total, elapsed);
+
+            let icon = if result.files_failed > 0 {
+                style(ICON_ERROR).red()
+            } else {
+                style(ICON_SUCCESS).green()
+            };
 
             let skipped_info = if result.files_skipped > 0 {
                 format!(
@@ -460,15 +479,44 @@ impl BatchDisplay {
                 String::new()
             };
 
+            let error_info = if result.files_failed > 0 {
+                format!(
+                    "\n  {} {} errors",
+                    style(ICON_ERROR).red(),
+                    style(result.files_failed).red()
+                )
+            } else {
+                String::new()
+            };
+
             item.header.set_message(format!(
-                "{} {}       {} files ({}) {:.0}s{}{}",
-                style(ICON_SUCCESS).green(),
+                "{} {}       {} files ({}) {:.0}s{}{}{}",
+                icon,
                 style(identifier).bold(),
                 result.files_downloaded,
                 format_bytes(result.bytes_total),
                 elapsed,
                 style(&speed).dim(),
                 skipped_info,
+                error_info,
+            ));
+            item.header.finish();
+        }
+    }
+
+    /// Handle an item-level failure (404, disk full, etc.) by updating the
+    /// display with an error icon and cleaning up any active progress bars.
+    pub fn on_item_error(&self, identifier: &str, error: &str) {
+        let Ok(mut items) = self.active_item_bars.lock() else {
+            return;
+        };
+        if let Some(item) = items.remove(identifier) {
+            item.bar.finish_and_clear();
+            item.header.set_message(format!(
+                "{} {}  {}",
+                style(ICON_ERROR).red(),
+                style(identifier).bold(),
+                style(error).red(),
             ));
             item.header.finish();
         }

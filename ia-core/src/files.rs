@@ -13,6 +13,35 @@ pub struct FileFilter {
     pub names: Vec<String>,
 }
 
+/// Validate that glob and exclude patterns in a filter are syntactically valid.
+///
+/// Returns an error describing the first invalid pattern found.
+/// Call this at the CLI boundary before starting work so the user gets a clear
+/// message instead of silently downloading everything.
+pub fn validate_filter(filter: &FileFilter) -> std::result::Result<(), String> {
+    if let Some(ref glob) = filter.glob {
+        for pattern in glob.split('|') {
+            let p = pattern.trim();
+            if !p.is_empty() {
+                if let Err(e) = Glob::new(p) {
+                    return Err(format!("invalid --glob pattern \"{p}\": {e}"));
+                }
+            }
+        }
+    }
+    if let Some(ref exclude) = filter.exclude {
+        for pattern in exclude.split('|') {
+            let p = pattern.trim();
+            if !p.is_empty() {
+                if let Err(e) = Glob::new(p) {
+                    return Err(format!("invalid --exclude pattern \"{p}\": {e}"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// List files from an item, applying filters.
 pub fn list<'a>(item: &'a ItemMetadata, filter: &FileFilter) -> Vec<&'a FileMetadata> {
     let glob_matcher = filter.glob.as_ref().and_then(|g| {
@@ -255,5 +284,59 @@ mod tests {
         ]);
         let files = list(&item, &FileFilter::default());
         assert_eq!(total_size(&files), 300);
+    }
+
+    #[test]
+    fn validate_filter_accepts_valid_glob() {
+        let filter = FileFilter {
+            glob: Some("*.mp4|*.webm".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_filter(&filter).is_ok());
+    }
+
+    #[test]
+    fn validate_filter_rejects_invalid_glob() {
+        let filter = FileFilter {
+            glob: Some("[invalid".to_string()),
+            ..Default::default()
+        };
+        let err = validate_filter(&filter).unwrap_err();
+        assert!(err.contains("--glob"), "error should mention --glob: {err}");
+        assert!(
+            err.contains("[invalid"),
+            "error should include pattern: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_filter_rejects_invalid_exclude() {
+        let filter = FileFilter {
+            exclude: Some("[bad".to_string()),
+            ..Default::default()
+        };
+        let err = validate_filter(&filter).unwrap_err();
+        assert!(
+            err.contains("--exclude"),
+            "error should mention --exclude: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_filter_catches_first_bad_in_pipe_separated() {
+        let filter = FileFilter {
+            glob: Some("*.mp4|[bad|*.webm".to_string()),
+            ..Default::default()
+        };
+        let err = validate_filter(&filter).unwrap_err();
+        assert!(
+            err.contains("[bad"),
+            "error should include bad pattern: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_filter_accepts_empty() {
+        assert!(validate_filter(&FileFilter::default()).is_ok());
     }
 }

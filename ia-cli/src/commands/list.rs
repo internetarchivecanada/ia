@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use color_print::cstr;
 use comfy_table::{Cell, Color, Table};
@@ -73,6 +73,10 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
         source: args.source,
         ..Default::default()
     };
+
+    if let Err(msg) = ia_core::files::validate_filter(&filter) {
+        bail!("{msg}");
+    }
 
     let file_list = files::list(&item, &filter);
 

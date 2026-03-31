@@ -40,8 +40,8 @@ pub enum IaError {
     #[error("disk full: {}", path.display())]
     DiskFull { path: PathBuf },
 
-    #[error("no disk in pool has {} free", format_bytes(*needed))]
-    NoDiskSpace { needed: u64 },
+    #[error("all disks full — need {}, largest free: {}", format_bytes(*needed), format_bytes(*largest_free))]
+    NoDiskSpace { needed: u64, largest_free: u64 },
 
     #[error("download resume failed for {file}: {reason}")]
     ResumeFailed { file: String, reason: String },
@@ -156,6 +156,18 @@ pub enum IaError {
 pub type Result<T> = std::result::Result<T, IaError>;
 
 impl IaError {
+    /// Whether this error indicates a disk-full condition.
+    ///
+    /// Checks both the explicit `DiskFull` variant and I/O errors with
+    /// `ErrorKind::StorageFull`.
+    pub fn is_disk_full(&self) -> bool {
+        match self {
+            IaError::DiskFull { .. } => true,
+            IaError::Io(e) => e.kind() == std::io::ErrorKind::StorageFull,
+            _ => false,
+        }
+    }
+
     /// Whether this error is transient and worth retrying.
     ///
     /// Returns `false` for permanent failures (access denied, not found, config
@@ -169,7 +181,7 @@ impl IaError {
             // Transient — may succeed on retry
             IaError::RateLimited { .. } => true,
             IaError::Network(_) => true,
-            IaError::Io(_) => true,
+            IaError::Io(e) => e.kind() != std::io::ErrorKind::StorageFull,
             IaError::ChecksumMismatch { .. } => true,
             IaError::ResumeFailed { .. } => true,
             // LLM API errors: retry on 429/5xx, not on 4xx
@@ -242,8 +254,12 @@ impl IaError {
                 extra.insert("path".into(), path.display().to_string().into());
                 "disk_full"
             }
-            IaError::NoDiskSpace { needed } => {
+            IaError::NoDiskSpace {
+                needed,
+                largest_free,
+            } => {
                 extra.insert("needed".into(), (*needed).into());
+                extra.insert("largest_free".into(), (*largest_free).into());
                 "no_disk_space"
             }
             IaError::ResumeFailed { file, reason } => {
@@ -525,7 +541,10 @@ mod tests {
 
     #[test]
     fn json_no_disk_space() {
-        let err = IaError::NoDiskSpace { needed: 1048576 };
+        let err = IaError::NoDiskSpace {
+            needed: 1048576,
+            largest_free: 512000,
+        };
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "no_disk_space");
         assert_eq!(v["error"]["needed"], 1048576);
@@ -688,6 +707,24 @@ mod tests {
             path: PathBuf::from("/mnt/data"),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn io_storage_full_is_not_retryable() {
+        let err = IaError::Io(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space",
+        ));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn io_other_is_retryable() {
+        let err = IaError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(err.is_retryable());
     }
 
     #[test]
@@ -1123,6 +1160,34 @@ mod tests {
     fn task_not_found_is_not_retryable() {
         let err = IaError::TaskNotFound { task_id: 123 };
         assert!(!err.is_retryable());
+    }
+
+    // -- is_disk_full tests --
+
+    #[test]
+    fn is_disk_full_for_disk_full_variant() {
+        let err = IaError::DiskFull {
+            path: PathBuf::from("/mnt/data"),
+        };
+        assert!(err.is_disk_full());
+    }
+
+    #[test]
+    fn is_disk_full_for_io_storage_full() {
+        let err = IaError::Io(std::io::Error::new(std::io::ErrorKind::StorageFull, ""));
+        assert!(err.is_disk_full());
+    }
+
+    #[test]
+    fn is_disk_full_for_other_io_error() {
+        let err = IaError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, ""));
+        assert!(!err.is_disk_full());
+    }
+
+    #[test]
+    fn is_disk_full_for_non_io_error() {
+        let err = IaError::NotFound("x".into());
+        assert!(!err.is_disk_full());
     }
 
     #[test]

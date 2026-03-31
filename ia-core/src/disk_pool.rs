@@ -86,9 +86,13 @@ impl DiskPool {
                 );
                 Ok(&self.disks[idx].path)
             }
-            None => Err(IaError::NoDiskSpace {
-                needed: estimated_size,
-            }),
+            None => {
+                let largest_free = self.disks.iter().map(|d| d.free_bytes).max().unwrap_or(0);
+                Err(IaError::NoDiskSpace {
+                    needed: estimated_size,
+                    largest_free,
+                })
+            }
         }
     }
 
@@ -133,7 +137,13 @@ impl DiskPool {
                 );
                 Ok(&self.disks[idx].path)
             }
-            None => Err(IaError::NoDiskSpace { needed: 0 }),
+            None => {
+                let largest_free = self.disks.iter().map(|d| d.free_bytes).max().unwrap_or(0);
+                Err(IaError::NoDiskSpace {
+                    needed: 0,
+                    largest_free,
+                })
+            }
         }
     }
 
@@ -267,5 +277,87 @@ mod tests {
 
         let result = pool.assign_item("huge-item", 1024);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_disk_full_reassigns() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+
+        // Assign item to disk 0 explicitly
+        pool.disks[0].free_bytes = 5000;
+        pool.disks[1].free_bytes = 100;
+        pool.assign_item("my-item", 100).unwrap();
+        // Verify it went to disk 0 (most free space)
+        assert_eq!(pool.dest_for_item("my-item"), Some(dir0.path()));
+
+        // handle_disk_full refreshes from OS, then reassigns excluding current disk.
+        // After refresh, both disks will have real free space from the OS, and
+        // the item should move to disk 1 (the only alternative).
+        let new_dest = pool.handle_disk_full("my-item").unwrap();
+        assert_eq!(
+            new_dest,
+            dir1.path(),
+            "item should be reassigned to the other disk"
+        );
+        assert_eq!(pool.dest_for_item("my-item"), Some(dir1.path()));
+    }
+
+    #[test]
+    fn handle_disk_full_no_alternative() {
+        // With a single-disk pool, handle_disk_full has no other disk to
+        // reassign to. It filters out the current disk index, leaving zero
+        // candidates. We use a real tempdir so disk_space() works, but since
+        // the single disk is excluded from candidates, the result is always
+        // NoDiskSpace regardless of actual free space.
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = DiskPool::single(dir.path().to_path_buf()).unwrap();
+
+        pool.assign_item("my-item", 100).unwrap();
+
+        let result = pool.handle_disk_full("my-item");
+        match result {
+            Err(IaError::NoDiskSpace { .. }) => {} // expected
+            other => panic!("expected NoDiskSpace error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_disk_space_includes_largest_free() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+
+        // Force known free values
+        pool.disks[0].free_bytes = 500;
+        pool.disks[1].free_bytes = 1000;
+
+        let result = pool.assign_item("big-item", 2000);
+        match result {
+            Err(IaError::NoDiskSpace {
+                needed,
+                largest_free,
+            }) => {
+                assert_eq!(needed, 2000);
+                assert_eq!(largest_free, 1000);
+            }
+            other => panic!("expected NoDiskSpace error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_item_exact_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = DiskPool::single(dir.path().to_path_buf()).unwrap();
+
+        // Force free to exactly 1000
+        pool.disks[0].free_bytes = 1000;
+
+        let dest = pool.assign_item("exact-item", 1000).unwrap();
+        assert_eq!(dest, dir.path());
+        assert_eq!(pool.disks[0].free_bytes, 0);
     }
 }
