@@ -21,80 +21,10 @@ fn empty_config() -> NamedTempFile {
 // ─── Argument validation ─────────────────────────────────────────────────────
 
 #[test]
-fn collection_create_missing_title_errors() {
-    let cfg = empty_config();
-    ia_with_config(&cfg)
-        .args([
-            "collection",
-            "create",
-            "test-col",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
-            "--collection",
-            "parent",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--title"));
-}
-
-#[test]
-fn collection_create_missing_description_errors() {
-    let cfg = empty_config();
-    ia_with_config(&cfg)
-        .args([
-            "collection",
-            "create",
-            "test-col",
-            "--title",
-            "Title",
-            "--subject",
-            "subj",
-            "--collection",
-            "parent",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--description"));
-}
-
-#[test]
-fn collection_create_missing_subject_errors() {
-    let cfg = empty_config();
-    ia_with_config(&cfg)
-        .args([
-            "collection",
-            "create",
-            "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--collection",
-            "parent",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--subject"));
-}
-
-#[test]
 fn collection_create_missing_collection_errors() {
     let cfg = empty_config();
     ia_with_config(&cfg)
-        .args([
-            "collection",
-            "create",
-            "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
-        ])
+        .args(["collection", "create", "test-col"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--collection"));
@@ -104,18 +34,7 @@ fn collection_create_missing_collection_errors() {
 fn collection_create_missing_identifier_errors() {
     let cfg = empty_config();
     ia_with_config(&cfg)
-        .args([
-            "collection",
-            "create",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
-            "--collection",
-            "parent",
-        ])
+        .args(["collection", "create", "--collection", "parent"])
         .assert()
         .failure();
 }
@@ -128,12 +47,6 @@ fn collection_create_invalid_metadata_format() {
             "collection",
             "create",
             "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
             "--collection",
             "parent",
             "-m",
@@ -145,8 +58,33 @@ fn collection_create_invalid_metadata_format() {
         .stderr(predicate::str::contains("invalid KEY:VALUE format"));
 }
 
+// ─── Dry-run ─────────────────────────────────────────────────────────────────
+
 #[test]
-fn collection_create_dry_run_no_auth_needed() {
+fn collection_create_dry_run_minimal() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "collection",
+            "create",
+            "test-col",
+            "--collection",
+            "parent",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("dry-run:")
+                .and(predicate::str::contains("identifier:"))
+                .and(predicate::str::contains("mediatype:"))
+                .and(predicate::str::contains("collection"))
+                .and(predicate::str::contains("test-col")),
+        );
+}
+
+#[test]
+fn collection_create_dry_run_with_all_fields() {
     let cfg = empty_config();
     ia_with_config(&cfg)
         .args([
@@ -154,18 +92,28 @@ fn collection_create_dry_run_no_auth_needed() {
             "create",
             "test-col",
             "--title",
-            "Title",
-            "--description",
-            "desc",
+            "My Title",
+            "-D",
+            "My description",
             "--subject",
             "subj",
             "--collection",
             "parent",
+            "-m",
+            "hidden:true",
             "--dry-run",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("dry-run:"));
+        .stdout(
+            predicate::str::contains("dry-run:")
+                .and(predicate::str::contains("My Title"))
+                .and(predicate::str::contains("My description"))
+                .and(predicate::str::contains("subj"))
+                .and(predicate::str::contains("parent"))
+                .and(predicate::str::contains("hidden:"))
+                .and(predicate::str::contains("true")),
+        );
 }
 
 #[test]
@@ -176,12 +124,6 @@ fn collection_create_dry_run_json() {
             "collection",
             "create",
             "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
             "--collection",
             "parent",
             "--dry-run",
@@ -189,8 +131,30 @@ fn collection_create_dry_run_json() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"identifier\":\"test-col\""));
+        .stdout(
+            predicate::str::contains("\"identifier\":\"test-col\"")
+                .and(predicate::str::contains("\"mediatype\":\"collection\"")),
+        );
 }
+
+#[test]
+fn collection_create_dry_run_no_auth_needed() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "collection",
+            "create",
+            "test-col",
+            "--collection",
+            "parent",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry-run:"));
+}
+
+// ─── Image / auth ────────────────────────────────────────────────────────────
 
 #[test]
 fn collection_create_nonexistent_image_errors() {
@@ -200,12 +164,6 @@ fn collection_create_nonexistent_image_errors() {
             "collection",
             "create",
             "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
             "--collection",
             "parent",
             "--image",
@@ -225,12 +183,6 @@ fn collection_alias_col_works() {
             "col",
             "create",
             "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
             "--collection",
             "parent",
             "--dry-run",
@@ -244,20 +196,29 @@ fn collection_alias_col_works() {
 fn collection_create_no_auth_errors() {
     let cfg = empty_config();
     ia_with_config(&cfg)
+        .args(["collection", "create", "test-col", "--collection", "parent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("credentials"));
+}
+
+// ─── Short flag -D for description ──────────────────────────────────────────
+
+#[test]
+fn collection_create_short_d_for_description() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
         .args([
             "collection",
             "create",
             "test-col",
-            "--title",
-            "Title",
-            "--description",
-            "desc",
-            "--subject",
-            "subj",
             "--collection",
             "parent",
+            "-D",
+            "Short desc",
+            "--dry-run",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("credentials"));
+        .success()
+        .stdout(predicate::str::contains("Short desc"));
 }

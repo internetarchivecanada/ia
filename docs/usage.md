@@ -679,53 +679,46 @@ Manage Internet Archive collections.
 
 #### `ia collection create`
 
-Create a new collection item on Internet Archive via S3. Requires title, description, subject, and parent collection. Optionally upload a collection image.
+Create a new collection item on Internet Archive via S3. Only the identifier and parent collection are required. Title, description, and subject are recommended but optional.
 
 ```sh
-ia collection create <IDENTIFIER> --title <TITLE> --description <DESC> --subject <SUBJ> --collection <COLL> [OPTIONS]
+ia collection create <IDENTIFIER> --collection <COLL> [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `<IDENTIFIER>` | Collection identifier (3-100 chars, alphanumeric + `._-@`) |
-| `-t, --title <TITLE>` | Collection title (required) |
-| `--description <DESC>` | Collection description (required) |
-| `-s, --subject <SUBJ>` | Subject/topic (required) |
 | `-C, --collection <COLL>` | Parent collection identifier (required) |
+| `-t, --title <TITLE>` | Collection title |
+| `-D, --description <DESC>` | Collection description |
+| `-s, --subject <SUBJ>` | Subject/topic |
 | `-I, --image <PATH>` | Path to collection cover image |
 | `-m, --metadata <K:V>` | Additional metadata (repeatable) |
-| `--derive` | Enable derivative generation (off by default for collections) |
-| `--dry-run` | Validate everything without creating the collection |
+| `--dry-run` | Validate and show full details without creating the collection |
 | `--json` | Output as JSON |
 
 ```sh
-# Create a simple collection
+# Minimal collection (identifier + parent only)
+ia collection create my-collection --collection opensource
+
+# Recommended: include title, description, subject
 ia collection create my-collection \
     --title "My Collection" \
-    --description "A collection of things" \
+    -D "A collection of things" \
     --subject "things" \
     --collection opensource
 
-# Create with an image
+# With an image and extra metadata
 ia collection create my-collection \
     --title "My Collection" \
-    --description "A collection of things" \
+    -D "A collection of things" \
     --subject "things" \
     --collection opensource \
-    --image logo.png
+    --image logo.png -m hidden:true
 
-# Create with extra metadata
+# Dry run (shows full metadata details)
 ia collection create my-collection \
-    --title "My Collection" \
-    --description "Desc" \
-    --subject "things" \
-    --collection opensource \
-    -m hidden:true -m num-top-dl:5
-
-# Dry run
-ia collection create my-collection \
-    --title "Test" --description "Test" --subject "test" --collection opensource \
-    --dry-run
+    --collection opensource --dry-run
 ```
 
 ### `ia config`

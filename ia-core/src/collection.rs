@@ -26,8 +26,9 @@ pub struct CreateCollectionResult {
 /// - `metadata`: Additional metadata key-value pairs. Any `mediatype` entries are silently dropped
 ///   (collections always use `mediatype=collection`).
 /// - `image`: Optional path to a cover image for the collection. Must have a file extension.
-/// - `queue_derive`: If `true`, request server-side derivative generation.
 /// - `dry_run`: If `true`, validate everything but send no HTTP requests.
+///
+/// Derive is always disabled for collections (`x-archive-queue-derive: 0`).
 ///
 /// # Errors
 ///
@@ -40,7 +41,6 @@ pub async fn create_collection(
     identifier: &str,
     metadata: &[(String, String)],
     image: Option<&Path>,
-    queue_derive: bool,
     dry_run: bool,
 ) -> Result<CreateCollectionResult> {
     validate_identifier(identifier)?;
@@ -72,26 +72,9 @@ pub async fn create_collection(
     let url = details_url(client, identifier);
 
     if let Some(img) = image {
-        create_with_image(
-            client,
-            identifier,
-            img,
-            &full_metadata,
-            queue_derive,
-            dry_run,
-            url,
-        )
-        .await
+        create_with_image(client, identifier, img, &full_metadata, dry_run, url).await
     } else {
-        create_without_image(
-            client,
-            identifier,
-            &full_metadata,
-            queue_derive,
-            dry_run,
-            url,
-        )
-        .await
+        create_without_image(client, identifier, &full_metadata, dry_run, url).await
     }
 }
 
@@ -129,13 +112,12 @@ fn details_url(client: &IaClient, identifier: &str) -> String {
 /// Create a collection by uploading a cover image.
 ///
 /// The image is uploaded as `{identifier}_itemimage.{ext}`. The upload carries
-/// the full metadata, auto-make-bucket, and the queue-derive setting.
+/// the full metadata, auto-make-bucket, and derive disabled.
 async fn create_with_image(
     client: &IaClient,
     identifier: &str,
     image: &Path,
     metadata: &[(String, String)],
-    queue_derive: bool,
     dry_run: bool,
     url: String,
 ) -> Result<CreateCollectionResult> {
@@ -146,7 +128,7 @@ async fn create_with_image(
 
     let opts = UploadOpts {
         metadata: metadata.to_vec(),
-        no_derive: !queue_derive,
+        no_derive: true,
         verify: false,
         dry_run,
         headers: vec![("Content-Type".to_string(), content_type.to_string())],
@@ -184,12 +166,11 @@ async fn create_with_image(
 /// Create a collection without a cover image.
 ///
 /// Sends a zero-body PUT to the S3 item URL with all required IA headers
-/// and the encoded metadata headers.
+/// and the encoded metadata headers. Derive is always disabled.
 async fn create_without_image(
     client: &IaClient,
     identifier: &str,
     metadata: &[(String, String)],
-    queue_derive: bool,
     dry_run: bool,
     url: String,
 ) -> Result<CreateCollectionResult> {
@@ -211,10 +192,7 @@ async fn create_without_image(
         .put(&s3_url)
         .header("Authorization", &auth_header)
         .header("x-amz-auto-make-bucket", "1")
-        .header(
-            "x-archive-queue-derive",
-            if queue_derive { "1" } else { "0" },
-        )
+        .header("x-archive-queue-derive", "0")
         .header("Content-Length", "0");
 
     for (k, v) in &metadata_headers {
@@ -363,7 +341,7 @@ mod tests {
     async fn invalid_identifier_rejected() {
         let server = MockServer::start().await;
         let client = test_client(&server).await;
-        let err = create_collection(&client, "ab", &[], None, false, false)
+        let err = create_collection(&client, "ab", &[], None, false)
             .await
             .unwrap_err();
         assert!(matches!(err, IaError::InvalidIdentifier { .. }));
@@ -376,7 +354,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = test_client(&server).await;
         let nonexistent = Path::new("/tmp/ia-test-no-such-file-xyz.png");
-        let err = create_collection(&client, "test-coll", &[], Some(nonexistent), false, false)
+        let err = create_collection(&client, "test-coll", &[], Some(nonexistent), false)
             .await
             .unwrap_err();
         assert!(matches!(err, IaError::UploadFailed { .. }));
@@ -397,16 +375,9 @@ mod tests {
         let no_ext_path_buf = no_ext.path().with_extension("");
         // Write the file without extension to disk
         std::fs::write(&no_ext_path_buf, b"fake image data").unwrap();
-        let err = create_collection(
-            &client,
-            "test-coll",
-            &[],
-            Some(&no_ext_path_buf),
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let err = create_collection(&client, "test-coll", &[], Some(&no_ext_path_buf), false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, IaError::UploadFailed { ref key, .. } if key == "(image)"));
         // Clean up
         let _ = std::fs::remove_file(&no_ext_path_buf);
@@ -428,30 +399,11 @@ mod tests {
             .await;
 
         let client = test_client(&server).await;
-        let result = create_collection(&client, "test-collection", &[], None, false, false)
+        let result = create_collection(&client, "test-collection", &[], None, false)
             .await
             .unwrap();
 
         assert_eq!(result.identifier, "test-collection");
-        assert_eq!(result.status, 200);
-    }
-
-    #[tokio::test]
-    async fn create_without_image_sends_queue_derive_header() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("PUT"))
-            .and(path("/test-collection"))
-            .and(header("x-archive-queue-derive", "1"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let client = test_client(&server).await;
-        let result = create_collection(&client, "test-collection", &[], None, true, false)
-            .await
-            .unwrap();
-
         assert_eq!(result.status, 200);
     }
 
@@ -471,16 +423,9 @@ mod tests {
 
         let client = test_client(&server).await;
         let img = temp_image_with_content("png", b"\x89PNG fake");
-        let result = create_collection(
-            &client,
-            "test-collection",
-            &[],
-            Some(img.path()),
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let result = create_collection(&client, "test-collection", &[], Some(img.path()), false)
+            .await
+            .unwrap();
 
         assert_eq!(result.identifier, "test-collection");
         assert_eq!(result.status, 200);
@@ -502,7 +447,7 @@ mod tests {
         let client = test_client(&server).await;
         // User passes mediatype=texts — should be overridden to collection
         let meta = vec![("mediatype".to_string(), "texts".to_string())];
-        let result = create_collection(&client, "my-coll", &meta, None, false, false)
+        let result = create_collection(&client, "my-coll", &meta, None, false)
             .await
             .unwrap();
 
@@ -521,7 +466,7 @@ mod tests {
         config.s3_secret = Some("test-secret".into());
         let client = IaClient::from_config_no_retry(config).unwrap();
 
-        let result = create_collection(&client, "test-coll", &[], None, false, true)
+        let result = create_collection(&client, "test-coll", &[], None, true)
             .await
             .unwrap();
 
@@ -544,7 +489,7 @@ mod tests {
             .await;
 
         let client = test_client(&server).await;
-        let err = create_collection(&client, "my-coll", &[], None, false, false)
+        let err = create_collection(&client, "my-coll", &[], None, false)
             .await
             .unwrap_err();
 
@@ -578,7 +523,7 @@ mod tests {
 
         let client = test_client(&server).await;
         let meta = vec![("hidden".to_string(), "true".to_string())];
-        let result = create_collection(&client, "my-coll", &meta, None, false, false)
+        let result = create_collection(&client, "my-coll", &meta, None, false)
             .await
             .unwrap();
 
@@ -597,7 +542,7 @@ mod tests {
         // No s3_access / s3_secret
         let client = IaClient::from_config_no_retry(config).unwrap();
 
-        let err = create_collection(&client, "test-coll", &[], None, false, false)
+        let err = create_collection(&client, "test-coll", &[], None, false)
             .await
             .unwrap_err();
 
