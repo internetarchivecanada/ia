@@ -225,8 +225,11 @@ fn metadata_write_flags_in_modify_help() {
 
 #[test]
 fn metadata_no_identifier_errors() {
-    // Read mode with no identifier should fail
-    ia().args(["metadata"]).assert().failure();
+    // Read mode with no identifier from piped stdin should warn and exit 0
+    ia().args(["metadata"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no identifiers found"));
 }
 
 #[test]
@@ -697,11 +700,11 @@ fn metadata_modify_help_no_exists_flag() {
 
 #[test]
 fn metadata_bare_read_still_requires_identifier() {
-    // Bare `ia metadata` with no args or subcommand should error
+    // Bare `ia metadata` with no args from piped stdin should warn and exit 0
     ia().args(["metadata"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("identifier"));
+        .success()
+        .stderr(predicate::str::contains("no identifiers found"));
 }
 
 #[test]
@@ -1058,4 +1061,107 @@ fn metadata_modify_help_mentions_compound_ops() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Chain multiple operations with +"));
+}
+
+#[test]
+fn metadata_empty_stdin_warns_and_exits_zero() {
+    ia().args(["metadata"])
+        .write_stdin("\n  \n\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no identifiers found"));
+}
+
+#[test]
+fn metadata_batch_exists_with_itemlist_accepted() {
+    // Clap should accept --exists with --itemlist (no longer rejected).
+    // Will fail on network/file read, but should NOT fail on arg parsing.
+    ia().args([
+        "metadata",
+        "--itemlist",
+        "/tmp/nonexistent_ia_test_ids.txt",
+        "--exists",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("cannot be used with").not());
+}
+
+#[test]
+fn metadata_batch_formats_with_itemlist_accepted() {
+    ia().args([
+        "metadata",
+        "--itemlist",
+        "/tmp/nonexistent_ia_test_ids.txt",
+        "--formats",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("cannot be used with").not());
+}
+
+// ─── Metadata shorthand: runtime validation ─────────────────────────────────
+
+#[test]
+fn metadata_dry_run_without_m_errors() {
+    ia().args(["metadata", "nasa", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires -m or a write subcommand",
+        ));
+}
+
+#[test]
+fn metadata_target_without_m_errors() {
+    ia().args(["metadata", "nasa", "--target", "files/foo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires -m or a write subcommand",
+        ));
+}
+
+#[test]
+fn metadata_expect_without_m_errors() {
+    ia().args(["metadata", "nasa", "--expect", "title:old"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires -m or a write subcommand",
+        ));
+}
+
+#[test]
+fn metadata_priority_without_m_errors() {
+    ia().args(["metadata", "nasa", "--priority", "5"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires -m or a write subcommand",
+        ));
+}
+
+#[test]
+fn metadata_reduced_priority_without_m_errors() {
+    ia().args(["metadata", "nasa", "--reduced-priority"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "requires -m or a write subcommand",
+        ));
+}
+
+#[test]
+fn metadata_shorthand_m_accepted() {
+    // -m at top level should be accepted by clap (not rejected as unknown argument)
+    let output = ia()
+        .args(["metadata", "nasa", "-m", "title:Test"])
+        .output()
+        .expect("failed to run ia");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap rejected -m: {stderr}"
+    );
 }

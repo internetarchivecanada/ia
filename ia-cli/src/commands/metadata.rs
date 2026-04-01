@@ -347,36 +347,69 @@ pub struct SchemaArgs {
 
 // ─── Top-level struct ────────────────────────────────────────────────────────
 
-#[derive(Args)]
+#[derive(Debug, Args)]
 #[command(
-    long_about = "Read or modify Internet Archive item metadata. Shows metadata as JSON \
-        by default. Use subcommands for write operations, bulk export, or batch import \
-        via --spreadsheet.\n\n\
+    long_about = "Read or modify Internet Archive item metadata.\n\n\
+        Without -m, reads metadata (JSON output). With -m, modifies metadata \
+        (shorthand for 'ia metadata modify').\n\n\
+        Use --search or --itemlist for batch operations — both reads and writes.\n\n\
         Chain multiple write operations with + for a single HTTP request:\n  \
-        ia metadata modify ID -m field:val + remove -m field:val",
+        ia metadata ID -m field:val + remove -m field:val",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
-         \n  <dim># Show item metadata</dim>\n  <bold>$ ia metadata nasa</bold>\
-         \n\n  <dim># Check if item exists</dim>\n  <bold>$ ia metadata nasa --exists</bold>\
-         \n\n  <dim># Modify metadata</dim>\n  <bold>$ ia metadata modify nasa -m \"title:New\"</bold>\
-         \n\n  <dim># Compound operations (single request)</dim>\
-         \n  <bold>$ ia metadata modify nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
-         \n\n  <dim># Bulk export</dim>\n  <bold>$ ia metadata export --search \"collection:nasa\"</bold>\
-         \n\n  <dim># Batch import from spreadsheet</dim>\n  <bold>$ ia metadata --spreadsheet data.csv</bold>\
-         \n\n  <dim># Preview spreadsheet changes</dim>\n  <bold>$ ia metadata --spreadsheet data.xlsx --dry-run</bold>\
-         \n\n  <dim># Browse metadata field definitions</dim>\n  <bold>$ ia metadata schema</bold>\
-         \n  <bold>$ ia metadata schema title</bold>\n"
+         \n  <dim># Read metadata</dim>\
+         \n  <bold>$ ia metadata nasa</bold>\
+         \n  <bold>$ ia metadata nasa --exists</bold>\
+         \n\
+         \n  <dim># Batch read</dim>\
+         \n  <bold>$ ia metadata --search \"collection:nasa\"</bold>\
+         \n  <bold>$ ia metadata --itemlist ids.txt</bold>\
+         \n  <bold>$ echo id1 | ia metadata</bold>\
+         \n\
+         \n  <dim># Modify metadata (shorthand for 'ia metadata modify')</dim>\
+         \n  <bold>$ ia metadata nasa -m \"title:New Title\"</bold>\
+         \n  <bold>$ ia metadata nasa -m \"subject:rockets\" --dry-run</bold>\
+         \n\
+         \n  <dim># Batch modify</dim>\
+         \n  <bold>$ ia metadata --search \"collection:test\" -m \"subject:updated\"</bold>\
+         \n  <bold>$ ia metadata --itemlist ids.txt -m \"subject:new-tag\"</bold>\
+         \n\
+         \n  <dim># Compound operations (single request)</dim>\
+         \n  <bold>$ ia metadata nasa -m \"title:New\" + remove -m \"subject:old\"</bold>\
+         \n\
+         \n  <dim># See 'ia metadata modify --help' for write options (--target, --expect, etc.)</dim>\
+         \n\
+         \n  <dim># Export to file</dim>\
+         \n  <bold>$ ia metadata export --search \"collection:nasa\" -o data.xlsx</bold>\
+         \n\
+         \n  <dim># Batch import from spreadsheet</dim>\
+         \n  <bold>$ ia metadata --spreadsheet data.csv --dry-run</bold>\
+         \n\
+         \n  <dim># Browse metadata field definitions</dim>\
+         \n  <bold>$ ia metadata schema</bold>\n"
     ),
     subcommand_required = false,
 )]
 pub struct MetadataArgs {
     /// Batch write metadata from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
-    #[arg(long, conflicts_with_all = ["identifiers", "exists", "formats"])]
+    #[arg(long, conflicts_with_all = ["identifiers", "exists", "formats", "metadata", "itemlist", "search"])]
     pub spreadsheet: Option<PathBuf>,
+
+    /// Modify metadata (shorthand for 'ia metadata modify')
+    #[arg(short = 'm', long = "metadata", conflicts_with_all = ["spreadsheet", "exists", "formats"])]
+    pub metadata: Vec<String>,
 
     /// Item identifier(s)
     #[arg()]
     pub identifiers: Vec<String>,
+
+    /// Read identifiers from file (one per line)
+    #[arg(long, conflicts_with = "spreadsheet")]
+    pub itemlist: Option<PathBuf>,
+
+    /// Use search results as input
+    #[arg(long, conflicts_with = "spreadsheet")]
+    pub search: Option<String>,
 
     /// Check if item exists (exit code 0/1)
     #[arg(short = 'e', long)]
@@ -394,25 +427,25 @@ pub struct MetadataArgs {
     #[arg(long)]
     pub json: bool,
 
-    // ── Spreadsheet-mode options ──────────────────────────────────────────
+    // ── Write-mode options (hidden from top-level help; see 'ia metadata modify --help') ──
     /// Target: "metadata" (default) or "files/FILENAME"
-    #[arg(long, default_value = "metadata", requires = "spreadsheet")]
-    pub target: String,
+    #[arg(long, hide = true)]
+    pub target: Option<String>,
 
     /// Optimistic concurrency check (repeatable, field:expected_value)
-    #[arg(long, requires = "spreadsheet")]
+    #[arg(long, hide = true)]
     pub expect: Vec<String>,
 
-    /// Task priority (default: -5 for batch)
-    #[arg(long, requires = "spreadsheet")]
+    /// Task priority (default: 0 single, -5 batch)
+    #[arg(long, hide = true)]
     pub priority: Option<i32>,
 
     /// Accept reduced priority to reduce rate limiting
-    #[arg(long, requires = "spreadsheet")]
+    #[arg(long, hide = true)]
     pub reduced_priority: bool,
 
     /// Show changes without writing
-    #[arg(long, requires = "spreadsheet")]
+    #[arg(long)]
     pub dry_run: bool,
 
     #[command(subcommand)]
@@ -464,7 +497,7 @@ pub async fn run(
         }
         let import_args = ImportArgs {
             file: args.spreadsheet,
-            target: args.target,
+            target: args.target.unwrap_or_else(|| "metadata".into()),
             expect: args.expect,
             priority: args.priority,
             reduced_priority: args.reduced_priority,
@@ -536,9 +569,86 @@ pub async fn run(
             run_schema(client, sub).await
         }
         None => {
-            if continuations.is_some() {
-                bail!("compound operations (+) require a write subcommand (modify, append, etc.)");
+            // -m at top level → treat as modify shorthand
+            if !args.metadata.is_empty() {
+                let input = BatchInput {
+                    identifiers: args.identifiers,
+                    itemlist: args.itemlist,
+                    search: args.search,
+                };
+                let write = WriteOpts {
+                    metadata: args.metadata,
+                    target: args.target.unwrap_or_else(|| "metadata".into()),
+                    expect: args.expect,
+                    priority: args.priority,
+                    reduced_priority: args.reduced_priority,
+                    dry_run: args.dry_run,
+                    json: args.json,
+                };
+                return run_write(client, input, write, MetadataOp::Set, continuations, &ctx).await;
             }
+
+            // No -m: read mode — reject write-only options
+            if continuations.is_some() {
+                bail!("compound operations (+) require -m or a write subcommand (modify, append, etc.)");
+            }
+            if args.dry_run {
+                bail!("--dry-run requires -m or a write subcommand");
+            }
+            if !args.expect.is_empty() {
+                bail!("--expect requires -m or a write subcommand");
+            }
+            if args.priority.is_some() {
+                bail!("--priority requires -m or a write subcommand");
+            }
+            if args.reduced_priority {
+                bail!("--reduced-priority requires -m or a write subcommand");
+            }
+            if args.target.is_some() {
+                bail!("--target requires -m or a write subcommand");
+            }
+
+            // Batch read: --search / --itemlist / stdin
+            let has_batch_input = args.search.is_some() || args.itemlist.is_some();
+            if has_batch_input || (args.identifiers.is_empty() && !std::io::stdin().is_terminal()) {
+                let input = BatchInput {
+                    identifiers: args.identifiers,
+                    itemlist: args.itemlist,
+                    search: args.search,
+                };
+                let identifiers = collect_identifiers_from_batch(&input, client).await?;
+                if identifiers.is_empty() {
+                    let source = if input.search.is_some() {
+                        "--search"
+                    } else if input.itemlist.is_some() {
+                        "--itemlist"
+                    } else {
+                        "stdin"
+                    };
+                    eprintln!(
+                        "{}: no identifiers found from {source}",
+                        style("warning").yellow().bold()
+                    );
+                    return Ok(());
+                }
+
+                if args.exists {
+                    return run_exists_multi(client, &identifiers, args.json, ctx.jobs).await;
+                }
+                if args.formats {
+                    return run_formats_multi(client, &identifiers, args.json, ctx.jobs).await;
+                }
+                return run_read_multi(
+                    client,
+                    &identifiers,
+                    args.pretty,
+                    args.json,
+                    ctx.quiet,
+                    ctx.jobs,
+                )
+                .await;
+            }
+
             if args.identifiers.is_empty() {
                 bail!("identifier required. Run 'ia metadata --help' for usage.");
             }
@@ -680,6 +790,96 @@ async fn run_read_multi(
             serde_json::to_string(item)?
         };
         println!("{output}");
+    }
+
+    Ok(())
+}
+
+async fn run_exists_multi(
+    client: &IaClient,
+    identifiers: &[String],
+    json: bool,
+    jobs: usize,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let client = Arc::new(client.clone());
+    let mut set = JoinSet::new();
+
+    for (idx, id) in identifiers.iter().enumerate() {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await?;
+            let exists = client
+                .item_exists(&id)
+                .await
+                .context(format!("failed to check existence of {id}"))?;
+            Ok::<_, anyhow::Error>((idx, id, exists))
+        });
+    }
+
+    let mut results: Vec<(usize, String, bool)> = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result??);
+    }
+    results.sort_by_key(|(idx, _, _)| *idx);
+
+    let any_missing = results.iter().any(|(_, _, exists)| !exists);
+    if json {
+        for (_, id, exists) in &results {
+            println!(
+                "{}",
+                serde_json::json!({"identifier": id, "exists": exists})
+            );
+        }
+    }
+
+    if any_missing {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn run_formats_multi(
+    client: &IaClient,
+    identifiers: &[String],
+    _json: bool,
+    jobs: usize,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(jobs));
+    let client = Arc::new(client.clone());
+    let mut set = JoinSet::new();
+
+    for (idx, id) in identifiers.iter().enumerate() {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await?;
+            let item = client
+                .get_item(&id)
+                .await
+                .context(format!("failed to fetch metadata for {id}"))?;
+            let mut fmts: Vec<String> =
+                item.files.iter().filter_map(|f| f.format.clone()).collect();
+            fmts.sort();
+            fmts.dedup();
+            Ok::<_, anyhow::Error>((idx, id, fmts))
+        });
+    }
+
+    let mut results: Vec<(usize, String, Vec<String>)> = Vec::new();
+    while let Some(result) = set.join_next().await {
+        results.push(result??);
+    }
+    results.sort_by_key(|(idx, _, _)| *idx);
+
+    // Always JSONL — batch output needs per-identifier attribution.
+    // Single-item --formats can print one format per line since the
+    // identifier is implicit, but batch mode always needs structure.
+    for (_, id, fmts) in &results {
+        println!("{}", serde_json::json!({"identifier": id, "formats": fmts}));
     }
 
     Ok(())
@@ -2296,5 +2496,344 @@ mod compound_tests {
         let a = args("ia list metadata");
         let result = extract_compound_from_argv(&a, &test_value_flags()).unwrap();
         assert!(result.is_none());
+    }
+
+    // ─── Top-level shorthand compound (no explicit subcommand) ──────────
+
+    #[test]
+    fn extract_compound_shorthand_with_plus() {
+        let a = args("ia metadata my-item -m title:New + remove -m subject:old");
+        let result = extract_compound_from_argv(&a, &test_value_flags())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.filtered_argv,
+            args("ia metadata my-item -m title:New")
+        );
+        assert_eq!(result.continuations.len(), 1);
+        assert_eq!(result.continuations[0].0, "remove");
+        assert_eq!(result.continuations[0].1, vec!["subject:old"]);
+    }
+
+    #[test]
+    fn extract_compound_shorthand_multi_continuations() {
+        let a = args("ia metadata my-item -m title:New + remove -m x:y + append-list -m z:w");
+        let result = extract_compound_from_argv(&a, &test_value_flags())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.filtered_argv,
+            args("ia metadata my-item -m title:New")
+        );
+        assert_eq!(result.continuations.len(), 2);
+        assert_eq!(result.continuations[0].0, "remove");
+        assert_eq!(result.continuations[1].0, "append-list");
+    }
+}
+
+// ─── MetadataArgs clap parsing tests ────────────────────────────────────────
+
+#[cfg(test)]
+mod args_parsing_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Wrapper to test MetadataArgs parsing in isolation.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: MetadataArgs,
+    }
+
+    fn parse(s: &str) -> MetadataArgs {
+        let argv: Vec<&str> = std::iter::once("test")
+            .chain(s.split_whitespace())
+            .collect();
+        TestCli::try_parse_from(argv).unwrap().args
+    }
+
+    fn parse_err(s: &str) -> String {
+        let argv: Vec<&str> = std::iter::once("test")
+            .chain(s.split_whitespace())
+            .collect();
+        TestCli::try_parse_from(argv).unwrap_err().to_string()
+    }
+
+    // ─── Read modes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn read_single_identifier() {
+        let a = parse("nasa");
+        assert_eq!(a.identifiers, vec!["nasa"]);
+        assert!(a.metadata.is_empty());
+        assert!(a.search.is_none());
+        assert!(a.itemlist.is_none());
+        assert!(a.command.is_none());
+    }
+
+    #[test]
+    fn read_multiple_identifiers() {
+        let a = parse("nasa apollo11");
+        assert_eq!(a.identifiers, vec!["nasa", "apollo11"]);
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn read_with_search() {
+        let a = parse("--search collection:nasa");
+        assert_eq!(a.search.as_deref(), Some("collection:nasa"));
+        assert!(a.metadata.is_empty());
+        assert!(a.identifiers.is_empty());
+    }
+
+    #[test]
+    fn read_with_itemlist() {
+        let a = parse("--itemlist ids.txt");
+        assert_eq!(a.itemlist.as_ref().unwrap().to_str().unwrap(), "ids.txt");
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn read_with_search_and_itemlist() {
+        let a = parse("--search collection:nasa --itemlist ids.txt");
+        assert!(a.search.is_some());
+        assert!(a.itemlist.is_some());
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn read_with_search_and_identifiers() {
+        let a = parse("--search collection:nasa extra-id");
+        assert!(a.search.is_some());
+        assert_eq!(a.identifiers, vec!["extra-id"]);
+    }
+
+    #[test]
+    fn read_with_exists() {
+        let a = parse("-e nasa");
+        assert!(a.exists);
+        assert_eq!(a.identifiers, vec!["nasa"]);
+    }
+
+    #[test]
+    fn read_with_pretty_json() {
+        let a = parse("nasa --pretty --json");
+        assert!(a.pretty);
+        assert!(a.json);
+    }
+
+    // ─── Write modes (with -m) ──────────────────────────────────────────
+
+    #[test]
+    fn write_single_metadata() {
+        let a = parse("nasa -m title:New");
+        assert_eq!(a.identifiers, vec!["nasa"]);
+        assert_eq!(a.metadata, vec!["title:New"]);
+    }
+
+    #[test]
+    fn write_multiple_metadata() {
+        let a = parse("nasa -m title:New -m date:2024");
+        assert_eq!(a.metadata, vec!["title:New", "date:2024"]);
+    }
+
+    #[test]
+    fn write_with_search() {
+        let a = parse("--search collection:test -m subject:updated");
+        assert!(a.search.is_some());
+        assert_eq!(a.metadata, vec!["subject:updated"]);
+    }
+
+    #[test]
+    fn write_with_itemlist() {
+        let a = parse("--itemlist ids.txt -m subject:new-tag");
+        assert!(a.itemlist.is_some());
+        assert_eq!(a.metadata, vec!["subject:new-tag"]);
+    }
+
+    #[test]
+    fn write_with_target() {
+        let a = parse("nasa -m title:X --target files/myfile.txt");
+        assert_eq!(a.target.as_deref(), Some("files/myfile.txt"));
+        assert_eq!(a.metadata, vec!["title:X"]);
+    }
+
+    #[test]
+    fn write_with_dry_run() {
+        let a = parse("nasa -m title:X --dry-run");
+        assert!(a.dry_run);
+    }
+
+    #[test]
+    fn write_with_expect_and_priority() {
+        let a = parse("nasa -m title:X --expect field:old --priority 5");
+        assert_eq!(a.expect, vec!["field:old"]);
+        assert_eq!(a.priority, Some(5));
+    }
+
+    #[test]
+    fn write_with_reduced_priority() {
+        let a = parse("nasa -m title:X --reduced-priority");
+        assert!(a.reduced_priority);
+    }
+
+    #[test]
+    fn write_with_all_options() {
+        let a = parse(
+            "nasa -m title:X --target files/f.txt --expect a:b --priority 3 --reduced-priority --dry-run --json",
+        );
+        assert_eq!(a.metadata, vec!["title:X"]);
+        assert_eq!(a.target.as_deref(), Some("files/f.txt"));
+        assert_eq!(a.expect, vec!["a:b"]);
+        assert_eq!(a.priority, Some(3));
+        assert!(a.reduced_priority);
+        assert!(a.dry_run);
+        assert!(a.json);
+    }
+
+    #[test]
+    fn target_defaults_to_metadata() {
+        let a = parse("nasa -m title:X");
+        // No explicit --target → None, which run() resolves to "metadata"
+        assert!(a.target.is_none());
+    }
+
+    // ─── Clap-level conflict errors ─────────────────────────────────────
+
+    #[test]
+    fn conflict_metadata_with_spreadsheet() {
+        let err = parse_err("--spreadsheet data.csv -m title:X");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    #[test]
+    fn conflict_metadata_with_exists() {
+        let err = parse_err("nasa -m title:X --exists");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    #[test]
+    fn conflict_metadata_with_formats() {
+        let err = parse_err("nasa -m title:X --formats");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    #[test]
+    fn conflict_spreadsheet_with_identifiers() {
+        let err = parse_err("--spreadsheet data.csv nasa");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    #[test]
+    fn conflict_spreadsheet_with_search() {
+        let err = parse_err("--spreadsheet data.csv --search query");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    #[test]
+    fn conflict_spreadsheet_with_itemlist() {
+        let err = parse_err("--spreadsheet data.csv --itemlist ids.txt");
+        assert!(
+            err.contains("cannot be used with"),
+            "expected conflict error: {err}"
+        );
+    }
+
+    // ─── Subcommand coexistence ─────────────────────────────────────────
+
+    #[test]
+    fn subcommand_modify_parses_separately() {
+        let a = parse("modify nasa -m title:New");
+        assert!(matches!(a.command, Some(MetadataCommand::Modify(_))));
+        // Top-level metadata should be empty — -m belongs to the subcommand
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn subcommand_export_with_search() {
+        let a = parse("export --search collection:nasa");
+        assert!(matches!(a.command, Some(MetadataCommand::Export(_))));
+    }
+
+    #[test]
+    fn subcommand_schema() {
+        let a = parse("schema");
+        assert!(matches!(a.command, Some(MetadataCommand::Schema(_))));
+    }
+
+    #[test]
+    fn subcommand_modify_with_target() {
+        let a = parse("modify nasa -m title:X --target files/f.txt");
+        match a.command {
+            Some(MetadataCommand::Modify(sub)) => {
+                assert_eq!(sub.write.target, "files/f.txt");
+                assert_eq!(sub.write.metadata, vec!["title:X"]);
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subcommand_remove() {
+        let a = parse("remove nasa -m subject:old");
+        assert!(matches!(a.command, Some(MetadataCommand::Remove(_))));
+    }
+
+    #[test]
+    fn subcommand_append_list() {
+        let a = parse("append-list nasa -m subject:new-tag");
+        assert!(matches!(a.command, Some(MetadataCommand::AppendList(_))));
+    }
+
+    // ─── Write-only options are accepted without -m at parse level ───────
+    // (Runtime validation rejects them — tested in integration tests)
+
+    #[test]
+    fn dry_run_without_metadata_parses_ok() {
+        // Clap accepts it; runtime should reject
+        let a = parse("nasa --dry-run");
+        assert!(a.dry_run);
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn target_without_metadata_parses_ok() {
+        let a = parse("nasa --target files/x");
+        assert_eq!(a.target.as_deref(), Some("files/x"));
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn priority_without_metadata_parses_ok() {
+        let a = parse("nasa --priority 5");
+        assert_eq!(a.priority, Some(5));
+        assert!(a.metadata.is_empty());
+    }
+
+    #[test]
+    fn target_is_none_by_default() {
+        let a = parse("nasa");
+        assert!(a.target.is_none());
+    }
+
+    #[test]
+    fn target_some_when_explicit() {
+        let a = parse("nasa -m title:X --target files/f.txt");
+        assert_eq!(a.target.as_deref(), Some("files/f.txt"));
     }
 }
