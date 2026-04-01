@@ -15,6 +15,16 @@ fn ia_cmd() -> Command {
 async fn test_tasks_list_json() {
     let mock_server = MockServer::start().await;
 
+    // Provide a config file with logged-in-user cookie so the bare `ia tasks`
+    // command can resolve the submitter email without a real config on disk.
+    let config_dir = tempfile::tempdir().unwrap();
+    let config_path = config_dir.path().join("ia.ini");
+    std::fs::write(
+        &config_path,
+        "[s3]\naccess = dummy\nsecret = dummy\n\n[cookies]\nlogged-in-user = test%40example.com\n",
+    )
+    .unwrap();
+
     // Mock whoami (POST /services/xauthn/?op=info)
     Mock::given(method("POST"))
         .and(path("/services/xauthn/"))
@@ -49,8 +59,7 @@ async fn test_tasks_list_json() {
     let host = mock_server.uri().replace("http://", "");
     let output = ia_cmd()
         .args(["--insecure", "-H", &host, "tasks", "--json"])
-        .env("IA_ACCESS_KEY_ID", "test_access")
-        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .env("IA_CONFIG_FILE", config_path.to_str().unwrap())
         .output()
         .unwrap();
 

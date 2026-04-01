@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use color_print::cstr;
 use console::style;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -756,40 +757,42 @@ async fn run_read_multi(
     identifiers: &[String],
     pretty: bool,
     _json: bool,
-    _quiet: u8,
+    quiet: u8,
     jobs: usize,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(jobs));
+    let total = identifiers.len();
     let client = Arc::new(client.clone());
-    let mut set = JoinSet::new();
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    for (idx, id) in identifiers.iter().enumerate() {
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let id = id.clone();
-        set.spawn(async move {
-            let _permit = sem.acquire().await?;
-            let item = client
-                .get_item(&id)
-                .await
-                .context(format!("failed to fetch metadata for {id}"))?;
-            Ok::<_, anyhow::Error>((idx, item))
-        });
-    }
+    let mut stream = stream::iter(identifiers.iter().cloned())
+        .map(|id| {
+            let client = client.clone();
+            let counter = counter.clone();
+            async move {
+                let item = client
+                    .get_item(&id)
+                    .await
+                    .context(format!("failed to fetch metadata for {id}"))?;
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok::<_, anyhow::Error>((item, n))
+            }
+        })
+        .buffer_unordered(jobs);
 
-    let mut results: Vec<(usize, ia_core::types::ItemMetadata)> = Vec::new();
-    while let Some(result) = set.join_next().await {
-        results.push(result??);
-    }
-    results.sort_by_key(|(idx, _)| *idx);
-
-    for (_, item) in &results {
+    while let Some(result) = stream.next().await {
+        let (item, n) = result?;
         let output = if pretty {
-            serde_json::to_string_pretty(item)?
+            serde_json::to_string_pretty(&item)?
         } else {
-            serde_json::to_string(item)?
+            serde_json::to_string(&item)?
         };
         println!("{output}");
+        if quiet == 0 {
+            eprint!("\rFetched {n}/{total} items");
+        }
+    }
+    if quiet == 0 && total > 0 {
+        eprintln!();
     }
 
     Ok(())
@@ -801,33 +804,28 @@ async fn run_exists_multi(
     json: bool,
     jobs: usize,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(jobs));
     let client = Arc::new(client.clone());
-    let mut set = JoinSet::new();
+    let mut any_missing = false;
 
-    for (idx, id) in identifiers.iter().enumerate() {
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let id = id.clone();
-        set.spawn(async move {
-            let _permit = sem.acquire().await?;
-            let exists = client
-                .item_exists(&id)
-                .await
-                .context(format!("failed to check existence of {id}"))?;
-            Ok::<_, anyhow::Error>((idx, id, exists))
-        });
-    }
+    let mut stream = stream::iter(identifiers.iter().cloned())
+        .map(|id| {
+            let client = client.clone();
+            async move {
+                let exists = client
+                    .item_exists(&id)
+                    .await
+                    .context(format!("failed to check existence of {id}"))?;
+                Ok::<_, anyhow::Error>((id, exists))
+            }
+        })
+        .buffer_unordered(jobs);
 
-    let mut results: Vec<(usize, String, bool)> = Vec::new();
-    while let Some(result) = set.join_next().await {
-        results.push(result??);
-    }
-    results.sort_by_key(|(idx, _, _)| *idx);
-
-    let any_missing = results.iter().any(|(_, _, exists)| !exists);
-    if json {
-        for (_, id, exists) in &results {
+    while let Some(result) = stream.next().await {
+        let (id, exists) = result?;
+        if !exists {
+            any_missing = true;
+        }
+        if json {
             println!(
                 "{}",
                 serde_json::json!({"identifier": id, "exists": exists})
@@ -847,38 +845,30 @@ async fn run_formats_multi(
     _json: bool,
     jobs: usize,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(jobs));
     let client = Arc::new(client.clone());
-    let mut set = JoinSet::new();
 
-    for (idx, id) in identifiers.iter().enumerate() {
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let id = id.clone();
-        set.spawn(async move {
-            let _permit = sem.acquire().await?;
-            let item = client
-                .get_item(&id)
-                .await
-                .context(format!("failed to fetch metadata for {id}"))?;
-            let mut fmts: Vec<String> =
-                item.files.iter().filter_map(|f| f.format.clone()).collect();
-            fmts.sort();
-            fmts.dedup();
-            Ok::<_, anyhow::Error>((idx, id, fmts))
-        });
-    }
-
-    let mut results: Vec<(usize, String, Vec<String>)> = Vec::new();
-    while let Some(result) = set.join_next().await {
-        results.push(result??);
-    }
-    results.sort_by_key(|(idx, _, _)| *idx);
+    let mut stream = stream::iter(identifiers.iter().cloned())
+        .map(|id| {
+            let client = client.clone();
+            async move {
+                let item = client
+                    .get_item(&id)
+                    .await
+                    .context(format!("failed to fetch metadata for {id}"))?;
+                let mut fmts: Vec<String> =
+                    item.files.iter().filter_map(|f| f.format.clone()).collect();
+                fmts.sort();
+                fmts.dedup();
+                Ok::<_, anyhow::Error>((id, fmts))
+            }
+        })
+        .buffer_unordered(jobs);
 
     // Always JSONL — batch output needs per-identifier attribution.
     // Single-item --formats can print one format per line since the
     // identifier is implicit, but batch mode always needs structure.
-    for (_, id, fmts) in &results {
+    while let Some(result) = stream.next().await {
+        let (id, fmts) = result?;
         println!("{}", serde_json::json!({"identifier": id, "formats": fmts}));
     }
 
@@ -1092,49 +1082,38 @@ async fn collect_identifiers_from_export(
 
 async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8, jobs: usize) -> Result<()> {
     let identifiers = collect_identifiers_from_export(&args, client).await?;
-
-    // Fetch all items concurrently with semaphore-bounded parallelism.
-    // Results are collected and sorted by original index for deterministic output.
-    let semaphore = Arc::new(Semaphore::new(jobs));
+    let total = identifiers.len();
     let client = Arc::new(client.clone());
-    let mut set = JoinSet::new();
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    for (idx, id) in identifiers.iter().enumerate() {
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let id = id.clone();
-        set.spawn(async move {
-            let _permit = sem.acquire().await?;
-            let item = client
-                .get_item(&id)
-                .await
-                .context(format!("failed to fetch metadata for {id}"))?;
-            Ok::<_, anyhow::Error>((idx, id, item))
-        });
-    }
+    // Fetch items concurrently, streaming results as they complete.
+    // Only `jobs` futures are in-flight at a time (not all N at once).
+    let mut stream = stream::iter(identifiers)
+        .map(|id| {
+            let client = client.clone();
+            let counter = counter.clone();
+            async move {
+                let item = client
+                    .get_item(&id)
+                    .await
+                    .context(format!("failed to fetch metadata for {id}"))?;
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok::<_, anyhow::Error>((id, item, n))
+            }
+        })
+        .buffer_unordered(jobs);
 
-    let mut results: Vec<(usize, String, ia_core::types::ItemMetadata)> = Vec::new();
-    while let Some(result) = set.join_next().await {
-        results.push(result??);
-    }
-    results.sort_by_key(|(idx, _, _)| *idx);
+    if let Some(ref path) = args.output {
+        // File mode: collect all records for unified column computation.
+        let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
-    // When writing to a file (-o), we collect all records into memory first so we can
-    // compute a unified column set across all items. For large exports this may use
-    // significant memory; stdout mode outputs items one at a time.
-    let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let (identifier, item, n) = result?;
+            if quiet == 0 {
+                eprint!("\rFetched {n}/{total} items");
+            }
 
-    for (_, identifier, item) in &results {
-        if args.output.is_none() {
-            // Stdout mode: output immediately
-            let output = if args.pretty {
-                serde_json::to_string_pretty(&item)?
-            } else {
-                serde_json::to_string(&item)?
-            };
-            println!("{output}");
-        } else {
-            // File mode: flatten metadata into tabular columns.
+            // Flatten metadata into tabular columns.
             // Multi-value fields expand into indexed columns:
             //   subject: ["science", "nasa"] → subject[0]="science", subject[1]="nasa"
             // Single-value fields use the bare field name:
@@ -1183,17 +1162,35 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8, jobs: usize)
                     }
                 }
             }
-            records.push((identifier.clone(), fields));
+            records.push((identifier, fields));
         }
-    }
 
-    // Write to file if -o specified
-    if let Some(ref path) = args.output {
+        if quiet == 0 && total > 0 {
+            eprintln!();
+        }
+
         ia_core::spreadsheet::write_spreadsheet(path, &records)
             .context(format!("failed to write export file: {}", path.display()))?;
 
         if quiet < 2 {
             eprintln!("{} item(s) exported to {}", records.len(), path.display());
+        }
+    } else {
+        // Stdout mode: stream results as they complete (no buffering).
+        while let Some(result) = stream.next().await {
+            let (_id, item, n) = result?;
+            let output = if args.pretty {
+                serde_json::to_string_pretty(&item)?
+            } else {
+                serde_json::to_string(&item)?
+            };
+            println!("{output}");
+            if quiet == 0 {
+                eprint!("\rFetched {n}/{total} items");
+            }
+        }
+        if quiet == 0 && total > 0 {
+            eprintln!();
         }
     }
 
