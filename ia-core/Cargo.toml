@@ -7,9 +7,9 @@ publish = false
 
 [dependencies]
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-reqwest-middleware = "0.4"
-reqwest-retry = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest-middleware = { version = "0.5", features = ["json", "query", "form"] }
+reqwest-retry = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "signal"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
