@@ -958,6 +958,127 @@ fn metadata_bare_file_like_identifier_hints_export() {
         );
 }
 
+// --- export joblog ---
+
+#[test]
+fn metadata_export_retry_failed_requires_joblog() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-id\n").unwrap();
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--retry-failed",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("--retry-failed requires --joblog"));
+}
+
+#[test]
+fn metadata_export_retry_failed_no_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-id\n").unwrap();
+
+    // Write a joblog with only successes
+    let log = dir.path().join("export.log");
+    std::fs::write(
+        &log,
+        r#"{"ts":"2026-01-01T00:00:00Z","op":"export","item":"test-id","file":"","status":"ok","bytes":100,"elapsed_ms":50}"#,
+    )
+    .unwrap();
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--retry-failed",
+        "--joblog",
+        log.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("No failed items in joblog"));
+}
+
+#[test]
+fn metadata_export_writes_joblog() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-nonexistent-id\n").unwrap();
+
+    let log = dir.path().join("export.log");
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    let content = std::fs::read_to_string(&log).unwrap();
+    assert!(!content.is_empty(), "joblog should have entries");
+    assert!(content.contains("\"op\":\"export\""));
+    assert!(content.contains("\"item\":\"test-nonexistent-id\""));
+}
+
+#[test]
+fn metadata_export_progress_bar_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-nonexistent-id\n").unwrap();
+
+    // indicatif suppresses the spinner label when not a TTY, but the summary
+    // separator and stats are always printed
+    ia().args(["metadata", "export", "--itemlist", ids.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("──────────"));
+}
+
+#[test]
+fn metadata_export_shows_summary_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-nonexistent-id\n").unwrap();
+
+    // Summary should show "items exported" and "fetched"
+    ia().args(["metadata", "export", "--itemlist", ids.to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("items exported"))
+        .stderr(predicate::str::contains("fetched"));
+}
+
+#[test]
+fn metadata_export_quiet_suppresses_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "test-nonexistent-id\n").unwrap();
+
+    // -q should suppress the progress bar but still show summary
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "-q",
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("Exporting metadata...").not())
+    .stderr(predicate::str::contains("items exported"));
+}
+
 #[test]
 fn search_advanced_help_has_rows() {
     ia().args(["search", "advanced", "--help"])

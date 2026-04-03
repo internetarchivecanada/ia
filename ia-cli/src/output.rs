@@ -13,18 +13,18 @@ use ia_core::upload::{UploadProgress, UploadProgressStatus, UploadResult, Upload
 // ─── Shared progress style ──────────────────────────────────────────────────
 
 /// Progress bar characters: filled, head, empty.
-const PROGRESS_CHARS: &str = "━╸─";
+pub const PROGRESS_CHARS: &str = "━╸─";
 
 /// Progress bar width for per-item bars.
 /// Total line: 2 (indent) + BAR + bytes + speed + msg ≈ 78 cols.
-const BAR_WIDTH: usize = 28;
+pub const BAR_WIDTH: usize = 28;
 
 // Icons used across all progress displays.
-const ICON_HEADER: &str = "▸";
-const ICON_SUCCESS: &str = "✓";
-const ICON_ERROR: &str = "✗";
-const ICON_SKIPPED: &str = "–";
-const ICON_DRY_RUN: &str = "⊘";
+pub const ICON_HEADER: &str = "▸";
+pub const ICON_SUCCESS: &str = "✓";
+pub const ICON_ERROR: &str = "✗";
+pub const ICON_SKIPPED: &str = "–";
+pub const ICON_DRY_RUN: &str = "⊘";
 
 /// Create a progress bar with the shared style.
 fn make_progress_bar(total_bytes: u64) -> ProgressBar {

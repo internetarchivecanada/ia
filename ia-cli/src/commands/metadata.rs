@@ -1,20 +1,23 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use color_print::cstr;
 use console::style;
 use futures::{stream, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use comfy_table::{Cell, Color, Table};
 
+use crate::output::{format_bytes, BAR_WIDTH, ICON_ERROR, ICON_SUCCESS, PROGRESS_CHARS};
 use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
@@ -25,6 +28,9 @@ use ia_core::metadata::{fetch_schema, SchemaField};
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
+
+/// Maximum number of errors to display inline during export.
+const MAX_INLINE_ERRORS: usize = 5;
 
 // ─── Filter enums ────────────────────────────────────────────────────────────
 
@@ -461,6 +467,7 @@ struct WriteContext {
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    retry_failed: bool,
 }
 
 // ─── Main dispatch ───────────────────────────────────────────────────────────
@@ -472,11 +479,13 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    retry_failed: bool,
 ) -> Result<()> {
     let ctx = WriteContext {
         quiet,
         jobs,
         joblog_path,
+        retry_failed,
     };
 
     // Deprecated `import` subcommand → redirect to --spreadsheet path
@@ -513,7 +522,15 @@ pub async fn run(
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with export");
             }
-            run_export(client, sub, ctx.quiet, ctx.jobs).await
+            run_export(
+                client,
+                sub,
+                ctx.quiet,
+                ctx.jobs,
+                ctx.joblog_path,
+                ctx.retry_failed,
+            )
+            .await
         }
         Some(MetadataCommand::Modify(sub)) => {
             run_write(
@@ -1080,25 +1097,205 @@ async fn collect_identifiers_from_export(
     Ok(ids)
 }
 
-async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8, jobs: usize) -> Result<()> {
-    let identifiers = collect_identifiers_from_export(&args, client).await?;
+/// Print the export summary footer to stderr.
+fn print_export_summary(
+    succeeded: usize,
+    failed: usize,
+    bytes: u64,
+    elapsed_secs: f64,
+    errors_shown: usize,
+    output_path: Option<&Path>,
+    quiet: u8,
+) {
+    if quiet >= 2 {
+        return;
+    }
+
+    let total = succeeded + failed;
+
+    // Overflow error count
+    let overflow = errors_shown.saturating_sub(MAX_INLINE_ERRORS);
+    if overflow > 0 && quiet == 0 {
+        eprintln!(
+            "  {} {overflow} more error(s) (see joblog)",
+            style("...").dim(),
+        );
+    }
+
+    // Separator
+    eprintln!(
+        "{}",
+        style("────────────────────────────────────────────────────").dim()
+    );
+
+    // Items line
+    if failed == 0 {
+        eprintln!(
+            "{} {} items exported",
+            style(ICON_SUCCESS).green(),
+            style(succeeded).green(),
+        );
+    } else {
+        eprintln!(
+            "{}/{} items exported · {} failed",
+            style(succeeded).green(),
+            total,
+            style(failed).red(),
+        );
+    }
+
+    // Bytes / speed / elapsed
+    let speed = if elapsed_secs > 0.0 {
+        format!("{:.1} items/s", total as f64 / elapsed_secs)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "{}",
+        style(format!(
+            "{} fetched · {} · {:.1}s elapsed",
+            format_bytes(bytes),
+            speed,
+            elapsed_secs,
+        ))
+        .dim(),
+    );
+
+    // Output file line
+    if let Some(path) = output_path {
+        eprintln!("exported to {}", style(path.display()).bold());
+    }
+
+    // Warning for failures
+    if failed > 0 {
+        eprintln!(
+            "{} {} item(s) failed — re-run with --retry-failed to retry",
+            style("warning:").yellow().bold(),
+            failed,
+        );
+    }
+}
+
+async fn run_export(
+    client: &IaClient,
+    args: ExportArgs,
+    quiet: u8,
+    jobs: usize,
+    joblog_path: Option<PathBuf>,
+    retry_failed: bool,
+) -> Result<()> {
+    let mut identifiers = collect_identifiers_from_export(&args, client).await?;
+
+    // --retry-failed: re-fetch only items that failed in a previous run
+    let is_retry = if retry_failed {
+        if let Some(ref path) = joblog_path {
+            let entries = ia_core::joblog::read(path)
+                .context(format!("failed to read joblog: {}", path.display()))?;
+            let failed = ia_core::joblog::failed_items(&entries);
+            if failed.is_empty() {
+                eprintln!("{} No failed items in joblog", style("✓").green());
+                return Ok(());
+            }
+            identifiers = failed;
+            true
+        } else {
+            bail!("--retry-failed requires --joblog");
+        }
+    } else {
+        false
+    };
+
+    // Auto-resume: skip items already successfully exported in this joblog
+    let skip_set: std::collections::HashSet<String> = if !retry_failed {
+        if let Some(ref path) = joblog_path {
+            if path.exists() {
+                let entries = ia_core::joblog::read(path)
+                    .context(format!("failed to read joblog: {}", path.display()))?;
+                let done: std::collections::HashSet<String> = entries
+                    .iter()
+                    .filter(|e| e.op == "export" && e.status == "ok")
+                    .map(|e| e.item.clone())
+                    .collect();
+                done
+            } else {
+                std::collections::HashSet::new()
+            }
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let before_skip = identifiers.len();
+    if !skip_set.is_empty() {
+        identifiers.retain(|id| !skip_set.contains(id));
+    }
+    let skipped = before_skip - identifiers.len();
+
+    // Open joblog writer
+    let joblog = joblog_path
+        .as_ref()
+        .map(|p| JoblogWriter::open(p))
+        .transpose()
+        .context("failed to open joblog")?;
+
     let total = identifiers.len();
+    let total_with_skipped = total + skipped;
     let client = Arc::new(client.clone());
-    let counter = Arc::new(AtomicUsize::new(0));
+
+    // Progress tracking
+    let succeeded = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let errors_shown = Arc::new(AtomicUsize::new(0));
+    let start = Instant::now();
+
+    // Progress bar
+    let pb = if quiet == 0 && total > 0 {
+        let pb = ProgressBar::new(total_with_skipped as u64);
+        pb.set_style(
+            ProgressStyle::with_template(&format!(
+                "{{msg}}\n  {{bar:{BAR_WIDTH}.cyan/dim}} {{pos}}/{{len}} {{per_sec:.dim}}  ({{elapsed}} elapsed)",
+            ))
+            .unwrap()
+            .progress_chars(PROGRESS_CHARS),
+        );
+
+        let msg = if is_retry {
+            format!(
+                "Retrying {} failed item(s) from joblog...",
+                style(total).bold()
+            )
+        } else if skipped > 0 {
+            format!(
+                "Exporting metadata... {}",
+                style(format!("(resuming — {skipped} already exported)")).dim()
+            )
+        } else {
+            "Exporting metadata...".to_string()
+        };
+        pb.set_message(msg);
+
+        if skipped > 0 {
+            pb.set_position(skipped as u64);
+        }
+
+        Some(pb)
+    } else {
+        None
+    };
 
     // Fetch items concurrently, streaming results as they complete.
     // Only `jobs` futures are in-flight at a time (not all N at once).
     let mut stream = stream::iter(identifiers)
         .map(|id| {
             let client = client.clone();
-            let counter = counter.clone();
             async move {
-                let item = client
-                    .get_item(&id)
-                    .await
-                    .context(format!("failed to fetch metadata for {id}"))?;
-                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                Ok::<_, anyhow::Error>((id, item, n))
+                let req_start = Instant::now();
+                let result = client.get_item(&id).await;
+                let elapsed_ms = req_start.elapsed().as_millis() as u64;
+                (id, result, elapsed_ms)
             }
         })
         .buffer_unordered(jobs);
@@ -1107,91 +1304,191 @@ async fn run_export(client: &IaClient, args: ExportArgs, quiet: u8, jobs: usize)
         // File mode: collect all records for unified column computation.
         let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
-        while let Some(result) = stream.next().await {
-            let (identifier, item, n) = result?;
-            if quiet == 0 {
-                eprint!("\rFetched {n}/{total} items");
-            }
-
-            // Flatten metadata into tabular columns.
-            // Multi-value fields expand into indexed columns:
-            //   subject: ["science", "nasa"] → subject[0]="science", subject[1]="nasa"
-            // Single-value fields use the bare field name:
-            //   title: "Apollo 11" → title="Apollo 11"
-            let metadata_json = serde_json::to_value(&item.metadata)?;
-            let mut fields = HashMap::new();
-            if let serde_json::Value::Object(map) = metadata_json {
-                for (key, value) in map {
-                    if key == "identifier" {
-                        continue;
+        while let Some((identifier, result, elapsed_ms)) = stream.next().await {
+            match result {
+                Ok(item) => {
+                    let json_bytes = serde_json::to_string(&item)
+                        .map(|s| s.len() as u64)
+                        .unwrap_or(0);
+                    if let Some(ref jl) = joblog {
+                        jl.write(
+                            &JoblogEntry::new("export", &identifier, "").ok(json_bytes, elapsed_ms),
+                        );
                     }
-                    match &value {
-                        serde_json::Value::String(s) => {
-                            if !s.is_empty() {
-                                fields.insert(key, s.clone());
+                    bytes_total.fetch_add(json_bytes, Ordering::Relaxed);
+                    succeeded.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref pb) = pb {
+                        pb.inc(1);
+                    }
+
+                    let metadata_json = serde_json::to_value(&item.metadata)?;
+                    let mut fields = HashMap::new();
+                    if let serde_json::Value::Object(map) = metadata_json {
+                        for (key, value) in map {
+                            if key == "identifier" {
+                                continue;
                             }
-                        }
-                        serde_json::Value::Array(arr) if arr.len() == 1 => {
-                            // Single-element array: use bare field name
-                            let s = match &arr[0] {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            if !s.is_empty() {
-                                fields.insert(key, s);
-                            }
-                        }
-                        serde_json::Value::Array(arr) => {
-                            for (i, elem) in arr.iter().enumerate() {
-                                let s = match elem {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                if !s.is_empty() {
-                                    fields.insert(format!("{key}[{i}]"), s);
+                            match &value {
+                                serde_json::Value::String(s) => {
+                                    if !s.is_empty() {
+                                        fields.insert(key, s.clone());
+                                    }
+                                }
+                                serde_json::Value::Array(arr) if arr.len() == 1 => {
+                                    let s = match &arr[0] {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    if !s.is_empty() {
+                                        fields.insert(key, s);
+                                    }
+                                }
+                                serde_json::Value::Array(arr) => {
+                                    for (i, elem) in arr.iter().enumerate() {
+                                        let s = match elem {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        };
+                                        if !s.is_empty() {
+                                            fields.insert(format!("{key}[{i}]"), s);
+                                        }
+                                    }
+                                }
+                                serde_json::Value::Null => {}
+                                other => {
+                                    let s = other.to_string();
+                                    if !s.is_empty() {
+                                        fields.insert(key, s);
+                                    }
                                 }
                             }
                         }
-                        serde_json::Value::Null => {}
-                        other => {
-                            let s = other.to_string();
-                            if !s.is_empty() {
-                                fields.insert(key, s);
-                            }
+                    }
+                    records.push((identifier, fields));
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if let Some(ref jl) = joblog {
+                        jl.write(&JoblogEntry::new("export", &identifier, "").error(&msg, 0));
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    let shown = errors_shown.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref pb) = pb {
+                        pb.inc(1);
+                    }
+                    if quiet == 0 && shown < MAX_INLINE_ERRORS {
+                        if let Some(ref pb) = pb {
+                            pb.suspend(|| {
+                                eprintln!(
+                                    "{} {} — {}",
+                                    style(ICON_ERROR).red(),
+                                    style(&identifier).bold(),
+                                    style(&msg).red(),
+                                );
+                            });
+                        } else {
+                            eprintln!(
+                                "{} {} — {}",
+                                style(ICON_ERROR).red(),
+                                style(&identifier).bold(),
+                                style(&msg).red(),
+                            );
                         }
                     }
                 }
             }
-            records.push((identifier, fields));
         }
 
-        if quiet == 0 && total > 0 {
-            eprintln!();
+        if let Some(ref pb) = pb {
+            pb.finish_and_clear();
         }
 
         ia_core::spreadsheet::write_spreadsheet(path, &records)
             .context(format!("failed to write export file: {}", path.display()))?;
 
-        if quiet < 2 {
-            eprintln!("{} item(s) exported to {}", records.len(), path.display());
-        }
+        print_export_summary(
+            succeeded.load(Ordering::Relaxed),
+            failed.load(Ordering::Relaxed),
+            bytes_total.load(Ordering::Relaxed),
+            start.elapsed().as_secs_f64(),
+            errors_shown.load(Ordering::Relaxed),
+            Some(path.as_path()),
+            quiet,
+        );
     } else {
         // Stdout mode: stream results as they complete (no buffering).
-        while let Some(result) = stream.next().await {
-            let (_id, item, n) = result?;
-            let output = if args.pretty {
-                serde_json::to_string_pretty(&item)?
-            } else {
-                serde_json::to_string(&item)?
-            };
-            println!("{output}");
-            if quiet == 0 {
-                eprint!("\rFetched {n}/{total} items");
+        while let Some((identifier, result, elapsed_ms)) = stream.next().await {
+            match result {
+                Ok(item) => {
+                    let json_bytes = serde_json::to_string(&item)
+                        .map(|s| s.len() as u64)
+                        .unwrap_or(0);
+                    if let Some(ref jl) = joblog {
+                        jl.write(
+                            &JoblogEntry::new("export", &identifier, "").ok(json_bytes, elapsed_ms),
+                        );
+                    }
+                    bytes_total.fetch_add(json_bytes, Ordering::Relaxed);
+                    succeeded.fetch_add(1, Ordering::Relaxed);
+
+                    let output = if args.pretty {
+                        serde_json::to_string_pretty(&item)?
+                    } else {
+                        serde_json::to_string(&item)?
+                    };
+                    if let Some(ref pb) = pb {
+                        pb.suspend(|| println!("{output}"));
+                        pb.inc(1);
+                    } else {
+                        println!("{output}");
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if let Some(ref jl) = joblog {
+                        jl.write(&JoblogEntry::new("export", &identifier, "").error(&msg, 0));
+                    }
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    let shown = errors_shown.fetch_add(1, Ordering::Relaxed);
+                    if let Some(ref pb) = pb {
+                        pb.inc(1);
+                    }
+                    if quiet == 0 && shown < MAX_INLINE_ERRORS {
+                        if let Some(ref pb) = pb {
+                            pb.suspend(|| {
+                                eprintln!(
+                                    "{} {} — {}",
+                                    style(ICON_ERROR).red(),
+                                    style(&identifier).bold(),
+                                    style(&msg).red(),
+                                );
+                            });
+                        } else {
+                            eprintln!(
+                                "{} {} — {}",
+                                style(ICON_ERROR).red(),
+                                style(&identifier).bold(),
+                                style(&msg).red(),
+                            );
+                        }
+                    }
+                }
             }
         }
-        if quiet == 0 && total > 0 {
-            eprintln!();
+
+        if let Some(ref pb) = pb {
+            pb.finish_and_clear();
         }
+
+        print_export_summary(
+            succeeded.load(Ordering::Relaxed),
+            failed.load(Ordering::Relaxed),
+            bytes_total.load(Ordering::Relaxed),
+            start.elapsed().as_secs_f64(),
+            errors_shown.load(Ordering::Relaxed),
+            None,
+            quiet,
+        );
     }
 
     Ok(())

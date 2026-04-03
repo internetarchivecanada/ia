@@ -257,6 +257,7 @@ async fn main() -> Result<()> {
                 cli.quiet,
                 cli.jobs,
                 cli.joblog.clone(),
+                cli.retry_failed,
             )
             .await?
         }
