@@ -1241,6 +1241,7 @@ async fn run_export(
         .context("failed to open joblog")?;
 
     let total = identifiers.len();
+    let total_with_skipped = total + skipped;
     let client = Arc::new(client.clone());
 
     // Progress tracking
@@ -1250,16 +1251,22 @@ async fn run_export(
     let errors_shown = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
-    // Progress bar — total is only the remaining work so rate calc is accurate
+    // Progress bar — total includes skipped items so count shows overall progress
+    // (e.g., 15280/125061), but rate only counts items fetched this session.
     let pb = if quiet == 0 && total > 0 {
-        let pb = ProgressBar::new(total as u64);
+        let skip_offset = skipped as u64;
+        let pb = ProgressBar::new(total_with_skipped as u64);
         pb.set_style(
             ProgressStyle::with_template(&format!(
                 "{{msg}}\n  {{bar:{BAR_WIDTH}.cyan/dim}} {{pos}}/{{len}} {{per_sec:.dim}}  ({{elapsed}} elapsed)",
             ))
             .unwrap()
-            .with_key("per_sec", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                write!(w, "{:.1}/s", state.per_sec()).ok();
+            .with_key("per_sec", move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                // Subtract skip offset so rate reflects only items actually fetched
+                let fetched = state.pos().saturating_sub(skip_offset);
+                let elapsed = state.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { fetched as f64 / elapsed } else { 0.0 };
+                write!(w, "{rate:.1}/s").ok();
             })
             .progress_chars(PROGRESS_CHARS),
         );
@@ -1278,6 +1285,11 @@ async fn run_export(
             "Exporting metadata...".to_string()
         };
         pb.set_message(msg);
+
+        // Start at skip offset so bar shows overall progress
+        if skipped > 0 {
+            pb.set_position(skip_offset);
+        }
 
         Some(pb)
     } else {
