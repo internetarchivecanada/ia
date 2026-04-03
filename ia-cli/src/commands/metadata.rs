@@ -1241,7 +1241,6 @@ async fn run_export(
         .context("failed to open joblog")?;
 
     let total = identifiers.len();
-    let total_with_skipped = total + skipped;
     let client = Arc::new(client.clone());
 
     // Progress tracking
@@ -1251,14 +1250,17 @@ async fn run_export(
     let errors_shown = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
-    // Progress bar
+    // Progress bar — total is only the remaining work so rate calc is accurate
     let pb = if quiet == 0 && total > 0 {
-        let pb = ProgressBar::new(total_with_skipped as u64);
+        let pb = ProgressBar::new(total as u64);
         pb.set_style(
             ProgressStyle::with_template(&format!(
                 "{{msg}}\n  {{bar:{BAR_WIDTH}.cyan/dim}} {{pos}}/{{len}} {{per_sec:.dim}}  ({{elapsed}} elapsed)",
             ))
             .unwrap()
+            .with_key("per_sec", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                write!(w, "{:.1}/s", state.per_sec()).ok();
+            })
             .progress_chars(PROGRESS_CHARS),
         );
 
@@ -1276,10 +1278,6 @@ async fn run_export(
             "Exporting metadata...".to_string()
         };
         pb.set_message(msg);
-
-        if skipped > 0 {
-            pb.set_position(skipped as u64);
-        }
 
         Some(pb)
     } else {
