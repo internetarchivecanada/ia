@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1098,9 +1098,11 @@ async fn collect_identifiers_from_export(
 }
 
 /// Print the export summary footer to stderr.
+#[allow(clippy::too_many_arguments)]
 fn print_export_summary(
     succeeded: usize,
     failed: usize,
+    skipped: usize,
     bytes: u64,
     elapsed_secs: f64,
     errors_shown: usize,
@@ -1129,15 +1131,23 @@ fn print_export_summary(
     );
 
     // Items line
+    let skip_note = if skipped > 0 {
+        format!(
+            " {}",
+            style(format!("({skipped} previously completed)")).dim()
+        )
+    } else {
+        String::new()
+    };
     if failed == 0 {
         eprintln!(
-            "{} {} items exported",
+            "{} {} items exported{skip_note}",
             style(ICON_SUCCESS).green(),
             style(succeeded).green(),
         );
     } else {
         eprintln!(
-            "{}/{} items exported · {} failed",
+            "{}/{} items exported · {} failed{skip_note}",
             style(succeeded).green(),
             total,
             style(failed).red(),
@@ -1233,6 +1243,21 @@ async fn run_export(
     }
     let skipped = before_skip - identifiers.len();
 
+    // All items already exported — return early without touching the output file
+    if identifiers.is_empty() && skipped > 0 {
+        if quiet < 2 {
+            eprintln!(
+                "{} All {} items already exported",
+                style(ICON_SUCCESS).green(),
+                style(skipped).green(),
+            );
+            if let Some(ref path) = args.output {
+                eprintln!("  {}", style(path.display()).dim());
+            }
+        }
+        return Ok(());
+    }
+
     // Open joblog writer
     let joblog = joblog_path
         .as_ref()
@@ -1311,8 +1336,41 @@ async fn run_export(
         .buffer_unordered(jobs);
 
     if let Some(ref path) = args.output {
-        // File mode: collect all records for unified column computation.
-        let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
+        // Detect JSONL output for streaming writes
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_jsonl = ext == "jsonl" || ext == "ndjson";
+
+        // JSONL: open in append mode for streaming writes (resilient to Ctrl+C).
+        // CSV/XLSX: collect records in memory for unified column computation.
+        let mut jsonl_file = if is_jsonl {
+            Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .context(format!("failed to open export file: {}", path.display()))?,
+            )
+        } else {
+            None
+        };
+
+        // CSV/TSV/XLSX on resume: read existing records so we can merge with new ones.
+        let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> =
+            if !is_jsonl && skipped > 0 && path.exists() {
+                ia_core::spreadsheet::read_spreadsheet(path).unwrap_or_else(|e| {
+                    eprintln!(
+                        "{} could not read existing export file, starting fresh: {e}",
+                        style("warning:").yellow().bold(),
+                    );
+                    Vec::new()
+                })
+            } else {
+                Vec::new()
+            };
 
         while let Some((identifier, result, elapsed_ms)) = stream.next().await {
             match result {
@@ -1331,50 +1389,58 @@ async fn run_export(
                         pb.inc(1);
                     }
 
-                    let metadata_json = serde_json::to_value(&item.metadata)?;
-                    let mut fields = HashMap::new();
-                    if let serde_json::Value::Object(map) = metadata_json {
-                        for (key, value) in map {
-                            if key == "identifier" {
-                                continue;
-                            }
-                            match &value {
-                                serde_json::Value::String(s) => {
-                                    if !s.is_empty() {
-                                        fields.insert(key, s.clone());
-                                    }
+                    // JSONL: write full API response immediately (append mode,
+                    // survives Ctrl+C). Identical to stdout mode output.
+                    // CSV/XLSX: extract metadata fields into flat columns.
+                    if let Some(ref mut f) = jsonl_file {
+                        let line = serde_json::to_string(&item)?;
+                        writeln!(f, "{line}").context("failed to write to export file")?;
+                    } else {
+                        let metadata_json = serde_json::to_value(&item.metadata)?;
+                        let mut fields = HashMap::new();
+                        if let serde_json::Value::Object(map) = metadata_json {
+                            for (key, value) in map {
+                                if key == "identifier" {
+                                    continue;
                                 }
-                                serde_json::Value::Array(arr) if arr.len() == 1 => {
-                                    let s = match &arr[0] {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        other => other.to_string(),
-                                    };
-                                    if !s.is_empty() {
-                                        fields.insert(key, s);
+                                match &value {
+                                    serde_json::Value::String(s) => {
+                                        if !s.is_empty() {
+                                            fields.insert(key, s.clone());
+                                        }
                                     }
-                                }
-                                serde_json::Value::Array(arr) => {
-                                    for (i, elem) in arr.iter().enumerate() {
-                                        let s = match elem {
+                                    serde_json::Value::Array(arr) if arr.len() == 1 => {
+                                        let s = match &arr[0] {
                                             serde_json::Value::String(s) => s.clone(),
                                             other => other.to_string(),
                                         };
                                         if !s.is_empty() {
-                                            fields.insert(format!("{key}[{i}]"), s);
+                                            fields.insert(key, s);
                                         }
                                     }
-                                }
-                                serde_json::Value::Null => {}
-                                other => {
-                                    let s = other.to_string();
-                                    if !s.is_empty() {
-                                        fields.insert(key, s);
+                                    serde_json::Value::Array(arr) => {
+                                        for (i, elem) in arr.iter().enumerate() {
+                                            let s = match elem {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                other => other.to_string(),
+                                            };
+                                            if !s.is_empty() {
+                                                fields.insert(format!("{key}[{i}]"), s);
+                                            }
+                                        }
+                                    }
+                                    serde_json::Value::Null => {}
+                                    other => {
+                                        let s = other.to_string();
+                                        if !s.is_empty() {
+                                            fields.insert(key, s);
+                                        }
                                     }
                                 }
                             }
                         }
+                        records.push((identifier, fields));
                     }
-                    records.push((identifier, fields));
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -1413,12 +1479,19 @@ async fn run_export(
             pb.finish_and_clear();
         }
 
-        ia_core::spreadsheet::write_spreadsheet(path, &records)
-            .context(format!("failed to write export file: {}", path.display()))?;
+        // CSV/TSV/XLSX: write all records (existing + new) at once.
+        // JSONL was already streamed above — just flush.
+        if let Some(mut f) = jsonl_file {
+            f.flush().context("failed to flush export file")?;
+        } else {
+            ia_core::spreadsheet::write_spreadsheet(path, &records)
+                .context(format!("failed to write export file: {}", path.display()))?;
+        }
 
         print_export_summary(
             succeeded.load(Ordering::Relaxed),
             failed.load(Ordering::Relaxed),
+            skipped,
             bytes_total.load(Ordering::Relaxed),
             start.elapsed().as_secs_f64(),
             errors_shown.load(Ordering::Relaxed),
@@ -1493,6 +1566,7 @@ async fn run_export(
         print_export_summary(
             succeeded.load(Ordering::Relaxed),
             failed.load(Ordering::Relaxed),
+            skipped,
             bytes_total.load(Ordering::Relaxed),
             start.elapsed().as_secs_f64(),
             errors_shown.load(Ordering::Relaxed),

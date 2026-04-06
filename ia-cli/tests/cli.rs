@@ -1079,6 +1079,263 @@ fn metadata_export_quiet_suppresses_progress() {
     .stderr(predicate::str::contains("items exported"));
 }
 
+// ── Export resume tests ──────────────────────────────────────────────────────
+
+#[test]
+fn metadata_export_resume_all_done_does_not_truncate_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate output file with existing data
+    let output = dir.path().join("out.jsonl");
+    std::fs::write(
+        &output,
+        "{\"identifier\":\"item1\",\"title\":\"First\"}\n{\"identifier\":\"item2\",\"title\":\"Second\"}\n",
+    )
+    .unwrap();
+
+    // Pre-populate joblog marking both items as done
+    let log = dir.path().join("export.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"export\",\"item\":\"item2\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    // Item list with same identifiers
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\nitem2\n").unwrap();
+
+    // Run export — should early-return without truncating the output file
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("already exported"));
+
+    // Output file must NOT be truncated
+    let content = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        content.contains("item1"),
+        "output file should still contain item1, got: {content}"
+    );
+    assert!(
+        content.contains("item2"),
+        "output file should still contain item2, got: {content}"
+    );
+}
+
+#[test]
+fn metadata_export_resume_all_done_does_not_truncate_csv() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate output CSV with existing data
+    let output = dir.path().join("out.csv");
+    std::fs::write(&output, "identifier,title\nitem1,First\nitem2,Second\n").unwrap();
+
+    // Pre-populate joblog marking both items as done
+    let log = dir.path().join("export.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"export\",\"item\":\"item2\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\nitem2\n").unwrap();
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("already exported"));
+
+    // Output CSV must NOT be truncated
+    let content = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        content.contains("item1"),
+        "CSV should still contain item1, got: {content}"
+    );
+}
+
+#[test]
+fn metadata_export_resume_appends_to_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate output file with one existing record
+    let output = dir.path().join("out.jsonl");
+    std::fs::write(&output, "{\"identifier\":\"item1\",\"title\":\"First\"}\n").unwrap();
+
+    // Joblog marks item1 as done, item2 still pending (will 404 but that's ok)
+    let log = dir.path().join("export.log");
+    std::fs::write(
+        &log,
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+    )
+    .unwrap();
+
+    // Item list has item1 (done) and a nonexistent item (will fail)
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\ntest-nonexistent-export-resume\n").unwrap();
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("previously completed"));
+
+    // Original record must still be present (JSONL appends, doesn't truncate)
+    let content = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        content.contains("item1"),
+        "JSONL should still contain item1 after resume, got: {content}"
+    );
+}
+
+#[test]
+fn metadata_export_resume_csv_merges_existing() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate output CSV with one existing record
+    let output = dir.path().join("out.csv");
+    std::fs::write(&output, "identifier,title\nitem1,First\n").unwrap();
+
+    // Joblog marks item1 as done
+    let log = dir.path().join("export.log");
+    std::fs::write(
+        &log,
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":100,\"elapsed_ms\":50}\n",
+    )
+    .unwrap();
+
+    // Item list has item1 (done) and a nonexistent item (will fail)
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\ntest-nonexistent-export-csv\n").unwrap();
+
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("previously completed"));
+
+    // Original record must still be present after CSV merge
+    let content = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        content.contains("item1"),
+        "CSV should still contain item1 after resume, got: {content}"
+    );
+    assert!(
+        content.contains("First"),
+        "CSV should preserve field values, got: {content}"
+    );
+}
+
+#[test]
+fn metadata_export_jsonl_matches_stdout_output() {
+    // Export a single item to both JSONL file and stdout, verify identical output.
+    // Uses a known public item with a short file list.
+    let dir = tempfile::tempdir().unwrap();
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "nasa\n").unwrap();
+
+    // Stdout mode
+    let stdout_result = ia()
+        .args([
+            "metadata",
+            "export",
+            "--itemlist",
+            ids.to_str().unwrap(),
+            "-qq",
+        ])
+        .output()
+        .unwrap();
+    let stdout_str = String::from_utf8_lossy(&stdout_result.stdout);
+    let stdout_json: serde_json::Value = serde_json::from_str(stdout_str.trim()).unwrap();
+
+    // File mode (JSONL)
+    let output = dir.path().join("out.jsonl");
+    ia().args([
+        "metadata",
+        "export",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "-qq",
+    ])
+    .assert()
+    .success();
+
+    let file_content = std::fs::read_to_string(&output).unwrap();
+    let file_json: serde_json::Value = serde_json::from_str(file_content.trim()).unwrap();
+
+    // Both must have the same top-level structure
+    assert!(
+        stdout_json.get("metadata").is_some(),
+        "stdout should have nested 'metadata' object"
+    );
+    assert!(
+        file_json.get("metadata").is_some(),
+        "JSONL file should have nested 'metadata' object, not flattened fields"
+    );
+    assert!(
+        file_json.get("files").is_some(),
+        "JSONL file should have 'files' array"
+    );
+    assert!(
+        file_json.get("server").is_some() || file_json.get("d1").is_some(),
+        "JSONL file should have server info"
+    );
+
+    // Verify arrays are preserved (not flattened to collection[0], collection[1])
+    let md = file_json.get("metadata").unwrap();
+    if let Some(coll) = md.get("collection") {
+        assert!(
+            coll.is_array() || coll.is_string(),
+            "collection should be array or string, not indexed keys"
+        );
+    }
+
+    // The two outputs should be identical JSON
+    assert_eq!(
+        stdout_json, file_json,
+        "JSONL file output must match stdout output exactly"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[test]
 fn search_advanced_help_has_rows() {
     ia().args(["search", "advanced", "--help"])
