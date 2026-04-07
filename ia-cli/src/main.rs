@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     user_agent_suffix: Option<String>,
 
-    /// Write operation results to a JSONL log file (enables auto-resume for uploads)
+    /// Write operation results to a JSONL log file (enables auto-resume)
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
