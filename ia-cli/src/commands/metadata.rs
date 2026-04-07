@@ -17,7 +17,9 @@ use tokio::task::JoinSet;
 
 use comfy_table::{Cell, Color, Table};
 
-use crate::output::{format_bytes, BAR_WIDTH, ICON_ERROR, ICON_SUCCESS, PROGRESS_CHARS};
+use crate::output::{
+    format_bytes, print_retry_summary, BAR_WIDTH, ICON_ERROR, ICON_SUCCESS, PROGRESS_CHARS,
+};
 use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
@@ -1498,6 +1500,9 @@ async fn run_export(
             Some(path.as_path()),
             quiet,
         );
+        if quiet < 2 {
+            print_retry_summary(client.retry_stats());
+        }
     } else {
         // Stdout mode: stream results as they complete (no buffering).
         while let Some((identifier, result, elapsed_ms)) = stream.next().await {
@@ -1573,6 +1578,9 @@ async fn run_export(
             None,
             quiet,
         );
+        if quiet < 2 {
+            print_retry_summary(client.retry_stats());
+        }
     }
 
     Ok(())

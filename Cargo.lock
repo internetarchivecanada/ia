@@ -1282,6 +1282,7 @@ name = "ia-core"
 version = "0.16.0"
 dependencies = [
  "async-stream",
+ "async-trait",
  "bytes",
  "calamine",
  "chrono",
@@ -1291,6 +1292,7 @@ dependencies = [
  "filetime",
  "futures",
  "globset",
+ "http",
  "httpdate",
  "json-patch",
  "libc",

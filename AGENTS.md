@@ -61,7 +61,7 @@ Every command supports `--json` as a subcommand flag. Design doc: `docs/plans/20
 ## Reserved CLI Short Flags
 
 Global flags — do not reuse in subcommands:
-`-c` (config-file), `-l` (log), `-d` (debug), `-i` (insecure), `-H` (host), `-j` (jobs), `-q` (quiet)
+`-c` (config-file), `-l` (log), `-v` (verbose), `-i` (insecure), `-H` (host), `-j` (jobs), `-q` (quiet)
 
 ## IA API Quirks
 

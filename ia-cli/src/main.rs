@@ -43,9 +43,15 @@ struct Cli {
     #[arg(short = 'l', long, global = true, help_heading = "Global Options")]
     log: bool,
 
-    /// Enable debug output
-    #[arg(short = 'd', long, global = true, help_heading = "Global Options")]
-    debug: bool,
+    /// Increase output verbosity (-v, -vv, -vvv)
+    #[arg(
+        short = 'v',
+        long,
+        global = true,
+        action = clap::ArgAction::Count,
+        help_heading = "Global Options",
+    )]
+    verbose: u8,
 
     /// Allow insecure (HTTP) connections
     #[arg(short = 'i', long, global = true, help_heading = "Global Options")]
@@ -202,12 +208,14 @@ async fn main() -> Result<()> {
         || matches!(&cli.command, Commands::Upload(ref args) if args.dashboard);
     let log_level = if dashboard_active {
         "off"
-    } else if cli.debug {
-        "debug"
-    } else if cli.log {
-        "info"
     } else {
-        "warn"
+        match cli.verbose {
+            0 if cli.log => "info",
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        }
     };
 
     tracing_subscriber::fmt()
@@ -215,6 +223,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
         )
+        .with_target(false)
         .with_writer(std::io::stderr)
         .init();
 
@@ -236,7 +245,7 @@ async fn main() -> Result<()> {
         config.general.user_agent_suffix = Some(suffix.clone());
     }
 
-    let client = ia_core::IaClient::from_config(config)?;
+    let client = ia_core::IaClient::from_config_with_verbosity(config, cli.verbose)?;
 
     match cli.command {
         #[cfg(feature = "alpha")]

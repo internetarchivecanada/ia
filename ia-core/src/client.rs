@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 
 use crate::config::IaConfig;
 use crate::error::Result;
+use crate::retry::{LoggingRetryStrategy, RetryStats, TimingMiddleware};
 use crate::user_agent::build_user_agent;
 
 /// Error returned when a redirect targets a non-archive.org domain.
@@ -43,6 +46,7 @@ pub struct IaClient {
     no_redirect_http: reqwest::Client,
     config: IaConfig,
     user_agent: String,
+    retry_stats: Arc<RetryStats>,
 }
 
 impl IaClient {
@@ -98,6 +102,14 @@ impl IaClient {
 
     /// Create a new client with the provided config.
     pub fn from_config(config: IaConfig) -> Result<Self> {
+        Self::from_config_with_verbosity(config, 0)
+    }
+
+    /// Create a new client with the provided config and verbosity level.
+    ///
+    /// `verbosity` controls diagnostic output detail (0 = dedup warnings,
+    /// 1+ = individual events). See [`RetryStats`] for details.
+    pub fn from_config_with_verbosity(config: IaConfig, verbosity: u8) -> Result<Self> {
         let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
 
         let retry_policy = ExponentialBackoff::builder()
@@ -107,11 +119,18 @@ impl IaClient {
             )
             .build_with_max_retries(3);
 
+        let stats = Arc::new(RetryStats::new(verbosity));
+        let strategy = LoggingRetryStrategy::new(stats.clone());
+
         // Clone before moving into middleware — reqwest::Client is Arc-based, cheap to clone.
         let raw_http = raw_client.clone();
 
         let http = ClientBuilder::new(raw_client)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(TimingMiddleware::new(stats.clone()))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                strategy,
+            ))
             .build();
 
         Ok(Self {
@@ -120,6 +139,7 @@ impl IaClient {
             no_redirect_http: no_redirect_client,
             config,
             user_agent,
+            retry_stats: stats,
         })
     }
 
@@ -188,6 +208,11 @@ impl IaClient {
         &self.config
     }
 
+    /// Shared HTTP diagnostic counters.
+    pub fn retry_stats(&self) -> &RetryStats {
+        &self.retry_stats
+    }
+
     /// Create a client without retry middleware.
     ///
     /// Useful when application-level retry handling (e.g., RateLimiter for 429)
@@ -195,6 +220,9 @@ impl IaClient {
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
         let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
+        // Stats are required by the struct but will always be zeros — no
+        // TimingMiddleware or LoggingRetryStrategy is wired in this path.
+        let stats = Arc::new(RetryStats::new(0));
         let raw_http = raw_client.clone();
         let http = ClientBuilder::new(raw_client).build();
 
@@ -204,6 +232,7 @@ impl IaClient {
             no_redirect_http: no_redirect_client,
             config,
             user_agent,
+            retry_stats: stats,
         })
     }
 
@@ -311,6 +340,20 @@ mod tests {
             result.unwrap_err(),
             crate::error::IaError::Auth(_)
         ));
+    }
+
+    #[test]
+    fn client_exposes_retry_stats() {
+        let client = IaClient::from_config(IaConfig::default()).unwrap();
+        let stats = client.retry_stats();
+        assert_eq!(stats.summary().requests_total, 0);
+        assert!(!stats.had_retries());
+    }
+
+    #[test]
+    fn client_with_verbosity() {
+        let client = IaClient::from_config_with_verbosity(IaConfig::default(), 2).unwrap();
+        assert_eq!(client.retry_stats().summary().requests_total, 0);
     }
 
     #[test]

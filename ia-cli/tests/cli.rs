@@ -29,7 +29,7 @@ fn help_shows_global_options() {
         .stdout(predicate::str::contains("--user-agent-suffix"))
         .stdout(predicate::str::contains("--joblog"))
         .stdout(predicate::str::contains("--log"))
-        .stdout(predicate::str::contains("--debug"))
+        .stdout(predicate::str::contains("--verbose"))
         .stdout(predicate::str::contains("--quiet"));
 }
 

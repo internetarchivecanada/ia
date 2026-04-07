@@ -1121,3 +1121,33 @@ pub fn disk_space_free(path: &std::path::Path) -> Option<u64> {
         None
     }
 }
+
+// ─── Retry summary ─────────────────────────────────────────────────────────
+
+/// Print HTTP retry summary to stderr if any retries occurred.
+///
+/// Shows retry count, 429/5xx breakdown, total server-requested wait time,
+/// and latency percentiles. Called at end of batch operations.
+pub fn print_retry_summary(stats: &ia_core::RetryStats) {
+    if !stats.had_retries() {
+        return;
+    }
+    let s = stats.summary();
+    eprintln!(
+        "  {} {} requests retried ({} rate-limited, {} server errors), {:.0}s total wait",
+        style("⚠").yellow(),
+        s.retries_total,
+        s.status_429_count,
+        s.status_5xx_count,
+        s.total_retry_wait.as_secs_f64(),
+    );
+    if let Some(p) = stats.percentiles() {
+        eprintln!(
+            "  {} p50={}ms p95={}ms p99={}ms",
+            style("latency:").dim(),
+            p.p50_ms,
+            p.p95_ms,
+            p.p99_ms,
+        );
+    }
+}

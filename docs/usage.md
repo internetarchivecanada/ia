@@ -931,7 +931,7 @@ These options can be used with any subcommand:
 | `--no-resume` | Don't resume from joblog — upload all files fresh |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
-| `-d, --debug` | Enable debug output |
+| `-v, --verbose` | Increase output verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
 
 ## Configuration
 

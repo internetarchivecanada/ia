@@ -13,6 +13,7 @@ pub mod identifier;
 pub mod joblog;
 pub mod metadata;
 pub mod rate_limit;
+pub mod retry;
 pub mod search;
 pub mod spreadsheet;
 pub mod tasks;
@@ -25,6 +26,7 @@ pub mod verify;
 pub use client::IaClient;
 pub use config::IaConfig;
 pub use error::{write_json_error, IaError, JsonError, JsonErrorBody, Result};
+pub use retry::RetryStats;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

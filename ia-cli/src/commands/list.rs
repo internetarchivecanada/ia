@@ -41,8 +41,8 @@ pub struct ListArgs {
     pub all: bool,
 
     /// Print column headers
-    #[arg(short = 'v', long)]
-    pub verbose: bool,
+    #[arg(short = 'V', long = "headers")]
+    pub headers: bool,
 
     /// Output results as JSON (one object per line)
     #[arg(long)]
@@ -129,7 +129,7 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::NOTHING);
 
-    if args.verbose {
+    if args.headers {
         let headers: Vec<Cell> = columns
             .iter()
             .map(|c| Cell::new(c.to_uppercase()).fg(Color::Cyan))
