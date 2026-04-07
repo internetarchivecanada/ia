@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -850,78 +850,6 @@ pub struct BatchDownloadResult {
     pub bytes_total: u64,
     pub elapsed: Duration,
     pub item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>>,
-}
-
-/// Callback invoked when an item starts downloading: (identifier, index, total).
-pub type OnItemStartFn = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
-
-/// Callback invoked when an item finishes downloading.
-pub type OnItemCompleteFn = Arc<dyn Fn(&ItemDownloadResult) + Send + Sync>;
-
-/// Callback invoked when an item fails at the item level (e.g. 404, metadata fetch error).
-pub type OnItemErrorFn = Arc<dyn Fn(&str, &IaError) + Send + Sync>;
-
-/// Download multiple items with controlled concurrency.
-///
-/// `items_concurrency` limits how many items download simultaneously.
-/// The `semaphore` separately limits total concurrent file transfers across all active items.
-#[allow(clippy::too_many_arguments)]
-pub async fn download_batch(
-    client: &IaClient,
-    identifiers: Vec<String>,
-    opts: &DownloadOpts,
-    semaphore: Arc<Semaphore>,
-    progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
-    on_item_start: Option<OnItemStartFn>,
-    on_item_complete: Option<OnItemCompleteFn>,
-    on_item_error: Option<OnItemErrorFn>,
-    items_concurrency: usize,
-) -> BatchDownloadResult {
-    let start = std::time::Instant::now();
-    let items_total = identifiers.len();
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    let item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>> =
-        stream::iter(identifiers)
-            .map(|identifier| {
-                let client = client.clone();
-                let opts = opts.clone();
-                let semaphore = Arc::clone(&semaphore);
-                let progress = progress.clone();
-                let counter = Arc::clone(&counter);
-                let on_item_start = on_item_start.clone();
-                let on_item_complete = on_item_complete.clone();
-                let on_item_error = on_item_error.clone();
-
-                async move {
-                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    if let Some(ref cb) = on_item_start {
-                        cb(&identifier, idx, items_total);
-                    }
-                    info!(item = %identifier, idx, "starting item download");
-
-                    match download_item(&client, &identifier, &opts, semaphore, progress).await {
-                        Ok(result) => {
-                            if let Some(ref cb) = on_item_complete {
-                                cb(&result);
-                            }
-                            Ok(result)
-                        }
-                        Err(e) => {
-                            warn!(identifier = %identifier, error = %e, "item download failed");
-                            if let Some(ref cb) = on_item_error {
-                                cb(&identifier, &e);
-                            }
-                            Err((identifier, e))
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(items_concurrency)
-            .collect()
-            .await;
-
-    collect_batch_results(items_total, item_results, start.elapsed())
 }
 
 /// Aggregate per-item results into a [`BatchDownloadResult`].
@@ -2157,76 +2085,6 @@ mod tests {
             metadata_requests.is_empty(),
             "download_item_with_metadata should not fetch metadata"
         );
-    }
-
-    // -- download_batch on_item_error callback test --
-
-    #[tokio::test]
-    async fn download_batch_calls_on_item_error() {
-        let mock_server = MockServer::start().await;
-
-        // item-ok: valid metadata + file download
-        Mock::given(method("GET"))
-            .and(path("/metadata/item-ok"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "metadata": {"identifier": "item-ok"},
-                "files": [
-                    {"name": "good.txt", "size": "4", "source": "original"}
-                ]
-            })))
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/download/item-ok/good.txt"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"good".to_vec()))
-            .mount(&mock_server)
-            .await;
-
-        // item-bad: 404 metadata
-        Mock::given(method("GET"))
-            .and(path("/metadata/item-bad"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-            .mount(&mock_server)
-            .await;
-
-        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let opts = DownloadOpts {
-            destdir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let semaphore = Arc::new(Semaphore::new(2));
-
-        let errors: Arc<std::sync::Mutex<Vec<(String, String)>>> =
-            Arc::new(std::sync::Mutex::new(vec![]));
-        let errors_clone = Arc::clone(&errors);
-        let on_item_error: OnItemErrorFn = Arc::new(move |id, err| {
-            errors_clone
-                .lock()
-                .unwrap()
-                .push((id.to_string(), err.to_string()));
-        });
-
-        let batch = download_batch(
-            &client,
-            vec!["item-ok".to_string(), "item-bad".to_string()],
-            &opts,
-            semaphore,
-            None,
-            None,
-            None,
-            Some(on_item_error),
-            2,
-        )
-        .await;
-
-        assert_eq!(batch.items_succeeded, 1);
-        assert_eq!(batch.items_failed, 1);
-
-        let captured = errors.lock().unwrap();
-        assert_eq!(captured.len(), 1, "on_item_error should be called once");
-        assert_eq!(captured[0].0, "item-bad");
     }
 
     // -- cleanup_item_dir tests --

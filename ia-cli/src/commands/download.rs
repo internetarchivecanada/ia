@@ -2,9 +2,10 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use color_print::cstr;
 use console::style;
-use futures::{stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
@@ -15,6 +16,7 @@ use ia_core::download::{
     FileDownloadResult, ItemDownloadResult,
 };
 use ia_core::error::IaError;
+use ia_core::error::Result as IaResult;
 use ia_core::files::FileFilter;
 use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
@@ -143,11 +145,9 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
         }
     }
 
-    // --search: collect identifiers from search results
+    // --search: collect identifiers from search results (dashboard path only —
+    // the streaming path in run() handles --search before reaching here).
     if let Some(ref query) = args.search {
-        if !args.files.is_empty() {
-            bail!("cannot combine file names with --search (file names apply to a single item)");
-        }
         let opts = SearchOpts::default();
         let mut stream = ia_core::search::scrape(client, query, &opts);
         while let Some(result) = stream.next().await {
@@ -187,38 +187,9 @@ pub async fn run(
         bail!("--json and --dashboard are mutually exclusive");
     }
 
-    let mut identifiers = collect_identifiers(&args, client).await?;
-
-    // Detect file paths passed as identifier and suggest --itemlist
-    if let Some(ref id) = args.identifier {
-        if std::path::Path::new(id).exists() && (id.contains('/') || id.contains('\\')) {
-            bail!(
-                "\"{}\" looks like a file path. Did you mean:\n  ia download --itemlist {}",
-                id,
-                id
-            );
-        }
-    }
-
-    // If --retry-failed, read joblog and use failed items as identifiers
-    if retry_failed {
-        if let Some(ref path) = joblog_path {
-            let entries = ia_core::joblog::read(path)
-                .context(format!("failed to read joblog: {}", path.display()))?;
-            let failed = ia_core::joblog::failed_items(&entries);
-            if failed.is_empty() {
-                eprintln!("{} No failed items in joblog", style("✓").green());
-                return Ok(());
-            }
-            identifiers = failed;
-        } else {
-            bail!("--retry-failed requires --joblog");
-        }
-    }
-
-    if identifiers.is_empty() {
-        bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
-    }
+    // ─── Shared setup ───────────────────────────────────────────────────
+    // Moved before collect_identifiers() so the streaming search path can
+    // use it without blocking on full identifier collection.
 
     // Open joblog writer if path provided
     let joblog = joblog_path
@@ -297,6 +268,120 @@ pub async fn run(
     let opts = make_opts(base_destdir.clone());
 
     let semaphore = Arc::new(Semaphore::new(jobs));
+
+    // ─── Validate --search + file names ─────────────────────────────────
+    if args.search.is_some() && !args.files.is_empty() {
+        bail!("cannot combine file names with --search (file names apply to a single item)");
+    }
+
+    // ─── Streaming search path ──────────────────────────────────────────
+    // When --search is used without --dashboard, pipe search results
+    // directly into the download pipeline instead of collecting all
+    // identifiers first. This avoids a 1-2 min delay for large collections.
+    if let Some(ref query) = args.search {
+        if !args.dashboard {
+            let json_mode = args.json;
+            let items_concurrency = args.items;
+
+            // Quick estimated total for progress display (~200ms).
+            let estimated_total = ia_core::search::num_found(client, query, &[])
+                .await
+                .unwrap_or(0) as usize;
+
+            let batch_display = if !json_mode && quiet == 0 {
+                Some(Arc::new(crate::output::BatchDisplay::new(
+                    estimated_total,
+                    jobs,
+                )))
+            } else {
+                None
+            };
+
+            let search_opts = SearchOpts::default();
+            let id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send + '_>> = Box::pin(
+                ia_core::search::scrape(client, query, &search_opts)
+                    .map(|r| r.map(|item| item.identifier)),
+            );
+
+            let has_disk_pool = disk_pool.is_some();
+            let result = if let Some(pool) = disk_pool.take() {
+                let (batch_result, returned_pool) = download_batch_with_pool(
+                    client,
+                    id_stream,
+                    &make_opts,
+                    &filter,
+                    pool,
+                    semaphore,
+                    batch_display.clone(),
+                    json_mode,
+                    0,
+                    items_concurrency,
+                )
+                .await?;
+                disk_pool = Some(returned_pool);
+                batch_result
+            } else {
+                download_batch_items(
+                    client,
+                    id_stream,
+                    &opts,
+                    semaphore,
+                    batch_display.clone(),
+                    json_mode,
+                    0,
+                    items_concurrency,
+                )
+                .await
+            };
+
+            return finish_batch(
+                result,
+                &joblog,
+                json_mode,
+                quiet,
+                has_disk_pool,
+                &batch_display,
+                &disk_pool,
+                &base_destdir,
+            );
+        }
+    }
+
+    // ─── Collect-first path ─────────────────────────────────────────────
+    // Used for --itemlist, stdin, positional identifiers, and
+    // --dashboard --search (dashboard needs all identifiers upfront).
+    let mut identifiers = collect_identifiers(&args, client).await?;
+
+    // Detect file paths passed as identifier and suggest --itemlist
+    if let Some(ref id) = args.identifier {
+        if std::path::Path::new(id).exists() && (id.contains('/') || id.contains('\\')) {
+            bail!(
+                "\"{}\" looks like a file path. Did you mean:\n  ia download --itemlist {}",
+                id,
+                id
+            );
+        }
+    }
+
+    // If --retry-failed, read joblog and use failed items as identifiers
+    if retry_failed {
+        if let Some(ref path) = joblog_path {
+            let entries = ia_core::joblog::read(path)
+                .context(format!("failed to read joblog: {}", path.display()))?;
+            let failed = ia_core::joblog::failed_items(&entries);
+            if failed.is_empty() {
+                eprintln!("{} No failed items in joblog", style("✓").green());
+                return Ok(());
+            }
+            identifiers = failed;
+        } else {
+            bail!("--retry-failed requires --joblog");
+        }
+    }
+
+    if identifiers.is_empty() {
+        bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
+    }
 
     // Dashboard mode
     #[cfg(feature = "tui")]
@@ -382,94 +467,279 @@ pub async fn run(
         return Ok(());
     }
 
-    // Batch mode
+    // Batch mode — wrap collected identifiers as a stream and use the
+    // same functions as the streaming search path.
     let json_mode = args.json;
     let items_concurrency = args.items;
+    let items_total = identifiers.len();
     let batch_display = if !json_mode && quiet == 0 {
         Some(Arc::new(crate::output::BatchDisplay::new(
-            identifiers.len(),
+            items_total,
             jobs,
         )))
     } else {
         None
     };
 
+    let id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send>> =
+        Box::pin(stream::iter(identifiers).map(Ok));
+
     let has_disk_pool = disk_pool.is_some();
-    let result =
-        if let Some(pool) = disk_pool.take() {
-            // Multi-disk mode: per-item loop with disk pool assignment.
-            // We can't use download_batch() because it applies a single destdir
-            // to all items. Instead, assign each item to a disk, then download
-            // with per-item opts.
-            let (batch_result, returned_pool) = download_batch_with_pool(
-                client,
-                identifiers,
-                &make_opts,
-                &filter,
-                pool,
-                semaphore,
-                batch_display.clone(),
-                json_mode,
-                items_concurrency,
-            )
-            .await?;
-            disk_pool = Some(returned_pool);
-            batch_result
-        } else {
-            // Standard single-destdir batch path — delegate to core.
-            let on_item_start: Option<ia_core::download::OnItemStartFn> = batch_display
-                .clone()
-                .map(|bd| -> ia_core::download::OnItemStartFn {
-                    Arc::new(move |id, current, total| bd.on_item_start(id, current, total))
-                });
+    let result = if let Some(pool) = disk_pool.take() {
+        let (batch_result, returned_pool) = download_batch_with_pool(
+            client,
+            id_stream,
+            &make_opts,
+            &filter,
+            pool,
+            semaphore,
+            batch_display.clone(),
+            json_mode,
+            items_total,
+            items_concurrency,
+        )
+        .await?;
+        disk_pool = Some(returned_pool);
+        batch_result
+    } else {
+        download_batch_items(
+            client,
+            id_stream,
+            &opts,
+            semaphore,
+            batch_display.clone(),
+            json_mode,
+            items_total,
+            items_concurrency,
+        )
+        .await
+    };
 
-            let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = batch_display
-                .clone()
-                .map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
-                    Arc::new(move |p: DownloadProgress| bd.on_progress(p))
-                });
+    finish_batch(
+        result,
+        &joblog,
+        json_mode,
+        quiet,
+        has_disk_pool,
+        &batch_display,
+        &disk_pool,
+        &base_destdir,
+    )
+}
 
-            let on_item_complete: Option<ia_core::download::OnItemCompleteFn> = if json_mode {
-                Some(Arc::new(move |result: &ItemDownloadResult| {
-                    let obj = serde_json::json!({
-                        "item": result.identifier,
-                        "status": "ok",
-                        "files_ok": result.files_downloaded,
-                        "files_skipped": result.files_skipped,
-                        "files_failed": result.files_failed,
-                        "bytes": result.bytes_total,
-                        "elapsed_ms": result.elapsed.as_millis() as u64,
-                    });
-                    println!("{}", obj);
-                }))
-            } else {
-                batch_display
+/// Batch download with per-item disk pool assignment.
+///
+/// Each item is assigned to the disk with the most free space before
+/// downloading. If a disk can't fit an item, the item is skipped with an
+/// error (not fatal to the batch). Items are downloaded concurrently up to
+/// `items_concurrency`.
+///
+/// Accepts a stream of identifiers — works for both collected Vecs (wrapped
+/// via `stream::iter(ids).map(Ok)`) and live search streams.
+/// `items_total` is used for progress display: pass `identifiers.len()` when
+/// known, or `0` for streaming (unknown total).
+#[allow(clippy::too_many_arguments)]
+async fn download_batch_with_pool(
+    client: &IaClient,
+    id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send + '_>>,
+    make_opts: &dyn Fn(PathBuf) -> DownloadOpts,
+    filter: &FileFilter,
+    pool: DiskPool,
+    semaphore: Arc<Semaphore>,
+    batch_display: Option<Arc<crate::output::BatchDisplay>>,
+    json_mode: bool,
+    items_total: usize,
+    items_concurrency: usize,
+) -> Result<(BatchDownloadResult, DiskPool)> {
+    let start = std::time::Instant::now();
+    let pool = Arc::new(Mutex::new(pool));
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let filter = filter.clone();
+
+    // Per-item: fetch metadata → compute filtered size → assign disk → download.
+    // The pool mutex is held only briefly for assign_item(). Metadata fetch and
+    // download run concurrently across items.
+    let item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>> = id_stream
+        .map(|id_result| {
+            let client = client.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let counter = Arc::clone(&counter);
+            let batch_display = batch_display.clone();
+            let pool = Arc::clone(&pool);
+            let filter = filter.clone();
+
+            async move {
+                let identifier = match id_result {
+                    Ok(id) => id,
+                    // Stream error (e.g. search pagination failure) — record
+                    // as a failed item. Unreachable for Vec-backed streams.
+                    Err(e) => {
+                        let msg = e.to_string();
+                        return Err(("<search>".to_string(), IaError::Config(msg)));
+                    }
+                };
+
+                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+                if let Some(ref bd) = batch_display {
+                    bd.on_item_start(&identifier, idx, items_total);
+                }
+                info!(item = %identifier, idx, "starting item download");
+
+                // Fetch metadata to compute filtered size for disk assignment
+                let item = match ia_core::metadata::get(&client, &identifier).await {
+                    Ok(item) => item,
+                    Err(e) => {
+                        warn!(item = %identifier, error = %e, "failed to fetch metadata");
+                        if let Some(ref bd) = batch_display {
+                            bd.on_item_error(&identifier, &e.to_string());
+                        }
+                        return Err((identifier, e));
+                    }
+                };
+
+                let files = ia_core::files::list(&item, &filter);
+                let estimated_size = ia_core::files::total_size(&files);
+
+                // Assign item to a disk (brief lock)
+                let dest = {
+                    let mut pool_guard = pool.lock().await;
+                    match pool_guard.assign_item(&identifier, estimated_size) {
+                        Ok(dest) => dest.to_path_buf(),
+                        Err(e) => {
+                            warn!(item = %identifier, error = %e, "skipping item: no disk space");
+                            if let Some(ref bd) = batch_display {
+                                bd.on_item_error(&identifier, &e.to_string());
+                            }
+                            return Err((identifier, e));
+                        }
+                    }
+                };
+
+                let item_opts = make_opts(dest);
+
+                let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = batch_display
                     .clone()
-                    .map(|bd| -> ia_core::download::OnItemCompleteFn {
-                        Arc::new(move |result| bd.on_item_complete(result))
-                    })
-            };
+                    .map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+                        Arc::new(move |p: DownloadProgress| bd.on_progress(p))
+                    });
 
-            let on_item_error: Option<ia_core::download::OnItemErrorFn> = batch_display
-                .clone()
-                .map(|bd| -> ia_core::download::OnItemErrorFn {
-                    Arc::new(move |id, err| bd.on_item_error(id, &err.to_string()))
-                });
+                let emit_success = |result: &ItemDownloadResult| {
+                    if json_mode {
+                        let obj = serde_json::json!({
+                            "item": result.identifier,
+                            "status": "ok",
+                            "files_ok": result.files_downloaded,
+                            "files_skipped": result.files_skipped,
+                            "files_failed": result.files_failed,
+                            "bytes": result.bytes_total,
+                            "elapsed_ms": result.elapsed.as_millis() as u64,
+                        });
+                        println!("{obj}");
+                    }
+                    if let Some(ref bd) = batch_display {
+                        bd.on_item_complete(result);
+                    }
+                };
 
-            ia_core::download::download_batch(
-                client,
-                identifiers,
-                &opts,
-                semaphore,
-                progress,
-                on_item_start,
-                on_item_complete,
-                on_item_error,
-                items_concurrency,
-            )
-            .await
-        };
+                let emit_error = |id: &str, e: &IaError| {
+                    if let Some(ref bd) = batch_display {
+                        bd.on_item_error(id, &e.to_string());
+                    }
+                };
 
+                match ia_core::download::download_item_with_metadata(
+                    &client,
+                    &identifier,
+                    &item,
+                    &item_opts,
+                    Arc::clone(&semaphore),
+                    progress.clone(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        emit_success(&result);
+                        Ok(result)
+                    }
+                    Err(e) if e.is_disk_full() => {
+                        warn!(item = %identifier, "disk full, cleaning up and attempting failover");
+
+                        ia_core::download::cleanup_item_dir(&item_opts.destdir, &identifier).await;
+
+                        let new_dest = {
+                            let mut pool_guard = pool.lock().await;
+                            pool_guard
+                                .handle_disk_full(&identifier)
+                                .map(|p| p.to_path_buf())
+                        };
+                        match new_dest {
+                            Ok(dest) => {
+                                let retry_opts = make_opts(dest);
+                                match ia_core::download::download_item_with_metadata(
+                                    &client,
+                                    &identifier,
+                                    &item,
+                                    &retry_opts,
+                                    semaphore,
+                                    progress,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        emit_success(&result);
+                                        Ok(result)
+                                    }
+                                    Err(e2) => {
+                                        warn!(item = %identifier, error = %e2, "retry after disk failover also failed");
+                                        emit_error(&identifier, &e2);
+                                        Err((identifier, e2))
+                                    }
+                                }
+                            }
+                            Err(no_space) => {
+                                warn!(item = %identifier, error = %no_space, "no alternative disk available");
+                                emit_error(&identifier, &no_space);
+                                Err((identifier, no_space))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(item = %identifier, error = %e, "item download failed");
+                        emit_error(&identifier, &e);
+                        Err((identifier, e))
+                    }
+                }
+            }
+        })
+        .buffer_unordered(items_concurrency)
+        .collect()
+        .await;
+
+    let actual_total = item_results.len();
+    let returned_pool = Arc::try_unwrap(pool)
+        .map_err(|_| {
+            anyhow::anyhow!("disk pool Arc still shared after batch completed — this is a bug")
+        })?
+        .into_inner();
+    Ok((
+        collect_batch_results(actual_total, item_results, start.elapsed()),
+        returned_pool,
+    ))
+}
+
+/// Shared batch result handling: joblog, JSON errors, summary, exit code.
+#[allow(clippy::too_many_arguments)]
+fn finish_batch(
+    result: BatchDownloadResult,
+    joblog: &Option<JoblogWriter>,
+    json_mode: bool,
+    quiet: u8,
+    has_disk_pool: bool,
+    batch_display: &Option<Arc<crate::output::BatchDisplay>>,
+    disk_pool: &Option<DiskPool>,
+    base_destdir: &Path,
+) -> Result<()> {
     // Print JSON for failed items (on_item_complete only fires for Ok results)
     if json_mode {
         for item_result in &result.item_results {
@@ -497,9 +767,9 @@ pub async fn run(
         if let Some(ref bd) = batch_display {
             if has_disk_pool {
                 bd.finish(&result, disk_statuses.as_deref());
-            } else if let Some(free) = crate::output::disk_space_free(&base_destdir) {
+            } else if let Some(free) = crate::output::disk_space_free(base_destdir) {
                 let single_status = vec![ia_core::disk_pool::DiskStatus {
-                    path: base_destdir.clone(),
+                    path: base_destdir.to_path_buf(),
                     free_bytes: free,
                     total_bytes: 0,
                     items_count: result.items_total,
@@ -529,94 +799,69 @@ pub async fn run(
     Ok(())
 }
 
-/// Batch download with per-item disk pool assignment.
+/// Batch download (single destdir).
 ///
-/// Each item is assigned to the disk with the most free space before
-/// downloading. If a disk can't fit an item, the item is skipped with an
-/// error (not fatal to the batch). Items are downloaded concurrently up to
-/// `items_concurrency`.
+/// Downloads items from a stream of identifiers with controlled concurrency.
+/// Works for both collected Vecs (wrapped via `stream::iter(ids).map(Ok)`)
+/// and live search streams.
+/// `items_total` is used for progress display: pass `identifiers.len()` when
+/// known, or `0` for streaming (unknown total).
 #[allow(clippy::too_many_arguments)]
-async fn download_batch_with_pool(
+async fn download_batch_items(
     client: &IaClient,
-    identifiers: Vec<String>,
-    make_opts: &dyn Fn(PathBuf) -> DownloadOpts,
-    filter: &FileFilter,
-    pool: DiskPool,
+    id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send + '_>>,
+    opts: &DownloadOpts,
     semaphore: Arc<Semaphore>,
     batch_display: Option<Arc<crate::output::BatchDisplay>>,
     json_mode: bool,
+    items_total: usize,
     items_concurrency: usize,
-) -> Result<(BatchDownloadResult, DiskPool)> {
+) -> BatchDownloadResult {
     let start = std::time::Instant::now();
-    let items_total = identifiers.len();
-    let pool = Arc::new(Mutex::new(pool));
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let filter = filter.clone();
 
-    // Per-item: fetch metadata → compute filtered size → assign disk → download.
-    // The pool mutex is held only briefly for assign_item(). Metadata fetch and
-    // download run concurrently across items.
-    let item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>> =
-        stream::iter(identifiers)
-            .map(|identifier| {
-                let client = client.clone();
-                let semaphore = Arc::clone(&semaphore);
-                let counter = Arc::clone(&counter);
-                let batch_display = batch_display.clone();
-                let pool = Arc::clone(&pool);
-                let filter = filter.clone();
+    let item_results: Vec<std::result::Result<ItemDownloadResult, (String, IaError)>> = id_stream
+        .map(|id_result| {
+            let client = client.clone();
+            let opts = opts.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let counter = Arc::clone(&counter);
+            let batch_display = batch_display.clone();
 
-                async move {
-                    let idx =
-                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-
-                    // Notify display of item start
-                    if let Some(ref bd) = batch_display {
-                        bd.on_item_start(&identifier, idx, items_total);
+            async move {
+                let identifier = match id_result {
+                    Ok(id) => id,
+                    // Stream error (e.g. search pagination failure) — record
+                    // as a failed item. Unreachable for Vec-backed streams.
+                    Err(e) => {
+                        let msg = e.to_string();
+                        return Err(("<search>".to_string(), IaError::Config(msg)));
                     }
+                };
 
-                    info!(item = %identifier, idx, "starting item download");
+                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
-                    // Fetch metadata to compute filtered size for disk assignment
-                    let item = match ia_core::metadata::get(&client, &identifier).await {
-                        Ok(item) => item,
-                        Err(e) => {
-                            warn!(item = %identifier, error = %e, "failed to fetch metadata");
-                            if let Some(ref bd) = batch_display {
-                                bd.on_item_error(&identifier, &e.to_string());
-                            }
-                            return Err((identifier, e));
-                        }
-                    };
+                if let Some(ref bd) = batch_display {
+                    bd.on_item_start(&identifier, idx, items_total);
+                }
+                info!(item = %identifier, idx, "starting item download");
 
-                    let files = ia_core::files::list(&item, &filter);
-                    let estimated_size = ia_core::files::total_size(&files);
+                let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> = batch_display
+                    .clone()
+                    .map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
+                        Arc::new(move |p: DownloadProgress| bd.on_progress(p))
+                    });
 
-                    // Assign item to a disk (brief lock)
-                    let dest = {
-                        let mut pool_guard = pool.lock().await;
-                        match pool_guard.assign_item(&identifier, estimated_size) {
-                            Ok(dest) => dest.to_path_buf(),
-                            Err(e) => {
-                                warn!(item = %identifier, error = %e, "skipping item: no disk space");
-                                if let Some(ref bd) = batch_display {
-                                    bd.on_item_error(&identifier, &e.to_string());
-                                }
-                                return Err((identifier, e));
-                            }
-                        }
-                    };
-
-                    let item_opts = make_opts(dest);
-
-                    let progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>> =
-                        batch_display
-                            .clone()
-                            .map(|bd| -> Arc<dyn Fn(DownloadProgress) + Send + Sync> {
-                                Arc::new(move |p: DownloadProgress| bd.on_progress(p))
-                            });
-
-                    let emit_success = |result: &ItemDownloadResult| {
+                match ia_core::download::download_item(
+                    &client,
+                    &identifier,
+                    &opts,
+                    semaphore,
+                    progress,
+                )
+                .await
+                {
+                    Ok(result) => {
                         if json_mode {
                             let obj = serde_json::json!({
                                 "item": result.identifier,
@@ -627,101 +872,29 @@ async fn download_batch_with_pool(
                                 "bytes": result.bytes_total,
                                 "elapsed_ms": result.elapsed.as_millis() as u64,
                             });
-                            println!("{}", obj);
+                            println!("{obj}");
                         }
                         if let Some(ref bd) = batch_display {
-                            bd.on_item_complete(result);
+                            bd.on_item_complete(&result);
                         }
-                    };
-
-                    let emit_error = |id: &str, e: &IaError| {
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        warn!(identifier = %identifier, error = %e, "item download failed");
                         if let Some(ref bd) = batch_display {
-                            bd.on_item_error(id, &e.to_string());
+                            bd.on_item_error(&identifier, &e.to_string());
                         }
-                    };
-
-                    match ia_core::download::download_item_with_metadata(
-                        &client,
-                        &identifier,
-                        &item,
-                        &item_opts,
-                        Arc::clone(&semaphore),
-                        progress.clone(),
-                    )
-                    .await
-                    {
-                        Ok(result) => {
-                            emit_success(&result);
-                            Ok(result)
-                        }
-                        Err(e) if e.is_disk_full() => {
-                            // Disk full: clean up partial download, reassign to
-                            // another disk, and retry the entire item from scratch.
-                            warn!(item = %identifier, "disk full, cleaning up and attempting failover");
-
-                            // Remove partial item directory on the full disk
-                            ia_core::download::cleanup_item_dir(
-                                &item_opts.destdir,
-                                &identifier,
-                            )
-                            .await;
-
-                            let new_dest = {
-                                let mut pool_guard = pool.lock().await;
-                                pool_guard.handle_disk_full(&identifier).map(|p| p.to_path_buf())
-                            };
-                            match new_dest {
-                                Ok(dest) => {
-                                    let retry_opts = make_opts(dest);
-                                    match ia_core::download::download_item_with_metadata(
-                                        &client,
-                                        &identifier,
-                                        &item,
-                                        &retry_opts,
-                                        semaphore,
-                                        progress,
-                                    )
-                                    .await
-                                    {
-                                        Ok(result) => {
-                                            emit_success(&result);
-                                            Ok(result)
-                                        }
-                                        Err(e2) => {
-                                            warn!(item = %identifier, error = %e2, "retry after disk failover also failed");
-                                            emit_error(&identifier, &e2);
-                                            Err((identifier, e2))
-                                        }
-                                    }
-                                }
-                                Err(no_space) => {
-                                    warn!(item = %identifier, error = %no_space, "no alternative disk available");
-                                    emit_error(&identifier, &no_space);
-                                    Err((identifier, no_space))
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(item = %identifier, error = %e, "item download failed");
-                            emit_error(&identifier, &e);
-                            Err((identifier, e))
-                        }
+                        Err((identifier, e))
                     }
                 }
-            })
-            .buffer_unordered(items_concurrency)
-            .collect()
-            .await;
+            }
+        })
+        .buffer_unordered(items_concurrency)
+        .collect()
+        .await;
 
-    let returned_pool = Arc::try_unwrap(pool)
-        .map_err(|_| {
-            anyhow::anyhow!("disk pool Arc still shared after batch completed — this is a bug")
-        })?
-        .into_inner();
-    Ok((
-        collect_batch_results(items_total, item_results, start.elapsed()),
-        returned_pool,
-    ))
+    let actual_total = item_results.len();
+    collect_batch_results(actual_total, item_results, start.elapsed())
 }
 
 fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownloadResult]) {

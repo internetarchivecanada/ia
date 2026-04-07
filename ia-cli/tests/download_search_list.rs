@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use serde_json::json;
 use std::fs;
 use tempfile::{NamedTempFile, TempDir};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn ia_cmd() -> Command {
@@ -751,5 +751,301 @@ async fn download_on_item_error_shows_in_batch() {
     assert!(
         dir.path().join("item-ok").join("good-file.txt").exists(),
         "item-ok/good-file.txt should have been downloaded despite item-bad failing"
+    );
+}
+
+// ─── Streaming search-to-download tests ─────────────────────────────────────
+
+/// Mock helpers for multi-page search tests.
+fn mock_item_metadata(identifier: &str, file_name: &str, size: &str) -> serde_json::Value {
+    json!({
+        "metadata": {
+            "identifier": identifier,
+            "mediatype": "texts",
+            "title": format!("Item {identifier}"),
+            "collection": ["test"]
+        },
+        "files": [{
+            "name": file_name,
+            "source": "original",
+            "format": "Text",
+            "size": size,
+            "md5": "d41d8cd98f00b204e9800998ecf8427e",
+            "mtime": "1700000000"
+        }]
+    })
+}
+
+/// Streaming search: downloads multiple items from a search query.
+/// Verifies the streaming batch path actually downloads files correctly.
+#[tokio::test]
+async fn download_search_streaming_batch() {
+    let mock_server = MockServer::start().await;
+
+    // Single-page scrape returning 3 items
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                {"identifier": "s-alpha"},
+                {"identifier": "s-beta"},
+                {"identifier": "s-gamma"}
+            ],
+            "count": 3,
+            "total": 3,
+            "cursor": ""
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // Mock metadata + file downloads for all 3 items
+    for (id, file) in [
+        ("s-alpha", "a.txt"),
+        ("s-beta", "b.txt"),
+        ("s-gamma", "c.txt"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_item_metadata(id, file, "5")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{id}/{file}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"hello")
+                    .insert_header("content-length", "5"),
+            )
+            .mount(&mock_server)
+            .await;
+    }
+
+    let host = mock_server.uri().replace("http://", "");
+    let dir = TempDir::new().unwrap();
+
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "--search",
+            "collection:stream-batch-test",
+            "--destdir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "streaming batch download should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // All 3 items should have been downloaded
+    assert!(dir.path().join("s-alpha").join("a.txt").exists());
+    assert!(dir.path().join("s-beta").join("b.txt").exists());
+    assert!(dir.path().join("s-gamma").join("c.txt").exists());
+
+    // Verify file contents
+    let content = fs::read_to_string(dir.path().join("s-alpha").join("a.txt")).unwrap();
+    assert_eq!(content, "hello");
+}
+
+/// Streaming search: num_found failure doesn't prevent downloads.
+#[tokio::test]
+async fn download_search_streaming_num_found_failure() {
+    let mock_server = MockServer::start().await;
+
+    // Mount order: scrape mock first (checked last), num_found 500 last (checked first)
+
+    // Scrape returns 1 item
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .and(query_param("q", "collection:fallback-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"identifier": "fallback-item"}],
+            "count": 1,
+            "total": 1,
+            "cursor": ""
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // num_found returns 500 — mounted LAST so it's checked first
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .and(query_param("total_only", "true"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/fallback-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_item_metadata(
+            "fallback-item",
+            "data.txt",
+            "4",
+        )))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/download/fallback-item/data.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"data")
+                .insert_header("content-length", "4"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let dir = TempDir::new().unwrap();
+
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "--search",
+            "collection:fallback-test",
+            "--destdir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "download should succeed even when num_found fails, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        dir.path().join("fallback-item").join("data.txt").exists(),
+        "file should be downloaded despite num_found failure"
+    );
+}
+
+/// Streaming search with JSON output emits per-item JSON lines.
+#[tokio::test]
+async fn download_search_streaming_json_output() {
+    let mock_server = MockServer::start().await;
+
+    // Mount order: scrape first (checked last), num_found last (checked first)
+
+    // Scrape
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .and(query_param("q", "collection:json-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"identifier": "json-item"}],
+            "count": 1,
+            "total": 1,
+            "cursor": ""
+        })))
+        .mount(&mock_server)
+        .await;
+
+    // num_found — mounted LAST so it's checked first
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .and(query_param("total_only", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "total": 1
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/json-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mock_item_metadata(
+            "json-item",
+            "doc.txt",
+            "3",
+        )))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/download/json-item/doc.txt"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"abc")
+                .insert_header("content-length", "3"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let dir = TempDir::new().unwrap();
+
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "--search",
+            "collection:json-test",
+            "--json",
+            "--destdir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "streaming search with --json should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("should be valid JSON");
+    assert_eq!(parsed["item"], "json-item");
+    assert_eq!(parsed["status"], "ok");
+}
+
+/// --search combined with file names should be rejected.
+/// Clap parses positionals as: first = identifier, rest = files.
+/// So `ia download --search 'q' myitem somefile.txt` puts "myitem" in
+/// identifier and "somefile.txt" in files — that's the case we reject.
+#[tokio::test]
+async fn download_search_rejects_file_names() {
+    let mock_server = MockServer::start().await;
+    let host = mock_server.uri().replace("http://", "");
+
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "--search",
+            "collection:test",
+            "some-item",
+            "somefile.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "--search with file names should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot combine file names with --search"),
+        "should show clear error, got: {stderr}"
     );
 }
