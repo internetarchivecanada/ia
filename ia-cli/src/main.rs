@@ -177,8 +177,16 @@ async fn main() -> Result<()> {
         Commands::Config(args) => {
             // Config command handles its own config/client creation
             // because some subcommands (login) don't require existing credentials
+            let is_login = matches!(args.command, commands::config::ConfigCommand::Login(_));
             let config = if let Some(path) = &cli.config {
-                ia_core::IaConfig::load_from_file(path)?
+                if path.exists() {
+                    ia_core::IaConfig::load_from_file(path)?
+                } else if is_login {
+                    // login creates the config file — use defaults if it doesn't exist yet
+                    ia_core::IaConfig::default()
+                } else {
+                    ia_core::IaConfig::load_from_file(path)?
+                }
             } else {
                 ia_core::IaConfig::load()?
             };

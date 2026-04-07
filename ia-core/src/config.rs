@@ -284,7 +284,7 @@ impl IaConfig {
     /// Creates parent directories (mode 0o700) and sets file permissions to 0o600.
     pub fn write_config_file(auth: &crate::auth::AuthConfig, path: &Path) -> Result<()> {
         // Create parent directories if needed
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
