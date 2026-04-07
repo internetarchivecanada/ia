@@ -2,6 +2,7 @@ pub mod ai;
 pub mod auth;
 pub mod client;
 pub mod collection;
+pub mod concurrency;
 pub mod config;
 pub mod disk_pool;
 pub mod download;
@@ -24,6 +25,7 @@ pub mod user_agent;
 pub mod verify;
 
 pub use client::IaClient;
+pub use concurrency::AdaptiveLimiter;
 pub use config::IaConfig;
 pub use error::{write_json_error, IaError, JsonError, JsonErrorBody, Result};
 pub use retry::RetryStats;

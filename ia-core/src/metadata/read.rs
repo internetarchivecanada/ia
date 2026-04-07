@@ -12,6 +12,12 @@ pub async fn get(client: &IaClient, identifier: &str) -> Result<ItemMetadata> {
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(IaError::NotFound(identifier.to_string()));
     }
+    if status.as_u16() == 429 {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
+        return Err(IaError::RateLimited {
+            retry_after: retry_after.unwrap_or(30),
+        });
+    }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
@@ -98,6 +104,51 @@ mod tests {
         let result = get(&client, "nonexistent").await;
 
         assert!(matches!(result, Err(IaError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn get_item_rate_limited() {
+        let mock_server = MockServer::start().await;
+
+        // 429 passes through middleware without retry.
+        Mock::given(method("GET"))
+            .and(path("/metadata/busy-item"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = get(&client, "busy-item").await;
+
+        match result {
+            Err(IaError::RateLimited { retry_after }) => {
+                assert_eq!(retry_after, 60);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_item_rate_limited_no_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/busy-item-2"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = get(&client, "busy-item-2").await;
+
+        match result {
+            Err(IaError::RateLimited { retry_after }) => {
+                assert_eq!(retry_after, 30); // default
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[tokio::test]

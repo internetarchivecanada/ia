@@ -89,17 +89,17 @@ impl RetryStats {
         tracing::debug!(latency_ms = ms, "request completed");
     }
 
-    /// Record a 429 retry event.
+    /// Record a 429 rate-limit event (NOT a middleware retry).
     ///
-    /// Increments `retries_total` and `status_429_count`. If `retry_after` is
-    /// provided, its value (in seconds) is added to `total_retry_wait_ms`.
+    /// Increments `status_429_count` and accumulates `Retry-After` wait time.
+    /// Does NOT increment `retries_total` because 429s are handled by the
+    /// application layer, not retried by middleware.
     ///
     /// Logging behaviour:
-    /// - verbosity ≥ 1: emits `tracing::info!` for every event.
+    /// - verbosity >= 1: emits `tracing::info!` for every event.
     /// - verbosity 0: emits `tracing::warn!` only on the first rate-limit
-    ///   (`false → true` transition of `currently_rate_limited`).
-    pub fn record_retry(&self, status: u16, retry_after: Option<u64>, url_path: &str) {
-        self.retries_total.fetch_add(1, Ordering::Relaxed);
+    ///   (`false -> true` transition of `currently_rate_limited`).
+    pub fn record_rate_limit(&self, status: u16, retry_after: Option<u64>, url_path: &str) {
         self.status_429_count.fetch_add(1, Ordering::Relaxed);
 
         if let Some(secs) = retry_after {
@@ -113,7 +113,7 @@ impl RetryStats {
                 status,
                 retry_after_secs = retry_after,
                 url_path,
-                "rate-limited, retrying"
+                "rate-limited by server"
             );
         } else {
             // Deduplicate: only log on the false→true transition.
@@ -140,9 +140,10 @@ impl RetryStats {
         tracing::info!(status, url_path, "server error, retrying");
     }
 
-    /// Returns `true` if any retry has been recorded.
+    /// Returns `true` if any retry or rate-limit event has been recorded.
     pub fn had_retries(&self) -> bool {
         self.retries_total.load(Ordering::Relaxed) > 0
+            || self.status_429_count.load(Ordering::Relaxed) > 0
     }
 
     /// Return a point-in-time snapshot of all counters.
@@ -224,8 +225,8 @@ impl RetryableStrategy for LoggingRetryStrategy {
                 let url_path = response.url().path();
 
                 if status == 429 {
-                    self.stats.record_retry(status, retry_after, url_path);
-                    Some(Retryable::Transient)
+                    self.stats.record_rate_limit(status, retry_after, url_path);
+                    None // Don't retry — caller handles via IaError::RateLimited
                 } else if status >= 500 {
                     self.stats.record_server_error(status, url_path);
                     Some(Retryable::Transient)
@@ -299,15 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn record_retry_429_increments_counters() {
+    fn record_rate_limit_429_increments_counters() {
         let stats = RetryStats::new(0);
-        stats.record_retry(429, Some(30), "/metadata/test");
+        stats.record_rate_limit(429, Some(30), "/metadata/test");
         let s = stats.summary();
-        assert_eq!(s.retries_total, 1);
+        assert_eq!(s.retries_total, 0, "429s are not middleware retries");
         assert_eq!(s.status_429_count, 1);
         assert_eq!(s.status_5xx_count, 0);
         assert_eq!(s.total_retry_wait, Duration::from_secs(30));
-        assert!(stats.had_retries());
+        assert!(stats.had_retries(), "had_retries includes rate limits");
     }
 
     #[test]
@@ -321,23 +322,23 @@ mod tests {
     }
 
     #[test]
-    fn record_retry_429_without_retry_after() {
+    fn record_rate_limit_429_without_retry_after() {
         let stats = RetryStats::new(0);
-        stats.record_retry(429, None, "/metadata/test");
+        stats.record_rate_limit(429, None, "/metadata/test");
         let s = stats.summary();
-        assert_eq!(s.retries_total, 1);
+        assert_eq!(s.retries_total, 0);
         assert_eq!(s.status_429_count, 1);
         assert_eq!(s.total_retry_wait, Duration::ZERO);
     }
 
     #[test]
-    fn multiple_retries_accumulate() {
+    fn multiple_events_accumulate() {
         let stats = RetryStats::new(0);
-        stats.record_retry(429, Some(10), "/metadata/a");
-        stats.record_retry(429, Some(20), "/metadata/b");
+        stats.record_rate_limit(429, Some(10), "/metadata/a");
+        stats.record_rate_limit(429, Some(20), "/metadata/b");
         stats.record_server_error(500, "/metadata/c");
         let s = stats.summary();
-        assert_eq!(s.retries_total, 3);
+        assert_eq!(s.retries_total, 1, "only 5xx counts as retry");
         assert_eq!(s.status_429_count, 2);
         assert_eq!(s.status_5xx_count, 1);
         assert_eq!(s.total_retry_wait, Duration::from_secs(30));
@@ -441,8 +442,8 @@ mod tests {
     }
 
     #[test]
-    fn strategy_429_returns_transient() {
-        use reqwest_retry::{Retryable, RetryableStrategy};
+    fn strategy_429_returns_none() {
+        use reqwest_retry::RetryableStrategy;
         let (stats, strategy) = make_strategy();
         let response = http::Response::builder()
             .status(429)
@@ -451,10 +452,10 @@ mod tests {
             .unwrap();
         let reqwest_resp = reqwest::Response::from(response);
         let result: Result<reqwest::Response, reqwest_middleware::Error> = Ok(reqwest_resp);
-        assert!(matches!(
-            strategy.handle(&result),
-            Some(Retryable::Transient)
-        ));
+        assert!(
+            strategy.handle(&result).is_none(),
+            "429 should not be retried by middleware"
+        );
         assert_eq!(stats.summary().status_429_count, 1);
         assert_eq!(stats.summary().total_retry_wait, Duration::from_secs(60));
     }
@@ -490,7 +491,10 @@ mod tests {
         let response = http::Response::builder().status(429).body("").unwrap();
         let reqwest_resp = reqwest::Response::from(response);
         let result: Result<reqwest::Response, reqwest_middleware::Error> = Ok(reqwest_resp);
-        strategy.handle(&result);
+        assert!(
+            strategy.handle(&result).is_none(),
+            "429 without retry-after should still not retry"
+        );
         assert_eq!(stats.summary().total_retry_wait, Duration::ZERO);
     }
 }

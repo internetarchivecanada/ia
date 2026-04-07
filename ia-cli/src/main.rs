@@ -77,15 +77,9 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations
-    #[arg(
-        short = 'j',
-        long,
-        global = true,
-        default_value = "2",
-        help_heading = "Global Options"
-    )]
-    jobs: usize,
+    /// Concurrent operations (omit for adaptive concurrency)
+    #[arg(short = 'j', long, global = true, help_heading = "Global Options")]
+    jobs: Option<usize>,
 
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
     #[arg(short = 'q', long, global = true, action = clap::ArgAction::Count, help_heading = "Global Options")]
@@ -247,22 +241,16 @@ async fn main() -> Result<()> {
 
     let client = ia_core::IaClient::from_config_with_verbosity(config, cli.verbose)?;
 
+    // Default for commands that don't support adaptive concurrency.
+    let jobs = cli.jobs.unwrap_or(2);
+
     match cli.command {
         #[cfg(feature = "alpha")]
-        Commands::Ai(args) => {
-            commands::ai::run(&client, args, cli.quiet, cli.jobs, cli.joblog).await?
-        }
+        Commands::Ai(args) => commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog).await?,
         Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
         Commands::Download(args) => {
-            commands::download::run(
-                &client,
-                args,
-                cli.quiet,
-                cli.jobs,
-                cli.joblog,
-                cli.retry_failed,
-            )
-            .await?
+            commands::download::run(&client, args, cli.quiet, jobs, cli.joblog, cli.retry_failed)
+                .await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {
@@ -272,7 +260,7 @@ async fn main() -> Result<()> {
                 args,
                 conts,
                 cli.quiet,
-                cli.jobs,
+                cli.jobs, // pass Option<usize> for adaptive support
                 cli.joblog.clone(),
                 cli.retry_failed,
             )
@@ -281,29 +269,22 @@ async fn main() -> Result<()> {
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args, cli.quiet).await?,
         Commands::Tasks(args) => {
-            commands::tasks::run(
-                &client,
-                args,
-                cli.quiet,
-                cli.jobs,
-                cli.joblog,
-                cli.retry_failed,
-            )
-            .await?
+            commands::tasks::run(&client, args, cli.quiet, jobs, cli.joblog, cli.retry_failed)
+                .await?
         }
         Commands::Upload(args) => {
             commands::upload::run(
                 &client,
                 args,
                 cli.quiet,
-                cli.jobs,
+                jobs,
                 cli.joblog,
                 cli.retry_failed,
                 cli.no_resume,
             )
             .await?
         }
-        Commands::Verify(args) => commands::verify::run(&client, args, cli.quiet, cli.jobs).await?,
+        Commands::Verify(args) => commands::verify::run(&client, args, cli.quiet, jobs).await?,
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]

@@ -101,7 +101,7 @@ pub struct DownloadArgs {
     search: Option<String>,
 
     /// Concurrent items for batch/search (use -j/--jobs for concurrent files)
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "5")]
     pub items: usize,
 
     /// Full-screen dashboard mode

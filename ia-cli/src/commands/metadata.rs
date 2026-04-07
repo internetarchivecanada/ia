@@ -479,13 +479,13 @@ pub async fn run(
     args: MetadataArgs,
     continuations: Option<Vec<(String, Vec<String>)>>,
     quiet: u8,
-    jobs: usize,
+    jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
     let ctx = WriteContext {
         quiet,
-        jobs,
+        jobs: jobs.unwrap_or(2), // writes use fixed concurrency
         joblog_path,
         retry_failed,
     };
@@ -528,7 +528,7 @@ pub async fn run(
                 client,
                 sub,
                 ctx.quiet,
-                ctx.jobs,
+                jobs, // pass Option for adaptive support
                 ctx.joblog_path,
                 ctx.retry_failed,
             )
@@ -1192,7 +1192,7 @@ async fn run_export(
     client: &IaClient,
     args: ExportArgs,
     quiet: u8,
-    jobs: usize,
+    jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
     retry_failed: bool,
 ) -> Result<()> {
@@ -1272,6 +1272,13 @@ async fn run_export(
     let client = Arc::new(client.clone());
 
     // Progress tracking
+    // Adaptive concurrency: when --jobs is omitted, start at 10 and ramp
+    // up/down via AIMD. When --jobs N is explicit, use fixed concurrency.
+    let limiter = match jobs {
+        Some(n) => ia_core::AdaptiveLimiter::fixed(n),
+        None => ia_core::AdaptiveLimiter::new(10, 2, 200),
+    };
+
     let succeeded = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let bytes_total = Arc::new(AtomicU64::new(0));
@@ -1283,6 +1290,8 @@ async fn run_export(
     let pb = if quiet == 0 && total > 0 {
         let skip_offset = skipped as u64;
         let pb = ProgressBar::new(total_with_skipped as u64);
+        let pb_limiter = limiter.clone();
+        let show_concurrency = limiter.is_adaptive();
         pb.set_style(
             ProgressStyle::with_template(&format!(
                 "{{msg}}\n  {{bar:{BAR_WIDTH}.cyan/dim}} {{pos}}/{{len}} {{per_sec:.dim}}  ({{elapsed}} elapsed)",
@@ -1293,7 +1302,11 @@ async fn run_export(
                 let fetched = state.pos().saturating_sub(skip_offset);
                 let elapsed = state.elapsed().as_secs_f64();
                 let rate = if elapsed > 0.0 { fetched as f64 / elapsed } else { 0.0 };
-                write!(w, "{rate:.1}/s").ok();
+                if show_concurrency {
+                    write!(w, "{rate:.1}/s j={}", pb_limiter.target()).ok();
+                } else {
+                    write!(w, "{rate:.1}/s").ok();
+                }
             })
             .progress_chars(PROGRESS_CHARS),
         );
@@ -1323,19 +1336,71 @@ async fn run_export(
         None
     };
 
-    // Fetch items concurrently, streaming results as they complete.
-    // Only `jobs` futures are in-flight at a time (not all N at once).
-    let mut stream = stream::iter(identifiers)
-        .map(|id| {
-            let client = client.clone();
-            async move {
+    // Channel-based bounded spawning: the feeder task acquires a permit
+    // before spawning each work task, so only `target` tasks + a small
+    // buffer exist at a time (no unbounded memory for large exports).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+        String,
+        Result<ia_core::types::ItemMetadata, ia_core::IaError>,
+        u64,
+    )>(64);
+
+    let feeder_client = client.clone();
+    let feeder_limiter = limiter.clone();
+    let feeder = tokio::spawn(async move {
+        for identifier in identifiers {
+            let permit = feeder_limiter.acquire().await;
+            let client = feeder_client.clone();
+            let lim = feeder_limiter.clone();
+            let tx = tx.clone();
+
+            tokio::spawn(async move {
                 let req_start = Instant::now();
-                let result = client.get_item(&id).await;
+                let adaptive = lim.is_adaptive();
+                let mut permit = Some(permit);
+
+                let result = loop {
+                    match client.get_item(&identifier).await {
+                        Ok(item) => {
+                            lim.on_success();
+                            break Ok(item);
+                        }
+                        Err(ia_core::IaError::RateLimited { retry_after }) => {
+                            lim.on_rate_limited(retry_after, |old, new, secs| {
+                                if adaptive {
+                                    tracing::warn!(
+                                        old_concurrency = old,
+                                        new_concurrency = new,
+                                        pause_secs = secs,
+                                        "rate limited — reducing concurrency",
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        pause_secs = secs,
+                                        "rate limited — pausing all workers",
+                                    );
+                                }
+                            })
+                            .await;
+                            // Release permit and re-acquire — excess workers
+                            // block here until active < target, naturally
+                            // draining to the new concurrency level.
+                            if let Some(p) = permit.take() {
+                                drop(p);
+                            }
+                            permit = Some(lim.acquire().await);
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+
                 let elapsed_ms = req_start.elapsed().as_millis() as u64;
-                (id, result, elapsed_ms)
-            }
-        })
-        .buffer_unordered(jobs);
+                drop(permit); // release concurrency slot
+                let _ = tx.send((identifier, result, elapsed_ms)).await;
+            });
+        }
+        // tx dropped here — signals completion to rx
+    });
 
     if let Some(ref path) = args.output {
         // Detect JSONL output for streaming writes
@@ -1374,7 +1439,7 @@ async fn run_export(
                 Vec::new()
             };
 
-        while let Some((identifier, result, elapsed_ms)) = stream.next().await {
+        while let Some((identifier, result, elapsed_ms)) = rx.recv().await {
             match result {
                 Ok(item) => {
                     let json_bytes = serde_json::to_string(&item)
@@ -1505,7 +1570,7 @@ async fn run_export(
         }
     } else {
         // Stdout mode: stream results as they complete (no buffering).
-        while let Some((identifier, result, elapsed_ms)) = stream.next().await {
+        while let Some((identifier, result, elapsed_ms)) = rx.recv().await {
             match result {
                 Ok(item) => {
                     let json_bytes = serde_json::to_string(&item)
@@ -1582,6 +1647,11 @@ async fn run_export(
             print_retry_summary(client.retry_stats());
         }
     }
+
+    // Ensure feeder task completes (it should already be done since rx drained).
+    feeder
+        .await
+        .map_err(|e| anyhow::anyhow!("metadata export feeder task panicked: {e}"))?;
 
     Ok(())
 }

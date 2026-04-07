@@ -1264,14 +1264,49 @@ fn metadata_export_resume_csv_merges_existing() {
 #[test]
 fn metadata_export_jsonl_matches_stdout_output() {
     // Export a single item to both JSONL file and stdout, verify identical output.
-    // Uses a known public item with a short file list.
+    // Uses a wiremock server — ZERO live requests to archive.org.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+
+    let mock_item = serde_json::json!({
+        "metadata": {
+            "identifier": "test-item",
+            "title": "Test Item",
+            "collection": ["test_collection"],
+            "mediatype": "texts"
+        },
+        "files": [
+            {"name": "file.txt", "size": "100", "format": "Text", "source": "original"}
+        ],
+        "server": "ia000000.us.archive.org",
+        "d1": "ia000000.us.archive.org",
+        "d2": "ia000001.us.archive.org",
+        "dir": "/0/items/test-item",
+        "files_count": 1,
+        "item_size": 100,
+        "is_dark": false
+    });
+
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/test-item"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&mock_item))
+            .mount(&server)
+            .await;
+    });
+
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+
     let dir = tempfile::tempdir().unwrap();
     let ids = dir.path().join("ids.txt");
-    std::fs::write(&ids, "nasa\n").unwrap();
+    std::fs::write(&ids, "test-item\n").unwrap();
 
     // Stdout mode
     let stdout_result = ia()
         .args([
+            "--insecure",
+            "--host",
+            &host,
             "metadata",
             "export",
             "--itemlist",
@@ -1286,6 +1321,9 @@ fn metadata_export_jsonl_matches_stdout_output() {
     // File mode (JSONL)
     let output = dir.path().join("out.jsonl");
     ia().args([
+        "--insecure",
+        "--host",
+        &host,
         "metadata",
         "export",
         "--itemlist",

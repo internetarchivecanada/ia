@@ -51,21 +51,14 @@ async fn successful_request_records_latency() {
 }
 
 #[tokio::test]
-async fn request_429_records_retry_stats() {
+async fn request_429_passes_through_without_retry() {
     let server = MockServer::start().await;
 
-    // First two calls: 429, third call: 200
+    // 429 is NOT retried by middleware — it passes through to the caller.
     Mock::given(method("GET"))
         .and(path("/metadata/rate-limited"))
         .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
-        .up_to_n_times(2)
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/metadata/rate-limited"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -77,14 +70,15 @@ async fn request_429_records_retry_stats() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 429, "429 should pass through to caller");
 
     let stats = client.retry_stats();
     assert!(stats.had_retries());
     let s = stats.summary();
-    assert_eq!(s.status_429_count, 2);
-    assert_eq!(s.total_retry_wait, Duration::from_secs(60)); // 30 * 2
-    assert_eq!(s.requests_total, 1); // one logical request
+    assert_eq!(s.status_429_count, 1);
+    assert_eq!(s.retries_total, 0, "429s are not middleware retries");
+    assert_eq!(s.total_retry_wait, Duration::from_secs(30));
+    assert_eq!(s.requests_total, 1);
 }
 
 #[tokio::test]
@@ -123,18 +117,11 @@ async fn request_503_records_server_error_stats() {
 }
 
 #[tokio::test]
-async fn mixed_429_and_5xx_retries() {
+async fn mixed_5xx_then_429_passes_429_through() {
     let server = MockServer::start().await;
 
-    // Sequence: 429 -> 503 -> 200
-    Mock::given(method("GET"))
-        .and(path("/metadata/mixed"))
-        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "10"))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
-        .await;
-
+    // Sequence: 503 -> 429. Middleware retries the 503 (transient),
+    // then gets a 429 which passes through (not retried).
     Mock::given(method("GET"))
         .and(path("/metadata/mixed"))
         .respond_with(ResponseTemplate::new(503))
@@ -145,7 +132,8 @@ async fn mixed_429_and_5xx_retries() {
 
     Mock::given(method("GET"))
         .and(path("/metadata/mixed"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "10"))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -157,10 +145,14 @@ async fn mixed_429_and_5xx_retries() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.status(),
+        429,
+        "429 should pass through after 503 retry"
+    );
 
     let s = client.retry_stats().summary();
-    assert_eq!(s.retries_total, 2);
+    assert_eq!(s.retries_total, 1, "only the 503 is a middleware retry");
     assert_eq!(s.status_429_count, 1);
     assert_eq!(s.status_5xx_count, 1);
     assert_eq!(s.total_retry_wait, Duration::from_secs(10));
