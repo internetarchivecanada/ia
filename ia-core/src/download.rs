@@ -542,34 +542,23 @@ async fn should_skip(path: &Path, file: &FileMetadata) -> Option<String> {
     let local_size = meta.len();
 
     // Size must match
-    if let Some(remote_size) = file.size {
-        if local_size != remote_size {
-            return None;
-        }
+    let remote_size = file.size?;
+    if local_size != remote_size {
+        return None;
+    }
+
+    // mtime must match
+    let remote_mtime = file.mtime?;
+    let local_mtime = meta.modified().ok()?;
+    let local_ts = local_mtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if local_ts == remote_mtime {
+        Some("size+mtime match".to_string())
     } else {
-        return None; // Can't compare without remote size
+        None
     }
-
-    // mtime must match (if available)
-    if let Some(remote_mtime) = file.mtime {
-        if let Ok(local_mtime) = meta.modified() {
-            let local_ts = local_mtime
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if local_ts == remote_mtime {
-                return Some("size+mtime match".to_string());
-            }
-        }
-        // Size matches but mtime doesn't — still skip.
-        // The mtime on disk may come from the HTTP Last-Modified header which
-        // can differ from the metadata API's mtime.  Re-downloading a
-        // correctly-sized file just because the timestamp disagrees is wasteful.
-        return Some("size match".to_string());
-    }
-
-    // No remote mtime to compare — skip on size alone
-    Some("size match (no remote mtime)".to_string())
 }
 
 /// Check if a file should be skipped based on MD5 checksum.
@@ -1054,10 +1043,17 @@ mod tests {
         let file_path = dir.path().join("existing.txt");
         std::fs::write(&file_path, "content").unwrap();
 
+        // Set a known mtime on the local file
+        let mtime = 1700000000u64;
+        filetime::set_file_mtime(
+            &file_path,
+            filetime::FileTime::from_unix_time(mtime as i64, 0),
+        );
+
         let file = FileMetadata {
             name: "existing.txt".to_string(),
             size: Some(7), // "content".len()
-            mtime: None,   // No mtime means skip on size alone
+            mtime: Some(mtime),
             ..test_file_meta("existing.txt", 7)
         };
 
@@ -1173,10 +1169,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_file_with_matching_size_but_different_mtime() {
-        // When the file has the right size but a different mtime (e.g. set
-        // from HTTP Last-Modified instead of metadata mtime), it should
-        // still be skipped rather than re-downloaded.
+    async fn redownload_file_with_matching_size_but_different_mtime() {
+        // When the file has the right size but a different mtime, it should
+        // be re-downloaded — both size and mtime must match to skip.
+        let mock_server = MockServer::start().await;
+        let body = b"hello";
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/data.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("last-modified", "Tue, 14 Nov 2023 22:13:20 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("data.bin");
         std::fs::write(&file_path, "hello").unwrap();
@@ -1195,7 +1203,16 @@ mod tests {
             ..test_file_meta("data.bin", 5)
         };
 
-        let client = IaClient::from_config(crate::config::IaConfig::default()).unwrap();
+        let mut config = crate::config::IaConfig::default();
+        let host = mock_server
+            .uri()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        config.general.host = host;
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
         let result = download_file(
             &client,
             "test-item",
@@ -1208,8 +1225,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result.status, DownloadStatus::Skipped(_)),
-            "file with matching size should be skipped even if mtime differs"
+            !matches!(result.status, DownloadStatus::Skipped(_)),
+            "file with matching size but different mtime should be re-downloaded"
         );
     }
 
