@@ -961,52 +961,6 @@ fn metadata_bare_file_like_identifier_hints_export() {
 // --- export joblog ---
 
 #[test]
-fn metadata_export_retry_failed_requires_joblog() {
-    let dir = tempfile::tempdir().unwrap();
-    let ids = dir.path().join("ids.txt");
-    std::fs::write(&ids, "test-id\n").unwrap();
-
-    ia().args([
-        "metadata",
-        "export",
-        "--itemlist",
-        ids.to_str().unwrap(),
-        "--retry-failed",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("--retry-failed requires --joblog"));
-}
-
-#[test]
-fn metadata_export_retry_failed_no_failures() {
-    let dir = tempfile::tempdir().unwrap();
-    let ids = dir.path().join("ids.txt");
-    std::fs::write(&ids, "test-id\n").unwrap();
-
-    // Write a joblog with only successes
-    let log = dir.path().join("export.log");
-    std::fs::write(
-        &log,
-        r#"{"ts":"2026-01-01T00:00:00Z","op":"export","item":"test-id","file":"","status":"ok","bytes":100,"elapsed_ms":50}"#,
-    )
-    .unwrap();
-
-    ia().args([
-        "metadata",
-        "export",
-        "--itemlist",
-        ids.to_str().unwrap(),
-        "--retry-failed",
-        "--joblog",
-        log.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stderr(predicate::str::contains("No failed items in joblog"));
-}
-
-#[test]
 fn metadata_export_writes_joblog() {
     let dir = tempfile::tempdir().unwrap();
     let ids = dir.path().join("ids.txt");

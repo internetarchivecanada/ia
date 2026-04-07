@@ -579,25 +579,6 @@ fn upload_help_shows_cleanup_subcommand() {
 // ─── Auto-resume ─────────────────────────────────────────────────────────────
 
 #[test]
-fn upload_retry_failed_shows_error() {
-    let config = empty_config();
-    ia_with_config(&config)
-        .args([
-            "upload",
-            "test-id",
-            "file.txt",
-            "--retry-failed",
-            "--joblog",
-            "/dev/null",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--retry-failed is no longer needed for uploads",
-        ));
-}
-
-#[test]
 fn upload_no_resume_flag_accepted() {
     let config = empty_config();
     ia_with_config(&config)

@@ -88,7 +88,7 @@ See the [agent-friendly output design](plans/2026-02-23-agent-friendly-output-de
 
 All I/O is async (`tokio`). A shared `Semaphore` controls parallelism: `--jobs N` sets the limit for both files within an item and items within a batch. This single knob replaces what would otherwise be separate file-level and item-level concurrency settings.
 
-Batch operations stream results as JSONL — one line per completed file or item. The `--joblog` flag writes the same format to a file for auditing and retry (`--retry-failed`).
+Batch operations stream results as JSONL — one line per completed file or item. The `--joblog` flag writes the same format to a file for auditing and automatic resume — re-running a command with the same joblog skips already-completed items.
 
 Multi-disk downloads assign items to the disk with the most free space and fail over automatically when a disk fills.
 

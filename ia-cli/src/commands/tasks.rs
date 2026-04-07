@@ -290,11 +290,10 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     match args.command {
         Some(TasksCommand::Submit(submit_args)) => {
-            run_submit(client, submit_args, quiet, jobs, joblog, retry_failed).await
+            run_submit(client, submit_args, quiet, jobs, joblog).await
         }
         Some(TasksCommand::Log(log_args)) => run_log(client, log_args).await,
         Some(TasksCommand::Rerun(rerun_args)) => run_rerun(client, rerun_args, quiet, jobs).await,
@@ -551,11 +550,10 @@ async fn run_submit(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     // For spreadsheet mode, cmd comes from the spreadsheet rows
     if args.spreadsheet.is_some() {
-        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog, retry_failed).await;
+        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog).await;
     }
 
     // Outside spreadsheet mode, cmd is required
@@ -586,21 +584,28 @@ async fn run_submit(
 
     let mut identifiers = collect_submit_identifiers(&args, client).await?;
 
-    // Handle --retry-failed
-    if retry_failed {
-        if let Some(ref path) = joblog {
+    // Auto-resume: skip identifiers already successfully submitted in this joblog
+    if let Some(ref path) = joblog {
+        if path.exists() {
             let entries =
                 joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
-            let failed = joblog::failed_items(&entries);
-            if failed.is_empty() {
-                if quiet == 0 {
-                    eprintln!("{} No failed items in joblog", style("ok").green());
+            let done: std::collections::HashSet<String> = entries
+                .iter()
+                .filter(|e| e.op == "task-submit" && e.status == "ok")
+                .map(|e| e.item.clone())
+                .collect();
+            if !done.is_empty() {
+                let before = identifiers.len();
+                identifiers.retain(|id| !done.contains(id));
+                let skipped = before - identifiers.len();
+                if skipped > 0 && quiet == 0 {
+                    eprintln!(
+                        "{} skipping {} already-submitted item(s) from joblog",
+                        style("resuming:").cyan().bold(),
+                        skipped,
+                    );
                 }
-                return Ok(());
             }
-            identifiers = failed;
-        } else {
-            bail!("--retry-failed requires --joblog");
         }
     }
 
@@ -912,7 +917,6 @@ async fn run_submit_spreadsheet(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     let spreadsheet_path = args
         .spreadsheet
@@ -979,22 +983,28 @@ async fn run_submit_spreadsheet(
         });
     }
 
-    // Handle --retry-failed
-    if retry_failed {
-        if let Some(ref path) = joblog {
+    // Auto-resume: skip identifiers already successfully submitted in this joblog
+    if let Some(ref path) = joblog {
+        if path.exists() {
             let entries =
                 joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
-            let failed_ids: std::collections::HashSet<String> =
-                joblog::failed_items(&entries).into_iter().collect();
-            if failed_ids.is_empty() {
-                if quiet == 0 {
-                    eprintln!("{} No failed items in joblog", style("ok").green());
+            let done: std::collections::HashSet<String> = entries
+                .iter()
+                .filter(|e| e.op == "task-submit" && e.status == "ok")
+                .map(|e| e.item.clone())
+                .collect();
+            if !done.is_empty() {
+                let before = submissions.len();
+                submissions.retain(|s| !done.contains(&s.identifier));
+                let skipped = before - submissions.len();
+                if skipped > 0 && quiet == 0 {
+                    eprintln!(
+                        "{} skipping {} already-submitted item(s) from joblog",
+                        style("resuming:").cyan().bold(),
+                        skipped,
+                    );
                 }
-                return Ok(());
             }
-            submissions.retain(|s| failed_ids.contains(&s.identifier));
-        } else {
-            bail!("--retry-failed requires --joblog");
         }
     }
 

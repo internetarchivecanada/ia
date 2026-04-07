@@ -70,7 +70,7 @@ cargo install --path ia-cli
 - **Config & Auth** — login, credential validation, whoami, cookie/auth header export
 - **Self-update** — check, list versions, install specific releases from GitHub
 - **`--json` on all commands** — structured JSON/JSONL output for scripts, AI agents, and MCP tool servers
-- **Job logging** — JSONL audit trail with `--retry-failed` support
+- **Job logging** — JSONL audit trail with automatic resume
 
 ## Documentation
 

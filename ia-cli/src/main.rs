@@ -69,10 +69,6 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
-    /// Retry failed operations from job log
-    #[arg(long, global = true, help_heading = "Global Options")]
-    retry_failed: bool,
-
     /// Don't resume from joblog — upload all files fresh
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
@@ -249,8 +245,7 @@ async fn main() -> Result<()> {
         Commands::Ai(args) => commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog).await?,
         Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
         Commands::Download(args) => {
-            commands::download::run(&client, args, cli.quiet, jobs, cli.joblog, cli.retry_failed)
-                .await?
+            commands::download::run(&client, args, cli.quiet, jobs, cli.joblog).await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {
@@ -262,27 +257,16 @@ async fn main() -> Result<()> {
                 cli.quiet,
                 cli.jobs, // pass Option<usize> for adaptive support
                 cli.joblog.clone(),
-                cli.retry_failed,
             )
             .await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args, cli.quiet).await?,
         Commands::Tasks(args) => {
-            commands::tasks::run(&client, args, cli.quiet, jobs, cli.joblog, cli.retry_failed)
-                .await?
+            commands::tasks::run(&client, args, cli.quiet, jobs, cli.joblog).await?
         }
         Commands::Upload(args) => {
-            commands::upload::run(
-                &client,
-                args,
-                cli.quiet,
-                jobs,
-                cli.joblog,
-                cli.retry_failed,
-                cli.no_resume,
-            )
-            .await?
+            commands::upload::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
         }
         Commands::Verify(args) => commands::verify::run(&client, args, cli.quiet, jobs).await?,
         Commands::Completions(_) => unreachable!("handled above"),

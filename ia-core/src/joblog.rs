@@ -219,15 +219,6 @@ pub fn failed_files(entries: &[JoblogEntry]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Get unique item identifiers that had any failures.
-pub fn failed_items(entries: &[JoblogEntry]) -> Vec<String> {
-    let failed = failed_files(entries);
-    let mut items: Vec<String> = failed.into_iter().map(|(item, _)| item).collect();
-    items.sort();
-    items.dedup();
-    items
-}
-
 /// Get (item, file) pairs that succeeded, for auto-resume.
 ///
 /// Scans entries filtered by `op`, keeps latest status per `(item, file)`,
@@ -628,17 +619,6 @@ mod tests {
         assert!(entry.changes.is_some());
         assert!(entry.tokens.is_some());
         assert_eq!(entry.changes.unwrap().len(), 1);
-    }
-
-    #[test]
-    fn failed_items_includes_ai_ops() {
-        let entries = vec![
-            JoblogEntry::new("ai", "good_item", "").ai_ok(vec![], None, 100),
-            JoblogEntry::new("ai", "bad_item", "").ai_error("write failed", 200),
-        ];
-        let failed = failed_items(&entries);
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0], "bad_item");
     }
 
     #[test]

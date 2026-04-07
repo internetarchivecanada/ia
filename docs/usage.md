@@ -926,9 +926,8 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file (enables auto-resume for uploads) |
-| `--retry-failed` | Retry failed operations from a job log |
-| `--no-resume` | Don't resume from joblog — upload all files fresh |
+| `--joblog <PATH>` | Write operation results to a JSONL log file (enables auto-resume) |
+| `--no-resume` | Don't resume from joblog — process all items fresh |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
 | `-v, --verbose` | Increase output verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
@@ -953,7 +952,7 @@ ia --config-file ~/my-ia.ini download nasa
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation.
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, auto-resume is enabled — re-running the same command automatically skips already-completed items.
 
 ```sh
 # Download with job logging
@@ -962,8 +961,8 @@ ia download nasa --joblog downloads.jsonl
 # View job log summary
 ia status --joblog downloads.jsonl
 
-# Retry failed downloads from the log
-ia download nasa --joblog downloads.jsonl --retry-failed
+# Re-run to retry failures (auto-resume skips completed items)
+ia download nasa --joblog downloads.jsonl
 ```
 
 ### Disk pool

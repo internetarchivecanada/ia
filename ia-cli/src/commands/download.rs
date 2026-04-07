@@ -181,7 +181,6 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
@@ -350,7 +349,7 @@ pub async fn run(
     // ─── Collect-first path ─────────────────────────────────────────────
     // Used for --itemlist, stdin, positional identifiers, and
     // --dashboard --search (dashboard needs all identifiers upfront).
-    let mut identifiers = collect_identifiers(&args, client).await?;
+    let identifiers = collect_identifiers(&args, client).await?;
 
     // Detect file paths passed as identifier and suggest --itemlist
     if let Some(ref id) = args.identifier {
@@ -360,22 +359,6 @@ pub async fn run(
                 id,
                 id
             );
-        }
-    }
-
-    // If --retry-failed, read joblog and use failed items as identifiers
-    if retry_failed {
-        if let Some(ref path) = joblog_path {
-            let entries = ia_core::joblog::read(path)
-                .context(format!("failed to read joblog: {}", path.display()))?;
-            let failed = ia_core::joblog::failed_items(&entries);
-            if failed.is_empty() {
-                eprintln!("{} No failed items in joblog", style("✓").green());
-                return Ok(());
-            }
-            identifiers = failed;
-        } else {
-            bail!("--retry-failed requires --joblog");
         }
     }
 

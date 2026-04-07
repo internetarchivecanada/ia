@@ -637,30 +637,6 @@ async fn test_tasks_rate_limit_human_output() {
 }
 
 #[tokio::test]
-async fn test_tasks_retry_failed_requires_joblog() {
-    let output = ia_cmd()
-        .args([
-            "tasks",
-            "submit",
-            "my-item",
-            "--cmd",
-            "derive",
-            "--retry-failed",
-        ])
-        .env("IA_ACCESS_KEY_ID", "test_access")
-        .env("IA_SECRET_ACCESS_KEY", "test_secret")
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--retry-failed requires --joblog"),
-        "should explain --retry-failed needs --joblog, got: {stderr}"
-    );
-}
-
-#[tokio::test]
 async fn test_tasks_submit_wait() {
     let mock_server = MockServer::start().await;
 

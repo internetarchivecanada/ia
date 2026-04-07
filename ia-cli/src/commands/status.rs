@@ -164,14 +164,10 @@ pub async fn run(args: StatusArgs, quiet: u8) -> Result<()> {
                 println!("      {}", style(&error_msg).red());
             }
 
-            // Detect operation type for the retry hint
-            let has_uploads = entries.iter().any(|e| e.op == "upload");
-            let retry_cmd = if has_uploads {
-                "ia upload --spreadsheet <file> --retry-failed --joblog <file>"
-            } else {
-                "ia download --retry-failed --joblog <file>"
-            };
-            println!("\n  Run {} to retry failures.", style(retry_cmd).cyan());
+            println!(
+                "\n  Re-run the original command with {} to retry failures (auto-resume skips completed items).",
+                style("--joblog").cyan(),
+            );
         }
 
         // Show AI section if present

@@ -385,7 +385,6 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
     no_resume: bool,
 ) -> Result<()> {
     if args.json && args.dashboard {
@@ -415,14 +414,6 @@ pub async fn run(
     if args.dashboard {
         bail!(
             "Dashboard mode requires the 'tui' feature. Rebuild with: cargo build --features tui"
-        );
-    }
-
-    if retry_failed {
-        bail!(
-            "--retry-failed is no longer needed for uploads.\n\
-             Resume is automatic when --joblog is provided. Re-run the same command to resume.\n\
-             Use --no-resume to upload all files fresh."
         );
     }
 

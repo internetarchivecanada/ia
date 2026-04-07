@@ -469,7 +469,6 @@ struct WriteContext {
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
 }
 
 // ─── Main dispatch ───────────────────────────────────────────────────────────
@@ -481,13 +480,11 @@ pub async fn run(
     quiet: u8,
     jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     let ctx = WriteContext {
         quiet,
         jobs: jobs.unwrap_or(2), // writes use fixed concurrency
         joblog_path,
-        retry_failed,
     };
 
     // Deprecated `import` subcommand → redirect to --spreadsheet path
@@ -530,7 +527,6 @@ pub async fn run(
                 ctx.quiet,
                 jobs, // pass Option for adaptive support
                 ctx.joblog_path,
-                ctx.retry_failed,
             )
             .await
         }
@@ -1181,7 +1177,7 @@ fn print_export_summary(
     // Warning for failures
     if failed > 0 {
         eprintln!(
-            "{} {} item(s) failed — re-run with --retry-failed to retry",
+            "{} {} item(s) failed — re-run the same command to retry (auto-resume skips completed items)",
             style("warning:").yellow().bold(),
             failed,
         );
@@ -1194,44 +1190,20 @@ async fn run_export(
     quiet: u8,
     jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
 ) -> Result<()> {
     let mut identifiers = collect_identifiers_from_export(&args, client).await?;
 
-    // --retry-failed: re-fetch only items that failed in a previous run
-    let is_retry = if retry_failed {
-        if let Some(ref path) = joblog_path {
+    // Auto-resume: skip items already successfully exported in this joblog
+    let skip_set: std::collections::HashSet<String> = if let Some(ref path) = joblog_path {
+        if path.exists() {
             let entries = ia_core::joblog::read(path)
                 .context(format!("failed to read joblog: {}", path.display()))?;
-            let failed = ia_core::joblog::failed_items(&entries);
-            if failed.is_empty() {
-                eprintln!("{} No failed items in joblog", style("✓").green());
-                return Ok(());
-            }
-            identifiers = failed;
-            true
-        } else {
-            bail!("--retry-failed requires --joblog");
-        }
-    } else {
-        false
-    };
-
-    // Auto-resume: skip items already successfully exported in this joblog
-    let skip_set: std::collections::HashSet<String> = if !retry_failed {
-        if let Some(ref path) = joblog_path {
-            if path.exists() {
-                let entries = ia_core::joblog::read(path)
-                    .context(format!("failed to read joblog: {}", path.display()))?;
-                let done: std::collections::HashSet<String> = entries
-                    .iter()
-                    .filter(|e| e.op == "export" && e.status == "ok")
-                    .map(|e| e.item.clone())
-                    .collect();
-                done
-            } else {
-                std::collections::HashSet::new()
-            }
+            let done: std::collections::HashSet<String> = entries
+                .iter()
+                .filter(|e| e.op == "export" && e.status == "ok")
+                .map(|e| e.item.clone())
+                .collect();
+            done
         } else {
             std::collections::HashSet::new()
         }
@@ -1311,12 +1283,7 @@ async fn run_export(
             .progress_chars(PROGRESS_CHARS),
         );
 
-        let msg = if is_retry {
-            format!(
-                "Retrying {} failed item(s) from joblog...",
-                style(total).bold()
-            )
-        } else if skipped > 0 {
+        let msg = if skipped > 0 {
             format!(
                 "Exporting metadata... {}",
                 style(format!("(resuming — {skipped} already exported)")).dim()
@@ -2551,7 +2518,7 @@ fn find_metadata_subcommand_pos(args: &[String], value_taking_flags: &[String]) 
             skip_next = true;
             continue;
         }
-        // Any other flag (boolean flags like -d, -l, -q, --retry-failed)
+        // Any other flag (boolean flags like -d, -l, -q, --no-resume)
         if arg.starts_with('-') {
             continue;
         }
