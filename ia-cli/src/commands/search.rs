@@ -296,10 +296,18 @@ async fn run_advanced(
     }
 
     let mut opts = build_search_opts(&field, &sort, &shared)?;
-    opts.rows = rows;
+    // If --parameters provides "rows", use that value for page size and result
+    // count so `--parameters 'rows=3'` behaves the same as `--rows 3`.
+    let effective_rows = opts
+        .params
+        .iter()
+        .find(|(k, _)| k == "rows")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(rows);
+    opts.rows = effective_rows;
     // Single page only: limit result count to one page worth of rows.
     if opts.count == 0 {
-        opts.count = rows;
+        opts.count = effective_rows;
     }
     let stream = ia_core::search::advanced(client, &query, &opts);
     run_output(stream, &shared, &field, &query, quiet).await

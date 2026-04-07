@@ -270,6 +270,9 @@ pub fn advanced<'a>(
         DEFAULT_ADVANCED_ROWS
     };
     let extra_params = opts.params.clone();
+    // If extra_params already contains "rows", let it take precedence over the
+    // default so that `--parameters 'rows=3'` works as expected.
+    let has_extra_rows = extra_params.iter().any(|(k, _)| k == "rows");
 
     Box::pin(async_stream::try_stream! {
         let mut page = 1usize;
@@ -282,10 +285,13 @@ pub fn advanced<'a>(
                 .query(&[
                     ("q", query.as_str()),
                     ("fl[]", fields.as_str()),
-                    ("rows", &rows.to_string()),
                     ("page", &page.to_string()),
                     ("output", "json"),
                 ]);
+
+            if !has_extra_rows {
+                req = req.query(&[("rows", &rows.to_string())]);
+            }
 
             if !sorts_str.is_empty() {
                 req = req.query(&[("sort[]", sorts_str.as_str())]);
@@ -661,6 +667,38 @@ mod tests {
         let results: Vec<Result<SearchResult>> = advanced(&client, "test", &opts).collect().await;
 
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn advanced_search_extra_params_rows_overrides_default() {
+        let mock_server = MockServer::start().await;
+
+        // The mock expects rows=3 (from extra params), NOT rows=50 (default).
+        Mock::given(method("GET"))
+            .and(path("/advancedsearch.php"))
+            .and(query_param("rows", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": {
+                    "numFound": 3,
+                    "docs": [
+                        {"identifier": "a"},
+                        {"identifier": "b"},
+                        {"identifier": "c"},
+                    ]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            params: vec![("rows".to_string(), "3".to_string())],
+            count: 3,
+            ..Default::default()
+        };
+        let results: Vec<Result<SearchResult>> = advanced(&client, "test", &opts).collect().await;
+
+        assert_eq!(results.len(), 3);
     }
 
     #[tokio::test]
