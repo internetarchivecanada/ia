@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use futures::StreamExt;
@@ -589,14 +589,20 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
 ///
 /// Uses exponential backoff from `initial_interval`, capped at 60s.
 /// Returns when the task is no longer in the active catalog (completed
-/// or errored). No total timeout — caller can cancel via Ctrl+C.
+/// or errored).
+///
+/// If `timeout` is `Some`, returns [`IaError::TaskTimeout`] when the
+/// duration elapses before the task finishes. Pass `None` to poll
+/// indefinitely (caller can still cancel via Ctrl+C).
 pub async fn wait_for_task(
     client: &IaClient,
     task_id: u64,
     initial_interval: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Option<TaskEntry>> {
     let max_interval = Duration::from_secs(60);
     let mut interval = initial_interval;
+    let start = Instant::now();
 
     loop {
         let query = TasksQuery {
@@ -610,6 +616,17 @@ pub async fn wait_for_task(
 
         if !still_active {
             return Ok(None);
+        }
+
+        // Check timeout before sleeping
+        if let Some(limit) = timeout {
+            let elapsed = start.elapsed();
+            if elapsed >= limit {
+                return Err(IaError::TaskTimeout {
+                    task_id,
+                    elapsed: elapsed.as_secs(),
+                });
+            }
         }
 
         // Log current state for debugging
@@ -1463,7 +1480,7 @@ mod tests {
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         // When catalog is empty for the task_id, it means the task finished
-        let result = wait_for_task(&client, 555, Duration::from_millis(10)).await;
+        let result = wait_for_task(&client, 555, Duration::from_millis(10), None).await;
         // Task completed (no longer in catalog)
         assert!(result.is_ok());
     }
@@ -1556,7 +1573,7 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let result = wait_for_task(&client, 888, Duration::from_millis(10)).await;
+        let result = wait_for_task(&client, 888, Duration::from_millis(10), None).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -1573,11 +1590,44 @@ mod tests {
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let result = wait_for_task(&client, 999, Duration::from_millis(10)).await;
+        let result = wait_for_task(&client, 999, Duration::from_millis(10), None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             IaError::Http { status: 403, .. } => {}
             other => panic!("expected Http 403 error, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_task_timeout() {
+        let mock_server = MockServer::start().await;
+
+        // Task stays in catalog forever
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "777"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "value": {
+                    "summary": {"queued": 0, "running": 1, "error": 0, "paused": 0},
+                    "catalog": [{"task_id": 777, "identifier": "stuck-item", "cmd": "derive.php", "color": "blue"}]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = wait_for_task(
+            &client,
+            777,
+            Duration::from_millis(1),
+            Some(Duration::from_millis(10)),
+        )
+        .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            IaError::TaskTimeout { task_id: 777, .. } => {}
+            other => panic!("expected TaskTimeout, got: {other}"),
         }
     }
 

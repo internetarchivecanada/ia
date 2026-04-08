@@ -143,6 +143,9 @@ pub enum IaError {
     #[error("task log not found for task {task_id}")]
     TaskNotFound { task_id: u64 },
 
+    #[error("timed out waiting for task {task_id} after {elapsed}s")]
+    TaskTimeout { task_id: u64, elapsed: u64 },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -212,6 +215,7 @@ impl IaError {
             IaError::TaskSubmitFailed { .. } => false,
             IaError::TaskRerunFailed { .. } => false,
             IaError::TaskNotFound { .. } => false,
+            IaError::TaskTimeout { .. } => false,
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -389,6 +393,11 @@ impl IaError {
             IaError::TaskNotFound { task_id } => {
                 extra.insert("task_id".into(), (*task_id).into());
                 "task_not_found"
+            }
+            IaError::TaskTimeout { task_id, elapsed } => {
+                extra.insert("task_id".into(), (*task_id).into());
+                extra.insert("elapsed_secs".into(), (*elapsed).into());
+                "task_timeout"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
