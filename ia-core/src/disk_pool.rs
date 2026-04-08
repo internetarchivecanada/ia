@@ -63,7 +63,22 @@ impl DiskPool {
     }
 
     /// Assign an item to the disk with the most free space.
+    ///
+    /// If the item is already assigned (e.g., from [`Self::scan_existing`]), the
+    /// existing disk is returned without re-assignment. This makes resume
+    /// stable across runs.
     pub fn assign_item(&mut self, item_id: &str, estimated_size: u64) -> Result<&Path> {
+        // If the item is already assigned (e.g., from scan_existing), return
+        // the existing disk. This makes resume stable.
+        if let Some(&idx) = self.assignments.get(item_id) {
+            debug!(
+                item = item_id,
+                disk = %self.disks[idx].path.display(),
+                "returning existing assignment"
+            );
+            return Ok(&self.disks[idx].path);
+        }
+
         // Find disk with most free space that can fit the item
         let best_idx = self
             .disks
@@ -92,6 +107,56 @@ impl DiskPool {
                     needed: estimated_size,
                     largest_free,
                 })
+            }
+        }
+    }
+
+    /// Scan destdir paths for existing item subdirectories and pre-populate
+    /// assignments. This makes resume stable: items stay on the drive where
+    /// they were originally downloaded, so checksum-skip works correctly.
+    ///
+    /// Only immediate subdirectories that are directories are considered.
+    /// Files and dotfiles are ignored. If an item directory exists on multiple
+    /// disks, the first disk (in pool order) wins.
+    pub fn scan_existing(&mut self) {
+        for (idx, disk) in self.disks.iter_mut().enumerate() {
+            let entries = match std::fs::read_dir(&disk.path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+
+                // Skip dotfiles (e.g., .ia-probe-*)
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                // Only consider directories (item folders)
+                if !entry.path().is_dir() {
+                    continue;
+                }
+
+                let item_id = name.to_string();
+
+                // First disk wins — don't reassign if already known
+                if self.assignments.contains_key(&item_id) {
+                    debug!(
+                        item = %item_id,
+                        disk = %disk.path.display(),
+                        "item already assigned to another disk, skipping"
+                    );
+                    continue;
+                }
+
+                self.assignments.insert(item_id.clone(), idx);
+                disk.assigned_items.push(item_id.clone());
+                debug!(
+                    item = %item_id,
+                    disk = %disk.path.display(),
+                    "found existing item on disk"
+                );
             }
         }
     }
@@ -346,6 +411,77 @@ mod tests {
             }
             other => panic!("expected NoDiskSpace error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn scan_existing_finds_item_dirs() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+
+        // Pre-create item directories on disk to simulate a previous run
+        std::fs::create_dir(dir0.path().join("item-a")).unwrap();
+        std::fs::create_dir(dir0.path().join("item-b")).unwrap();
+        std::fs::create_dir(dir1.path().join("item-c")).unwrap();
+
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+        pool.scan_existing();
+
+        // Items should be assigned to the disk where they already exist
+        assert_eq!(pool.dest_for_item("item-a"), Some(dir0.path()));
+        assert_eq!(pool.dest_for_item("item-b"), Some(dir0.path()));
+        assert_eq!(pool.dest_for_item("item-c"), Some(dir1.path()));
+        // Unknown item should not be assigned
+        assert_eq!(pool.dest_for_item("item-d"), None);
+    }
+
+    #[test]
+    fn scan_existing_prevents_reassignment() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+
+        // item-a was previously downloaded to dir0
+        std::fs::create_dir(dir0.path().join("item-a")).unwrap();
+
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+        pool.scan_existing();
+
+        // assign_item should return the existing assignment, not pick a new disk
+        let dest = pool.assign_item("item-a", 1024).unwrap();
+        assert_eq!(dest, dir0.path());
+    }
+
+    #[test]
+    fn scan_existing_first_disk_wins() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+
+        // Same item exists on both disks (from the duplication bug)
+        std::fs::create_dir(dir0.path().join("item-a")).unwrap();
+        std::fs::create_dir(dir1.path().join("item-a")).unwrap();
+
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+        pool.scan_existing();
+
+        // First disk in pool order wins
+        assert_eq!(pool.dest_for_item("item-a"), Some(dir0.path()));
+    }
+
+    #[test]
+    fn scan_existing_empty_dirs() {
+        let dir0 = tempfile::tempdir().unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+
+        // No pre-existing items
+        let mut pool =
+            DiskPool::new(&[dir0.path().to_path_buf(), dir1.path().to_path_buf()]).unwrap();
+        pool.scan_existing();
+
+        // No assignments — assign_item should work normally
+        let dest = pool.assign_item("new-item", 1024).unwrap();
+        assert!(dest == dir0.path() || dest == dir1.path());
     }
 
     #[test]

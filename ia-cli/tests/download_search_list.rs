@@ -1015,6 +1015,174 @@ async fn download_search_streaming_json_output() {
     assert_eq!(parsed["status"], "ok");
 }
 
+// ─── Multi-disk destdir validation tests ────────────────────────────────────
+
+#[test]
+fn download_errors_on_missing_destdir_multi_disk() {
+    let config = empty_config();
+    let dir1 = TempDir::new().unwrap();
+    let nonexistent = dir1.path().join("ghost-drive");
+
+    ia_with_config(&config)
+        .args([
+            "download",
+            "test-item",
+            "--destdir",
+            dir1.path().to_str().unwrap(),
+            "--destdir",
+            nonexistent.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("does not exist"));
+}
+
+#[tokio::test]
+async fn download_single_destdir_creates_dir() {
+    let mock_server = MockServer::start().await;
+    let host = mock_server.uri().replace("http://", "");
+    let config = empty_config();
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata_response()))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the file downloads
+    Mock::given(method("GET"))
+        .and(path("/download/test-item/test.pdf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake pdf"))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/download/test-item/test_meta.xml"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"<metadata/>"))
+        .mount(&mock_server)
+        .await;
+
+    let parent = TempDir::new().unwrap();
+    let new_subdir = parent.path().join("new-dir");
+
+    ia_with_config(&config)
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "download",
+            "test-item",
+            "--destdir",
+            new_subdir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(new_subdir.exists());
+}
+
+// ─── Multi-disk resume integration tests ────────────────────────────────────
+
+/// Simulate multi-disk resume: items exist on drives from a prior run,
+/// second run should skip everything (not re-download to different drives).
+#[tokio::test]
+async fn multi_disk_resume_skips_existing_items() {
+    let mock_server = MockServer::start().await;
+    let host = mock_server.uri().replace("http://", "");
+    let config = empty_config();
+
+    // Single-file item
+    let meta = json!({
+        "metadata": {"identifier": "test-item"},
+        "files": [
+            {
+                "name": "file1.txt",
+                "source": "original",
+                "format": "Data",
+                "size": "5",
+                "md5": "5d41402abc4b2a76b9719d911017c592",
+                "mtime": "1700000000"
+            }
+        ],
+        "server": "ia000.us.archive.org",
+        "d1": "ia000.us.archive.org",
+        "d2": "ia000.us.archive.org",
+        "dir": "/0/items/test-item"
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&meta))
+        .mount(&mock_server)
+        .await;
+
+    let drive1 = TempDir::new().unwrap();
+    let drive2 = TempDir::new().unwrap();
+
+    // Simulate a completed prior download on drive1
+    let item_dir = drive1.path().join("test-item");
+    fs::create_dir(&item_dir).unwrap();
+    // Write file with correct content so checksum matches ("hello" -> md5 5d41402abc4b2a76b9719d911017c592)
+    fs::write(item_dir.join("file1.txt"), b"hello").unwrap();
+    // Set mtime to match metadata (1700000000)
+    let mtime = filetime::FileTime::from_unix_time(1700000000, 0);
+    filetime::set_file_mtime(item_dir.join("file1.txt"), mtime).unwrap();
+
+    // Run with --checksum — should skip the file
+    let output = ia_with_config(&config)
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "download",
+            "test-item",
+            "--destdir",
+            drive1.path().to_str().unwrap(),
+            "--destdir",
+            drive2.path().to_str().unwrap(),
+            "--checksum",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "resume should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skipped"),
+        "should report skipped files: {stderr}"
+    );
+
+    // File should NOT be duplicated on drive2
+    assert!(
+        !drive2.path().join("test-item").exists(),
+        "item should not be duplicated on second drive"
+    );
+}
+
+// ─── --parameters tests ─────────────────────────────────────────────────────
+
+#[test]
+fn download_search_rejects_bad_parameter_format() {
+    let config = empty_config();
+
+    ia_with_config(&config)
+        .args([
+            "download",
+            "--search",
+            "collection:test",
+            "--parameters",
+            "badparam",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("expected key:value or key=value"));
+}
+
 /// --search combined with file names should be rejected.
 /// Clap parses positionals as: first = identifier, rest = files.
 /// So `ia download --search 'q' myitem somefile.txt` puts "myitem" in

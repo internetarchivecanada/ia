@@ -1259,6 +1259,7 @@ dependencies = [
  "comfy-table",
  "console 0.15.11",
  "crossterm 0.28.1",
+ "filetime",
  "futures",
  "ia-core",
  "indicatif",

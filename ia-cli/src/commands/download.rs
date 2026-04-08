@@ -100,6 +100,10 @@ pub struct DownloadArgs {
     #[arg(short = 's', long)]
     search: Option<String>,
 
+    /// Extra search parameters (key:value or key=value, repeatable)
+    #[arg(short = 'p', long = "parameters", value_name = "PARAMETERS")]
+    search_parameters: Vec<String>,
+
     /// Concurrent items for batch/search (use -j/--jobs for concurrent files)
     #[arg(long, default_value = "5")]
     pub items: usize,
@@ -122,6 +126,24 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
             "unknown source: {s} (expected: original, derivative, metadata)"
         )),
     }
+}
+
+/// Parse `--parameters` into a [`SearchOpts`] with extra params.
+fn search_opts_from_params(params: &[String]) -> Result<SearchOpts> {
+    let mut opts = SearchOpts::default();
+    for param in params {
+        let (key, value) = param
+            .split_once(':')
+            .or_else(|| param.split_once('='))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid parameter '{}': expected key:value or key=value",
+                    param
+                )
+            })?;
+        opts.params.push((key.to_string(), value.to_string()));
+    }
+    Ok(opts)
 }
 
 /// Collect all identifiers from args, --itemlist file, --search, and stdin.
@@ -148,7 +170,7 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
     // --search: collect identifiers from search results (dashboard path only —
     // the streaming path in run() handles --search before reaching here).
     if let Some(ref query) = args.search {
-        let opts = SearchOpts::default();
+        let opts = search_opts_from_params(&args.search_parameters)?;
         let mut stream = ia_core::search::scrape(client, query, &opts);
         while let Some(result) = stream.next().await {
             let item = result.context("search failed")?;
@@ -205,6 +227,7 @@ pub async fn run(
     };
 
     // Validate destdir paths early so typos are caught before any downloads.
+    let multi_disk = destdirs.len() > 1;
     for dir in &destdirs {
         if dir.exists() {
             if !dir.is_dir() {
@@ -219,8 +242,18 @@ pub async fn run(
                 bail!("--destdir is not writable: {} ({e})", dir.display());
             }
             let _ = std::fs::remove_file(&probe);
+        } else if multi_disk {
+            // Multi-disk: require directories to exist (external drives).
+            // If /Volumes/MyDrive doesn't exist, the drive is unplugged —
+            // creating it as a regular dir would silently download to boot disk.
+            bail!(
+                "--destdir does not exist: {}\n\
+                 When using multiple --destdir paths (disk pool), all directories\n\
+                 must already exist. Is the drive plugged in?",
+                dir.display()
+            );
         } else {
-            // Try to create the directory — fail fast if impossible
+            // Single destdir: auto-create is fine (backwards compat)
             std::fs::create_dir_all(dir).context(format!(
                 "--destdir does not exist and cannot be created: {}",
                 dir.display()
@@ -229,7 +262,9 @@ pub async fn run(
     }
 
     let mut disk_pool = if destdirs.len() > 1 {
-        Some(DiskPool::new(&destdirs).context("failed to initialize disk pool")?)
+        let mut pool = DiskPool::new(&destdirs).context("failed to initialize disk pool")?;
+        pool.scan_existing();
+        Some(pool)
     } else {
         None
     };
@@ -296,7 +331,7 @@ pub async fn run(
                 None
             };
 
-            let search_opts = SearchOpts::default();
+            let search_opts = search_opts_from_params(&args.search_parameters)?;
             let id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send + '_>> = Box::pin(
                 ia_core::search::scrape(client, query, &search_opts)
                     .map(|r| r.map(|item| item.identifier)),
