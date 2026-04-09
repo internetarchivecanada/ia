@@ -1535,3 +1535,150 @@ fn metadata_shorthand_m_accepted() {
         "clap rejected -m: {stderr}"
     );
 }
+
+// ── Metadata modify resume tests ────────────────────────────────────────────
+
+#[test]
+fn metadata_modify_resume_skips_completed_items() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate joblog marking both items as done
+    let log = dir.path().join("modify.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"modify\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"modify\",\"item\":\"item2\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\nitem2\n").unwrap();
+
+    // Run modify — should early-return without hitting the API
+    ia().args([
+        "metadata",
+        "modify",
+        "--itemlist",
+        ids.to_str().unwrap(),
+        "-m",
+        "title:Test",
+        "--joblog",
+        log.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("already modified"));
+}
+
+#[test]
+fn metadata_modify_resume_only_retries_failed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // item1 succeeded, item2 failed — only item2 should be retried
+    let log = dir.path().join("modify.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"modify\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"modify\",\"item\":\"item2\",\"file\":\"\",\"status\":\"error\",\"error\":\"timeout\"}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "item1\nitem2\n").unwrap();
+
+    // Run modify — item1 is skipped (resumed), item2 is retried and fails (no auth)
+    let output = ia()
+        .args([
+            "metadata",
+            "modify",
+            "--itemlist",
+            ids.to_str().unwrap(),
+            "-m",
+            "title:Test",
+            "--joblog",
+            log.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run ia");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail because item2 retry hits a real error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("already modified"),
+        "should mention resumed items, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 of 1"),
+        "should report 1 of 1 failed (only item2 was retried), got: {stderr}"
+    );
+}
+
+#[test]
+fn metadata_import_resume_skips_completed_items() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Pre-populate joblog marking both items as done
+    let log = dir.path().join("import.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"modify\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"modify\",\"item\":\"item2\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    // Spreadsheet with same identifiers
+    let csv = dir.path().join("data.csv");
+    std::fs::write(&csv, "identifier,title\nitem1,First\nitem2,Second\n").unwrap();
+
+    // Run import — should early-return without hitting the API
+    ia().args([
+        "metadata",
+        "--spreadsheet",
+        csv.to_str().unwrap(),
+        "--joblog",
+        log.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("already modified"));
+}
+
+#[test]
+fn metadata_import_resume_only_retries_failed() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // item1 succeeded, item2 failed
+    let log = dir.path().join("import.log");
+    let joblog = concat!(
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"modify\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":50}\n",
+        "{\"ts\":\"2026-01-01T00:00:01Z\",\"op\":\"modify\",\"item\":\"item2\",\"file\":\"\",\"status\":\"error\",\"error\":\"timeout\"}\n",
+    );
+    std::fs::write(&log, joblog).unwrap();
+
+    let csv = dir.path().join("data.csv");
+    std::fs::write(&csv, "identifier,title\nitem1,First\nitem2,Second\n").unwrap();
+
+    // Run import — item1 skipped, item2 retried and fails (no auth)
+    let output = ia()
+        .args([
+            "metadata",
+            "--spreadsheet",
+            csv.to_str().unwrap(),
+            "--joblog",
+            log.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run ia");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail because item2 retry hits a real error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("already modified"),
+        "should mention resumed items, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 of 1"),
+        "should report 1 of 1 failed (only item2 was retried), got: {stderr}"
+    );
+}

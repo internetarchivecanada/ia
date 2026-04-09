@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1095,6 +1095,17 @@ async fn collect_identifiers_from_export(
     Ok(ids)
 }
 
+/// Read a joblog and return the set of items that completed successfully for the given operation.
+fn completed_items_from_joblog(path: &Path, op: &str) -> Result<HashSet<String>> {
+    let entries = ia_core::joblog::read(path)
+        .with_context(|| format!("failed to read joblog: {}", path.display()))?;
+    Ok(entries
+        .iter()
+        .filter(|e| e.op == op && e.status == "ok")
+        .map(|e| e.item.clone())
+        .collect())
+}
+
 /// Print the export summary footer to stderr.
 #[allow(clippy::too_many_arguments)]
 fn print_export_summary(
@@ -1194,21 +1205,14 @@ async fn run_export(
     let mut identifiers = collect_identifiers_from_export(&args, client).await?;
 
     // Auto-resume: skip items already successfully exported in this joblog
-    let skip_set: std::collections::HashSet<String> = if let Some(ref path) = joblog_path {
+    let skip_set: HashSet<String> = if let Some(ref path) = joblog_path {
         if path.exists() {
-            let entries = ia_core::joblog::read(path)
-                .context(format!("failed to read joblog: {}", path.display()))?;
-            let done: std::collections::HashSet<String> = entries
-                .iter()
-                .filter(|e| e.op == "export" && e.status == "ok")
-                .map(|e| e.item.clone())
-                .collect();
-            done
+            completed_items_from_joblog(path, "export")?
         } else {
-            std::collections::HashSet::new()
+            HashSet::new()
         }
     } else {
-        std::collections::HashSet::new()
+        HashSet::new()
     };
 
     let before_skip = identifiers.len();
@@ -1743,9 +1747,37 @@ async fn run_write_inner(
     let json = write.json;
 
     // Collect identifiers
-    let identifiers = collect_identifiers_from_batch(&input, client).await?;
+    let mut identifiers = collect_identifiers_from_batch(&input, client).await?;
     if identifiers.is_empty() {
         bail!("no identifiers provided");
+    }
+
+    // Auto-resume: skip items already successfully modified in this joblog
+    let skip_set: HashSet<String> = if let Some(ref path) = ctx.joblog_path {
+        if path.exists() {
+            completed_items_from_joblog(path, MODIFY_OP)?
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let before_skip = identifiers.len();
+    if !skip_set.is_empty() {
+        identifiers.retain(|id| !skip_set.contains(id));
+    }
+    let skipped = before_skip - identifiers.len();
+
+    if identifiers.is_empty() && skipped > 0 {
+        if ctx.quiet < 2 {
+            eprintln!(
+                "{} All {} item(s) already modified",
+                style(ICON_SUCCESS).green(),
+                style(skipped).green(),
+            );
+        }
+        return Ok(());
     }
 
     let joblog = ctx
@@ -1798,6 +1830,13 @@ async fn run_write_inner(
     let rate_limiter = RateLimiter::new();
     let mut set = JoinSet::new();
     let total_count = identifiers.len();
+
+    if skipped > 0 && !json && ctx.quiet == 0 {
+        eprintln!(
+            "{}",
+            style(format!("(resuming — {skipped} already modified)")).dim()
+        );
+    }
 
     for identifier in identifiers {
         let client = client.clone();
@@ -1942,13 +1981,6 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
 
     let priority = args.priority.unwrap_or(-5);
 
-    let joblog = ctx
-        .joblog_path
-        .as_ref()
-        .map(|p| JoblogWriter::open(p))
-        .transpose()
-        .context("failed to open joblog")?;
-
     // Build (identifier, change_groups) pairs from records.
     // Each record's columns are parsed for operation prefixes.
     let mut work_items: Vec<(String, Vec<ChangeGroup>)> = Vec::new();
@@ -1983,14 +2015,49 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
         }
     }
 
+    // Auto-resume: skip items already successfully modified in this joblog
+    let skip_set: HashSet<String> = if let Some(ref path) = ctx.joblog_path {
+        if path.exists() {
+            completed_items_from_joblog(path, MODIFY_OP)?
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let before_skip = work_items.len();
+    if !skip_set.is_empty() {
+        work_items.retain(|(id, _)| !skip_set.contains(id));
+    }
+    let skipped = before_skip - work_items.len();
+
     let item_count = work_items.len();
+
+    if item_count == 0 && skipped > 0 {
+        if ctx.quiet < 2 {
+            eprintln!(
+                "{} All {} item(s) already modified",
+                style(ICON_SUCCESS).green(),
+                style(skipped).green(),
+            );
+        }
+        return Ok(());
+    }
+
+    let joblog = ctx
+        .joblog_path
+        .as_ref()
+        .map(|p| JoblogWriter::open(p))
+        .transpose()
+        .context("failed to open joblog")?;
 
     // Parse --expect values
     let expect: Option<HashMap<String, serde_json::Value>> = if !args.expect.is_empty() {
         let mut map = HashMap::new();
         for s in &args.expect {
             let (key, value) =
-                parse_key_value(s).context(format!("invalid expect key:value: {s:?}"))?;
+                parse_key_value(s).with_context(|| format!("invalid expect key:value: {s:?}"))?;
             map.insert(key, json!(value));
         }
         Some(map)
@@ -2032,6 +2099,13 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
     let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let rate_limiter = RateLimiter::new();
     let mut set = JoinSet::new();
+
+    if skipped > 0 && !json && ctx.quiet == 0 {
+        eprintln!(
+            "{}",
+            style(format!("(resuming — {skipped} already modified)")).dim()
+        );
+    }
 
     for (identifier, groups) in work_items {
         let client = client.clone();
@@ -2213,6 +2287,9 @@ enum OutcomeKind {
     Error,
 }
 
+/// Joblog operation name for metadata modify/import writes.
+const MODIFY_OP: &str = "modify";
+
 fn record_modify_outcome(
     identifier: &str,
     outcome: &ModifyOutcome,
@@ -2238,7 +2315,7 @@ fn record_modify_outcome(
                 println!("{identifier}: success (task_id: {})", task_id.unwrap_or(0));
             }
             if let Some(jl) = joblog {
-                let entry = JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
+                let entry = JoblogEntry::new(MODIFY_OP, identifier, file_target).ok(0, elapsed_ms);
                 jl.write(&entry);
             }
             OutcomeKind::Success
@@ -2257,7 +2334,7 @@ fn record_modify_outcome(
                 eprintln!("warning: {identifier}: no changes (values already match)");
             }
             if let Some(jl) = joblog {
-                let entry = JoblogEntry::new("modify", identifier, file_target).ok(0, elapsed_ms);
+                let entry = JoblogEntry::new(MODIFY_OP, identifier, file_target).ok(0, elapsed_ms);
                 jl.write(&entry);
             }
             OutcomeKind::NoChanges
@@ -2277,7 +2354,7 @@ fn record_modify_outcome(
                 eprintln!("error: {identifier}: {e}");
             }
             if let Some(jl) = joblog {
-                let entry = JoblogEntry::new("modify", identifier, file_target).error(e, 0);
+                let entry = JoblogEntry::new(MODIFY_OP, identifier, file_target).error(e, 0);
                 jl.write(&entry);
             }
             OutcomeKind::Error
