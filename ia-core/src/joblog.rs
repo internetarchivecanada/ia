@@ -219,6 +219,28 @@ pub fn failed_files(entries: &[JoblogEntry]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Get unique item identifiers that never succeeded.
+///
+/// An item is "failed" if none of its entries (across all files) have `status == "ok"`.
+/// Returns a sorted, deduplicated list of identifiers.
+pub fn failed_items(entries: &[JoblogEntry]) -> Vec<String> {
+    use std::collections::{BTreeSet, HashSet};
+
+    let succeeded: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.status == "ok")
+        .map(|e| e.item.as_str())
+        .collect();
+
+    let failed: BTreeSet<&str> = entries
+        .iter()
+        .filter(|e| !succeeded.contains(e.item.as_str()))
+        .map(|e| e.item.as_str())
+        .collect();
+
+    failed.into_iter().map(String::from).collect()
+}
+
 /// Get (item, file) pairs that succeeded, for auto-resume.
 ///
 /// Scans entries filtered by `op`, keeps latest status per `(item, file)`,
@@ -509,6 +531,78 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let entries = read(&path).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    // --- failed_items tests ---
+
+    #[test]
+    fn failed_items_empty() {
+        assert!(failed_items(&[]).is_empty());
+    }
+
+    #[test]
+    fn failed_items_all_succeeded() {
+        let entries = vec![
+            JoblogEntry::new("download", "item-a", "f1.jpg").ok(100, 50),
+            JoblogEntry::new("download", "item-b", "f2.jpg").ok(200, 60),
+        ];
+        assert!(failed_items(&entries).is_empty());
+    }
+
+    #[test]
+    fn failed_items_some_failed() {
+        let entries = vec![
+            JoblogEntry::new("download", "item-a", "f1.jpg").ok(100, 50),
+            JoblogEntry::new("download", "item-b", "f1.jpg").error("timeout", 3),
+            JoblogEntry::new("download", "item-c", "f1.jpg").error("404", 0),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed, vec!["item-b", "item-c"]);
+    }
+
+    #[test]
+    fn failed_items_retry_succeeds() {
+        let entries = vec![
+            JoblogEntry::new("download", "item-a", "f1.jpg").error("timeout", 3),
+            JoblogEntry::new("download", "item-a", "f1.jpg").ok(100, 50), // retry succeeded
+            JoblogEntry::new("download", "item-b", "f1.jpg").error("404", 0),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed, vec!["item-b"]);
+    }
+
+    #[test]
+    fn failed_items_mixed_files_per_item() {
+        // item-a: one file ok, another error — item still counts as succeeded
+        let entries = vec![
+            JoblogEntry::new("download", "item-a", "f1.jpg").ok(100, 50),
+            JoblogEntry::new("download", "item-a", "f2.jpg").error("timeout", 3),
+            JoblogEntry::new("download", "item-b", "f1.jpg").error("404", 0),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed, vec!["item-b"]);
+    }
+
+    #[test]
+    fn failed_items_skipped_only() {
+        // items with only skipped entries are not "succeeded"
+        let entries = vec![
+            JoblogEntry::new("download", "item-a", "f1.jpg").skipped(),
+            JoblogEntry::new("download", "item-b", "f1.jpg").ok(100, 50),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed, vec!["item-a"]);
+    }
+
+    #[test]
+    fn failed_items_sorted_deduped() {
+        let entries = vec![
+            JoblogEntry::new("download", "zzz", "f1.jpg").error("err", 0),
+            JoblogEntry::new("download", "aaa", "f1.jpg").error("err", 0),
+            JoblogEntry::new("download", "aaa", "f2.jpg").error("err", 0),
+        ];
+        let failed = failed_items(&entries);
+        assert_eq!(failed, vec!["aaa", "zzz"]);
     }
 
     // --- AI joblog extension tests ---

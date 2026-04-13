@@ -13,7 +13,9 @@ use ia_core::joblog;
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># View job log summary</dim>\n  <bold>$ ia status --joblog downloads.jsonl</bold>\n\
-         \n  <dim># Machine-readable status output</dim>\n  <bold>$ ia status --joblog downloads.jsonl --json</bold>\n"
+         \n  <dim># Machine-readable status output</dim>\n  <bold>$ ia status --joblog downloads.jsonl --json</bold>\n\
+         \n  <dim># List identifiers that never succeeded</dim>\n  <bold>$ ia status --joblog uploads.jsonl --failed-items</bold>\n\
+         \n  <dim># Pipe failed identifiers into another command</dim>\n  <bold>$ ia status --joblog uploads.jsonl --failed-items | ia metadata export -</bold>\n"
     ),
 )]
 pub struct StatusArgs {
@@ -24,6 +26,10 @@ pub struct StatusArgs {
     /// Output results as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Print only identifiers that never succeeded (one per line)
+    #[arg(long)]
+    pub failed_items: bool,
 }
 
 pub async fn run(args: StatusArgs, quiet: u8) -> Result<()> {
@@ -34,6 +40,21 @@ pub async fn run(args: StatusArgs, quiet: u8) -> Result<()> {
     }
 
     let entries = joblog::read(path).context("failed to read joblog")?;
+
+    if args.failed_items {
+        let items = joblog::failed_items(&entries);
+        if args.json {
+            println!("{}", serde_json::to_string(&items)?);
+        } else {
+            for item in &items {
+                println!("{item}");
+            }
+        }
+        if !items.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     if entries.is_empty() {
         if args.json {
