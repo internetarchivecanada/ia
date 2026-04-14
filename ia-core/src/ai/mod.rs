@@ -1,5 +1,11 @@
 pub mod client;
+pub mod extracted_metadata;
+pub mod ia_config;
+pub mod image;
 pub mod pipeline;
+pub mod promote;
 pub mod prompt;
+pub mod qa;
 pub mod types;
 pub mod undo;
+pub mod zip;

@@ -123,15 +123,15 @@ pub struct WriteOpts {
 #[derive(Debug, Args)]
 pub struct BatchInput {
     /// Item identifier(s)
-    #[arg()]
+    #[arg(conflicts_with_all = ["itemlist", "search"])]
     pub identifiers: Vec<String>,
 
     /// Read identifiers from file (one per line)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["identifiers", "search"])]
     pub itemlist: Option<PathBuf>,
 
     /// Use search results as input
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["identifiers", "itemlist"])]
     pub search: Option<String>,
 }
 
@@ -266,15 +266,15 @@ pub struct WriteSubArgs {
 #[derive(Debug, Args)]
 pub struct ExportArgs {
     /// Input files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line)
-    #[arg()]
+    #[arg(conflicts_with_all = ["itemlist", "search"])]
     pub files: Vec<PathBuf>,
 
     /// Read identifiers from file (one per line)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["files", "search"])]
     pub itemlist: Option<PathBuf>,
 
     /// Use search results as input
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["files", "itemlist"])]
     pub search: Option<String>,
 
     /// Output file (format inferred from extension: .csv, .tsv, .xlsx, .jsonl)

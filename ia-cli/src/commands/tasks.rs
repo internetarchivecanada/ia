@@ -10,7 +10,6 @@ use console::style;
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{self, JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::tasks::{self, TaskEntry, TaskSubmission, TasksQuery, TasksSummary};
@@ -169,7 +168,7 @@ pub enum TasksCommand {
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
     /// Item identifier (omit for batch mode with --itemlist/--search/--spreadsheet)
-    #[arg()]
+    #[arg(conflicts_with_all = ["itemlist", "search"])]
     pub identifier: Option<String>,
 
     /// Task command (e.g. derive, make_dark)
@@ -217,11 +216,11 @@ pub struct SubmitArgs {
     pub dry_run: bool,
 
     /// Read identifiers from file
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["identifier", "search"])]
     pub itemlist: Option<std::path::PathBuf>,
 
     /// Use search results as input
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["identifier", "itemlist"])]
     pub search: Option<String>,
 
     /// Batch submit tasks from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
@@ -582,7 +581,16 @@ async fn run_submit(
         extra_params.push((k.to_string(), v.to_string()));
     }
 
-    let mut identifiers = collect_submit_identifiers(&args, client).await?;
+    let positional: Vec<String> = args.identifier.iter().cloned().collect();
+    let search_opts = ia_core::search::SearchOpts::default();
+    let search = args.search.as_deref().map(|q| (q, &search_opts));
+    let mut identifiers = crate::identifier::collect_identifiers(
+        &positional,
+        args.itemlist.as_deref(),
+        search,
+        client,
+    )
+    .await?;
 
     // Auto-resume: skip identifiers already successfully submitted in this joblog
     if let Some(ref path) = joblog {
@@ -1136,53 +1144,6 @@ async fn run_submit_spreadsheet(
     }
 
     Ok(())
-}
-
-async fn collect_submit_identifiers(args: &SubmitArgs, client: &IaClient) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
-
-    if let Some(ref id) = args.identifier {
-        ids.push(id.clone());
-    }
-
-    if let Some(ref path) = args.itemlist {
-        let content = std::fs::read_to_string(path)
-            .context(format!("failed to read itemlist: {}", path.display()))?;
-        for line in content.lines() {
-            if let Some(id) = parse_identifier_line(line) {
-                ids.push(id);
-            }
-        }
-    }
-
-    if let Some(ref query) = args.search {
-        let opts = ia_core::search::SearchOpts::default();
-        let mut stream = ia_core::search::scrape(client, query, &opts);
-        while let Some(result) = stream.next().await {
-            let item = result.context("search failed")?;
-            ids.push(item.identifier);
-        }
-    }
-
-    // Auto-detect stdin when piped and no other sources provided
-    if ids.is_empty()
-        && args.identifier.is_none()
-        && args.itemlist.is_none()
-        && args.search.is_none()
-        && args.spreadsheet.is_none()
-        && !std::io::stdin().is_terminal()
-    {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line.context("failed to read from stdin")?;
-            if let Some(id) = parse_identifier_line(&line) {
-                ids.push(id);
-            }
-        }
-    }
-
-    Ok(ids)
 }
 
 /// Retry submit on 429 rate-limit responses from the Tasks API.

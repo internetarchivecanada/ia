@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use ia_core::ai::pipeline::{PipelineConfig, ReviewMode};
-use ia_core::ai::types::{AiConfig, ChangeStatus, FocusConfig, JoblogChange, JoblogTokens};
+use ia_core::ai::types::{
+    AiConfig, ChangeStatus, FocusConfig, JoblogChange, JoblogTokens, Provider,
+};
 use ia_core::ai::undo::undo_from_joblog;
 use ia_core::joblog::{self, JoblogEntry, JoblogWriter};
 use ia_core::{IaClient, IaConfig};
@@ -109,7 +111,7 @@ async fn pipeline_headless_dry_run_single_item() {
 
     // Mock LLM chat completions endpoint
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .expect(1)
         .mount(&llm_server)
@@ -124,6 +126,7 @@ async fn pipeline_headless_dry_run_single_item() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -169,7 +172,7 @@ async fn pipeline_headless_dry_run_multiple_items() {
     }
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -183,6 +186,7 @@ async fn pipeline_headless_dry_run_multiple_items() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -226,7 +230,7 @@ async fn pipeline_writes_joblog() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -244,6 +248,7 @@ async fn pipeline_writes_joblog() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -290,7 +295,7 @@ async fn pipeline_source_error_tracked_in_summary() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -304,6 +309,7 @@ async fn pipeline_source_error_tracked_in_summary() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -343,7 +349,7 @@ async fn pipeline_no_changes_from_llm() {
 
     // LLM returns empty array (no changes needed)
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response("[]")))
         .mount(&llm_server)
         .await;
@@ -357,6 +363,7 @@ async fn pipeline_no_changes_from_llm() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -397,7 +404,7 @@ async fn pipeline_record_only_writes_output_file() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -414,6 +421,7 @@ async fn pipeline_record_only_writes_output_file() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::RecordOnly,
@@ -459,7 +467,7 @@ async fn pipeline_llm_error_tracks_item() {
 
     // LLM returns a permanent error (401)
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
         .mount(&llm_server)
         .await;
@@ -473,6 +481,7 @@ async fn pipeline_llm_error_tracks_item() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Headless,
@@ -723,7 +732,7 @@ async fn pipeline_interactive_mode_accepts_all() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .expect(1)
         .mount(&llm_server)
@@ -743,6 +752,7 @@ async fn pipeline_interactive_mode_accepts_all() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Interactive,
@@ -796,7 +806,7 @@ async fn pipeline_interactive_mode_rejects_all() {
         .await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -814,6 +824,7 @@ async fn pipeline_interactive_mode_rejects_all() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Interactive,
@@ -870,7 +881,7 @@ async fn pipeline_interactive_mode_early_quit() {
     }
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_response(&llm_changes_json())))
         .mount(&llm_server)
         .await;
@@ -889,6 +900,7 @@ async fn pipeline_interactive_mode_early_quit() {
             model: "test-model".to_string(),
             temperature: 0.2,
             max_tokens: 100,
+            provider: Provider::OpenAi,
         },
         focus: FocusConfig::default(),
         review_mode: ReviewMode::Interactive,

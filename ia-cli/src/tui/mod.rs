@@ -1,5 +1,8 @@
-#[cfg(feature = "alpha")]
+#[cfg(feature = "ai-analyze")]
 pub mod ai;
+#[cfg(feature = "ai-qa")]
+#[allow(dead_code)] // Dashboard implementation — wired up via ia ai qa --dashboard
+pub mod ai_qa;
 mod app;
 pub mod dashboard;
 pub mod errors_tab;

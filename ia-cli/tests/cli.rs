@@ -728,50 +728,64 @@ fn metadata_import_requires_file() {
 
 #[cfg(feature = "alpha")]
 #[test]
-fn ai_undo_subcommand_shown_in_help() {
+fn ai_help_shows_qa_and_config() {
     ia().args(["ai", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("undo"));
+        .stdout(predicate::str::contains("qa"))
+        .stdout(predicate::str::contains("config"));
 }
 
 #[cfg(feature = "alpha")]
+#[test]
+fn ai_qa_no_input_errors() {
+    // `ia ai qa` with no args should error about missing input
+    ia().args(["ai", "qa"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no identifier").or(predicate::str::contains("no input")));
+}
+
+#[cfg(feature = "alpha")]
+#[test]
+fn ai_qa_help_has_expected_flags() {
+    ia().args(["ai", "qa", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--promote"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--model"))
+        .stdout(predicate::str::contains("--confidence"));
+}
+
+#[cfg(feature = "alpha")]
+#[test]
+fn ai_config_show_requires_collection() {
+    ia().args(["ai", "config", "show"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("COLLECTION").or(predicate::str::contains("collection")));
+}
+
+#[cfg(feature = "alpha")]
+#[test]
+fn ai_config_help_shows_subcommands() {
+    ia().args(["ai", "config", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("edit"));
+}
+
+#[cfg(all(feature = "alpha", feature = "ai-analyze"))]
 #[test]
 fn ai_undo_subcommand_requires_joblog() {
     ia().args(["ai", "undo"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("JOBLOG").or(predicate::str::contains("joblog")));
-}
-
-#[cfg(feature = "alpha")]
-#[test]
-fn ai_bare_no_input_errors() {
-    // Bare `ia ai` with no args should error about missing input, NOT about subcommands
-    ia().args(["ai"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("no input specified"));
-}
-
-#[cfg(feature = "alpha")]
-#[test]
-fn ai_undo_help_has_dry_run_and_json() {
-    ia().args(["ai", "undo", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--dry-run"))
-        .stdout(predicate::str::contains("--json"));
-}
-
-#[cfg(feature = "alpha")]
-#[test]
-fn ai_undo_help_no_headless() {
-    // Undo subcommand should NOT have --headless
-    ia().args(["ai", "undo", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--headless").not());
 }
 
 #[test]

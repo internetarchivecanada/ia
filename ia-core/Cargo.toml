@@ -33,6 +33,9 @@ json-patch = "3"
 calamine = "0.26"
 csv = "1"
 rust_xlsxwriter = "0.79"
+indexmap = { version = "2", features = ["serde"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 wiremock = "0.6"

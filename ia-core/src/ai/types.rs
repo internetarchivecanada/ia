@@ -142,10 +142,112 @@ impl FocusConfig {
     }
 }
 
+/// LLM API provider — determines wire format and auth headers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// OpenAI-compatible `/chat/completions` format (also used by ollama, vLLM,
+    /// OpenRouter, LiteLLM, etc.).
+    #[default]
+    OpenAi,
+    /// Anthropic Messages API (`/v1/messages`) with native auth headers.
+    Anthropic,
+}
+
+impl Provider {
+    /// Auto-detect provider from a base URL.
+    ///
+    /// Returns `Anthropic` if the URL contains `anthropic.com`, otherwise `OpenAi`.
+    pub fn detect(base_url: &str) -> Self {
+        if base_url.contains("anthropic.com") {
+            Self::Anthropic
+        } else {
+            Self::OpenAi
+        }
+    }
+
+    /// Build the full API endpoint URL from a base URL.
+    ///
+    /// Normalizes the base URL (strips trailing slashes) and appends the
+    /// provider-specific path if not already present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ia_core::ai::types::Provider;
+    ///
+    /// // OpenAI
+    /// assert_eq!(
+    ///     Provider::OpenAi.endpoint_url("https://api.openai.com/v1"),
+    ///     "https://api.openai.com/v1/chat/completions"
+    /// );
+    /// assert_eq!(
+    ///     Provider::OpenAi.endpoint_url("https://api.openai.com"),
+    ///     "https://api.openai.com/v1/chat/completions"
+    /// );
+    ///
+    /// // Anthropic
+    /// assert_eq!(
+    ///     Provider::Anthropic.endpoint_url("https://api.anthropic.com"),
+    ///     "https://api.anthropic.com/v1/messages"
+    /// );
+    /// assert_eq!(
+    ///     Provider::Anthropic.endpoint_url("https://api.anthropic.com/v1"),
+    ///     "https://api.anthropic.com/v1/messages"
+    /// );
+    /// ```
+    pub fn endpoint_url(&self, base_url: &str) -> String {
+        let url = base_url.trim_end_matches('/');
+        match self {
+            Self::OpenAi => {
+                if url.ends_with("/chat/completions") {
+                    url.to_string()
+                } else if url.ends_with("/v1") {
+                    format!("{url}/chat/completions")
+                } else {
+                    format!("{url}/v1/chat/completions")
+                }
+            }
+            Self::Anthropic => {
+                if url.ends_with("/messages") {
+                    url.to_string()
+                } else if url.ends_with("/v1") {
+                    format!("{url}/messages")
+                } else {
+                    format!("{url}/v1/messages")
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenAi => write!(f, "openai"),
+            Self::Anthropic => write!(f, "anthropic"),
+        }
+    }
+}
+
+impl std::str::FromStr for Provider {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            _ => Err(format!(
+                "unknown provider '{s}': expected 'openai' or 'anthropic'"
+            )),
+        }
+    }
+}
+
 /// LLM API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiConfig {
-    /// Base URL for the OpenAI-compatible API.
+    /// Base URL for the LLM API.
     pub base_url: String,
     /// API key for authentication.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +258,9 @@ pub struct AiConfig {
     pub temperature: f64,
     /// Max tokens in the response.
     pub max_tokens: u64,
+    /// API provider (determines wire format and auth headers).
+    #[serde(default)]
+    pub provider: Provider,
 }
 
 impl Default for AiConfig {
@@ -166,6 +271,7 @@ impl Default for AiConfig {
             model: "gpt-4o-mini".to_string(),
             temperature: 0.2,
             max_tokens: 4096,
+            provider: Provider::OpenAi,
         }
     }
 }
@@ -203,6 +309,113 @@ mod tests {
         assert_eq!(config.temperature, 0.2);
         assert_eq!(config.max_tokens, 4096);
         assert!(config.api_key.is_none());
+        assert_eq!(config.provider, Provider::OpenAi);
+    }
+
+    #[test]
+    fn provider_detect_from_url() {
+        assert_eq!(
+            Provider::detect("https://api.anthropic.com"),
+            Provider::Anthropic
+        );
+        assert_eq!(
+            Provider::detect("https://api.anthropic.com/v1"),
+            Provider::Anthropic
+        );
+        assert_eq!(
+            Provider::detect("https://api.openai.com/v1"),
+            Provider::OpenAi
+        );
+        assert_eq!(
+            Provider::detect("http://localhost:11434/v1"),
+            Provider::OpenAi
+        );
+        assert_eq!(
+            Provider::detect("https://openrouter.ai/api/v1"),
+            Provider::OpenAi
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_url_openai() {
+        assert_eq!(
+            Provider::OpenAi.endpoint_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::OpenAi.endpoint_url("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::OpenAi.endpoint_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            Provider::OpenAi.endpoint_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        // Already has full path
+        assert_eq!(
+            Provider::OpenAi.endpoint_url("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn provider_endpoint_url_anthropic() {
+        assert_eq!(
+            Provider::Anthropic.endpoint_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            Provider::Anthropic.endpoint_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            Provider::Anthropic.endpoint_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // Already has full path
+        assert_eq!(
+            Provider::Anthropic.endpoint_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn provider_from_str() {
+        assert_eq!("openai".parse::<Provider>().unwrap(), Provider::OpenAi);
+        assert_eq!(
+            "anthropic".parse::<Provider>().unwrap(),
+            Provider::Anthropic
+        );
+        assert_eq!("OpenAI".parse::<Provider>().unwrap(), Provider::OpenAi);
+        assert_eq!(
+            "ANTHROPIC".parse::<Provider>().unwrap(),
+            Provider::Anthropic
+        );
+        assert!("unknown".parse::<Provider>().is_err());
+    }
+
+    #[test]
+    fn provider_display() {
+        assert_eq!(Provider::OpenAi.to_string(), "openai");
+        assert_eq!(Provider::Anthropic.to_string(), "anthropic");
+    }
+
+    #[test]
+    fn provider_serde_roundtrip() {
+        let openai = Provider::OpenAi;
+        let json = serde_json::to_string(&openai).unwrap();
+        assert_eq!(json, "\"openai\"");
+        let parsed: Provider = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Provider::OpenAi);
+
+        let anthropic = Provider::Anthropic;
+        let json = serde_json::to_string(&anthropic).unwrap();
+        assert_eq!(json, "\"anthropic\"");
+        let parsed: Provider = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Provider::Anthropic);
     }
 
     #[test]
