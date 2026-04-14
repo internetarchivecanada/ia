@@ -19,6 +19,8 @@ struct QaSingleOpts<'a> {
     print_prompt: bool,
     image_urls: bool,
     image_quality: ia_core::ai::image::ImageQuality,
+    /// When true, suppress per-item verbose stderr (progress bar mode).
+    compact: bool,
 }
 
 /// `--print-prompt` output: mirrors the exact JSON request body sent to the
@@ -102,7 +104,8 @@ pub enum AiCommand {
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># QA a single item</dim>\n  <bold>$ ia ai qa my-item</bold>\
              \n\n  <dim># QA items from a search, output JSONL</dim>\n  <bold>$ ia ai qa --json --search \"collection:theses\"</bold>\
-             \n\n  <dim># QA with extra search parameters</dim>\n  <bold>$ ia ai qa --search \"collection:theses\" -p rows=10 -p sort:date</bold>\
+             \n\n  <dim># Save results to XLSX and JSONL</dim>\n  <bold>$ ia ai qa --search \"collection:theses\" -o results.xlsx -o results.jsonl</bold>\
+             \n\n  <dim># Re-process cached results into XLSX (no LLM calls)</dim>\n  <bold>$ ia ai qa --from-results results.jsonl -o results.xlsx</bold>\
              \n\n  <dim># QA and promote confirmed metadata</dim>\n  <bold>$ ia ai qa --promote --confidence 0.9 item1 item2</bold>\
              \n\n  <dim># Dry run — show what would be promoted</dim>\n  <bold>$ ia ai qa --promote --dry-run my-item</bold>\
              \n\n  <dim># Use Anthropic API directly</dim>\n  <bold>$ ia ai qa --base-url https://api.anthropic.com --model claude-sonnet-4-6 item1</bold>\
@@ -198,9 +201,24 @@ pub struct QaArgs {
     pub min_field_confidence: f64,
 
     // --- Output ---
-    /// Output results as JSONL
+    /// Output results as JSONL to stdout
     #[arg(long)]
     pub json: bool,
+
+    /// Write results to file(s). Format inferred from extension: .xlsx, .jsonl, .csv, .tsv
+    ///
+    /// Multiple -o flags are supported to write several formats in one run.
+    /// XLSX produces a two-sheet workbook (Items summary + Fields detail).
+    /// CSV/TSV produces the Fields layout (one row per field per item).
+    #[arg(short = 'o', long = "output")]
+    pub outputs: Vec<PathBuf>,
+
+    /// Re-process cached QA results from a JSONL file (no LLM calls)
+    ///
+    /// Reads a JSONL file of QaResult objects (from a previous --json or -o run)
+    /// and formats them into -o outputs. No network access required.
+    #[arg(long)]
+    pub from_results: Option<PathBuf>,
 
     /// Write confirmed metadata to items after QA
     #[arg(long)]
@@ -404,7 +422,6 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
     no_resume: bool,
 ) -> Result<()> {
     let ai_config_path = args.ai_config;
@@ -417,7 +434,6 @@ pub async fn run(
                 quiet,
                 jobs,
                 joblog_path,
-                retry_failed,
                 no_resume,
             )
             .await
@@ -434,7 +450,6 @@ pub async fn run(
 
 // ── QA implementation ───────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn run_qa(
     client: &IaClient,
     args: QaArgs,
@@ -442,9 +457,88 @@ async fn run_qa(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
-    retry_failed: bool,
     no_resume: bool,
 ) -> Result<()> {
+    // ── Validate -o extensions ────────────────────────────────────────
+    for output_path in &args.outputs {
+        if !ia_core::ai::qa_output::is_supported_extension(output_path) {
+            bail!(
+                "unsupported output format: {} (expected .xlsx, .jsonl, .csv, or .tsv)",
+                output_path.display()
+            );
+        }
+    }
+
+    // ── --from-results mode: read cached JSONL, format into -o outputs ──
+    if let Some(ref from_results_path) = args.from_results {
+        // Mutual exclusions
+        if args.search.is_some() {
+            bail!("--from-results cannot be combined with --search");
+        }
+        if args.itemlist.is_some() {
+            bail!("--from-results cannot be combined with --itemlist");
+        }
+        if !args.identifiers.is_empty() {
+            bail!("--from-results cannot be combined with positional identifiers");
+        }
+        if args.promote {
+            bail!("--from-results cannot be combined with --promote");
+        }
+
+        let results = ia_core::ai::qa_output::read_jsonl(from_results_path).context(format!(
+            "failed to read results from {}",
+            from_results_path.display()
+        ))?;
+
+        if quiet == 0 && !args.json {
+            eprintln!(
+                "{} Loaded {} result{} from {}",
+                style("●").cyan(),
+                results.len(),
+                if results.len() == 1 { "" } else { "s" },
+                from_results_path.display(),
+            );
+        }
+
+        // Show stderr display (per-item verdicts)
+        if quiet == 0 && !args.json {
+            for result in &results {
+                let verdict_style = match result.verdict {
+                    ia_core::ai::qa::QaVerdict::Pass => style("PASS").green().bold(),
+                    ia_core::ai::qa::QaVerdict::Fail => style("FAIL").red().bold(),
+                    ia_core::ai::qa::QaVerdict::NeedsReview => style("REVIEW").yellow().bold(),
+                };
+                eprintln!(
+                    "  {} {} (confidence: {:.0}%, {} fields)",
+                    verdict_style,
+                    result.identifier,
+                    result.overall_confidence * 100.0,
+                    result.fields.len(),
+                );
+            }
+        }
+
+        // --json to stdout
+        if args.json {
+            for result in &results {
+                println!("{}", serde_json::to_string(result).unwrap_or_default());
+            }
+        }
+
+        // Write -o outputs
+        for output_path in &args.outputs {
+            ia_core::ai::qa_output::write_results(&results, output_path).context(format!(
+                "failed to write output to {}",
+                output_path.display()
+            ))?;
+            if quiet == 0 && !args.json {
+                eprintln!("{} Wrote {}", style("✓").green(), output_path.display(),);
+            }
+        }
+
+        return Ok(());
+    }
+
     // Validate input sources
     if args.identifiers.is_empty() && args.itemlist.is_none() && args.search.is_none() {
         // Check stdin
@@ -488,35 +582,12 @@ async fn run_qa(
         ids
     };
 
-    // ── Retry-failed: replace identifiers with only errored items ────
     let mut identifiers = identifiers;
-    if retry_failed {
-        if let Some(ref path) = joblog_path {
-            let entries = ia_core::joblog::read(path)
-                .context(format!("failed to read joblog: {}", path.display()))?;
-            let failed = ia_core::joblog::failed_items(&entries);
-            if failed.is_empty() {
-                if quiet == 0 {
-                    eprintln!("{} No failed items in joblog", style("✓").green());
-                }
-                return Ok(());
-            }
-            if quiet == 0 && !args.json {
-                eprintln!(
-                    "{} Retrying {} failed item{}",
-                    style("▸").cyan(),
-                    failed.len(),
-                    if failed.len() == 1 { "" } else { "s" },
-                );
-            }
-            identifiers = failed;
-        } else {
-            bail!("--retry-failed requires --joblog");
-        }
-    }
+    let original_item_count = identifiers.len();
+    let mut items_already_done: usize = 0;
 
     // ── Auto-resume: skip already-completed items ────────────────────
-    if !no_resume && !retry_failed && !args.print_prompt {
+    if !no_resume && !args.print_prompt {
         if let Some(ref path) = joblog_path {
             if path.exists() {
                 let entries = ia_core::joblog::read(path).context(format!(
@@ -527,12 +598,13 @@ async fn run_qa(
                 if !done.is_empty() {
                     let before = identifiers.len();
                     identifiers.retain(|id| !done.contains(id));
+                    items_already_done = before - identifiers.len();
                     if quiet == 0 && !args.json {
                         eprintln!(
                             "{} Resuming: {} item{} already QA'd (from {})",
                             style("▸").cyan(),
-                            done.len(),
-                            if done.len() == 1 { "" } else { "s" },
+                            items_already_done,
+                            if items_already_done == 1 { "" } else { "s" },
                             path.display(),
                         );
                     }
@@ -721,11 +793,29 @@ async fn run_qa(
 
     let item_count = identifiers.len();
     if quiet == 0 && !args.json {
+        // Compute estimated total cost for the header
+        let page_count = if let Some(ref path) = ai_config_path {
+            ia_core::ai::ia_config::load_ai_config_from_file(path)
+                .map(|cfg| ia_core::ai::ia_config::compute_page_count(&cfg.result.page_info))
+                .unwrap_or(8)
+        } else {
+            8 // default: cover + title + other + normal:5
+        };
+        let est_image_tokens = page_count as u64 * args.image_quality.est_tokens_per_image();
+        let est_input = est_image_tokens + 1_100;
+        let est_output: u64 = 800;
+        let est_per_item = estimate_vision_cost(&ai_config.model, est_input, est_output);
+        let est_total_str = est_per_item
+            .map(|c| format!(", est. ≈${:.2}", c * original_item_count as f64))
+            .unwrap_or_default();
+
         eprintln!(
-            "{} QA checking {} item{}...",
+            "{} QA checking {} item{} ({}{})...",
             style("●").cyan(),
-            item_count,
-            if item_count == 1 { "" } else { "s" }
+            original_item_count,
+            if original_item_count == 1 { "" } else { "s" },
+            ai_config.model,
+            est_total_str,
         );
     }
 
@@ -750,6 +840,10 @@ async fn run_qa(
     };
 
     let image_quality = args.image_quality;
+    let has_outputs = !args.outputs.is_empty();
+
+    // Compact mode: suppress per-item verbose stderr when -o is active
+    let compact = has_outputs && !args.json && quiet == 0;
 
     let single_opts = QaSingleOpts {
         ai_config_path: ai_config_path.as_deref(),
@@ -760,6 +854,7 @@ async fn run_qa(
         print_prompt: args.print_prompt,
         image_urls: args.image_urls,
         image_quality,
+        compact,
     };
 
     use futures::StreamExt;
@@ -772,6 +867,38 @@ async fn run_qa(
     let joblog = std::sync::Arc::new(joblog);
     let stdout_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let llm_client = std::sync::Arc::new(llm_client);
+
+    // Collect results for -o output (only when -o flags are present)
+    let collected_results: std::sync::Arc<tokio::sync::Mutex<Vec<ia_core::ai::qa::QaResult>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Collect errors for end-of-run display (compact mode)
+    let collected_errors: std::sync::Arc<tokio::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    // Running cost accumulator (in dollars, stored as f64 bits in AtomicU64)
+    let total_cost_bits = std::sync::Arc::new(AtomicU64::new(0));
+    let model_name = ai_config.model.clone();
+
+    // Progress bar for compact (-o) mode
+    let progress_bar: Option<indicatif::ProgressBar> = if compact {
+        use indicatif::{ProgressBar, ProgressStyle};
+        let bar = ProgressBar::new(original_item_count as u64);
+        bar.set_style(
+            ProgressStyle::with_template(&format!(
+                "  {{bar:{}.cyan/dim}} {{pos}}/{{len}} items  {{msg}}  ({{per_sec}})",
+                crate::output::BAR_WIDTH,
+            ))
+            .unwrap()
+            .progress_chars(crate::output::PROGRESS_CHARS),
+        );
+        bar.set_position(items_already_done as u64);
+        bar.set_message("≈$0.000 spent");
+        Some(bar)
+    } else {
+        None
+    };
+    let progress_bar = std::sync::Arc::new(progress_bar);
 
     let is_print_prompt = args.print_prompt;
     let is_dry_run = args.dry_run;
@@ -787,6 +914,11 @@ async fn run_qa(
             let joblog = std::sync::Arc::clone(&joblog);
             let stdout_lock = std::sync::Arc::clone(&stdout_lock);
             let llm_client = std::sync::Arc::clone(&llm_client);
+            let collected_results = std::sync::Arc::clone(&collected_results);
+            let collected_errors = std::sync::Arc::clone(&collected_errors);
+            let total_cost_bits = std::sync::Arc::clone(&total_cost_bits);
+            let progress_bar = std::sync::Arc::clone(&progress_bar);
+            let model_name = model_name.clone();
             let single_opts = QaSingleOpts {
                 ai_config_path: ai_config_path.as_deref(),
                 qa_opts: &qa_opts,
@@ -796,6 +928,7 @@ async fn run_qa(
                 print_prompt: is_print_prompt,
                 image_urls,
                 image_quality,
+                compact,
             };
 
             async move {
@@ -846,9 +979,41 @@ async fn run_qa(
                                     review_count.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                            // Accumulate cost from actual token usage
+                            if let Some(ref usage) = result.token_usage {
+                                if let Some(cost) = estimate_vision_cost(
+                                    &model_name,
+                                    usage.prompt_tokens,
+                                    usage.completion_tokens,
+                                ) {
+                                    // Add cost using atomic CAS on f64 bits
+                                    let cost_bits = cost.to_bits();
+                                    let _ = total_cost_bits.fetch_update(
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                        |old| {
+                                            let old_f = f64::from_bits(old);
+                                            Some((old_f + f64::from_bits(cost_bits)).to_bits())
+                                        },
+                                    );
+                                }
+                            }
+
                             if is_json {
                                 let _guard = stdout_lock.lock().await;
                                 println!("{}", serde_json::to_string(&result).unwrap_or_default());
+                            }
+
+                            // Update progress bar
+                            if let Some(ref bar) = *progress_bar {
+                                bar.inc(1);
+                                let spent = f64::from_bits(total_cost_bits.load(Ordering::Relaxed));
+                                bar.set_message(format!("≈${spent:.3} spent"));
+                            }
+
+                            // Collect for -o output
+                            if has_outputs {
+                                collected_results.lock().await.push(result);
                             }
                         }
                     }
@@ -861,15 +1026,34 @@ async fn run_qa(
                                     .ai_error(&e.to_string(), 0),
                             );
                         }
-                        let _guard = stdout_lock.lock().await;
-                        if is_json {
-                            let json_err = serde_json::json!({
-                                "identifier": identifier,
-                                "error": e.to_string(),
-                            });
-                            eprintln!("{}", serde_json::to_string(&json_err).unwrap_or_default());
-                        } else if quiet == 0 {
-                            eprintln!("  {} {}: {:#}", style("✗").red(), identifier, e);
+
+                        // Collect error for end-of-run display (compact mode)
+                        if compact {
+                            collected_errors
+                                .lock()
+                                .await
+                                .push(format!("{}: {:#}", identifier, e,));
+                        }
+
+                        // Update progress bar (errors still count as progress)
+                        if let Some(ref bar) = *progress_bar {
+                            bar.inc(1);
+                        }
+
+                        if !compact {
+                            let _guard = stdout_lock.lock().await;
+                            if is_json {
+                                let json_err = serde_json::json!({
+                                    "identifier": identifier,
+                                    "error": e.to_string(),
+                                });
+                                eprintln!(
+                                    "{}",
+                                    serde_json::to_string(&json_err).unwrap_or_default()
+                                );
+                            } else if quiet == 0 {
+                                eprintln!("  {} {}: {:#}", style("✗").red(), identifier, e);
+                            }
                         }
                     }
                 }
@@ -879,31 +1063,107 @@ async fn run_qa(
         .collect::<Vec<()>>()
         .await;
 
+    // Finish progress bar
+    if let Some(ref bar) = *progress_bar {
+        bar.finish_and_clear();
+    }
+
     let pass_count = pass_count.load(Ordering::Relaxed);
     let fail_count = fail_count.load(Ordering::Relaxed);
     let review_count = review_count.load(Ordering::Relaxed);
     let error_count = error_count.load(Ordering::Relaxed);
+    let total_cost = f64::from_bits(total_cost_bits.load(Ordering::Relaxed));
 
     // Print summary
     if quiet == 0 && !args.json && !args.print_prompt {
-        eprintln!();
-        if args.dry_run {
-            eprintln!("{}", style("Dry run complete").yellow());
+        if compact {
+            // Batch-style summary for -o mode
+            let succeeded = pass_count + fail_count + review_count;
+            eprintln!(
+                "{}",
+                style("────────────────────────────────────────────────────").dim()
+            );
+            if error_count > 0 {
+                eprintln!(
+                    "{}/{} items ({} done) · {} error{}",
+                    succeeded,
+                    original_item_count,
+                    style(succeeded).green(),
+                    style(error_count).red(),
+                    if error_count == 1 { "" } else { "s" },
+                );
+            } else {
+                eprintln!(
+                    "{}/{} items ({} done)",
+                    succeeded,
+                    original_item_count,
+                    style(succeeded).green(),
+                );
+            }
+            if pass_count > 0 || fail_count > 0 || review_count > 0 {
+                eprintln!(
+                    "  Pass: {}  Fail: {}  Review: {}",
+                    style(pass_count).green(),
+                    style(fail_count).red(),
+                    style(review_count).yellow(),
+                );
+            }
+            // Show collected errors
+            let errors = collected_errors.lock().await;
+            for (i, err) in errors.iter().enumerate() {
+                if i >= 5 {
+                    eprintln!(
+                        "  ... and {} more error{}",
+                        errors.len() - 5,
+                        if errors.len() - 5 == 1 { "" } else { "s" },
+                    );
+                    break;
+                }
+                eprintln!("  {} {}", style("✗").red(), err);
+            }
+            if total_cost > 0.0 {
+                eprintln!("Cost: ${total_cost:.3}");
+            }
         } else {
-            eprintln!("{}", style("QA complete").green().bold());
+            // Verbose summary (non -o mode)
+            eprintln!();
+            if args.dry_run {
+                eprintln!("{}", style("Dry run complete").yellow());
+            } else {
+                eprintln!("{}", style("QA complete").green().bold());
+            }
+            eprintln!("  Items: {item_count}");
+            if pass_count > 0 {
+                eprintln!("  Pass: {}", style(pass_count).green());
+            }
+            if fail_count > 0 {
+                eprintln!("  Fail: {}", style(fail_count).red());
+            }
+            if review_count > 0 {
+                eprintln!("  Needs review: {}", style(review_count).yellow());
+            }
+            if error_count > 0 {
+                eprintln!("  Errors: {}", style(error_count).red());
+            }
         }
-        eprintln!("  Items: {item_count}");
-        if pass_count > 0 {
-            eprintln!("  Pass: {}", style(pass_count).green());
-        }
-        if fail_count > 0 {
-            eprintln!("  Fail: {}", style(fail_count).red());
-        }
-        if review_count > 0 {
-            eprintln!("  Needs review: {}", style(review_count).yellow());
-        }
-        if error_count > 0 {
-            eprintln!("  Errors: {}", style(error_count).red());
+    }
+
+    // Write -o outputs
+    if !args.outputs.is_empty() && !args.print_prompt {
+        let results = collected_results.lock().await;
+        for output_path in &args.outputs {
+            ia_core::ai::qa_output::write_results(&results, output_path).context(format!(
+                "failed to write output to {}",
+                output_path.display()
+            ))?;
+            if quiet == 0 && !args.json {
+                eprintln!(
+                    "  {} Wrote {} ({} results)",
+                    style("✓").green(),
+                    output_path.display(),
+                    results.len(),
+                );
+            }
         }
     }
 
@@ -1148,6 +1408,8 @@ async fn run_qa_single(
             fields: indexmap::IndexMap::new(),
             token_usage: None,
             elapsed_ms: 0,
+            existing_metadata: None,
+            pages_sent: None,
         });
     }
 
@@ -1214,7 +1476,7 @@ async fn run_qa_single(
         ia_core::ai::qa::PageImages::Base64(images)
     };
 
-    if !opts.json && opts.quiet == 0 {
+    if !opts.json && opts.quiet == 0 && !opts.compact {
         let page_count = if opts.qa_opts.dry_run {
             selected.len()
         } else {
@@ -1230,7 +1492,7 @@ async fn run_qa_single(
     }
 
     // 6. Run QA
-    let result = ia_core::ai::qa::qa_item(
+    let mut result = ia_core::ai::qa::qa_item(
         llm_client,
         identifier,
         &config,
@@ -1241,8 +1503,40 @@ async fn run_qa_single(
     .await
     .context(format!("QA failed for {identifier}"))?;
 
+    // 6b. Enrich result with existing metadata and pages_sent for output
+    {
+        // Existing metadata: serialize item metadata, pick the fields that were QA'd
+        let item_json = serde_json::to_value(&item.metadata).unwrap_or_default();
+        if let serde_json::Value::Object(all_meta) = item_json {
+            let mut existing = serde_json::Map::new();
+            for field_name in result.fields.keys() {
+                if let Some(val) = all_meta.get(field_name) {
+                    existing.insert(field_name.clone(), val.clone());
+                }
+            }
+            if !existing.is_empty() {
+                result.existing_metadata = Some(existing);
+            }
+        }
+
+        // Pages sent: extract from selected pages vec
+        let pages_sent: Vec<ia_core::ai::qa::PageSent> = selected
+            .iter()
+            .filter_map(|(_, sd_page)| {
+                let page = sd_page.as_ref()?;
+                Some(ia_core::ai::qa::PageSent {
+                    leaf_num: page.leaf_num,
+                    page_type: page.page_type.to_lowercase(),
+                })
+            })
+            .collect();
+        if !pages_sent.is_empty() {
+            result.pages_sent = Some(pages_sent);
+        }
+    }
+
     // 7. Print per-item summary (non-JSON mode)
-    if !opts.json && opts.quiet == 0 {
+    if !opts.json && opts.quiet == 0 && !opts.compact {
         if opts.qa_opts.dry_run {
             // Dry-run: show extracted metadata that would be checked, no fake verdicts
             eprintln!(
@@ -1313,7 +1607,7 @@ async fn run_qa_single(
     }
 
     // 7b. Cost estimate
-    if !opts.json && opts.quiet == 0 {
+    if !opts.json && opts.quiet == 0 && !opts.compact {
         let num_pages = if opts.qa_opts.dry_run {
             selected.len()
         } else {
@@ -1364,7 +1658,7 @@ async fn run_qa_single(
                 .await
                 .context(format!("promotion failed for {identifier}"))?;
 
-        if !opts.json && opts.quiet == 0 {
+        if !opts.json && opts.quiet == 0 && !opts.compact {
             if promote_result.dry_run {
                 eprintln!(
                     "    Would promote {} field(s), skip {}",

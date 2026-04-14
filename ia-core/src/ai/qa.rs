@@ -9,6 +9,31 @@ use crate::ai::extracted_metadata::ExtractedMetadata;
 use crate::ai::ia_config::IaAiConfig;
 use crate::error::Result;
 
+/// A page sent to the QA model, with its leaf number and semantic type.
+///
+/// Stored in [`QaResult::pages_sent`] so that offline re-processing
+/// (`--from-results`) can construct page URLs without re-fetching scandata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PageSent {
+    /// 0-based leaf number from scandata (maps to BookReader URL `page/n{leaf_num}`).
+    pub leaf_num: u32,
+    /// Semantic page type: `"cover"`, `"title"`, `"normal"`, `"other"`.
+    pub page_type: String,
+}
+
+impl PageSent {
+    /// Construct a BookReader page URL for this page.
+    ///
+    /// Format: `https://archive.org/details/{identifier}/page/n{leaf_num}/mode/2up`
+    #[must_use]
+    pub fn page_url(&self, identifier: &str) -> String {
+        format!(
+            "https://archive.org/details/{identifier}/page/n{}/mode/2up",
+            self.leaf_num
+        )
+    }
+}
+
 /// Result of QA verification for a single item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QaResult {
@@ -28,6 +53,14 @@ pub struct QaResult {
     pub token_usage: Option<crate::ai::types::TokenUsage>,
     /// Wall-clock time for the QA call in milliseconds.
     pub elapsed_ms: u64,
+    /// Existing metadata values from the item (for comparison in reports).
+    /// Populated when the QA result is enriched; absent in older JSONL files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Pages sent to the QA model, with leaf numbers and types.
+    /// Populated when the QA result is enriched; absent in older JSONL files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages_sent: Option<Vec<PageSent>>,
 }
 
 /// Overall verdict for an item's extracted metadata.
@@ -111,45 +144,60 @@ independently verify each extracted field against the source images.
 
 For each metadata field, examine the page images carefully and determine whether the \
 extracted value is correct, incorrect, or uncertain. You are the second pair of eyes — \
-be thorough but fair. Minor formatting differences (e.g., \"1988\" vs \"1988-01-01\") are \
-acceptable if the core information is correct.
+be thorough but fair.
+
+## What counts as correct
+
+The extracted value is correct if it captures the same information, even with \
+formatting differences. These are all correct — do NOT mark them incorrect:
+
+- Hyphens, dashes, spaces in identifiers: \"9781614683490\" = \"978-1-61468-349-0\"
+- Date format variations: \"1988\" = \"1988-01-01\" = \"January 1988\"
+- Name ordering: \"Smith, John\" = \"John Smith\" = \"J. Smith\"
+- Capitalization: \"THE GREAT GATSBY\" = \"The Great Gatsby\"
+- Minor punctuation: trailing periods, extra spaces, curly vs straight quotes
+- Abbreviations: \"Univ.\" = \"University\", \"MIT Press\" = \"The MIT Press\"
+- ISBN-10 vs ISBN-13: both are valid representations of the same book
+
+Only mark \"incorrect\" when the *information itself* is wrong — wrong year, wrong \
+author name, missing words in a title, factually different content.
 
 ## Verification Guidelines
 
-- **Titles**: Check title pages, cover pages, and headers. Accept minor punctuation or \
-capitalization differences if the words match. Flag truncated or substantially different titles.
+- **Titles**: Check title pages, cover pages, and headers. Flag truncated or \
+substantially different titles. Subtitle inclusion/exclusion is acceptable either way.
 - **Dates**: Look for dates on title pages, copyright pages, and colophons. A year-only \
 extraction is correct if the full date isn't visible. Flag wrong years or decades.
-- **Authors/Creators**: Check title pages and bylines. Accept name format variations \
-(e.g., \"J. Smith\" vs \"John Smith\") as correct. Flag misspellings or wrong names.
-- **Publishers**: Check title pages and copyright pages. Accept abbreviations.
+- **Authors/Creators**: Check title pages and bylines. Flag misspellings or entirely \
+wrong names. Accept format variations and abbreviations.
+- **Publishers**: Check title pages and copyright pages. Accept abbreviations and \
+minor variations (\"Oxford University Press\" = \"OUP\").
 - **Languages**: Verify by examining the actual text content in the images.
-- **Subjects/Topics**: Use your judgment — these may not appear verbatim in the images. \
-Mark as \"uncertain\" if you cannot verify from visual evidence alone.
-- **Schema-defined fields**: If the expected schema defines allowed values or formats, \
-verify the extracted value conforms.
+- **Subjects/Topics**: These are interpretive — the extraction model may have used \
+context beyond the visible pages. Mark as \"correct\" if the subjects are reasonable \
+for the content shown. Only mark \"incorrect\" if a subject is clearly wrong for this \
+work. Mark \"uncertain\" only if you truly cannot assess.
+- **ISBNs/Identifiers**: Verify the digits match. Ignore hyphens, spaces, and format.
 
 ## When to use each verdict
 
-- **\"correct\"**: The extracted value accurately represents what is shown in the images. \
-High confidence that the extraction is right.
-- **\"incorrect\"**: The extracted value clearly contradicts what is shown in the images. \
-You MUST provide a \"suggested_correction\" with the correct value.
-- **\"uncertain\"**: The field cannot be verified from the available images (e.g., the \
-relevant page wasn't included, or the information isn't visually apparent). Do NOT use \
-\"uncertain\" as a hedge when you can see the answer — commit to correct/incorrect.
+- **\"correct\"**: The extracted value captures the same information as the source.
+- **\"incorrect\"**: The extracted value is factually wrong — different information, not \
+just different formatting. You MUST provide a \"suggested_correction\" as a plain \
+string (not an array or object).
+- **\"uncertain\"**: The field cannot be verified from the available images.
 
 ## Response Format
 
-Respond with a JSON object where keys are field names and values are objects with \
-\"verdict\", \"confidence\", \"suggested_correction\" (optional), and \"note\" (optional).
+Respond with a JSON object. Keys are field names, values have \"verdict\", \"confidence\" \
+(0.0–1.0), and optionally \"suggested_correction\" (plain string) and \"note\" (string).
 
 {
   \"field_name\": {
     \"verdict\": \"correct\" | \"incorrect\" | \"uncertain\",
-    \"confidence\": 0.0 to 1.0,
-    \"suggested_correction\": \"...\",
-    \"note\": \"...\"
+    \"confidence\": 0.95,
+    \"suggested_correction\": \"corrected value here\",
+    \"note\": \"brief explanation\"
   }
 }
 
@@ -256,6 +304,8 @@ pub async fn qa_item(
         fields,
         token_usage: response.token_usage,
         elapsed_ms,
+        existing_metadata: None,
+        pages_sent: None,
     })
 }
 
@@ -420,6 +470,8 @@ fn dry_run_result(identifier: &str, extracted: &ExtractedMetadata, opts: &QaOpts
         fields,
         token_usage: None,
         elapsed_ms: 0,
+        existing_metadata: None,
+        pages_sent: None,
     }
 }
 
@@ -640,6 +692,8 @@ mod tests {
             fields,
             token_usage: None,
             elapsed_ms: 1500,
+            existing_metadata: None,
+            pages_sent: None,
         };
 
         let json = serde_json::to_string_pretty(&result).unwrap();

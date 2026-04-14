@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod promote;
 pub mod prompt;
 pub mod qa;
+pub mod qa_output;
 pub mod types;
 pub mod undo;
 pub mod zip;

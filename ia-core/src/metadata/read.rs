@@ -3,10 +3,17 @@ use crate::error::{IaError, Result};
 use crate::types::ItemMetadata;
 
 /// Fetch full metadata for an item.
+///
+/// Sends S3 auth headers when credentials are configured, which is
+/// required for accessing private/dark items.
 pub async fn get(client: &IaClient, identifier: &str) -> Result<ItemMetadata> {
     let url = client.url(&format!("/metadata/{identifier}"));
 
-    let response = client.http().get(&url).send().await?;
+    let mut req = client.http().get(&url);
+    if let Some(auth) = crate::auth::s3_auth_value(client.config()) {
+        req = req.header("Authorization", auth);
+    }
+    let response = req.send().await?;
 
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
