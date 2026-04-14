@@ -402,6 +402,8 @@ mod tests {
             fields,
             token_usage: None,
             elapsed_ms: 100,
+            existing_metadata: None,
+            pages_sent: None,
         }
     }
 

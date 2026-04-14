@@ -41,24 +41,9 @@ pub async fn list_zip_contents(
 
     debug!(identifier, zip_filename, "listing zip contents");
 
-    let response = client
-        .http()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| IaError::Http {
-            status: 0,
-            message: format!("failed to list zip contents: {e}"),
-        })?;
-
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(IaError::Http {
-            status,
-            message: format!("failed to list zip {zip_filename} for {identifier}: {body}"),
-        });
-    }
+    // Use fetch_response for auth headers + redirect following with auth
+    // preservation (reqwest strips Authorization on redirect by default).
+    let response = super::fetch_response(client, &url, None).await?;
 
     let html = response.text().await.map_err(|e| IaError::Http {
         status: 0,

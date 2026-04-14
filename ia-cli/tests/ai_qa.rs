@@ -340,6 +340,261 @@ fn ai_qa_print_prompt_conflicts_with_promote() {
         );
 }
 
+// ── ia ai qa -o / --from-results ────────────────────────────────────────
+
+#[test]
+fn ai_qa_help_shows_output_and_from_results_flags() {
+    ia().args(["ai", "qa", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("--from-results"));
+}
+
+#[test]
+fn ai_qa_from_results_conflicts_with_search() {
+    let cfg = empty_config();
+    let results_file = NamedTempFile::with_suffix(".jsonl").unwrap();
+    fs::write(results_file.path(), "").unwrap();
+
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(results_file.path())
+        .args(["--search", "collection:test"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--from-results").and(predicate::str::contains("--search")),
+        );
+}
+
+#[test]
+fn ai_qa_from_results_conflicts_with_itemlist() {
+    let cfg = empty_config();
+    let results_file = NamedTempFile::with_suffix(".jsonl").unwrap();
+    fs::write(results_file.path(), "").unwrap();
+    let itemlist = NamedTempFile::new().unwrap();
+    fs::write(itemlist.path(), "item1\n").unwrap();
+
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(results_file.path())
+        .args(["--itemlist"])
+        .arg(itemlist.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--from-results").and(predicate::str::contains("--itemlist")),
+        );
+}
+
+#[test]
+fn ai_qa_from_results_conflicts_with_identifiers() {
+    let cfg = empty_config();
+    let results_file = NamedTempFile::with_suffix(".jsonl").unwrap();
+    fs::write(results_file.path(), "").unwrap();
+
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(results_file.path())
+        .args(["some-item"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--from-results").and(predicate::str::contains("identifiers")),
+        );
+}
+
+#[test]
+fn ai_qa_from_results_conflicts_with_promote() {
+    let cfg = empty_config();
+    let results_file = NamedTempFile::with_suffix(".jsonl").unwrap();
+    fs::write(results_file.path(), "").unwrap();
+
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(results_file.path())
+        .args(["--promote"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--from-results").and(predicate::str::contains("--promote")),
+        );
+}
+
+#[test]
+fn ai_qa_unsupported_output_extension() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "ai",
+            "qa",
+            "-o",
+            "results.pdf",
+            "--model",
+            "test",
+            "--base-url",
+            "http://localhost:11434/v1",
+            "some-item",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported output format"));
+}
+
+#[test]
+fn ai_qa_from_results_reads_and_formats() {
+    use tempfile::TempDir;
+
+    let cfg = empty_config();
+    let dir = TempDir::new().unwrap();
+
+    // Create a valid JSONL file with a QaResult
+    let jsonl_path = dir.path().join("input.jsonl");
+    let qa_result = serde_json::json!({
+        "identifier": "test-item-123",
+        "overall_confidence": 0.92,
+        "verdict": "pass",
+        "extraction_model": "gpt-5-nano",
+        "qa_model": "claude-sonnet-4-6",
+        "fields": {
+            "title": {
+                "extracted_value": "My Book",
+                "verdict": "correct",
+                "confidence": 0.95
+            }
+        },
+        "token_usage": null,
+        "elapsed_ms": 1000,
+        "existing_metadata": {
+            "title": "My Book"
+        },
+        "pages_sent": [
+            {"leaf_num": 0, "page_type": "cover"},
+            {"leaf_num": 3, "page_type": "title"}
+        ]
+    });
+    fs::write(&jsonl_path, serde_json::to_string(&qa_result).unwrap()).unwrap();
+
+    // --from-results → --json to stdout
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_path)
+        .args(["--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("test-item-123"));
+
+    // --from-results → -o XLSX
+    let xlsx_path = dir.path().join("output.xlsx");
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_path)
+        .args(["-o"])
+        .arg(&xlsx_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Wrote"));
+
+    assert!(xlsx_path.exists());
+
+    // --from-results → -o CSV
+    let csv_path = dir.path().join("output.csv");
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_path)
+        .args(["-o"])
+        .arg(&csv_path)
+        .assert()
+        .success();
+
+    let csv_content = fs::read_to_string(&csv_path).unwrap();
+    assert!(csv_content.contains("identifier"));
+    assert!(csv_content.contains("test-item-123"));
+    assert!(csv_content.contains("correct"));
+}
+
+#[test]
+fn ai_qa_from_results_backward_compat_old_format() {
+    // Old-format JSONL (no existing_metadata, no pages_sent) should work
+    let cfg = empty_config();
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let jsonl_path = dir.path().join("old.jsonl");
+    let old_result = serde_json::json!({
+        "identifier": "old-item",
+        "overall_confidence": 0.85,
+        "verdict": "pass",
+        "extraction_model": "gpt-5-nano",
+        "qa_model": "claude-sonnet-4-6",
+        "fields": {
+            "date": {
+                "extracted_value": "1990",
+                "verdict": "correct",
+                "confidence": 0.9
+            }
+        },
+        "token_usage": null,
+        "elapsed_ms": 500
+    });
+    fs::write(&jsonl_path, serde_json::to_string(&old_result).unwrap()).unwrap();
+
+    // Should succeed with --json
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_path)
+        .args(["--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old-item"));
+
+    // Should succeed writing XLSX
+    let xlsx_path = dir.path().join("old.xlsx");
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_path)
+        .args(["-o"])
+        .arg(&xlsx_path)
+        .assert()
+        .success();
+    assert!(xlsx_path.exists());
+}
+
+#[test]
+fn ai_qa_from_results_multiple_outputs() {
+    let cfg = empty_config();
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let jsonl_input = dir.path().join("input.jsonl");
+    let result = serde_json::json!({
+        "identifier": "multi-out",
+        "overall_confidence": 0.9,
+        "verdict": "pass",
+        "extraction_model": "gpt-5-nano",
+        "qa_model": "claude-sonnet-4-6",
+        "fields": {"title": {"extracted_value": "Test", "verdict": "correct", "confidence": 0.95}},
+        "token_usage": null,
+        "elapsed_ms": 100
+    });
+    fs::write(&jsonl_input, serde_json::to_string(&result).unwrap()).unwrap();
+
+    let xlsx_path = dir.path().join("out.xlsx");
+    let jsonl_path = dir.path().join("out.jsonl");
+
+    ia_with_config(&cfg)
+        .args(["ai", "qa", "--from-results"])
+        .arg(&jsonl_input)
+        .args(["-o"])
+        .arg(&xlsx_path)
+        .args(["-o"])
+        .arg(&jsonl_path)
+        .assert()
+        .success();
+
+    assert!(xlsx_path.exists());
+    assert!(jsonl_path.exists());
+}
+
 // ── ia download --zip-list / --zip-member ───────────────────────────────
 
 #[test]

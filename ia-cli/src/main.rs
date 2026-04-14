@@ -244,16 +244,7 @@ async fn main() -> Result<()> {
     match cli.command {
         #[cfg(feature = "alpha")]
         Commands::Ai(args) => {
-            commands::ai::run(
-                &client,
-                args,
-                cli.quiet,
-                jobs,
-                cli.joblog,
-                false, // retry_failed removed from global flags (PR #319)
-                cli.no_resume,
-            )
-            .await?
+            commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
         }
         Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
         Commands::Download(args) => {

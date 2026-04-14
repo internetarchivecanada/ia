@@ -199,6 +199,16 @@ pub async fn login(client: &IaClient, email: &str, password: &str) -> Result<Aut
     })
 }
 
+/// Build the `Authorization: LOW access:secret` header value from config.
+///
+/// Returns `None` if S3 credentials are not configured.
+#[must_use]
+pub fn s3_auth_value(config: &crate::config::IaConfig) -> Option<String> {
+    let access = config.s3_access.as_deref()?;
+    let secret = config.s3_secret.as_deref()?;
+    Some(format!("LOW {access}:{secret}"))
+}
+
 /// Parse a netrc file and extract archive.org credentials.
 ///
 /// Looks for a `machine archive.org` entry with `login` and `password` fields.
