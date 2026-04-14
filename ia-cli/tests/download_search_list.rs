@@ -1213,7 +1213,7 @@ async fn download_search_rejects_file_names() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot combine file names with --search"),
-        "should show clear error, got: {stderr}"
+        stderr.contains("cannot be used with") || stderr.contains("cannot combine"),
+        "should show conflict error, got: {stderr}"
     );
 }

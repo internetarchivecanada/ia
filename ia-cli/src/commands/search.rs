@@ -380,7 +380,7 @@ fn build_search_opts(
     })
 }
 
-fn parse_extra_params(parameters: &[String]) -> Result<Vec<(String, String)>> {
+pub(crate) fn parse_extra_params(parameters: &[String]) -> Result<Vec<(String, String)>> {
     parameters
         .iter()
         .map(|p| {

@@ -241,6 +241,26 @@ pub fn failed_items(entries: &[JoblogEntry]) -> Vec<String> {
     failed.into_iter().map(String::from).collect()
 }
 
+/// Get item identifiers that succeeded, for auto-resume of item-level operations.
+///
+/// Scans entries filtered by `op`, keeps latest status per item,
+/// returns items where latest status is `"ok"`. Used to skip already-processed
+/// items when resuming a batch (e.g. QA, AI analysis).
+pub fn successful_items(entries: &[JoblogEntry], op: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+
+    let mut latest: HashMap<String, &str> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.op == op) {
+        latest.insert(entry.item.clone(), entry.status.as_str());
+    }
+
+    latest
+        .into_iter()
+        .filter(|(_, status)| *status == "ok")
+        .map(|(item, _)| item)
+        .collect()
+}
+
 /// Get (item, file) pairs that succeeded, for auto-resume.
 ///
 /// Scans entries filtered by `op`, keeps latest status per `(item, file)`,
@@ -367,7 +387,7 @@ pub fn summarize_dedup(entries: &[JoblogEntry]) -> JoblogSummary {
 pub fn ai_summarize(entries: &[JoblogEntry]) -> Option<AiSummary> {
     let ai_entries: Vec<&JoblogEntry> = entries
         .iter()
-        .filter(|e| e.op == "ai" || e.op == "ai-undo")
+        .filter(|e| e.op == "ai" || e.op == "ai-undo" || e.op == "ai-qa")
         .collect();
 
     if ai_entries.is_empty() {
@@ -378,7 +398,7 @@ pub fn ai_summarize(entries: &[JoblogEntry]) -> Option<AiSummary> {
 
     for entry in &ai_entries {
         match entry.op.as_str() {
-            "ai" => match entry.status.as_str() {
+            "ai" | "ai-qa" => match entry.status.as_str() {
                 "ok" => {
                     summary.items_analyzed += 1;
                     if let Some(ref changes) = entry.changes {
@@ -1063,5 +1083,76 @@ mod tests {
         let set = successful_files(&entries, "upload");
         assert!(!set.contains(&("item-1".into(), "file-a.txt".into())));
         assert!(set.contains(&("item-2".into(), "file-b.txt".into())));
+    }
+
+    // --- successful_items tests (item-level auto-resume) ---
+
+    #[test]
+    fn successful_items_empty() {
+        let set = successful_items(&[], "ai-qa");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn successful_items_basic() {
+        let entries = vec![
+            JoblogEntry::new("ai-qa", "item1", "").ai_ok(vec![], None, 100),
+            JoblogEntry::new("ai-qa", "item2", "").ai_error("timeout", 0),
+            JoblogEntry::new("ai-qa", "item3", "").skipped(),
+        ];
+        let set = successful_items(&entries, "ai-qa");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("item1"));
+        assert!(!set.contains("item2"));
+        assert!(!set.contains("item3"));
+    }
+
+    #[test]
+    fn successful_items_latest_wins() {
+        let entries = vec![
+            // error then ok → in set
+            JoblogEntry::new("ai-qa", "item1", "").ai_error("timeout", 0),
+            JoblogEntry::new("ai-qa", "item1", "").ai_ok(vec![], None, 100),
+            // ok then error → NOT in set
+            JoblogEntry::new("ai-qa", "item2", "").ai_ok(vec![], None, 100),
+            JoblogEntry::new("ai-qa", "item2", "").ai_error("timeout", 0),
+        ];
+        let set = successful_items(&entries, "ai-qa");
+        assert!(set.contains("item1"));
+        assert!(!set.contains("item2"));
+    }
+
+    #[test]
+    fn successful_items_filters_by_op() {
+        let entries = vec![
+            JoblogEntry::new("ai", "item1", "").ai_ok(vec![], None, 100),
+            JoblogEntry::new("ai-qa", "item2", "").ai_ok(vec![], None, 100),
+        ];
+        let set = successful_items(&entries, "ai-qa");
+        assert!(!set.contains("item1"));
+        assert!(set.contains("item2"));
+    }
+
+    #[test]
+    fn ai_summarize_includes_qa_entries() {
+        let entries = vec![
+            JoblogEntry::new("ai-qa", "item1", "").ai_ok(
+                vec![],
+                Some(JoblogTokens {
+                    prompt: 500,
+                    completion: 100,
+                }),
+                200,
+            ),
+            JoblogEntry::new("ai-qa", "item2", "").ai_error("network error", 0),
+            JoblogEntry::new("ai-qa", "item3", "").skipped(),
+        ];
+        let summary = ai_summarize(&entries).unwrap();
+        assert_eq!(summary.items_analyzed, 1);
+        assert_eq!(summary.items_with_changes, 0); // QA has empty changes
+        assert_eq!(summary.items_errored, 1);
+        assert_eq!(summary.items_skipped, 1);
+        assert_eq!(summary.prompt_tokens, 500);
+        assert_eq!(summary.completion_tokens, 100);
     }
 }

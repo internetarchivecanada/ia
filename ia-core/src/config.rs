@@ -1,8 +1,23 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::ai::types::AiConfig;
+use crate::ai::types::{AiConfig, Provider};
 use crate::error::{IaError, Result};
+
+/// Sparse AI config overlay for layered resolution.
+///
+/// All fields are optional. Used by the `[ai-qa]` config section and
+/// QA-specific environment variable overrides. During resolution, values
+/// cascade: CLI flag → `[ai-qa]` → `[ai]` → error.
+#[derive(Debug, Clone, Default)]
+pub struct AiConfigOverlay {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u64>,
+    pub provider: Option<Provider>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct IaConfig {
@@ -12,6 +27,7 @@ pub struct IaConfig {
     pub general: GeneralConfig,
     pub logging: LoggingConfig,
     pub ai: Option<AiConfig>,
+    pub ai_qa: Option<AiConfigOverlay>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +135,25 @@ impl IaConfig {
             config.ai = Some(ai);
         }
 
+        // [ai-qa] section (sparse overlay for QA-specific LLM config)
+        if ini.get_map_ref().contains_key("ai-qa") {
+            let qa = AiConfigOverlay {
+                base_url: ini.get("ai-qa", "base_url"),
+                api_key: ini.get("ai-qa", "api_key"),
+                model: ini.get("ai-qa", "model"),
+                temperature: ini
+                    .get("ai-qa", "temperature")
+                    .and_then(|s| s.parse::<f64>().ok()),
+                max_tokens: ini
+                    .get("ai-qa", "max_tokens")
+                    .and_then(|s| s.parse::<u64>().ok()),
+                provider: ini
+                    .get("ai-qa", "provider")
+                    .and_then(|s| s.parse::<Provider>().ok()),
+            };
+            config.ai_qa = Some(qa);
+        }
+
         config.apply_env_overrides();
         Ok(config)
     }
@@ -147,6 +182,28 @@ impl IaConfig {
             }
             if let Ok(model) = std::env::var("IA_AI_MODEL") {
                 ai.model = model;
+            }
+        }
+
+        // AI QA env var overrides (IA_AI_QA_*)
+        let has_ai_qa_env = std::env::var("IA_AI_QA_BASE_URL").is_ok()
+            || std::env::var("IA_AI_QA_API_KEY").is_ok()
+            || std::env::var("IA_AI_QA_MODEL").is_ok()
+            || std::env::var("IA_AI_QA_PROVIDER").is_ok();
+
+        if has_ai_qa_env {
+            let qa = self.ai_qa.get_or_insert_with(AiConfigOverlay::default);
+            if let Ok(url) = std::env::var("IA_AI_QA_BASE_URL") {
+                qa.base_url = Some(url);
+            }
+            if let Ok(key) = std::env::var("IA_AI_QA_API_KEY") {
+                qa.api_key = Some(key);
+            }
+            if let Ok(model) = std::env::var("IA_AI_QA_MODEL") {
+                qa.model = Some(model);
+            }
+            if let Ok(p) = std::env::var("IA_AI_QA_PROVIDER") {
+                qa.provider = p.parse::<Provider>().ok();
             }
         }
     }
@@ -267,13 +324,43 @@ impl IaConfig {
                 "api_key": if show_secrets {
                     serde_json::json!(ai.api_key)
                 } else {
-                    redacted
+                    redacted.clone()
                 },
                 "model": ai.model,
                 "temperature": ai.temperature,
                 "max_tokens": ai.max_tokens,
             });
             obj["ai"] = ai_val;
+        }
+
+        if let Some(qa) = &self.ai_qa {
+            let mut qa_obj = serde_json::Map::new();
+            if let Some(url) = &qa.base_url {
+                qa_obj.insert("base_url".into(), serde_json::json!(url));
+            }
+            if qa.api_key.is_some() {
+                qa_obj.insert(
+                    "api_key".into(),
+                    if show_secrets {
+                        serde_json::json!(qa.api_key)
+                    } else {
+                        redacted.clone()
+                    },
+                );
+            }
+            if let Some(model) = &qa.model {
+                qa_obj.insert("model".into(), serde_json::json!(model));
+            }
+            if let Some(temp) = qa.temperature {
+                qa_obj.insert("temperature".into(), serde_json::json!(temp));
+            }
+            if let Some(tokens) = qa.max_tokens {
+                qa_obj.insert("max_tokens".into(), serde_json::json!(tokens));
+            }
+            if let Some(provider) = &qa.provider {
+                qa_obj.insert("provider".into(), serde_json::json!(provider));
+            }
+            obj["ai-qa"] = serde_json::Value::Object(qa_obj);
         }
 
         obj
@@ -631,6 +718,134 @@ mod tests {
         // General should NOT be redacted
         let general = obj["general"].as_object().unwrap();
         assert_eq!(general["screenname"], "testuser");
+    }
+
+    #[test]
+    fn default_config_has_no_ai_qa() {
+        let config = IaConfig::default();
+        assert!(config.ai_qa.is_none());
+    }
+
+    #[test]
+    fn load_ai_qa_section_from_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai-qa]").unwrap();
+        writeln!(f, "base_url = https://api.anthropic.com").unwrap();
+        writeln!(f, "api_key = sk-ant-test").unwrap();
+        writeln!(f, "model = claude-sonnet-4-6").unwrap();
+        writeln!(f, "temperature = 0.1").unwrap();
+        writeln!(f, "max_tokens = 8192").unwrap();
+        writeln!(f, "provider = anthropic").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        let qa = config.ai_qa.unwrap();
+        assert_eq!(qa.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(qa.api_key.as_deref(), Some("sk-ant-test"));
+        assert_eq!(qa.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(qa.temperature, Some(0.1));
+        assert_eq!(qa.max_tokens, Some(8192));
+        assert_eq!(qa.provider, Some(Provider::Anthropic));
+    }
+
+    #[test]
+    fn ai_qa_section_sparse() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai-qa]").unwrap();
+        writeln!(f, "model = claude-sonnet-4-6").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        let qa = config.ai_qa.unwrap();
+        assert!(qa.base_url.is_none());
+        assert!(qa.api_key.is_none());
+        assert_eq!(qa.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert!(qa.temperature.is_none());
+        assert!(qa.max_tokens.is_none());
+        assert!(qa.provider.is_none());
+    }
+
+    #[test]
+    fn missing_ai_qa_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai]").unwrap();
+        writeln!(f, "model = gpt-4o").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        assert!(config.ai_qa.is_none());
+    }
+
+    #[test]
+    fn ai_qa_and_ai_sections_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_path = dir.path().join("ia.ini");
+        let mut f = std::fs::File::create(&ini_path).unwrap();
+        writeln!(f, "[ai]").unwrap();
+        writeln!(f, "model = gpt-4o").unwrap();
+        writeln!(f, "base_url = https://api.openai.com/v1").unwrap();
+        writeln!(f, "[ai-qa]").unwrap();
+        writeln!(f, "model = claude-sonnet-4-6").unwrap();
+        writeln!(f, "provider = anthropic").unwrap();
+
+        let config = IaConfig::load_from_file(&ini_path).unwrap();
+        let ai = config.ai.unwrap();
+        assert_eq!(ai.model, "gpt-4o");
+
+        let qa = config.ai_qa.unwrap();
+        assert_eq!(qa.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(qa.provider, Some(Provider::Anthropic));
+        // QA doesn't inherit from [ai] — that's done in the CLI layer
+        assert!(qa.base_url.is_none());
+    }
+
+    #[test]
+    fn ai_qa_env_var_overrides() {
+        std::env::set_var("IA_AI_QA_BASE_URL", "https://api.anthropic.com");
+        std::env::set_var("IA_AI_QA_API_KEY", "qa-env-key");
+        std::env::set_var("IA_AI_QA_MODEL", "qa-env-model");
+        std::env::set_var("IA_AI_QA_PROVIDER", "anthropic");
+
+        let mut config = IaConfig::default();
+        config.apply_env_overrides();
+
+        std::env::remove_var("IA_AI_QA_BASE_URL");
+        std::env::remove_var("IA_AI_QA_API_KEY");
+        std::env::remove_var("IA_AI_QA_MODEL");
+        std::env::remove_var("IA_AI_QA_PROVIDER");
+
+        let qa = config.ai_qa.unwrap();
+        assert_eq!(qa.base_url.as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(qa.api_key.as_deref(), Some("qa-env-key"));
+        assert_eq!(qa.model.as_deref(), Some("qa-env-model"));
+        assert_eq!(qa.provider, Some(Provider::Anthropic));
+    }
+
+    #[test]
+    fn to_json_includes_ai_qa() {
+        let mut config = IaConfig::default();
+        config.ai_qa = Some(AiConfigOverlay {
+            model: Some("claude-sonnet-4-6".into()),
+            base_url: Some("https://api.anthropic.com".into()),
+            api_key: Some("secret-key".into()),
+            provider: Some(Provider::Anthropic),
+            ..AiConfigOverlay::default()
+        });
+
+        let json = config.to_json(false);
+        let qa = json["ai-qa"].as_object().unwrap();
+        assert_eq!(qa["model"], "claude-sonnet-4-6");
+        assert_eq!(qa["base_url"], "https://api.anthropic.com");
+        assert_eq!(qa["api_key"], "REDACTED");
+        assert_eq!(qa["provider"], "anthropic");
+
+        // With secrets shown
+        let json = config.to_json(true);
+        let qa = json["ai-qa"].as_object().unwrap();
+        assert_eq!(qa["api_key"], "secret-key");
     }
 
     #[test]

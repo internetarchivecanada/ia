@@ -21,6 +21,7 @@ console = "0.15"
 comfy-table = "7.1"
 libc = "0.2"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 urlencoding = "2"
 chrono = "0.4"
@@ -29,12 +30,16 @@ color-print = "0.3"
 rpassword = "5"
 tempfile = "3"
 rust_xlsxwriter = "0.79"
+globset = "0.4"
+indexmap = "2"
 
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:open"]
 self-update = []
-alpha = []
+alpha = ["ai-qa"]
+ai-qa = []
+ai-analyze = []
 
 [dependencies.ratatui]
 version = "0.30"

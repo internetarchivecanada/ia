@@ -43,13 +43,14 @@ use crate::output::DownloadDisplay;
 )]
 pub struct DownloadArgs {
     /// Item identifier to download
+    #[arg(conflicts_with_all = ["itemlist", "search"])]
     pub identifier: Option<String>,
 
     /// Specific file(s) to download from the item
     pub files: Vec<String>,
 
     /// File containing item identifiers (one per line)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["identifier", "search"])]
     itemlist: Option<PathBuf>,
 
     /// Filter files by glob pattern (pipe-separated: "*.mp4|*.webm")
@@ -97,7 +98,7 @@ pub struct DownloadArgs {
     dry_run: bool,
 
     /// Download items matching a search query (downloads each result)
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, conflicts_with_all = ["identifier", "itemlist"])]
     search: Option<String>,
 
     /// Extra search parameters (key:value or key=value, repeatable)
@@ -115,6 +116,18 @@ pub struct DownloadArgs {
     /// Output results as JSON (one object per line)
     #[arg(long)]
     pub json: bool,
+
+    /// List files inside a ZIP archive (e.g., "item_jp2.zip")
+    #[arg(long, value_name = "ZIPFILE")]
+    pub zip_list: Option<String>,
+
+    /// Download a file from inside a ZIP archive (e.g., "item_jp2.zip/item_jp2/item_0001.jp2")
+    #[arg(long, value_name = "ZIPFILE/MEMBER")]
+    pub zip_member: Option<String>,
+
+    /// Convert format when downloading a zip member (e.g., "jpg" to convert JP2 → JPEG)
+    #[arg(long, value_name = "EXT", requires = "zip_member")]
+    pub zip_convert: Option<String>,
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -206,6 +219,11 @@ pub async fn run(
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
+    }
+
+    // Handle zip-specific operations early (these don't go through the normal download path)
+    if args.zip_list.is_some() || args.zip_member.is_some() {
+        return run_zip(client, &args, quiet).await;
     }
 
     // ─── Shared setup ───────────────────────────────────────────────────
@@ -1080,5 +1098,208 @@ mod tests {
         assert_eq!(v["status"], "error");
         assert_eq!(v["error"]["code"], "not_found");
         assert!(v["error"]["message"].as_str().unwrap().contains("broken"));
+    }
+}
+
+// ─── Zip operations ──────────────────────────────────────────────────────────
+
+/// Handle zip-specific operations: --zip-list and --zip-member.
+async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()> {
+    let identifier = args
+        .identifier
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("identifier required for zip operations"))?;
+
+    if let Some(ref zip_filename) = args.zip_list {
+        // List contents of a zip file
+        let all_entries =
+            ia_core::download::zip::list_zip_contents(client, identifier, zip_filename)
+                .await
+                .context(format!(
+                    "failed to list zip {zip_filename} for {identifier}"
+                ))?;
+
+        // Apply glob/exclude filters if present
+        let entries: Vec<_> = {
+            use globset::Glob;
+            let glob_matchers = args.glob.as_ref().map(|g| {
+                g.split('|')
+                    .filter_map(|p| Glob::new(p.trim()).ok().map(|g| g.compile_matcher()))
+                    .collect::<Vec<_>>()
+            });
+            let exclude_matchers = args.exclude.as_ref().map(|g| {
+                g.split('|')
+                    .filter_map(|p| Glob::new(p.trim()).ok().map(|g| g.compile_matcher()))
+                    .collect::<Vec<_>>()
+            });
+
+            all_entries
+                .into_iter()
+                .filter(|e| {
+                    if let Some(ref matchers) = glob_matchers {
+                        if !matchers.iter().any(|m| m.is_match(&e.path)) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref matchers) = exclude_matchers {
+                        if matchers.iter().any(|m| m.is_match(&e.path)) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect()
+        };
+
+        if args.json {
+            for entry in &entries {
+                let obj = serde_json::json!({
+                    "path": entry.path,
+                    "size": entry.size,
+                    "modified": entry.modified,
+                });
+                println!("{}", serde_json::to_string(&obj)?);
+            }
+        } else {
+            if quiet == 0 {
+                eprintln!(
+                    "{} {} entries in {}/{}",
+                    style("●").cyan(),
+                    entries.len(),
+                    identifier,
+                    zip_filename,
+                );
+            }
+            for entry in &entries {
+                if let Some(size) = entry.size {
+                    println!("{:>10}  {}", size, entry.path);
+                } else {
+                    println!("         -  {}", entry.path);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(ref zip_member_spec) = args.zip_member {
+        let (zip_filename, member_path) = parse_zip_member_spec(zip_member_spec)?;
+
+        let out_filename = if let Some(ref ext) = args.zip_convert {
+            let base = member_path.rsplit('/').next().unwrap_or(&member_path);
+            if let Some(dot) = base.rfind('.') {
+                format!("{}.{ext}", &base[..dot])
+            } else {
+                format!("{base}.{ext}")
+            }
+        } else {
+            member_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&member_path)
+                .to_string()
+        };
+
+        let dest = if args.destdir.is_empty() {
+            PathBuf::from(".")
+        } else {
+            args.destdir[0].clone()
+        };
+        let out_path = dest.join(&out_filename);
+
+        if args.dry_run {
+            if quiet == 0 {
+                eprintln!(
+                    "{} Would download {}/{}/{} → {}",
+                    style("●").cyan(),
+                    identifier,
+                    zip_filename,
+                    member_path,
+                    out_path.display(),
+                );
+            }
+            if args.json {
+                let obj = serde_json::json!({
+                    "identifier": identifier,
+                    "zip": zip_filename,
+                    "member": member_path,
+                    "output": out_path.display().to_string(),
+                    "dry_run": true,
+                });
+                println!("{}", serde_json::to_string(&obj)?);
+            }
+            return Ok(());
+        }
+
+        let data = if let Some(ref ext) = args.zip_convert {
+            ia_core::download::zip::download_zip_member_converted(
+                client,
+                identifier,
+                &zip_filename,
+                &member_path,
+                ext,
+            )
+            .await
+            .context(format!(
+                "failed to download {member_path} as {ext} from {zip_filename}"
+            ))?
+        } else {
+            ia_core::download::zip::download_zip_member(
+                client,
+                identifier,
+                &zip_filename,
+                &member_path,
+            )
+            .await
+            .context(format!(
+                "failed to download {member_path} from {zip_filename}"
+            ))?
+        };
+
+        tokio::fs::write(&out_path, &data)
+            .await
+            .context(format!("failed to write {}", out_path.display()))?;
+
+        if quiet == 0 && !args.json {
+            eprintln!(
+                "{} {} ({} bytes)",
+                style("✓").green(),
+                out_path.display(),
+                data.len(),
+            );
+        }
+        if args.json {
+            let obj = serde_json::json!({
+                "identifier": identifier,
+                "zip": zip_filename,
+                "member": member_path,
+                "output": out_path.display().to_string(),
+                "size": data.len(),
+            });
+            println!("{}", serde_json::to_string(&obj)?);
+        }
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Parse a "zipfile/member/path" spec into (zip_filename, member_path).
+///
+/// The zip filename is the first path segment that ends with `.zip`.
+/// Everything after is the member path.
+fn parse_zip_member_spec(spec: &str) -> Result<(String, String)> {
+    if let Some(zip_end) = spec.find(".zip/") {
+        let zip_filename = spec[..zip_end + 4].to_string();
+        let member_path = spec[zip_end + 5..].to_string();
+        if member_path.is_empty() {
+            bail!("no member path after zip filename in: {spec:?}");
+        }
+        Ok((zip_filename, member_path))
+    } else {
+        bail!(
+            "invalid zip member spec: {spec:?}\n\
+             Expected format: ZIPFILE.zip/member/path\n\
+             Example: item_jp2.zip/item_jp2/item_0001.jp2"
+        );
     }
 }

@@ -15,6 +15,7 @@ pub mod joblog;
 pub mod metadata;
 pub mod rate_limit;
 pub mod retry;
+pub mod scandata;
 pub mod search;
 pub mod spreadsheet;
 pub mod tasks;

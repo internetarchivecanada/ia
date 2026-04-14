@@ -1,3 +1,5 @@
+pub mod zip;
+
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -177,6 +179,120 @@ pub struct FileDownloadResult {
     pub elapsed: Duration,
 }
 
+/// Fetch a response from archive.org with auth, manual redirect following, and SSRF guard.
+///
+/// Handles:
+/// - LOW auth headers from S3 credentials
+/// - Manual redirect following with auth preservation (reqwest strips Authorization on redirect)
+/// - SSRF guard: only follows redirects to *.archive.org or the configured host
+/// - HTML error page stripping
+/// - Optional resume via Range header
+///
+/// Returns the raw response for callers to consume (stream to disk or collect to bytes).
+pub(crate) async fn fetch_response(
+    client: &IaClient,
+    url: &str,
+    resume_from: Option<u64>,
+) -> Result<reqwest::Response> {
+    // Build auth header if credentials are available.
+    let auth_value = client
+        .config()
+        .s3_access
+        .as_deref()
+        .zip(client.config().s3_secret.as_deref())
+        .map(|(access, secret)| format!("LOW {access}:{secret}"));
+
+    // Use the no-redirect client and follow redirects manually so the
+    // Authorization header is preserved. archive.org redirects /download/
+    // to data-node hosts (ia800XXX.us.archive.org), and reqwest strips
+    // Authorization on redirect by default.
+    let max_redirects = 10;
+    let mut current_url = url.to_string();
+    let mut resp = None;
+
+    for _ in 0..=max_redirects {
+        let mut req = client.no_redirect_http().get(&current_url);
+        if let Some(ref auth) = auth_value {
+            req = req.header("Authorization", auth);
+        }
+        if let Some(offset) = resume_from {
+            req = req.header("Range", format!("bytes={offset}-"));
+        }
+
+        let r = req
+            .send()
+            .await
+            .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
+
+        if r.status().is_redirection() {
+            let location = r
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| IaError::Http {
+                    status: r.status().as_u16(),
+                    message: "redirect without Location header".to_string(),
+                })?;
+
+            let base = reqwest::Url::parse(&current_url)
+                .map_err(|e| IaError::Config(format!("invalid download URL: {e}")))?;
+            let new_url = base
+                .join(location)
+                .map_err(|e| IaError::Config(format!("invalid redirect location: {e}")))?;
+
+            // Only follow redirects to *.archive.org (SSRF guard).
+            // Also allow the configured host so tests with wiremock work.
+            let config_host = client.host();
+            match new_url.host_str() {
+                Some(host)
+                    if host == "archive.org"
+                        || host.ends_with(".archive.org")
+                        || new_url.authority() == config_host =>
+                {
+                    debug!(location = %new_url, "following redirect");
+                    current_url = new_url.to_string();
+                    continue;
+                }
+                _ => {
+                    return Err(IaError::Http {
+                        status: r.status().as_u16(),
+                        message: format!("redirect to non-archive.org domain: {new_url}"),
+                    });
+                }
+            }
+        }
+
+        resp = Some(r);
+        break;
+    }
+
+    let response = resp.ok_or_else(|| IaError::Http {
+        status: 0,
+        message: "too many redirects".to_string(),
+    })?;
+
+    let status = response.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        let body = response.text().await.unwrap_or_default();
+        // IA often returns full HTML error pages (e.g. "Item not available").
+        // Strip HTML and use the canonical reason phrase instead.
+        let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
+            status
+                .canonical_reason()
+                .unwrap_or("unknown error")
+                .to_string()
+        } else {
+            body
+        };
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message,
+        });
+    }
+
+    Ok(response)
+}
+
 /// Download a single file from an item.
 pub async fn download_file(
     client: &IaClient,
@@ -285,14 +401,6 @@ pub async fn download_file(
         Err(_) => None,
     };
 
-    // Build auth header if credentials are available.
-    let auth_value = client
-        .config()
-        .s3_access
-        .as_deref()
-        .zip(client.config().s3_secret.as_deref())
-        .map(|(access, secret)| format!("LOW {access}:{secret}"));
-
     if let Some(p) = progress {
         p(DownloadProgress {
             identifier: identifier.to_string(),
@@ -303,100 +411,8 @@ pub async fn download_file(
         });
     }
 
-    // Use the no-redirect client and follow redirects manually so the
-    // Authorization header is preserved. archive.org redirects /download/
-    // to data-node hosts (ia800XXX.us.archive.org), and reqwest strips
-    // Authorization on redirect by default. This is the equivalent of
-    // curl's --location-trusted flag.
-    let response = {
-        let max_redirects = 10;
-        let mut current_url = url;
-        let mut resp = None;
-
-        for _ in 0..=max_redirects {
-            let mut req = client.no_redirect_http().get(&current_url);
-            if let Some(ref auth) = auth_value {
-                req = req.header("Authorization", auth);
-            }
-            if let Some(offset) = resume_from {
-                debug!(file = %file.name, offset, "resuming download");
-                req = req.header("Range", format!("bytes={offset}-"));
-            }
-
-            let r = req.send().await.map_err(|e| {
-                // Wrap raw reqwest::Error into the middleware error type
-                // so it converts to IaError::Network (which is retryable).
-                IaError::Network(reqwest_middleware::Error::Reqwest(e))
-            })?;
-
-            if r.status().is_redirection() {
-                let location = r
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| IaError::Http {
-                        status: r.status().as_u16(),
-                        message: "redirect without Location header".to_string(),
-                    })?;
-
-                // Resolve relative URLs against the current URL.
-                let base = reqwest::Url::parse(&current_url)
-                    .map_err(|e| IaError::Config(format!("invalid download URL: {e}")))?;
-                let new_url = base
-                    .join(location)
-                    .map_err(|e| IaError::Config(format!("invalid redirect location: {e}")))?;
-
-                // Only follow redirects to *.archive.org (same SSRF guard
-                // as the main client's redirect policy). Also allow the
-                // configured host so tests with wiremock work correctly.
-                let config_host = client.host();
-                match new_url.host_str() {
-                    Some(host)
-                        if host == "archive.org"
-                            || host.ends_with(".archive.org")
-                            || new_url.authority() == config_host =>
-                    {
-                        debug!(file = %file.name, location = %new_url, "following redirect");
-                        current_url = new_url.to_string();
-                        continue;
-                    }
-                    _ => {
-                        return Err(IaError::Http {
-                            status: r.status().as_u16(),
-                            message: format!("redirect to non-archive.org domain: {new_url}"),
-                        });
-                    }
-                }
-            }
-
-            resp = Some(r);
-            break;
-        }
-
-        resp.ok_or_else(|| IaError::Http {
-            status: 0,
-            message: "too many redirects".to_string(),
-        })?
-    };
+    let response = fetch_response(client, &url, resume_from).await?;
     let status = response.status();
-
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        let body = response.text().await.unwrap_or_default();
-        // IA often returns full HTML error pages (e.g. "Item not available").
-        // Strip HTML and use the canonical reason phrase instead.
-        let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
-            status
-                .canonical_reason()
-                .unwrap_or("unknown error")
-                .to_string()
-        } else {
-            body
-        };
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message,
-        });
-    }
 
     // If we asked for a Range but got 200 (not 206), the server ignored our
     // Range header and is sending the full file.  Truncate the .part file so
