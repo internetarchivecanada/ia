@@ -91,7 +91,10 @@ mod tests {
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let item = get(&client, "test-item").await.unwrap();
 
-        assert_eq!(item.metadata.identifier.as_deref(), Some("test-item"));
+        assert_eq!(
+            item.metadata.identifier.as_ref().map(|v| v.first()),
+            Some("test-item")
+        );
         assert_eq!(item.files.len(), 1);
         assert_eq!(item.files[0].name, "test.pdf");
         assert_eq!(item.files[0].size, Some(1000));

@@ -49,7 +49,12 @@ pub struct AiRequestInfo {
 /// top-level field (with the same shape as `ExtractedMetadataResult`).
 /// This avoids a separate HTTP request to download the derivative file.
 pub fn extract_from_item(item: &ItemMetadata) -> Result<ExtractedMetadata> {
-    let identifier = item.metadata.identifier.as_deref().unwrap_or("<unknown>");
+    let identifier = item
+        .metadata
+        .identifier
+        .as_ref()
+        .map(|v| v.first())
+        .unwrap_or("<unknown>");
     let value = item
         .extra
         .get("extracted_metadata")
@@ -134,7 +139,7 @@ mod tests {
     ) -> ItemMetadata {
         ItemMetadata {
             metadata: crate::types::MetadataFields {
-                identifier: Some(identifier.to_string()),
+                identifier: Some(crate::types::MetadataValue::Single(identifier.to_string())),
                 ..Default::default()
             },
             files: vec![],
