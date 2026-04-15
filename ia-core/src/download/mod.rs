@@ -2040,7 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_item_with_metadata_skips_metadata_fetch() {
-        use crate::types::{ItemMetadata, MetadataFields};
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
 
         let mock_server = MockServer::start().await;
 
@@ -2058,7 +2058,7 @@ mod tests {
 
         let item = ItemMetadata {
             metadata: MetadataFields {
-                identifier: Some("pre-meta".to_string()),
+                identifier: Some(MetadataValue::Single("pre-meta".to_string())),
                 ..Default::default()
             },
             files: vec![test_file_meta("x.txt", 5), test_file_meta("y.txt", 5)],
@@ -2153,7 +2153,7 @@ mod tests {
         // The actual disk-full propagation is tested end-to-end in the CLI
         // integration tests (download_search_list.rs). Here we test the
         // cleanup_item_dir + collect_batch_results plumbing.
-        use crate::types::{ItemMetadata, MetadataFields};
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
 
         let mock_server = MockServer::start().await;
 
@@ -2171,7 +2171,7 @@ mod tests {
 
         let item = ItemMetadata {
             metadata: MetadataFields {
-                identifier: Some("disk-test".to_string()),
+                identifier: Some(MetadataValue::Single("disk-test".to_string())),
                 ..Default::default()
             },
             files: vec![test_file_meta("big.txt", 1024)],

@@ -1,7 +1,9 @@
+pub mod audit;
 mod read;
 pub mod schema;
 pub mod write;
 
+pub use audit::{audit_item, AuditResult, Finding, FindingKind, Severity};
 pub use read::{exists, get};
 pub use schema::{fetch_schema, SchemaData, SchemaField};
 pub use write::{

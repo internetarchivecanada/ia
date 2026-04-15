@@ -41,49 +41,85 @@ pub struct ItemMetadata {
 }
 
 /// Item-level metadata fields.
-/// Uses a mix of typed common fields and a catch-all HashMap.
+///
+/// All fields use [`MetadataValue`] so deserialization never fails regardless
+/// of what the API returns. Use `.first()` for convenient string access,
+/// `.is_other()` to detect unexpected types, and `.as_value()` for raw access.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MetadataFields {
-    pub identifier: Option<String>,
-    pub title: Option<StringOrVec>,
-    pub description: Option<StringOrVec>,
-    pub mediatype: Option<String>,
-    pub collection: Option<StringOrVec>,
-    pub creator: Option<StringOrVec>,
-    pub date: Option<String>,
-    pub subject: Option<StringOrVec>,
-    pub language: Option<StringOrVec>,
-    pub publicdate: Option<String>,
-    pub addeddate: Option<String>,
-    pub uploader: Option<String>,
+    pub identifier: Option<MetadataValue>,
+    pub title: Option<MetadataValue>,
+    pub description: Option<MetadataValue>,
+    pub mediatype: Option<MetadataValue>,
+    pub collection: Option<MetadataValue>,
+    pub creator: Option<MetadataValue>,
+    pub date: Option<MetadataValue>,
+    pub subject: Option<MetadataValue>,
+    pub language: Option<MetadataValue>,
+    pub publicdate: Option<MetadataValue>,
+    pub addeddate: Option<MetadataValue>,
+    pub uploader: Option<MetadataValue>,
 
     /// All other metadata fields not captured above.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// IA metadata fields can be a single string or a vec of strings.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// A metadata field value that accepts any JSON type without failing.
+///
+/// IA metadata is schemaless — any field can be a string, array of strings,
+/// number, object, or anything else. `MetadataValue` tries variants in order:
+/// `Single(String)` first, then `Multiple(Vec<String>)`, then `Other(Value)`
+/// as a catch-all. Deserialization **cannot fail**.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum StringOrVec {
+pub enum MetadataValue {
+    /// A single string value (the most common case).
     Single(String),
+    /// An array of strings (e.g., multiple collections, subjects).
     Multiple(Vec<String>),
+    /// Any other JSON value (number, object, mixed array, etc.).
+    /// Present but not in an expected string form.
+    Other(serde_json::Value),
 }
 
-impl StringOrVec {
-    /// Get the first value (or only value).
+/// Backward-compatibility alias.
+pub type StringOrVec = MetadataValue;
+
+impl MetadataValue {
+    /// Get the first string value, or `""` for non-string types.
     pub fn first(&self) -> &str {
         match self {
-            StringOrVec::Single(s) => s,
-            StringOrVec::Multiple(v) => v.first().map(|s| s.as_str()).unwrap_or(""),
+            MetadataValue::Single(s) => s,
+            MetadataValue::Multiple(v) => v.first().map(|s| s.as_str()).unwrap_or(""),
+            MetadataValue::Other(_) => "",
         }
     }
 
-    /// Get all values as a vec.
+    /// Get all values as strings, or `[]` for non-string types.
     pub fn to_vec(&self) -> Vec<&str> {
         match self {
-            StringOrVec::Single(s) => vec![s.as_str()],
-            StringOrVec::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
+            MetadataValue::Single(s) => vec![s.as_str()],
+            MetadataValue::Multiple(v) => v.iter().map(|s| s.as_str()).collect(),
+            MetadataValue::Other(_) => vec![],
+        }
+    }
+
+    /// True if the value didn't match `String` or `Vec<String>`.
+    pub fn is_other(&self) -> bool {
+        matches!(self, MetadataValue::Other(_))
+    }
+
+    /// Get the underlying `serde_json::Value` for any variant.
+    pub fn as_value(&self) -> serde_json::Value {
+        match self {
+            MetadataValue::Single(s) => serde_json::Value::String(s.clone()),
+            MetadataValue::Multiple(v) => serde_json::Value::Array(
+                v.iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+            MetadataValue::Other(v) => v.clone(),
         }
     }
 }
@@ -207,7 +243,10 @@ mod tests {
         }"#;
 
         let item: ItemMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(item.metadata.identifier.as_deref(), Some("nasa"));
+        assert_eq!(
+            item.metadata.identifier.as_ref().map(|v| v.first()),
+            Some("nasa")
+        );
         assert_eq!(item.metadata.title.as_ref().unwrap().first(), "NASA Images");
         assert_eq!(item.files.len(), 2);
         assert_eq!(item.files[0].name, "photo.jpg");
@@ -218,19 +257,70 @@ mod tests {
     }
 
     #[test]
-    fn string_or_vec_single() {
+    fn metadata_value_single() {
         let json = r#""hello""#;
-        let v: StringOrVec = serde_json::from_str(json).unwrap();
+        let v: MetadataValue = serde_json::from_str(json).unwrap();
         assert_eq!(v.first(), "hello");
         assert_eq!(v.to_vec(), vec!["hello"]);
+        assert!(!v.is_other());
     }
 
     #[test]
-    fn string_or_vec_multiple() {
+    fn metadata_value_multiple() {
         let json = r#"["a", "b", "c"]"#;
-        let v: StringOrVec = serde_json::from_str(json).unwrap();
+        let v: MetadataValue = serde_json::from_str(json).unwrap();
         assert_eq!(v.first(), "a");
         assert_eq!(v.to_vec(), vec!["a", "b", "c"]);
+        assert!(!v.is_other());
+    }
+
+    #[test]
+    fn metadata_value_number_falls_through_to_other() {
+        let json = "42";
+        let v: MetadataValue = serde_json::from_str(json).unwrap();
+        assert!(v.is_other());
+        assert_eq!(v.first(), "");
+        assert!(v.to_vec().is_empty());
+        assert_eq!(v.as_value(), serde_json::json!(42));
+    }
+
+    #[test]
+    fn metadata_value_object_falls_through_to_other() {
+        let json = r#"{"nested": "object"}"#;
+        let v: MetadataValue = serde_json::from_str(json).unwrap();
+        assert!(v.is_other());
+        assert_eq!(v.as_value(), serde_json::json!({"nested": "object"}));
+    }
+
+    #[test]
+    fn metadata_value_mixed_array_falls_through_to_other() {
+        let json = r#"[1, "two", 3]"#;
+        let v: MetadataValue = serde_json::from_str(json).unwrap();
+        assert!(v.is_other());
+        assert_eq!(v.as_value(), serde_json::json!([1, "two", 3]));
+    }
+
+    #[test]
+    fn metadata_value_as_value_roundtrip() {
+        let single: MetadataValue = serde_json::from_str(r#""hello""#).unwrap();
+        assert_eq!(single.as_value(), serde_json::json!("hello"));
+
+        let multi: MetadataValue = serde_json::from_str(r#"["a", "b"]"#).unwrap();
+        assert_eq!(multi.as_value(), serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn metadata_value_bool_falls_through_to_other() {
+        let v: MetadataValue = serde_json::from_str("true").unwrap();
+        assert!(v.is_other());
+        assert_eq!(v.as_value(), serde_json::json!(true));
+    }
+
+    #[test]
+    fn metadata_value_null_falls_through_to_other() {
+        let v: MetadataValue = serde_json::from_str("null").unwrap();
+        assert!(v.is_other());
+        assert_eq!(v.as_value(), serde_json::json!(null));
     }
 
     #[test]
@@ -252,6 +342,38 @@ mod tests {
         let json = r#"{"name": "test.txt"}"#;
         let f: FileMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(f.size, None);
+    }
+
+    #[test]
+    fn date_as_string() {
+        let json = r#"{"date": "2004"}"#;
+        let m: MetadataFields = serde_json::from_str(json).unwrap();
+        assert_eq!(m.date.as_ref().unwrap().first(), "2004");
+        assert!(!m.date.as_ref().unwrap().is_other());
+    }
+
+    #[test]
+    fn date_as_array_no_longer_crashes() {
+        let json = r#"{"date": ["2004", "December 6, 2004", "December 6, 2004"]}"#;
+        let m: MetadataFields = serde_json::from_str(json).unwrap();
+        let date = m.date.unwrap();
+        assert_eq!(date.first(), "2004");
+        assert_eq!(
+            date.to_vec(),
+            vec!["2004", "December 6, 2004", "December 6, 2004"]
+        );
+        assert!(!date.is_other());
+    }
+
+    #[test]
+    fn unexpected_field_type_preserved_in_other() {
+        let json = r#"{"identifier": "test", "mediatype": 42}"#;
+        let m: MetadataFields = serde_json::from_str(json).unwrap();
+        assert_eq!(m.identifier.as_ref().unwrap().first(), "test");
+        // mediatype is a number — lands in Other, not a crash
+        let mt = m.mediatype.unwrap();
+        assert!(mt.is_other());
+        assert_eq!(mt.as_value(), serde_json::json!(42));
     }
 
     #[test]

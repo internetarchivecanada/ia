@@ -26,7 +26,9 @@ use ia_core::metadata::write::{
     extract_target_metadata, parse_indexed_key, parse_key_value, ChangeGroup,
     CompoundModifyRequest, MetadataOp, ADMIN_ONLY_FIELDS, IMMUTABLE_FIELDS,
 };
-use ia_core::metadata::{fetch_schema, SchemaField};
+use ia_core::metadata::{
+    audit_item, fetch_schema, AuditResult, FindingKind, SchemaField, Severity,
+};
 use ia_core::rate_limit::RateLimiter;
 use ia_core::search::SearchOpts;
 use ia_core::{IaClient, IaError};
@@ -233,6 +235,24 @@ pub enum MetadataCommand {
     #[command(hide = true)]
     Import(ImportArgs),
 
+    /// Audit metadata against the IA schema
+    #[command(
+        long_about = "Audit item metadata against the Internet Archive metadata schema. \
+            Reports type mismatches, missing required fields, deprecated fields, \
+            and repeatability violations.\n\n\
+            Fetches the live schema from archive.org and compares each item's \
+            metadata against it.",
+        after_long_help = cstr!(
+            "<bold><underline>Examples:</underline></bold>\n\
+             \n  <dim># Audit a single item</dim>\n  <bold>$ ia metadata audit myitem</bold>\
+             \n\n  <dim># Audit items from a list</dim>\n  <bold>$ ia metadata audit --itemlist ids.txt</bold>\
+             \n\n  <dim># Audit search results</dim>\n  <bold>$ ia metadata audit --search \"collection:test\"</bold>\
+             \n\n  <dim># Only check specific fields</dim>\n  <bold>$ ia metadata audit myitem --field date --field collection</bold>\
+             \n\n  <dim># Machine-readable output</dim>\n  <bold>$ ia metadata audit myitem --json</bold>\n"
+        ),
+    )]
+    Audit(AuditArgs),
+
     /// Look up Internet Archive metadata field definitions
     #[command(
         long_about = "Look up Internet Archive metadata field definitions. Shows a table of \
@@ -350,6 +370,28 @@ pub struct SchemaArgs {
     pub edit_access: Option<EditAccessFilter>,
 
     /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AuditArgs {
+    #[command(flatten)]
+    pub input: BatchInput,
+
+    /// Output file (format inferred from extension: .csv, .tsv, .xlsx, .jsonl)
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
+
+    /// Only check specific field(s) (repeatable)
+    #[arg(long)]
+    pub field: Vec<String>,
+
+    /// Only report missing required fields
+    #[arg(long)]
+    pub required_only: bool,
+
+    /// Output as JSONL
     #[arg(long)]
     pub json: bool,
 }
@@ -578,6 +620,12 @@ pub async fn run(
             .await
         }
         Some(MetadataCommand::Import(_)) => unreachable!("handled above"),
+        Some(MetadataCommand::Audit(sub)) => {
+            if continuations.is_some() {
+                bail!("compound operations (+) cannot be used with audit");
+            }
+            run_audit(client, sub, ctx.quiet, jobs).await
+        }
         Some(MetadataCommand::Schema(sub)) => {
             if continuations.is_some() {
                 bail!("compound operations (+) cannot be used with schema");
@@ -1019,6 +1067,263 @@ async fn run_schema(client: &IaClient, args: SchemaArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─── Audit ──────────────────────────────────────────────────────────────────
+
+/// Severity icon for terminal output.
+fn severity_icon(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Error => "✗",
+        Severity::Warning => "⚠",
+        Severity::Info => "ℹ",
+    }
+}
+
+/// Style a severity icon with color.
+fn styled_severity(severity: &Severity) -> console::StyledObject<&'static str> {
+    match severity {
+        Severity::Error => style(severity_icon(severity)).red().bold(),
+        Severity::Warning => style(severity_icon(severity)).yellow(),
+        Severity::Info => style(severity_icon(severity)).dim(),
+    }
+}
+
+async fn run_audit(
+    client: &IaClient,
+    args: AuditArgs,
+    quiet: u8,
+    jobs: Option<usize>,
+) -> Result<()> {
+    let identifiers = collect_identifiers_from_batch(&args.input, client).await?;
+    if identifiers.is_empty() {
+        bail!(
+            "No input provided. Pass identifiers, --search, or pipe via stdin.\n\
+             Examples:\n  \
+             ia metadata audit myitem\n  \
+             ia metadata audit --search \"collection:test\"\n  \
+             ia metadata audit --itemlist ids.txt"
+        );
+    }
+
+    // Fetch schema once.
+    let schema_data = fetch_schema(client)
+        .await
+        .context("failed to fetch metadata schema")?;
+    let schema = &schema_data.metadata_schema;
+
+    let total = identifiers.len();
+    let client = Arc::new(client.clone());
+    let concurrency = jobs.unwrap_or(10).max(1);
+
+    // Progress bar for batch operations.
+    let pb = if quiet == 0 && total > 1 {
+        let pb = ProgressBar::new(total as u64);
+        pb.set_style(
+            ProgressStyle::with_template(&format!(
+                "Auditing metadata...\n  {{bar:{BAR_WIDTH}.cyan/dim}} {{pos}}/{{len}} {{per_sec:.dim}}  ({{elapsed}} elapsed)",
+            ))
+            .unwrap()
+            .progress_chars(PROGRESS_CHARS),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Concurrent fetch + audit.
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<AuditResult, (String, String)>>(64);
+
+    let feeder_client = client.clone();
+    let field_filter: Arc<Vec<String>> = Arc::new(args.field.clone());
+    let required_only = args.required_only;
+    let schema_arc: Arc<Vec<SchemaField>> = Arc::new(schema.clone());
+
+    let feeder = tokio::spawn(async move {
+        for identifier in identifiers {
+            let permit = Arc::clone(&sem).acquire_owned().await.unwrap();
+            let client = feeder_client.clone();
+            let tx = tx.clone();
+            let schema = schema_arc.clone();
+            let field_filter = field_filter.clone();
+
+            tokio::spawn(async move {
+                let result = match client.get_item(&identifier).await {
+                    Ok(item) => {
+                        let mut audit = audit_item(&identifier, &item.metadata, &schema);
+
+                        // Apply field filter.
+                        if !field_filter.is_empty() {
+                            audit.findings.retain(|f| field_filter.contains(&f.field));
+                        }
+
+                        // Apply required-only filter.
+                        if required_only {
+                            audit
+                                .findings
+                                .retain(|f| f.kind == FindingKind::MissingRequired);
+                        }
+
+                        Ok(audit)
+                    }
+                    Err(e) => Err((identifier, format!("{e:#}"))),
+                };
+
+                drop(permit);
+                let _ = tx.send(result).await;
+            });
+        }
+    });
+
+    // Collect results.
+    let mut results: Vec<AuditResult> = Vec::new();
+    let mut fetch_errors: Vec<(String, String)> = Vec::new();
+    let mut items_with_findings = 0usize;
+    let mut error_count = 0usize;
+    let mut warning_count = 0usize;
+
+    while let Some(result) = rx.recv().await {
+        if let Some(ref pb) = pb {
+            pb.inc(1);
+        }
+
+        match result {
+            Ok(audit) => {
+                if !audit.is_clean() {
+                    items_with_findings += 1;
+                    error_count += audit.count(&Severity::Error);
+                    warning_count += audit.count(&Severity::Warning);
+                }
+                results.push(audit);
+            }
+            Err((id, msg)) => {
+                fetch_errors.push((id, msg));
+            }
+        }
+    }
+
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    feeder.await?;
+
+    // Sort results by identifier for deterministic output.
+    results.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+
+    // Output.
+    if let Some(ref path) = args.output {
+        write_audit_file(path, &results, &fetch_errors)?;
+    }
+
+    if args.json && args.output.is_none() {
+        // JSONL to stdout.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for result in &results {
+            serde_json::to_writer(&mut out, result)?;
+            writeln!(out)?;
+        }
+        for (id, msg) in &fetch_errors {
+            serde_json::to_writer(
+                &mut out,
+                &json!({
+                    "identifier": id,
+                    "error": msg,
+                }),
+            )?;
+            writeln!(out)?;
+        }
+    } else if args.output.is_none() {
+        // Terminal output.
+        for result in &results {
+            if result.is_clean() {
+                continue;
+            }
+            eprintln!("{}", style(&result.identifier).bold());
+            for finding in &result.findings {
+                eprintln!(
+                    "  {} {}: {}",
+                    styled_severity(&finding.severity),
+                    style(&finding.field).cyan(),
+                    finding.message
+                );
+            }
+            eprintln!();
+        }
+
+        for (id, msg) in &fetch_errors {
+            eprintln!("{} {} — {}", style(ICON_ERROR).red(), style(id).bold(), msg);
+        }
+    }
+
+    // Summary.
+    if quiet < 2 && total > 1 {
+        eprintln!("{}", style("─".repeat(48)).dim());
+        eprint!(
+            "{} item(s) audited",
+            style(results.len() + fetch_errors.len()).bold(),
+        );
+        if items_with_findings > 0 {
+            eprint!(
+                " · {} with findings ({} errors, {} warnings)",
+                style(items_with_findings).yellow(),
+                style(error_count).red(),
+                style(warning_count).yellow(),
+            );
+        } else if fetch_errors.is_empty() {
+            eprint!(" · {}", style("all clean").green());
+        }
+        if !fetch_errors.is_empty() {
+            eprint!(" · {} fetch error(s)", style(fetch_errors.len()).red(),);
+        }
+        eprintln!();
+        if let Some(ref path) = args.output {
+            eprintln!("  {}", style(path.display()).dim());
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert audit results to spreadsheet records for file output.
+///
+/// Each finding becomes one row: identifier + {field, severity, message}.
+/// This reuses `ia_core::spreadsheet::write_spreadsheet` which handles
+/// CSV, TSV, XLSX, and JSONL output.
+fn write_audit_file(
+    path: &Path,
+    results: &[AuditResult],
+    fetch_errors: &[(String, String)],
+) -> Result<()> {
+    let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
+
+    for result in results {
+        for finding in &result.findings {
+            let sev = match finding.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            };
+            let mut fields = HashMap::new();
+            fields.insert("field".to_string(), finding.field.clone());
+            fields.insert("severity".to_string(), sev.to_string());
+            fields.insert("message".to_string(), finding.message.clone());
+            records.push((result.identifier.clone(), fields));
+        }
+    }
+
+    for (id, msg) in fetch_errors {
+        let mut fields = HashMap::new();
+        fields.insert("field".to_string(), String::new());
+        fields.insert("severity".to_string(), "error".to_string());
+        fields.insert("message".to_string(), msg.clone());
+        records.push((id.clone(), fields));
+    }
+
+    ia_core::spreadsheet::write_spreadsheet(path, &records)
+        .context(format!("failed to write audit file: {}", path.display()))
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────

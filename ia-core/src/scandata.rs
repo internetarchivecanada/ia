@@ -67,7 +67,12 @@ pub fn find_scandata_file(identifier: &str, files: &[FileMetadata]) -> Option<St
 
 /// Convenience: find scandata file from an `ItemMetadata`.
 pub fn find_scandata_file_from_item(item: &ItemMetadata) -> Option<String> {
-    let identifier = item.metadata.identifier.as_deref().unwrap_or_default();
+    let identifier = item
+        .metadata
+        .identifier
+        .as_ref()
+        .map(|v| v.first())
+        .unwrap_or_default();
     find_scandata_file(identifier, &item.files)
 }
 
