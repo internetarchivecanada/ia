@@ -424,12 +424,10 @@ pub fn ai_summarize(entries: &[JoblogEntry]) -> Option<AiSummary> {
                 }
                 _ => {}
             },
-            "ai-undo" => {
-                if entry.status == "ok" {
-                    summary.undos += 1;
-                    if let Some(ref changes) = entry.changes {
-                        summary.changes_reversed += changes.len();
-                    }
+            "ai-undo" if entry.status == "ok" => {
+                summary.undos += 1;
+                if let Some(ref changes) = entry.changes {
+                    summary.changes_reversed += changes.len();
                 }
             }
             _ => {}

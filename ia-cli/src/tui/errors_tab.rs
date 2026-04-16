@@ -111,7 +111,7 @@ impl TabView for ErrorsTab {
                 // Sort by count descending
                 let mut cat_vec: Vec<(String, usize)> =
                     cats.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-                cat_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                cat_vec.sort_by_key(|b| std::cmp::Reverse(b.1));
 
                 let hist = error_histogram(&s.error_timestamps, s.session_start);
                 let elapsed = s.session_start.elapsed();
