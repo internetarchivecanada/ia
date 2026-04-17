@@ -20,23 +20,10 @@ fn download_search_and_itemlist_conflict() {
         .stderr(predicate::str::contains("cannot be used with"));
 }
 
-#[test]
-fn download_identifier_and_search_conflict() {
-    ia_cmd()
-        .args(["download", "my-item", "--search", "collection:test"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-}
-
-#[test]
-fn download_identifier_and_itemlist_conflict() {
-    ia_cmd()
-        .args(["download", "my-item", "--itemlist", "ids.txt"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-}
+// Note: `download <name> --search <q>` and `download <name> --itemlist <p>`
+// are intentionally NOT conflicts. In batch mode the positional arg is
+// treated as a file name applied per item (with optional `{identifier}`
+// substitution). See download_search_with_identifier_template for coverage.
 
 #[test]
 fn metadata_modify_search_and_itemlist_conflict() {

@@ -37,20 +37,24 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Download specific files</dim>\n  <bold>$ ia download nasa NASAarchiveLogo.jpg</bold>\
          \n\n  <dim># Download only MP4 files</dim>\n  <bold>$ ia download nasa --glob \"*.mp4\"</bold>\
          \n\n  <dim># Batch download from a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\
+         \n\n  <dim># Batch download specific files per item via {identifier} template</dim>\n  <bold>$ ia download --search \"collection:us-supreme-court\" '{identifier}.pdf' '{identifier}_meta.xml'</bold>\
          \n\n  <dim># Batch download from piped identifiers</dim>\n  <bold>$ ia search -q collection:nasa --json | ia download</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
 pub struct DownloadArgs {
-    /// Item identifier to download
-    #[arg(conflicts_with_all = ["itemlist", "search"])]
+    /// Item identifier to download (single-item mode)
     pub identifier: Option<String>,
 
-    /// Specific file(s) to download from the item
+    /// File names to download from each item.
+    ///
+    /// In single-item mode (positional identifier): exact file names from that item.
+    /// In batch mode (--search / --itemlist / piped stdin): file names applied to
+    /// every item; supports `{identifier}` substitution, e.g. `'{identifier}.pdf'`.
     pub files: Vec<String>,
 
     /// File containing item identifiers (one per line)
-    #[arg(long, conflicts_with_all = ["identifier", "search"])]
+    #[arg(long, conflicts_with = "search")]
     itemlist: Option<PathBuf>,
 
     /// Filter files by glob pattern (pipe-separated: "*.mp4|*.webm")
@@ -98,7 +102,7 @@ pub struct DownloadArgs {
     dry_run: bool,
 
     /// Download items matching a search query (downloads each result)
-    #[arg(short = 's', long, conflicts_with_all = ["identifier", "itemlist"])]
+    #[arg(short = 's', long, conflicts_with = "itemlist")]
     search: Option<String>,
 
     /// Extra search parameters (key:value or key=value, repeatable)
@@ -163,14 +167,7 @@ fn search_opts_from_params(params: &[String]) -> Result<SearchOpts> {
 async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<Vec<String>> {
     let mut ids: Vec<String> = args.identifier.iter().cloned().collect();
 
-    if !args.files.is_empty() && ids.is_empty() {
-        bail!("file names require an identifier: ia download <identifier> <file> [file ...]");
-    }
-
     if let Some(path) = &args.itemlist {
-        if !args.files.is_empty() {
-            bail!("cannot combine file names with --itemlist (file names apply to a single item)");
-        }
         let content = std::fs::read_to_string(path)
             .context(format!("failed to read itemlist: {}", path.display()))?;
         for line in content.lines() {
@@ -207,18 +204,33 @@ async fn collect_identifiers(args: &DownloadArgs, client: &IaClient) -> Result<V
         }
     }
 
+    if !args.files.is_empty() && ids.is_empty() {
+        bail!(
+            "file names require an identifier source \
+             (positional, --search, --itemlist, or piped stdin)"
+        );
+    }
+
     Ok(ids)
 }
 
 pub async fn run(
     client: &IaClient,
-    args: DownloadArgs,
+    mut args: DownloadArgs,
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
+    }
+
+    // In batch mode (--search / --itemlist), positional args are file names per
+    // item, not identifiers. Clap parses positionals as identifier+files; merge
+    // the first positional back into `files` so downstream sees the right shape.
+    if (args.search.is_some() || args.itemlist.is_some()) && args.identifier.is_some() {
+        let ident = args.identifier.take().unwrap();
+        args.files.insert(0, ident);
     }
 
     // Handle zip-specific operations early (these don't go through the normal download path)
@@ -306,6 +318,9 @@ pub async fn run(
     if let Err(msg) = ia_core::files::validate_filter(&filter) {
         bail!("{msg}");
     }
+    if let Err(msg) = ia_core::files::validate_name_placeholders(&args.files) {
+        bail!("{msg}");
+    }
 
     let make_opts = |destdir: PathBuf| DownloadOpts {
         destdir,
@@ -320,11 +335,6 @@ pub async fn run(
     let opts = make_opts(base_destdir.clone());
 
     let semaphore = Arc::new(Semaphore::new(jobs));
-
-    // ─── Validate --search + file names ─────────────────────────────────
-    if args.search.is_some() && !args.files.is_empty() {
-        bail!("cannot combine file names with --search (file names apply to a single item)");
-    }
 
     // ─── Streaming search path ──────────────────────────────────────────
     // When --search is used without --dashboard, pipe search results
@@ -634,7 +644,9 @@ async fn download_batch_with_pool(
                     }
                 };
 
-                let files = ia_core::files::list(&item, &filter);
+                let mut item_filter = filter.clone();
+                item_filter.names = ia_core::files::substitute_names(&filter.names, &identifier);
+                let files = ia_core::files::list(&item, &item_filter);
                 let estimated_size = ia_core::files::total_size(&files);
 
                 // Assign item to a disk (brief lock)

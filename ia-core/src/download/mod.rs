@@ -650,8 +650,12 @@ pub async fn download_item_with_metadata(
 ) -> Result<ItemDownloadResult> {
     let start = std::time::Instant::now();
 
-    // Filter files
-    let files = crate::files::list(item, &opts.filter);
+    // Filter files. Substitute `{identifier}` per-item so positional file-name
+    // args like `'{identifier}.pdf'` work in batch/search/itemlist downloads.
+    // Idempotent: literal names and already-substituted names pass through.
+    let mut item_filter = opts.filter.clone();
+    item_filter.names = crate::files::substitute_names(&opts.filter.names, identifier);
+    let files = crate::files::list(item, &item_filter);
     let files_total = files.len();
 
     if files.is_empty() {
