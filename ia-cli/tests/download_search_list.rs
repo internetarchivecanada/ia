@@ -1183,12 +1183,111 @@ fn download_search_rejects_bad_parameter_format() {
         .stderr(predicates::str::contains("expected key:value or key=value"));
 }
 
-/// --search combined with file names should be rejected.
-/// Clap parses positionals as: first = identifier, rest = files.
-/// So `ia download --search 'q' myitem somefile.txt` puts "myitem" in
-/// identifier and "somefile.txt" in files — that's the case we reject.
+/// `--search` with positional file names downloads only those names per item.
+/// Supports `{identifier}` substitution so per-item filenames work in batch mode.
 #[tokio::test]
-async fn download_search_rejects_file_names() {
+async fn download_search_with_identifier_template() {
+    let mock_server = MockServer::start().await;
+
+    // Two items, each with a templated PDF/meta and a noise file we should skip.
+    Mock::given(method("POST"))
+        .and(path("/services/search/v1/scrape"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [
+                {"identifier": "tmpl-alpha"},
+                {"identifier": "tmpl-beta"}
+            ],
+            "count": 2,
+            "total": 2,
+            "cursor": ""
+        })))
+        .mount(&mock_server)
+        .await;
+
+    for id in ["tmpl-alpha", "tmpl-beta"] {
+        let pdf = format!("{id}.pdf");
+        let meta = format!("{id}_meta.xml");
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "metadata": {
+                    "identifier": id,
+                    "mediatype": "texts",
+                    "title": format!("Item {id}"),
+                    "collection": ["test"]
+                },
+                "files": [
+                    {"name": pdf, "source": "original", "format": "PDF",
+                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "mtime": "1700000000"},
+                    {"name": meta, "source": "original", "format": "Metadata",
+                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "mtime": "1700000000"},
+                    {"name": "noise.txt", "source": "original", "format": "Text",
+                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "mtime": "1700000000"}
+                ]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        for name in [pdf.as_str(), meta.as_str()] {
+            Mock::given(method("GET"))
+                .and(path(format!("/download/{id}/{name}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"hello")
+                        .insert_header("content-length", "5"),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+    }
+
+    let host = mock_server.uri().replace("http://", "");
+    let dir = TempDir::new().unwrap();
+
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "--search",
+            "collection:tmpl-test",
+            "{identifier}.pdf",
+            "{identifier}_meta.xml",
+            "--destdir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "templated search download should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for id in ["tmpl-alpha", "tmpl-beta"] {
+        assert!(
+            dir.path().join(id).join(format!("{id}.pdf")).exists(),
+            "{id}.pdf should be downloaded"
+        );
+        assert!(
+            dir.path().join(id).join(format!("{id}_meta.xml")).exists(),
+            "{id}_meta.xml should be downloaded"
+        );
+        assert!(
+            !dir.path().join(id).join("noise.txt").exists(),
+            "noise.txt should NOT be downloaded for {id}"
+        );
+    }
+}
+
+/// Unknown placeholders like `{foo}` must error before any work starts.
+#[tokio::test]
+async fn download_rejects_unknown_placeholder() {
     let mock_server = MockServer::start().await;
     let host = mock_server.uri().replace("http://", "");
 
@@ -1199,21 +1298,24 @@ async fn download_search_rejects_file_names() {
             &host,
             "download",
             "--search",
-            "collection:test",
-            "some-item",
-            "somefile.txt",
+            "collection:doesnt-matter",
+            "{foo}.pdf",
         ])
         .output()
         .unwrap();
 
     assert!(
         !output.status.success(),
-        "--search with file names should fail"
+        "unknown placeholder should fail fast"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot be used with") || stderr.contains("cannot combine"),
-        "should show conflict error, got: {stderr}"
+        stderr.contains("{foo}"),
+        "error should name the bad placeholder: {stderr}"
+    );
+    assert!(
+        stderr.contains("{identifier}"),
+        "error should list supported placeholders: {stderr}"
     );
 }

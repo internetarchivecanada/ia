@@ -42,6 +42,48 @@ pub fn validate_filter(filter: &FileFilter) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Placeholders recognized inside positional file-name args (e.g. `{identifier}.pdf`).
+///
+/// Add new entries here when expanding the template grammar.
+pub const KNOWN_NAME_PLACEHOLDERS: &[&str] = &["{identifier}"];
+
+/// Substitute supported placeholders in a list of file names with per-item values.
+///
+/// Currently supports `{identifier}`. Names without placeholders pass through
+/// unchanged, so callers may invoke this unconditionally.
+pub fn substitute_names(names: &[String], identifier: &str) -> Vec<String> {
+    names
+        .iter()
+        .map(|n| n.replace("{identifier}", identifier))
+        .collect()
+}
+
+/// Reject `{...}` placeholders that aren't in [`KNOWN_NAME_PLACEHOLDERS`].
+///
+/// Run this at the CLI boundary so a typo like `{ident}.pdf` fails loudly
+/// instead of silently producing an empty download.
+pub fn validate_name_placeholders(names: &[String]) -> std::result::Result<(), String> {
+    for name in names {
+        let mut rest = name.as_str();
+        while let Some(open) = rest.find('{') {
+            let after_open = &rest[open..];
+            let close = after_open
+                .find('}')
+                .ok_or_else(|| format!("unterminated `{{` placeholder in file name \"{name}\""))?;
+            let placeholder = &after_open[..=close];
+            if !KNOWN_NAME_PLACEHOLDERS.contains(&placeholder) {
+                return Err(format!(
+                    "unknown placeholder \"{placeholder}\" in file name \"{name}\" \
+                     (supported: {})",
+                    KNOWN_NAME_PLACEHOLDERS.join(", ")
+                ));
+            }
+            rest = &after_open[close + 1..];
+        }
+    }
+    Ok(())
+}
+
 /// List files from an item, applying filters.
 pub fn list<'a>(item: &'a ItemMetadata, filter: &FileFilter) -> Vec<&'a FileMetadata> {
     let glob_matcher = filter.glob.as_ref().and_then(|g| {
@@ -338,5 +380,69 @@ mod tests {
     #[test]
     fn validate_filter_accepts_empty() {
         assert!(validate_filter(&FileFilter::default()).is_ok());
+    }
+
+    #[test]
+    fn substitute_names_expands_identifier() {
+        let names = vec!["{identifier}.pdf".to_string()];
+        let out = substitute_names(&names, "scotus-12-345");
+        assert_eq!(out, vec!["scotus-12-345.pdf".to_string()]);
+    }
+
+    #[test]
+    fn substitute_names_passes_literals_unchanged() {
+        let names = vec!["README.md".to_string(), "data.json".to_string()];
+        let out = substitute_names(&names, "anything");
+        assert_eq!(out, names);
+    }
+
+    #[test]
+    fn substitute_names_replaces_multiple_occurrences() {
+        let names = vec!["{identifier}/{identifier}_meta.xml".to_string()];
+        let out = substitute_names(&names, "abc");
+        assert_eq!(out, vec!["abc/abc_meta.xml".to_string()]);
+    }
+
+    #[test]
+    fn substitute_names_is_idempotent_when_already_substituted() {
+        let once = substitute_names(&["{identifier}.pdf".to_string()], "abc");
+        let twice = substitute_names(&once, "different");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn validate_name_placeholders_accepts_known() {
+        let names = vec![
+            "{identifier}.pdf".to_string(),
+            "{identifier}_meta.xml".to_string(),
+            "literal.txt".to_string(),
+        ];
+        assert!(validate_name_placeholders(&names).is_ok());
+    }
+
+    #[test]
+    fn validate_name_placeholders_rejects_unknown() {
+        let names = vec!["{ident}.pdf".to_string()];
+        let err = validate_name_placeholders(&names).unwrap_err();
+        assert!(
+            err.contains("{ident}"),
+            "error should name the placeholder: {err}"
+        );
+        assert!(
+            err.contains("{identifier}"),
+            "error should list supported placeholders: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_name_placeholders_rejects_unterminated_brace() {
+        let names = vec!["{identifier.pdf".to_string()];
+        let err = validate_name_placeholders(&names).unwrap_err();
+        assert!(err.contains("unterminated"), "error: {err}");
+    }
+
+    #[test]
+    fn validate_name_placeholders_accepts_empty() {
+        assert!(validate_name_placeholders(&[]).is_ok());
     }
 }
