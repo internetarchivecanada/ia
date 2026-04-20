@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
     let client = ia_core::IaClient::from_config_with_verbosity(config, cli.verbose)?;
 
     // Default for commands that don't support adaptive concurrency.
-    let jobs = cli.jobs.unwrap_or(2);
+    let jobs = cli.jobs.unwrap_or(8);
 
     match cli.command {
         #[cfg(feature = "alpha")]
@@ -248,7 +248,8 @@ async fn main() -> Result<()> {
         }
         Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
         Commands::Download(args) => {
-            commands::download::run(&client, args, cli.quiet, jobs, cli.joblog).await?
+            commands::download::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume)
+                .await?
         }
         Commands::List(args) => commands::list::run(&client, args, cli.quiet).await?,
         Commands::Metadata(args) => {

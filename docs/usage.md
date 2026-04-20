@@ -45,7 +45,6 @@ ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 | `-R, --retries <N>` | Max retries per file (default: 5) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
-| `--items <N>` | Concurrent items for batch/search downloads (default: 2) |
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
@@ -64,8 +63,8 @@ ia download nasa --source original --format "MPEG4"
 # Download multiple items
 ia download item1 item2 item3
 
-# Batch download from a search query with 4 concurrent items
-ia download --search "collection:nasa AND mediatype:image" --items 4
+# Batch download from a search query with 16 parallel downloads
+ia download --search "collection:nasa AND mediatype:image" --jobs 16
 
 # Batch download from a file of identifiers
 ia download --itemlist items.txt
@@ -922,7 +921,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent file operations (default: 2) |
+| `-j, --jobs <N>` | Concurrent file operations (default: 8) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |

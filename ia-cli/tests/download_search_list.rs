@@ -77,6 +77,17 @@ fn download_no_identifier_and_no_search_errors() {
     ia_with_config(&cfg).arg("download").assert().failure();
 }
 
+/// `--items` was removed in favour of unifying on `--jobs`. Passing it should
+/// be rejected by clap (unknown argument), not silently ignored.
+#[test]
+fn download_items_flag_removed() {
+    ia_cmd()
+        .args(["download", "--items", "5", "some-item"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected").or(predicate::str::contains("unknown")));
+}
+
 #[tokio::test]
 async fn download_dry_run_shows_files() {
     let mock_server = MockServer::start().await;
