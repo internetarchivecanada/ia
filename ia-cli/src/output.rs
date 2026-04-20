@@ -1,7 +1,7 @@
 use console::{style, Color};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -54,6 +54,33 @@ fn format_speed(bytes: u64, elapsed_secs: f64) -> String {
         )
     } else {
         String::new()
+    }
+}
+
+/// Insert ASCII thousands separators: `1234567` -> `"1,234,567"`.
+fn format_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+/// Format a duration like `12s`, `4m12s`, `1h23m45s`. Zero → `"0s"`.
+fn format_elapsed(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -164,6 +191,45 @@ pub fn print_batch_summary(
     eprintln!("{:.1}s elapsed", summary.elapsed_secs);
 }
 
+/// Print a one-line HTTP diagnostics summary to stderr.
+///
+/// Shows request count, retries (429/5xx breakdown), and p50/p95 latency.
+/// Silent when the client made no requests. Useful for diagnosing whether
+/// "slow" is archive.org rate-limiting, bad data-nodes, or something else.
+pub fn print_http_diagnostics(stats: &ia_core::retry::RetryStats) {
+    let summary = stats.summary();
+    if summary.requests_total == 0 {
+        return;
+    }
+
+    let mut parts = vec![format!("{} requests", summary.requests_total)];
+    if summary.retries_total > 0 || summary.status_429_count > 0 || summary.status_5xx_count > 0 {
+        let mut detail = Vec::new();
+        if summary.status_429_count > 0 {
+            detail.push(format!("{}\u{00d7} 429", summary.status_429_count));
+        }
+        if summary.status_5xx_count > 0 {
+            detail.push(format!("{}\u{00d7} 5xx", summary.status_5xx_count));
+        }
+        let detail_str = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", detail.join(", "))
+        };
+        parts.push(format!("{} retries{}", summary.retries_total, detail_str));
+    }
+    if let Some(p) = stats.percentiles() {
+        parts.push(format!("p50 {} ms", p.p50_ms));
+        parts.push(format!("p95 {} ms", p.p95_ms));
+    }
+
+    eprintln!(
+        "{} {}",
+        style("HTTP:").dim(),
+        style(parts.join(" \u{00b7} ")).dim()
+    );
+}
+
 // ─── DownloadDisplay ────────────────────────────────────────────────────────
 
 /// Single-item download progress: one aggregate bar, no dynamic insertion.
@@ -197,6 +263,9 @@ impl DownloadDisplay {
 
     pub fn update(&self, progress: DownloadProgress) {
         match &progress.status {
+            DownloadStatus::Resolving => {
+                self.bar.set_message("resolving\u{2026}".to_string());
+            }
             DownloadStatus::Enumerated {
                 files_count,
                 bytes_total,
@@ -265,8 +334,17 @@ impl DownloadDisplay {
                     self.bar.set_message(msg);
                 }
             }
-            DownloadStatus::Verifying => {}
+            DownloadStatus::Verifying => {
+                self.bar
+                    .set_message(format!("verifying {}\u{2026}", progress.file_name));
+            }
         }
+    }
+
+    /// Clear the progress bar on cancellation. Caller is responsible for
+    /// any "Interrupted." marker printed to stderr.
+    pub fn finish_cancelled(&self) {
+        self.bar.finish_and_clear();
     }
 
     pub fn finish(&self, result: &ItemDownloadResult, destdir: &Path) {
@@ -307,8 +385,17 @@ pub struct BatchDisplay {
     batch_header: ProgressBar,
     bottom_sentinel: ProgressBar,
     active_item_bars: Mutex<HashMap<String, ItemBars>>,
-    #[allow(dead_code)]
     started_at: Instant,
+    items_total: AtomicUsize,
+    items_done: AtomicUsize,
+    items_failed: AtomicUsize,
+    bytes_downloaded: AtomicU64,
+    /// (identifier, reason) pairs for the end-of-run Errors block.
+    /// Populated on per-item failures; surfaced by `finish()`.
+    errors: Mutex<Vec<(String, String)>>,
+    /// Optional joblog path shown in the summary as the pointer to the
+    /// durable per-item record.
+    joblog_path: Mutex<Option<PathBuf>>,
 }
 
 struct ItemBars {
@@ -321,16 +408,19 @@ struct ItemBars {
 }
 
 impl BatchDisplay {
-    pub fn new(items_total: usize, jobs: usize) -> Self {
+    pub fn new(items_total: usize) -> Self {
         let multi = MultiProgress::new();
 
+        // Spinner + message; steady_tick makes the spinner visibly animate
+        // even when no item is completing, so users see the process is alive
+        // during long mid-item downloads.
         let batch_header = multi.add(ProgressBar::new_spinner());
-        batch_header.set_style(ProgressStyle::with_template("{msg}").unwrap());
-        batch_header.set_message(format!(
-            "Downloading {} items ({} workers)...",
-            style(items_total).bold(),
-            jobs,
-        ));
+        batch_header.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]),
+        );
+        batch_header.enable_steady_tick(Duration::from_millis(100));
 
         // Bottom sentinel — new item bars are inserted before this
         let bottom_sentinel = multi.add(ProgressBar::new_spinner());
@@ -338,13 +428,93 @@ impl BatchDisplay {
         bottom_sentinel.set_message("");
         bottom_sentinel.finish();
 
-        Self {
+        let display = Self {
             multi,
             batch_header,
             bottom_sentinel,
             active_item_bars: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
+            items_total: AtomicUsize::new(items_total),
+            items_done: AtomicUsize::new(0),
+            items_failed: AtomicUsize::new(0),
+            bytes_downloaded: AtomicU64::new(0),
+            errors: Mutex::new(Vec::new()),
+            joblog_path: Mutex::new(None),
+        };
+        display.refresh_header();
+        display
+    }
+
+    /// Record the joblog path so the end-of-run summary can point
+    /// users to it for the full per-item record.
+    pub fn set_joblog_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut slot) = self.joblog_path.lock() {
+            *slot = path;
         }
+    }
+
+    /// Record a per-item error for the end-of-run summary.
+    fn add_error(&self, identifier: &str, reason: &str) {
+        if let Ok(mut list) = self.errors.lock() {
+            list.push((identifier.to_string(), reason.to_string()));
+        }
+    }
+
+    /// Update the single top status line from the live counters. Called
+    /// on item start/complete/error. The spinner keeps animating via
+    /// `enable_steady_tick` even between these calls, so the line
+    /// always looks alive.
+    ///
+    /// Example:
+    ///
+    /// ```text
+    /// ⠼ Downloaded 1,247 of 125,061 · 3.4 GiB · 14.0 MiB/s · 4m12s · 3 errors
+    /// ```
+    fn refresh_header(&self) {
+        let done = self.items_done.load(Ordering::Relaxed);
+        let failed = self.items_failed.load(Ordering::Relaxed);
+        let total = self.items_total.load(Ordering::Relaxed);
+        let bytes = self.bytes_downloaded.load(Ordering::Relaxed);
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+
+        let count_segment = if total > 0 {
+            format!(
+                "Downloaded {} of {}",
+                format_count(done),
+                format_count(total)
+            )
+        } else {
+            format!("Downloaded {} items", format_count(done))
+        };
+
+        let rate_segment = if elapsed > 0.0 {
+            format!(" · {}/s", format_bytes((bytes as f64 / elapsed) as u64))
+        } else {
+            String::new()
+        };
+
+        let errors_segment = if failed > 0 {
+            format!(
+                " · {}",
+                style(format!(
+                    "{} error{}",
+                    failed,
+                    if failed == 1 { "" } else { "s" }
+                ))
+                .red()
+            )
+        } else {
+            String::new()
+        };
+
+        self.batch_header.set_message(format!(
+            "{} · {}{} · {}{}",
+            count_segment,
+            format_bytes(bytes),
+            rate_segment,
+            format_elapsed(elapsed as u64),
+            errors_segment,
+        ));
     }
 
     pub fn on_item_start(&self, identifier: &str, _current: usize, _total: usize) {
@@ -385,6 +555,7 @@ impl BatchDisplay {
                 },
             );
         }
+        self.refresh_header();
     }
 
     pub fn on_progress(&self, progress: DownloadProgress) {
@@ -397,6 +568,9 @@ impl BatchDisplay {
         };
 
         match &progress.status {
+            DownloadStatus::Resolving => {
+                item.bar.set_message("resolving\u{2026}".to_string());
+            }
             DownloadStatus::Enumerated {
                 files_count,
                 bytes_total,
@@ -443,7 +617,10 @@ impl BatchDisplay {
                     item.files_processed, item.files_total
                 ));
             }
-            DownloadStatus::Verifying => {}
+            DownloadStatus::Verifying => {
+                item.bar
+                    .set_message(format!("verifying {}\u{2026}", progress.file_name));
+            }
         }
     }
 
@@ -452,56 +629,43 @@ impl BatchDisplay {
         let Ok(mut items) = self.active_item_bars.lock() else {
             return;
         };
+
+        // Harvest per-file error strings before we drop the row. They are
+        // recorded in the end-of-run summary (not printed mid-flight, so
+        // scrollback stays clean per the uv-style design).
+        let per_file_errors: Vec<String> = items
+            .get(identifier)
+            .map(|item| item.errors.clone())
+            .unwrap_or_default();
+
         if let Some(item) = items.remove(identifier) {
             item.bar.finish_and_clear();
-
-            // Print collected per-file errors
-            for err_line in &item.errors {
-                eprintln!("{err_line}");
-            }
-
-            let elapsed = result.elapsed.as_secs_f64();
-            let speed = format_speed(result.bytes_total, elapsed);
-
-            let icon = if result.files_failed > 0 {
-                style(ICON_ERROR).red()
-            } else {
-                style(ICON_SUCCESS).green()
-            };
-
-            let skipped_info = if result.files_skipped > 0 {
-                format!(
-                    "\n  {} {} skipped",
-                    style(ICON_SKIPPED).dim(),
-                    style(result.files_skipped).yellow()
-                )
-            } else {
-                String::new()
-            };
-
-            let error_info = if result.files_failed > 0 {
-                format!(
-                    "\n  {} {} errors",
-                    style(ICON_ERROR).red(),
-                    style(result.files_failed).red()
-                )
-            } else {
-                String::new()
-            };
-
-            item.header.set_message(format!(
-                "{} {}       {} files ({}) {:.0}s{}{}{}",
-                icon,
-                style(identifier).bold(),
-                result.files_downloaded,
-                format_bytes(result.bytes_total),
-                elapsed,
-                style(&speed).dim(),
-                skipped_info,
-                error_info,
-            ));
-            item.header.finish();
+            item.header.finish_and_clear();
         }
+        drop(items); // release lock before we re-acquire in refresh_header
+
+        // Record errors from per-file failures (full item errors go through
+        // on_item_error).
+        if result.files_failed > 0 {
+            self.items_failed.fetch_add(1, Ordering::Relaxed);
+            let reason = if per_file_errors.is_empty() {
+                format!("{} file errors", result.files_failed)
+            } else {
+                // strip ANSI styling and leading whitespace that the
+                // mid-flight formatter adds — we want a plain reason
+                // for the summary block.
+                console::strip_ansi_codes(&per_file_errors[0])
+                    .trim()
+                    .to_string()
+            };
+            self.add_error(identifier, &reason);
+        } else {
+            self.items_done.fetch_add(1, Ordering::Relaxed);
+        }
+
+        self.bytes_downloaded
+            .fetch_add(result.bytes_total, Ordering::Relaxed);
+        self.refresh_header();
     }
 
     /// Handle an item-level failure (404, disk full, etc.) by updating the
@@ -512,34 +676,139 @@ impl BatchDisplay {
         };
         if let Some(item) = items.remove(identifier) {
             item.bar.finish_and_clear();
-            item.header.set_message(format!(
-                "{} {}  {}",
-                style(ICON_ERROR).red(),
-                style(identifier).bold(),
-                style(error).red(),
-            ));
-            item.header.finish();
+            item.header.finish_and_clear();
         }
+        drop(items);
+        self.items_failed.fetch_add(1, Ordering::Relaxed);
+        self.add_error(identifier, error);
+        self.refresh_header();
     }
 
     pub fn finish(
         &self,
-        result: &ia_core::download::BatchDownloadResult,
+        _result: &ia_core::download::BatchDownloadResult,
+        disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>,
+    ) {
+        self.print_summary(None, disk_statuses);
+    }
+
+    /// Ctrl-C / SIGINT path. Same layout as `finish` but prefixed with
+    /// "Interrupted." so the user knows the summary is partial.
+    pub fn finish_cancelled(&self, disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>) {
+        self.print_summary(Some("Interrupted."), disk_statuses);
+    }
+
+    /// Render the end-of-run summary from the live counters so it works
+    /// on both clean completion and SIGINT cancellation.
+    fn print_summary(
+        &self,
+        prefix: Option<&str>,
         disk_statuses: Option<&[ia_core::disk_pool::DiskStatus]>,
     ) {
         self.batch_header.finish_and_clear();
         self.bottom_sentinel.finish_and_clear();
 
-        let summary = BatchSummary {
-            items_total: result.items_total,
-            items_succeeded: result.items_succeeded,
-            items_failed: result.items_failed,
-            files_skipped: result.files_skipped,
-            files_failed: result.files_failed,
-            bytes_total: result.bytes_total,
-            elapsed_secs: result.elapsed.as_secs_f64(),
+        let done = self.items_done.load(Ordering::Relaxed);
+        let failed = self.items_failed.load(Ordering::Relaxed);
+        let total = self.items_total.load(Ordering::Relaxed);
+        let bytes = self.bytes_downloaded.load(Ordering::Relaxed);
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+
+        if let Some(p) = prefix {
+            eprintln!("{}", style(p).bold().yellow());
+        }
+
+        eprintln!(
+            "{}",
+            style("────────────────────────────────────────────────────").dim()
+        );
+
+        let total_str = if total > 0 {
+            format!("/{}", format_count(total))
+        } else {
+            String::new()
         };
-        print_batch_summary(&summary, "downloaded", disk_statuses);
+        let errors_segment = if failed > 0 {
+            format!(
+                " · {}",
+                style(format!(
+                    "{} error{}",
+                    failed,
+                    if failed == 1 { "" } else { "s" }
+                ))
+                .red()
+            )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "{}{} items ({} done){}",
+            format_count(done + failed),
+            total_str,
+            style(format_count(done)).green(),
+            errors_segment,
+        );
+
+        let rate = if elapsed > 0.0 {
+            format!(" · {}/s", format_bytes((bytes as f64 / elapsed) as u64))
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "{} downloaded{} · {}",
+            format_bytes(bytes),
+            style(&rate).dim(),
+            format_elapsed(elapsed as u64),
+        );
+
+        if let Some(statuses) = disk_statuses {
+            let disk_line: Vec<String> = statuses
+                .iter()
+                .map(|ds| {
+                    format!(
+                        "{}: {} free",
+                        style(ds.path.display()).dim(),
+                        format_bytes(ds.free_bytes)
+                    )
+                })
+                .collect();
+            eprintln!("{}", disk_line.join(" │ "));
+        }
+
+        if let Ok(errs) = self.errors.lock() {
+            if !errs.is_empty() {
+                eprintln!();
+                eprintln!("{}", style("Errors:").bold().red());
+                let show = errs.len().min(10);
+                for (id, reason) in errs.iter().take(show) {
+                    eprintln!(
+                        "  {} {} {} {}",
+                        style(ICON_ERROR).red(),
+                        style(id).bold(),
+                        style("—").dim(),
+                        reason.trim(),
+                    );
+                }
+                if errs.len() > show {
+                    let remaining = errs.len() - show;
+                    let joblog = self.joblog_path.lock().ok().and_then(|g| g.clone());
+                    let tail = match joblog {
+                        Some(p) => format!(
+                            "  {} {} more (see {})",
+                            style("…").dim(),
+                            remaining,
+                            style(p.display()).dim(),
+                        ),
+                        None => format!(
+                            "  {} {} more (run with --joblog to capture all)",
+                            style("…").dim(),
+                            remaining,
+                        ),
+                    };
+                    eprintln!("{tail}");
+                }
+            }
+        }
     }
 }
 
@@ -1149,5 +1418,31 @@ pub fn print_retry_summary(stats: &ia_core::RetryStats) {
             p.p95_ms,
             p.p99_ms,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_count_basic() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(5), "5");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(12_345), "12,345");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_count(125_061), "125,061");
+    }
+
+    #[test]
+    fn format_elapsed_basic() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(12), "12s");
+        assert_eq!(format_elapsed(60), "1m00s");
+        assert_eq!(format_elapsed(252), "4m12s");
+        assert_eq!(format_elapsed(3600), "1h00m00s");
+        assert_eq!(format_elapsed(5025), "1h23m45s");
     }
 }

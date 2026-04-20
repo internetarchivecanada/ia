@@ -261,6 +261,56 @@ pub fn successful_items(entries: &[JoblogEntry], op: &str) -> std::collections::
         .collect()
 }
 
+/// Get items where every recorded file's latest status is `ok` or `skipped`,
+/// for auto-resume of batch downloads.
+///
+/// Takes the latest status per `(item, file)` (later entries supersede
+/// earlier ones — matches `successful_items` semantics, just at file
+/// granularity since download entries are per-file). An item is "fully
+/// downloaded" iff:
+///
+/// - at least one entry exists for it in `op`, AND
+/// - every file's latest status is `"ok"` or `"skipped"`.
+///
+/// This means a successful re-run of a previously-failed item clears the
+/// failure from the skip computation. A download run interrupted mid-item
+/// writes no joblog entries (writes happen at item completion), so such
+/// items are not mistakenly skipped.
+///
+/// Edge case: a different `--glob` between runs means we only know about
+/// files we've seen. This is the same limitation per-file resume already
+/// has.
+pub fn items_fully_downloaded(
+    entries: &[JoblogEntry],
+    op: &str,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashMap;
+
+    // (item, file) -> latest status (later entries overwrite earlier)
+    let mut latest: HashMap<(&str, &str), &str> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.op == op) {
+        latest.insert((&entry.item, &entry.file), entry.status.as_str());
+    }
+
+    // Aggregate per item: (has_bad, any_entry)
+    let mut per_item: HashMap<String, (bool, bool)> = HashMap::new();
+    for ((item, _), status) in &latest {
+        let rec = per_item
+            .entry((*item).to_string())
+            .or_insert((false, false));
+        rec.1 = true;
+        if *status != "ok" && *status != "skipped" {
+            rec.0 = true;
+        }
+    }
+
+    per_item
+        .into_iter()
+        .filter(|(_, (has_bad, any))| *any && !has_bad)
+        .map(|(item, _)| item)
+        .collect()
+}
+
 /// Get (item, file) pairs that succeeded, for auto-resume.
 ///
 /// Scans entries filtered by `op`, keeps latest status per `(item, file)`,
@@ -1129,6 +1179,80 @@ mod tests {
         let set = successful_items(&entries, "ai-qa");
         assert!(!set.contains("item1"));
         assert!(set.contains("item2"));
+    }
+
+    // --- items_fully_downloaded tests (download auto-resume) ---
+
+    #[test]
+    fn items_fully_downloaded_empty() {
+        let set = items_fully_downloaded(&[], "download");
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn items_fully_downloaded_all_ok() {
+        let entries = vec![
+            JoblogEntry::new("download", "item1", "a.txt").ok(100, 10),
+            JoblogEntry::new("download", "item1", "b.txt").ok(200, 20),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(set.contains("item1"));
+    }
+
+    #[test]
+    fn items_fully_downloaded_one_failure_blocks_item() {
+        let entries = vec![
+            JoblogEntry::new("download", "item1", "a.txt").ok(100, 10),
+            JoblogEntry::new("download", "item1", "b.txt").error("503", 3),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(!set.contains("item1"));
+    }
+
+    #[test]
+    fn items_fully_downloaded_skipped_counts_as_complete() {
+        let entries = vec![
+            JoblogEntry::new("download", "item1", "a.txt").skipped(),
+            JoblogEntry::new("download", "item1", "b.txt").ok(200, 20),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(set.contains("item1"));
+    }
+
+    #[test]
+    fn items_fully_downloaded_filters_by_op() {
+        let entries = vec![
+            JoblogEntry::new("upload", "item1", "a.txt").ok(100, 10),
+            JoblogEntry::new("download", "item2", "a.txt").ok(100, 10),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(!set.contains("item1"));
+        assert!(set.contains("item2"));
+    }
+
+    #[test]
+    fn items_fully_downloaded_later_success_supersedes_failure() {
+        // Run 1 errored on a.txt; run 2 re-downloaded it successfully.
+        // The item should be skipped on resume.
+        let entries = vec![
+            JoblogEntry::new("download", "item1", "a.txt").error("503", 3),
+            JoblogEntry::new("download", "item1", "b.txt").ok(200, 20),
+            JoblogEntry::new("download", "item1", "a.txt").ok(100, 10),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(set.contains("item1"));
+    }
+
+    #[test]
+    fn items_fully_downloaded_latest_error_still_blocks() {
+        // Run 1 succeeded on a.txt; run 2 erred on a.txt. Item stays blocked.
+        let entries = vec![
+            JoblogEntry::new("download", "item1", "a.txt").ok(100, 10),
+            JoblogEntry::new("download", "item1", "b.txt").ok(200, 20),
+            JoblogEntry::new("download", "item1", "a.txt").error("503", 3),
+        ];
+        let set = items_fully_downloaded(&entries, "download");
+        assert!(!set.contains("item1"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub struct ItemState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ItemStatus {
     Pending,
+    Resolving,
     Downloading,
     Complete,
     Failed(String),
@@ -157,7 +158,7 @@ impl TuiState {
                         0.0
                     }
                 }
-                ItemStatus::Pending => 0.0,
+                ItemStatus::Pending | ItemStatus::Resolving => 0.0,
             })
             .sum();
         total_progress / items_total as f64
@@ -182,8 +183,14 @@ impl TuiState {
         if let Some(&idx) = self.item_index.get(&progress.identifier) {
             let item = &mut self.items[idx];
             match &progress.status {
-                DownloadStatus::Enumerated { files_count, .. } => {
+                DownloadStatus::Resolving => {
                     if item.status == ItemStatus::Pending {
+                        item.status = ItemStatus::Resolving;
+                        item.started_at = Instant::now();
+                    }
+                }
+                DownloadStatus::Enumerated { files_count, .. } => {
+                    if matches!(item.status, ItemStatus::Pending | ItemStatus::Resolving) {
                         item.status = ItemStatus::Downloading;
                         item.started_at = Instant::now();
                     }
@@ -215,12 +222,22 @@ impl TuiState {
                 DownloadStatus::Failed(_) => {
                     item.files_failed += 1;
                 }
-                DownloadStatus::Verifying => {}
+                DownloadStatus::Verifying => {
+                    // Show activity during MD5 hashing (can take seconds
+                    // per large file under --checksum). The item stays in
+                    // Downloading/Resolving; the Workers panel below shows
+                    // the active file with a verifying marker.
+                    if matches!(item.status, ItemStatus::Pending | ItemStatus::Resolving) {
+                        item.status = ItemStatus::Downloading;
+                        item.started_at = Instant::now();
+                    }
+                }
             }
         }
 
         // Update global state
         match &progress.status {
+            DownloadStatus::Resolving => {}
             DownloadStatus::Enumerated {
                 files_count,
                 bytes_total,
@@ -274,7 +291,20 @@ impl TuiState {
                 self.files_failed += 1;
                 self.failed_files.push((progress.file_name, msg.clone()));
             }
-            DownloadStatus::Verifying => {}
+            DownloadStatus::Verifying => {
+                // Treat Verifying like Starting so the Workers panel shows
+                // the file while it's being hashed. For pre-skip hashes
+                // there was no prior Starting event; this is the first
+                // activity on this file.
+                self.active_files
+                    .entry(file_key)
+                    .or_insert_with(|| FileProgress {
+                        name: progress.file_name.clone(),
+                        bytes_downloaded: 0,
+                        total_bytes: progress.total_bytes,
+                        started_at: Instant::now(),
+                    });
+            }
         }
 
         // Sample throughput every second

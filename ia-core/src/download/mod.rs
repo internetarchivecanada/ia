@@ -157,6 +157,10 @@ pub struct DownloadProgress {
 /// Status of a file download.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadStatus {
+    /// Fetching item metadata. Emitted before `Enumerated` so the UI can
+    /// show activity during the 5-15 s metadata round-trip instead of
+    /// appearing frozen on `Pending`.
+    Resolving,
     /// Item metadata fetched; reports total file count and bytes for the item.
     Enumerated {
         files_count: usize,
@@ -349,7 +353,23 @@ pub async fn download_file(
         }
     }
 
-    // Checksum skip: compute local MD5 and compare
+    // Checksum skip: compute local MD5 and compare.
+    //
+    // The hash can take several seconds for large files. Emit a Verifying
+    // progress event first so UIs can show activity instead of sitting
+    // silent while disk I/O grinds.
+    if opts.checksum && file_path.exists() && file.md5.is_some() {
+        if let Some(p) = progress {
+            p(DownloadProgress {
+                identifier: identifier.to_string(),
+                file_name: file.name.clone(),
+                bytes_downloaded: 0,
+                total_bytes: file.size,
+                status: DownloadStatus::Verifying,
+            });
+        }
+    }
+
     if opts.checksum {
         if let Some(skip_reason) = should_skip_checksum(&file_path, file).await {
             debug!(file = %file.name, reason = %skip_reason, "skipping file (checksum match)");
@@ -445,11 +465,65 @@ pub async fn download_file(
         }
     }
 
-    // Stream to .part file
-    let mut output = if resume_from.is_some() {
+    // Stream to .part file. Hyper delivers ~16 KB chunks; buffering coalesces
+    // them into 256 KB writes to avoid per-chunk spawn_blocking round trips.
+    let raw_file = if resume_from.is_some() {
         fs::OpenOptions::new().append(true).open(&part_path).await?
     } else {
         fs::File::create(&part_path).await?
+    };
+    let mut output = tokio::io::BufWriter::with_capacity(256 * 1024, raw_file);
+
+    // Rolling MD5 hasher fed from the download stream — avoids the old
+    // write-then-re-read-the-whole-file second pass. For resumed downloads,
+    // seed it with the bytes already present in .part so the final hash
+    // covers the full file.
+    let mut hasher = if opts.checksum && file.md5.is_some() {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        if let Some(resumed_bytes) = resume_from {
+            // Seeding reads the full .part before the HTTP stream opens — on
+            // a 10 GB partial that's tens of seconds of silent CPU+IO. Emit
+            // Verifying so the console/TUI shows activity, and re-emit every
+            // 16 MiB with progress.
+            use tokio::io::AsyncReadExt;
+            if let Some(p) = progress {
+                p(DownloadProgress {
+                    identifier: identifier.to_string(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded: 0,
+                    total_bytes: Some(resumed_bytes),
+                    status: DownloadStatus::Verifying,
+                });
+            }
+            let mut seed = fs::File::open(&part_path).await?;
+            let mut buf = vec![0u8; 1024 * 1024];
+            let mut seeded: u64 = 0;
+            let mut last_emit: u64 = 0;
+            loop {
+                let n = seed.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                seeded += n as u64;
+                if let Some(p) = progress {
+                    if seeded - last_emit >= 16 * 1024 * 1024 {
+                        p(DownloadProgress {
+                            identifier: identifier.to_string(),
+                            file_name: file.name.clone(),
+                            bytes_downloaded: seeded,
+                            total_bytes: Some(resumed_bytes),
+                            status: DownloadStatus::Verifying,
+                        });
+                        last_emit = seeded;
+                    }
+                }
+            }
+        }
+        Some(h)
+    } else {
+        None
     };
 
     let mut bytes_downloaded = resume_from.unwrap_or(0);
@@ -459,6 +533,10 @@ pub async fn download_file(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(reqwest_middleware::Error::from)?;
         output.write_all(&chunk).await?;
+        if let Some(h) = hasher.as_mut() {
+            use md5::Digest;
+            h.update(&chunk);
+        }
         bytes_downloaded += chunk.len() as u64;
 
         // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
@@ -493,8 +571,8 @@ pub async fn download_file(
     output.flush().await?;
     drop(output);
 
-    // Checksum verification if requested
-    if opts.checksum {
+    // Post-download checksum comparison using the inline-computed hash.
+    if let Some(hasher) = hasher {
         if let Some(expected_md5) = &file.md5 {
             if let Some(p) = progress {
                 p(DownloadProgress {
@@ -506,7 +584,8 @@ pub async fn download_file(
                 });
             }
 
-            let actual_md5 = compute_md5(&part_path).await?;
+            use md5::Digest;
+            let actual_md5 = format!("{:x}", hasher.finalize());
             if &actual_md5 != expected_md5 {
                 // Delete the bad file
                 let _ = fs::remove_file(&part_path).await;
@@ -632,6 +711,15 @@ pub async fn download_item(
     semaphore: Arc<Semaphore>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
 ) -> Result<ItemDownloadResult> {
+    if let Some(ref p) = progress {
+        p(DownloadProgress {
+            identifier: identifier.to_string(),
+            file_name: String::new(),
+            bytes_downloaded: 0,
+            total_bytes: None,
+            status: DownloadStatus::Resolving,
+        });
+    }
     let item = crate::metadata::get(client, identifier).await?;
     download_item_with_metadata(client, identifier, &item, opts, semaphore, progress).await
 }
@@ -2264,5 +2352,137 @@ mod tests {
             }
             other => panic!("expected Http error, got: {other:?}"),
         }
+    }
+
+    // --- inline checksum + Verifying event tests ---
+
+    /// Helper: FileMetadata with a specific md5 (not the empty-file default).
+    fn test_file_meta_with_md5(name: &str, size: u64, md5: &str) -> FileMetadata {
+        let mut m = test_file_meta(name, size);
+        m.md5 = Some(md5.to_string());
+        m
+    }
+
+    /// Compute MD5 hex of a byte slice (for test expectations).
+    fn md5_hex(bytes: &[u8]) -> String {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    #[tokio::test]
+    async fn checksum_inline_hash_matches_server_md5() {
+        let body = b"hello inline checksum world".to_vec();
+        let expected = md5_hex(&body);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/a.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta_with_md5("a.txt", body.len() as u64, &expected);
+
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        // .part should be finalized to the real name
+        assert!(dir.path().join("a.txt").exists());
+        assert!(!dir.path().join("a.txt.part").exists());
+    }
+
+    #[tokio::test]
+    async fn checksum_inline_hash_detects_mismatch_and_removes_part() {
+        let body = b"correct content".to_vec();
+        let wrong_md5 = "00000000000000000000000000000000"; // not the real md5
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/b.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, wrong_md5);
+
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+        let err = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }));
+        // Bad .part must be deleted, final file must not exist.
+        assert!(!dir.path().join("b.txt").exists());
+        assert!(!dir.path().join("b.txt.part").exists());
+    }
+
+    #[tokio::test]
+    async fn checksum_pre_skip_emits_verifying_before_skipped() {
+        // Pre-populate the destination with content matching the
+        // server-reported md5, so should_skip_checksum fires.
+        let body = b"already-downloaded content";
+        let expected = md5_hex(body);
+
+        let dir = tempfile::tempdir().unwrap();
+        let item_dir = dir.path().join("test-item");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        let target = item_dir.join("c.txt");
+        std::fs::write(&target, body).unwrap();
+
+        // Metadata fetch isn't hit because the skip-check short-circuits,
+        // but the client still needs a valid base URL.
+        let mock_server = MockServer::start().await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let file = test_file_meta_with_md5("c.txt", body.len() as u64, &expected);
+
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+        let result = download_file(&client, "test-item", &file, &item_dir, &opts, Some(&*cb))
+            .await
+            .unwrap();
+
+        assert!(matches!(result.status, DownloadStatus::Skipped(_)));
+
+        let seen = events.lock().unwrap();
+        let verifying_idx = seen.iter().position(|s| *s == DownloadStatus::Verifying);
+        let skipped_idx = seen
+            .iter()
+            .position(|s| matches!(s, DownloadStatus::Skipped(_)));
+        assert!(
+            verifying_idx.is_some(),
+            "Verifying event should fire before pre-skip MD5 hash: {seen:?}"
+        );
+        assert!(skipped_idx.is_some(), "Skipped event should fire: {seen:?}");
+        assert!(
+            verifying_idx < skipped_idx,
+            "Verifying must precede Skipped: {seen:?}"
+        );
     }
 }

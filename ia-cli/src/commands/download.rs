@@ -6,8 +6,9 @@ use futures::{stream, Stream, StreamExt};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{info, warn};
 
 use ia_core::disk_pool::DiskPool;
@@ -108,10 +109,6 @@ pub struct DownloadArgs {
     /// Extra search parameters (key:value or key=value, repeatable)
     #[arg(short = 'p', long = "parameters", value_name = "PARAMETERS")]
     search_parameters: Vec<String>,
-
-    /// Concurrent items for batch/search (use -j/--jobs for concurrent files)
-    #[arg(long, default_value = "5")]
-    pub items: usize,
 
     /// Full-screen dashboard mode
     #[arg(long)]
@@ -220,6 +217,7 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
@@ -238,6 +236,38 @@ pub async fn run(
         return run_zip(client, &args, quiet).await;
     }
 
+    // ─── Two-press Ctrl-C handler ───────────────────────────────────────
+    // First press: print a shutdown message, wake the main select so we
+    //   tear down cleanly (summary + http diagnostics), then exit 130.
+    // Second press: exit 130 immediately — even if the first-press cleanup
+    //   is stuck on a mutex or blocking I/O.
+    // Installed here so it covers joblog read, metadata fetch, and every
+    // download code path below. TUI mode runs crossterm in raw mode which
+    // intercepts Ctrl-C as a key event, so this watcher only fires before
+    // the TUI takes over (or after it exits) — no conflict.
+    let cancel = Arc::new(Notify::new());
+    {
+        let cancel = Arc::clone(&cancel);
+        let presses = Arc::new(AtomicU8::new(0));
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                let prev = presses.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 {
+                    eprintln!(
+                        "\n{} shutting down — press Ctrl-C again to force quit",
+                        style("interrupt:").bold().yellow(),
+                    );
+                    cancel.notify_waiters();
+                } else {
+                    std::process::exit(130);
+                }
+            }
+        });
+    }
+
     // ─── Shared setup ───────────────────────────────────────────────────
     // Moved before collect_identifiers() so the streaming search path can
     // use it without blocking on full identifier collection.
@@ -248,6 +278,58 @@ pub async fn run(
         .map(|p| JoblogWriter::open(p))
         .transpose()
         .context("failed to open joblog")?;
+
+    // Build item-level resume skip set from joblog — items whose last run
+    // recorded no failures are treated as fully downloaded and filtered out
+    // before any metadata fetch happens. Per-file `.part` resume still
+    // handles partial files inside items we do end up processing.
+    let resume_skip: std::collections::HashSet<String> = if no_resume {
+        std::collections::HashSet::new()
+    } else if let Some(ref path) = joblog_path {
+        if path.exists() {
+            // Joblog read is blocking and can take seconds on a log with
+            // hundreds of thousands of entries. Show a spinner so the
+            // user knows the tool is alive.
+            let spinner = if quiet < 2 {
+                let sp = indicatif::ProgressBar::new_spinner();
+                sp.set_style(
+                    indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                        .unwrap()
+                        .tick_strings(&[
+                            "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}",
+                            "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}", " ",
+                        ]),
+                );
+                sp.enable_steady_tick(std::time::Duration::from_millis(100));
+                sp.set_message(format!("resuming — reading {}", path.display()));
+                Some(sp)
+            } else {
+                None
+            };
+
+            let entries = ia_core::joblog::read(path)
+                .with_context(|| format!("failed to read joblog for resume: {}", path.display()))?;
+            let set = ia_core::joblog::items_fully_downloaded(&entries, "download");
+
+            if let Some(sp) = spinner {
+                sp.finish_and_clear();
+            }
+
+            if !set.is_empty() && quiet < 2 {
+                eprintln!(
+                    "{} {} item{} already completed, skipping on this run",
+                    style("resume:").bold().cyan(),
+                    set.len(),
+                    if set.len() == 1 { "" } else { "s" },
+                );
+            }
+            set
+        } else {
+            std::collections::HashSet::new()
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
 
     // Set up disk pool if multiple destdirs
     let destdirs = if args.destdir.is_empty() {
@@ -343,68 +425,95 @@ pub async fn run(
     if let Some(ref query) = args.search {
         if !args.dashboard {
             let json_mode = args.json;
-            let items_concurrency = args.items;
+            // Item-level concurrency caps how many items are in "resolving
+            // metadata" or "active download" simultaneously. Files across
+            // those items share the single file-level semaphore (capacity =
+            // jobs), so total in-flight files is capped at --jobs regardless.
+            let items_concurrency = jobs;
 
             // Quick estimated total for progress display (~200ms).
             let estimated_total = ia_core::search::num_found(client, query, &[])
                 .await
                 .unwrap_or(0) as usize;
 
+            // If resuming, the header total represents "remaining this run"
+            // — already-completed items are filtered before they reach the
+            // pipeline and so never increment items_done.
+            let header_total = estimated_total.saturating_sub(resume_skip.len());
+
             let batch_display = if !json_mode && quiet == 0 {
-                Some(Arc::new(crate::output::BatchDisplay::new(
-                    estimated_total,
-                    jobs,
-                )))
+                let bd = Arc::new(crate::output::BatchDisplay::new(header_total));
+                bd.set_joblog_path(joblog_path.clone());
+                Some(bd)
             } else {
                 None
             };
 
             let search_opts = search_opts_from_params(&args.search_parameters)?;
+            let resume_skip = resume_skip.clone();
             let id_stream: Pin<Box<dyn Stream<Item = IaResult<String>> + Send + '_>> = Box::pin(
                 ia_core::search::scrape(client, query, &search_opts)
-                    .map(|r| r.map(|item| item.identifier)),
+                    .map(|r| r.map(|item| item.identifier))
+                    .filter(move |r| {
+                        let keep = match r {
+                            Ok(id) => !resume_skip.contains(id),
+                            Err(_) => true,
+                        };
+                        async move { keep }
+                    }),
             );
 
             let has_disk_pool = disk_pool.is_some();
-            let result = if let Some(pool) = disk_pool.take() {
-                let (batch_result, returned_pool) = download_batch_with_pool(
-                    client,
-                    id_stream,
-                    &make_opts,
-                    &filter,
-                    pool,
-                    semaphore,
-                    batch_display.clone(),
-                    json_mode,
-                    0,
-                    items_concurrency,
-                )
-                .await?;
-                disk_pool = Some(returned_pool);
-                batch_result
-            } else {
-                download_batch_items(
-                    client,
-                    id_stream,
-                    &opts,
-                    semaphore,
-                    batch_display.clone(),
-                    json_mode,
-                    0,
-                    items_concurrency,
-                )
-                .await
+            let pool_opt = disk_pool.take();
+            let display_for_cancel = batch_display.clone();
+            let cancel_branch = Arc::clone(&cancel);
+
+            // Race the batch download against the first-press cancel
+            // notify so SIGINT produces the end-of-run summary from live
+            // counters. The detached per-file tasks inside are only
+            // terminated by `process::exit(130)` below, not by dropping
+            // this future — dropping just abandons them on the runtime.
+            let result = tokio::select! {
+                biased;
+                _ = cancel_branch.notified() => {
+                    if let Some(ref bd) = display_for_cancel {
+                        bd.finish_cancelled(None);
+                    }
+                    crate::output::print_http_diagnostics(client.retry_stats());
+                    std::process::exit(130);
+                }
+                r = async {
+                    match pool_opt {
+                        Some(pool) => {
+                            let (batch_result, returned_pool) = download_batch_with_pool(
+                                client, id_stream, &make_opts, &filter, pool,
+                                semaphore, batch_display.clone(), json_mode, 0,
+                                items_concurrency, joblog.clone(),
+                            ).await?;
+                            disk_pool = Some(returned_pool);
+                            Ok::<_, anyhow::Error>(batch_result)
+                        }
+                        None => {
+                            let batch_result = download_batch_items(
+                                client, id_stream, &opts, semaphore,
+                                batch_display.clone(), json_mode, 0,
+                                items_concurrency, joblog.clone(),
+                            ).await;
+                            Ok(batch_result)
+                        }
+                    }
+                } => r?,
             };
 
             return finish_batch(
                 result,
-                &joblog,
                 json_mode,
                 quiet,
                 has_disk_pool,
                 &batch_display,
                 &disk_pool,
                 &base_destdir,
+                client.retry_stats(),
             );
         }
     }
@@ -412,7 +521,7 @@ pub async fn run(
     // ─── Collect-first path ─────────────────────────────────────────────
     // Used for --itemlist, stdin, positional identifiers, and
     // --dashboard --search (dashboard needs all identifiers upfront).
-    let identifiers = collect_identifiers(&args, client).await?;
+    let mut identifiers = collect_identifiers(&args, client).await?;
 
     // Detect file paths passed as identifier and suggest --itemlist
     if let Some(ref id) = args.identifier {
@@ -429,17 +538,25 @@ pub async fn run(
         bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
     }
 
+    // Filter out items already fully downloaded per joblog.
+    if !resume_skip.is_empty() {
+        identifiers.retain(|id| !resume_skip.contains(id));
+        if identifiers.is_empty() {
+            if quiet < 2 {
+                eprintln!(
+                    "{} all items already completed per joblog; nothing to do",
+                    style("resume:").bold().cyan(),
+                );
+            }
+            return Ok(());
+        }
+    }
+
     // Dashboard mode
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_tui(
-            client,
-            &identifiers,
-            &opts,
-            Arc::clone(&semaphore),
-            args.items,
-        )
-        .await;
+        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore), jobs)
+            .await;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -474,15 +591,26 @@ pub async fn run(
                     Arc::new(move |p| d.update(p))
                 });
 
-        let result = ia_core::download::download_item(
-            client,
-            identifier,
-            &item_opts,
-            Arc::clone(&semaphore),
-            progress,
-        )
-        .await
-        .context(format!("failed to download {}", identifier))?;
+        let cancel_branch = Arc::clone(&cancel);
+        let display_for_cancel = display.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancel_branch.notified() => {
+                if let Some(d) = display_for_cancel {
+                    d.finish_cancelled();
+                }
+                eprintln!("{} {}", style("interrupted:").bold().yellow(), identifier);
+                crate::output::print_http_diagnostics(client.retry_stats());
+                std::process::exit(130);
+            }
+            r = ia_core::download::download_item(
+                client,
+                identifier,
+                &item_opts,
+                Arc::clone(&semaphore),
+                progress,
+            ) => r.context(format!("failed to download {}", identifier))?,
+        };
 
         if let Some(d) = display {
             d.finish(&result, &item_opts.destdir);
@@ -506,6 +634,10 @@ pub async fn run(
             );
         }
 
+        if !args.json && quiet < 2 {
+            crate::output::print_http_diagnostics(client.retry_stats());
+        }
+
         if result.files_failed > 0 {
             std::process::exit(1);
         }
@@ -516,13 +648,12 @@ pub async fn run(
     // Batch mode — wrap collected identifiers as a stream and use the
     // same functions as the streaming search path.
     let json_mode = args.json;
-    let items_concurrency = args.items;
+    let items_concurrency = jobs;
     let items_total = identifiers.len();
     let batch_display = if !json_mode && quiet == 0 {
-        Some(Arc::new(crate::output::BatchDisplay::new(
-            items_total,
-            jobs,
-        )))
+        let bd = Arc::new(crate::output::BatchDisplay::new(items_total));
+        bd.set_joblog_path(joblog_path.clone());
+        Some(bd)
     } else {
         None
     };
@@ -531,45 +662,51 @@ pub async fn run(
         Box::pin(stream::iter(identifiers).map(Ok));
 
     let has_disk_pool = disk_pool.is_some();
-    let result = if let Some(pool) = disk_pool.take() {
-        let (batch_result, returned_pool) = download_batch_with_pool(
-            client,
-            id_stream,
-            &make_opts,
-            &filter,
-            pool,
-            semaphore,
-            batch_display.clone(),
-            json_mode,
-            items_total,
-            items_concurrency,
-        )
-        .await?;
-        disk_pool = Some(returned_pool);
-        batch_result
-    } else {
-        download_batch_items(
-            client,
-            id_stream,
-            &opts,
-            semaphore,
-            batch_display.clone(),
-            json_mode,
-            items_total,
-            items_concurrency,
-        )
-        .await
+    let pool_opt = disk_pool.take();
+    let display_for_cancel = batch_display.clone();
+    let cancel_branch = Arc::clone(&cancel);
+
+    let result = tokio::select! {
+        biased;
+        _ = cancel_branch.notified() => {
+            if let Some(ref bd) = display_for_cancel {
+                bd.finish_cancelled(None);
+            }
+            crate::output::print_http_diagnostics(client.retry_stats());
+            std::process::exit(130);
+        }
+        r = async {
+            match pool_opt {
+                Some(pool) => {
+                    let (batch_result, returned_pool) = download_batch_with_pool(
+                        client, id_stream, &make_opts, &filter, pool,
+                        semaphore, batch_display.clone(), json_mode,
+                        items_total, items_concurrency, joblog.clone(),
+                    ).await?;
+                    disk_pool = Some(returned_pool);
+                    Ok::<_, anyhow::Error>(batch_result)
+                }
+                None => {
+                    let batch_result = download_batch_items(
+                        client, id_stream, &opts, semaphore,
+                        batch_display.clone(), json_mode, items_total,
+                        items_concurrency, joblog.clone(),
+                    ).await;
+                    Ok(batch_result)
+                }
+            }
+        } => r?,
     };
 
     finish_batch(
         result,
-        &joblog,
         json_mode,
         quiet,
         has_disk_pool,
         &batch_display,
         &disk_pool,
         &base_destdir,
+        client.retry_stats(),
     )
 }
 
@@ -596,6 +733,7 @@ async fn download_batch_with_pool(
     json_mode: bool,
     items_total: usize,
     items_concurrency: usize,
+    joblog: Option<JoblogWriter>,
 ) -> Result<(BatchDownloadResult, DiskPool)> {
     let start = std::time::Instant::now();
     let pool = Arc::new(Mutex::new(pool));
@@ -613,6 +751,7 @@ async fn download_batch_with_pool(
             let batch_display = batch_display.clone();
             let pool = Arc::clone(&pool);
             let filter = filter.clone();
+            let joblog = joblog.clone();
 
             async move {
                 let identifier = match id_result {
@@ -621,6 +760,11 @@ async fn download_batch_with_pool(
                     // as a failed item. Unreachable for Vec-backed streams.
                     Err(e) => {
                         let msg = e.to_string();
+                        if let Some(ref jl) = joblog {
+                            jl.write(
+                                &JoblogEntry::new("download", "<search>", "").error(&msg, 0),
+                            );
+                        }
                         return Err(("<search>".to_string(), IaError::Config(msg)));
                     }
                 };
@@ -632,11 +776,31 @@ async fn download_batch_with_pool(
                 }
                 info!(item = %identifier, idx, "starting item download");
 
+                // Emit Resolving so TUI/console show activity during the
+                // 5-15 s metadata round-trip instead of a silent "starting..."
+                // (multi-disk path fetches metadata outside download_item,
+                // so the Resolving emit there doesn't cover this branch).
+                if let Some(ref bd) = batch_display {
+                    bd.on_progress(DownloadProgress {
+                        identifier: identifier.clone(),
+                        file_name: String::new(),
+                        bytes_downloaded: 0,
+                        total_bytes: None,
+                        status: DownloadStatus::Resolving,
+                    });
+                }
+
                 // Fetch metadata to compute filtered size for disk assignment
                 let item = match ia_core::metadata::get(&client, &identifier).await {
                     Ok(item) => item,
                     Err(e) => {
                         warn!(item = %identifier, error = %e, "failed to fetch metadata");
+                        if let Some(ref jl) = joblog {
+                            jl.write(
+                                &JoblogEntry::new("download", &identifier, "")
+                                    .error(&e.to_string(), 0),
+                            );
+                        }
                         if let Some(ref bd) = batch_display {
                             bd.on_item_error(&identifier, &e.to_string());
                         }
@@ -656,6 +820,12 @@ async fn download_batch_with_pool(
                         Ok(dest) => dest.to_path_buf(),
                         Err(e) => {
                             warn!(item = %identifier, error = %e, "skipping item: no disk space");
+                            if let Some(ref jl) = joblog {
+                                jl.write(
+                                    &JoblogEntry::new("download", &identifier, "")
+                                        .error(&e.to_string(), 0),
+                                );
+                            }
                             if let Some(ref bd) = batch_display {
                                 bd.on_item_error(&identifier, &e.to_string());
                             }
@@ -673,6 +843,9 @@ async fn download_batch_with_pool(
                     });
 
                 let emit_success = |result: &ItemDownloadResult| {
+                    if let Some(ref jl) = joblog {
+                        write_item_results(jl, &result.identifier, &result.results);
+                    }
                     if json_mode {
                         let obj = serde_json::json!({
                             "item": result.identifier,
@@ -691,6 +864,9 @@ async fn download_batch_with_pool(
                 };
 
                 let emit_error = |id: &str, e: &IaError| {
+                    if let Some(ref jl) = joblog {
+                        jl.write(&JoblogEntry::new("download", id, "").error(&e.to_string(), 0));
+                    }
                     if let Some(ref bd) = batch_display {
                         bd.on_item_error(id, &e.to_string());
                     }
@@ -776,17 +952,21 @@ async fn download_batch_with_pool(
     ))
 }
 
-/// Shared batch result handling: joblog, JSON errors, summary, exit code.
+/// Shared batch result handling: JSON errors, summary, exit code.
+///
+/// Joblog writes happen per-item inside `download_batch_items` and
+/// `download_batch_with_pool` so an interrupted run keeps whatever
+/// progress made it to disk.
 #[allow(clippy::too_many_arguments)]
 fn finish_batch(
     result: BatchDownloadResult,
-    joblog: &Option<JoblogWriter>,
     json_mode: bool,
     quiet: u8,
     has_disk_pool: bool,
     batch_display: &Option<Arc<crate::output::BatchDisplay>>,
     disk_pool: &Option<DiskPool>,
     base_destdir: &Path,
+    retry_stats: &ia_core::retry::RetryStats,
 ) -> Result<()> {
     // Print JSON for failed items (on_item_complete only fires for Ok results)
     if json_mode {
@@ -797,17 +977,8 @@ fn finish_batch(
         }
     }
 
-    // Write batch results to joblog
-    if let Some(ref jl) = joblog {
-        for item_result in &result.item_results {
-            match item_result {
-                Ok(ir) => write_item_results(jl, &ir.identifier, &ir.results),
-                Err((id, err)) => {
-                    jl.write(&JoblogEntry::new("download", id, "").error(&err.to_string(), 0));
-                }
-            }
-        }
-    }
+    // NOTE: joblog writes happen per-item inside download_batch_items and
+    // download_batch_with_pool. Writing here too would duplicate every entry.
 
     // Print summary
     if !json_mode && quiet < 2 {
@@ -838,6 +1009,8 @@ fn finish_batch(
                 result.elapsed.as_secs_f64(),
             );
         }
+
+        crate::output::print_http_diagnostics(retry_stats);
     }
 
     if result.files_failed > 0 || result.items_failed > 0 {
@@ -864,6 +1037,7 @@ async fn download_batch_items(
     json_mode: bool,
     items_total: usize,
     items_concurrency: usize,
+    joblog: Option<JoblogWriter>,
 ) -> BatchDownloadResult {
     let start = std::time::Instant::now();
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -875,6 +1049,7 @@ async fn download_batch_items(
             let semaphore = Arc::clone(&semaphore);
             let counter = Arc::clone(&counter);
             let batch_display = batch_display.clone();
+            let joblog = joblog.clone();
 
             async move {
                 let identifier = match id_result {
@@ -883,6 +1058,9 @@ async fn download_batch_items(
                     // as a failed item. Unreachable for Vec-backed streams.
                     Err(e) => {
                         let msg = e.to_string();
+                        if let Some(ref jl) = joblog {
+                            jl.write(&JoblogEntry::new("download", "<search>", "").error(&msg, 0));
+                        }
                         return Err(("<search>".to_string(), IaError::Config(msg)));
                     }
                 };
@@ -910,6 +1088,9 @@ async fn download_batch_items(
                 .await
                 {
                     Ok(result) => {
+                        if let Some(ref jl) = joblog {
+                            write_item_results(jl, &result.identifier, &result.results);
+                        }
                         if json_mode {
                             let obj = serde_json::json!({
                                 "item": result.identifier,
@@ -929,6 +1110,12 @@ async fn download_batch_items(
                     }
                     Err(e) => {
                         warn!(identifier = %identifier, error = %e, "item download failed");
+                        if let Some(ref jl) = joblog {
+                            jl.write(
+                                &JoblogEntry::new("download", &identifier, "")
+                                    .error(&e.to_string(), 0),
+                            );
+                        }
                         if let Some(ref bd) = batch_display {
                             bd.on_item_error(&identifier, &e.to_string());
                         }

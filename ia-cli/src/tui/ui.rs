@@ -122,6 +122,7 @@ fn draw_items_panel(f: &mut Frame, area: Rect, state: &TuiState) {
     for item in &state.items {
         let status_icon = match &item.status {
             ItemStatus::Pending => Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            ItemStatus::Resolving => Span::styled(" \u{22ef}", Style::default().fg(Color::Yellow)),
             ItemStatus::Downloading => Span::styled(" \u{25b8}", Style::default().fg(Color::Cyan)),
             ItemStatus::Complete => Span::styled(" \u{2713}", Style::default().fg(Color::Green)),
             ItemStatus::Failed(_) => Span::styled(" \u{2717}", Style::default().fg(Color::Red)),

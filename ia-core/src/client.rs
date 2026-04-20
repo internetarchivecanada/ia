@@ -75,9 +75,19 @@ impl IaClient {
             attempt.error(RedirectBlockedError(target_url))
         });
 
+        // HTTP/2 flow-control windows default to 65,535 bytes in hyper (RFC
+        // minimum). At ~40 ms RTT that caps per-stream throughput at ~1.6
+        // MB/s — the actual cause of "slow downloads on fiber." Advertise
+        // large receive windows (16 MB stream, 64 MB connection) and enable
+        // BDP-adaptive windowing so the window grows with real throughput.
+        // TCP_NODELAY eliminates Nagle delays for small control frames.
         let raw_client = reqwest::Client::builder()
             .default_headers(headers.clone())
             .pool_max_idle_per_host(10)
+            .http2_adaptive_window(true)
+            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_connection_window_size(64 * 1024 * 1024)
+            .tcp_nodelay(true)
             .redirect(redirect_policy)
             .build()
             .map_err(|e| {
@@ -91,6 +101,10 @@ impl IaClient {
         let no_redirect_client = reqwest::Client::builder()
             .default_headers(headers)
             .pool_max_idle_per_host(10)
+            .http2_adaptive_window(true)
+            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_connection_window_size(64 * 1024 * 1024)
+            .tcp_nodelay(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
