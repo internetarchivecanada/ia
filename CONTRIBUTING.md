@@ -83,8 +83,8 @@ Link any related issues with `Closes #N` in the PR body.
 ## Code Conventions
 
 - **Errors**: `thiserror` in `ia-core`, `anyhow` in `ia-cli`. No `unwrap()`/`expect()` outside tests.
-- **Tests**: `wiremock` for HTTP mocks. Write-operation tests must always use mocks — never hit
-  live archive.org.
+- **Tests**: hermetic — zero outbound network requests. Every HTTP call (read or write) must
+  go through a `wiremock` mock.
 - **Dependencies**: Don't add crates without discussing first. See the crate stack in
   [`AGENTS.md`](./AGENTS.md).
 - **CLI help**: Every flag and subcommand needs accurate help text.
@@ -115,7 +115,8 @@ To preview without making changes:
 
 These apply to all contributors — human or AI:
 
-- **Never send write requests to live archive.org** in automated tests. Use mocks.
+- **Tests must be hermetic.** Zero outbound network requests; mock every HTTP call with `wiremock`.
+- **Never send write requests to live archive.org** from automated code paths.
 - **Never commit secrets.**
 - **Never commit to main.** Use a feature branch.
 
