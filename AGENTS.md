@@ -5,7 +5,9 @@ Design doc: `docs/plans/2026-02-20-ia-rust-port-design.md`
 
 ## Safety
 
-**NEVER send write requests to live archive.org** — no POST/PUT/DELETE/PATCH that modifies data. All write-operation tests must use wiremock mocks. Reading credentials for read operations is fine. Read-only operations and POST to read-only endpoints (search scrape, FTS, xauthn login) are OK.
+**Tests must be hermetic — zero outbound network requests.** Every HTTP call in a test, read or write, must go through a `wiremock` mock.
+
+Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive.org from any automated code path.
 
 ## Architecture
 

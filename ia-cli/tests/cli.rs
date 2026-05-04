@@ -1538,9 +1538,53 @@ fn metadata_reduced_priority_without_m_errors() {
 
 #[test]
 fn metadata_shorthand_m_accepted() {
-    // -m at top level should be accepted by clap (not rejected as unknown argument)
+    // -m at top level should be accepted by clap (not rejected as unknown argument).
+    //
+    // CRITICAL: this test MUST NOT hit archive.org. A previous version ran
+    // `ia metadata nasa -m title:Test` for real, and on a machine with valid IA
+    // credentials it repeatedly overwrote the live `nasa` item's title. We now
+    // point `--host` at a wiremock server that mocks the metadata GET, and pass
+    // `--dry-run` so even the mocked server never sees a write.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+
+    let mock_item = serde_json::json!({
+        "metadata": {
+            "identifier": "test-item",
+            "title": "Original Title",
+            "mediatype": "texts"
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org",
+        "d1": "ia000000.us.archive.org",
+        "d2": "ia000001.us.archive.org",
+        "dir": "/0/items/test-item",
+        "files_count": 0,
+        "item_size": 0,
+        "is_dark": false
+    });
+
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/test-item"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&mock_item))
+            .mount(&server)
+            .await;
+    });
+
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+
     let output = ia()
-        .args(["metadata", "nasa", "-m", "title:Test"])
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "test-item",
+            "-m",
+            "title:Test",
+            "--dry-run",
+        ])
         .output()
         .expect("failed to run ia");
     let stderr = String::from_utf8_lossy(&output.stderr);
