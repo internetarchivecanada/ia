@@ -119,13 +119,43 @@ fn ai_qa_no_api_key_errors() {
         );
 }
 
+/// Spin up a wiremock server that returns 404 for `/metadata/some-item` so the
+/// pipeline short-circuits immediately after config validation, without any
+/// outbound traffic to archive.org or to an LLM endpoint.
+///
+/// Returns the server (must be kept alive for the duration of the test), the
+/// owning `tokio::runtime::Runtime` (also must outlive the server), and the
+/// host string suitable for passing to `--host`.
+fn mock_archive_404() -> (wiremock::MockServer, tokio::runtime::Runtime, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/some-item"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    (server, rt, host)
+}
+
 #[test]
 fn ai_qa_localhost_no_api_key_ok() {
     // Localhost URLs should skip the API key check (may succeed or fail on item fetch,
-    // but should NOT fail on "API key" config validation)
+    // but should NOT fail on "API key" config validation).
+    //
+    // CRITICAL: this test MUST NOT hit archive.org or any LLM endpoint. The
+    // archive.org metadata GET is mocked to 404 so the pipeline bails after
+    // config validation. The LLM base-url stays on localhost:11434 (unreachable
+    // in CI) but is never called because the item fetch fails first.
     let cfg = empty_config();
+    let (_server, _rt, host) = mock_archive_404();
     ia_with_config(&cfg)
         .args([
+            "--insecure",
+            "--host",
+            &host,
             "ai",
             "qa",
             "--model",
@@ -142,6 +172,9 @@ fn ai_qa_localhost_no_api_key_ok() {
 fn ai_qa_config_section_fallback() {
     // [ai] section values should be used when [ai-qa] is absent.
     // Gets past config validation; may succeed or fail on item fetch.
+    //
+    // CRITICAL: see note on `ai_qa_localhost_no_api_key_ok`. archive.org is
+    // mocked to 404; the LLM endpoint is never reached.
     let cfg = NamedTempFile::new().unwrap();
     fs::write(
         cfg.path(),
@@ -149,8 +182,9 @@ fn ai_qa_config_section_fallback() {
     )
     .unwrap();
 
+    let (_server, _rt, host) = mock_archive_404();
     ia_with_config(&cfg)
-        .args(["ai", "qa", "some-item"])
+        .args(["--insecure", "--host", &host, "ai", "qa", "some-item"])
         .assert()
         .stderr(
             predicate::str::contains("no LLM model")
