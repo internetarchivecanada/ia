@@ -1629,6 +1629,11 @@ fn metadata_modify_resume_skips_completed_items() {
 
 #[test]
 fn metadata_modify_resume_only_retries_failed() {
+    // CRITICAL: this test MUST NOT hit archive.org. A previous version ran the
+    // retry POST against the live server, which on a machine with valid IA
+    // credentials would have mutated the live `item2` item. We now route all
+    // requests through a wiremock server: GET returns a stub item, POST returns
+    // 500 so the retry surface still produces "1 of 1 failed".
     let dir = tempfile::tempdir().unwrap();
 
     // item1 succeeded, item2 failed — only item2 should be retried
@@ -1642,9 +1647,50 @@ fn metadata_modify_resume_only_retries_failed() {
     let ids = dir.path().join("ids.txt");
     std::fs::write(&ids, "item1\nitem2\n").unwrap();
 
-    // Run modify — item1 is skipped (resumed), item2 is retried and fails (no auth)
+    let empty_cfg = dir.path().join("empty.ini");
+    std::fs::write(&empty_cfg, "").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    let item2_json = serde_json::json!({
+        "metadata": {
+            "identifier": "item2",
+            "title": "Original Title",
+            "mediatype": "texts"
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org",
+        "d1": "ia000000.us.archive.org",
+        "d2": "ia000001.us.archive.org",
+        "dir": "/0/items/item2",
+        "files_count": 0,
+        "item_size": 0,
+        "is_dark": false
+    });
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&item2_json))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/metadata/item2"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("mock failure"))
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+
+    // Run modify — item1 is skipped (resumed), item2 is retried and fails (mock 500)
     let output = ia()
+        .env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
         .args([
+            "--insecure",
+            "--host",
+            &host,
+            "--config-file",
+            empty_cfg.to_str().unwrap(),
             "metadata",
             "modify",
             "--itemlist",
@@ -1659,7 +1705,7 @@ fn metadata_modify_resume_only_retries_failed() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "should fail because item2 retry hits a real error, got: {stderr}"
+        "should fail because item2 retry hits the mocked 500, got: {stderr}"
     );
     assert!(
         stderr.contains("already modified"),
@@ -1702,6 +1748,10 @@ fn metadata_import_resume_skips_completed_items() {
 
 #[test]
 fn metadata_import_resume_only_retries_failed() {
+    // CRITICAL: this test MUST NOT hit archive.org — see the matching note on
+    // `metadata_modify_resume_only_retries_failed`. All HTTP traffic is routed
+    // to a wiremock server; the POST is mocked to 500 to preserve the
+    // "1 of 1 failed" assertion.
     let dir = tempfile::tempdir().unwrap();
 
     // item1 succeeded, item2 failed
@@ -1715,9 +1765,50 @@ fn metadata_import_resume_only_retries_failed() {
     let csv = dir.path().join("data.csv");
     std::fs::write(&csv, "identifier,title\nitem1,First\nitem2,Second\n").unwrap();
 
-    // Run import — item1 skipped, item2 retried and fails (no auth)
+    let empty_cfg = dir.path().join("empty.ini");
+    std::fs::write(&empty_cfg, "").unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    let item2_json = serde_json::json!({
+        "metadata": {
+            "identifier": "item2",
+            "title": "Original Title",
+            "mediatype": "texts"
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org",
+        "d1": "ia000000.us.archive.org",
+        "d2": "ia000001.us.archive.org",
+        "dir": "/0/items/item2",
+        "files_count": 0,
+        "item_size": 0,
+        "is_dark": false
+    });
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&item2_json))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/metadata/item2"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("mock failure"))
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+
+    // Run import — item1 skipped, item2 retried and fails (mock 500)
     let output = ia()
+        .env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
         .args([
+            "--insecure",
+            "--host",
+            &host,
+            "--config-file",
+            empty_cfg.to_str().unwrap(),
             "metadata",
             "--spreadsheet",
             csv.to_str().unwrap(),
@@ -1729,7 +1820,7 @@ fn metadata_import_resume_only_retries_failed() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "should fail because item2 retry hits a real error, got: {stderr}"
+        "should fail because item2 retry hits the mocked 500, got: {stderr}"
     );
     assert!(
         stderr.contains("already modified"),
