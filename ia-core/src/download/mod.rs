@@ -128,6 +128,14 @@ pub struct DownloadOpts {
     pub dry_run: bool,
     /// File filter.
     pub filter: FileFilter,
+    /// Increment archive.org's public view counter on each fetch.
+    ///
+    /// `false` (default) sends `cnt=0` with every download request so the
+    /// public view counter is not incremented. Set to `true` to omit the
+    /// `cnt` parameter entirely — archive.org only counts a view when the
+    /// `cnt` query parameter is absent (any value, including `cnt=1`,
+    /// suppresses counting).
+    pub count_views: bool,
 }
 
 impl Default for DownloadOpts {
@@ -140,6 +148,7 @@ impl Default for DownloadOpts {
             no_timestamps: false,
             dry_run: false,
             filter: FileFilter::default(),
+            count_views: false,
         }
     }
 }
@@ -183,6 +192,26 @@ pub struct FileDownloadResult {
     pub elapsed: Duration,
 }
 
+/// Ensure a `/download/` URL carries the `cnt=0` query parameter so archive.org
+/// does not increment the public view counter for the requested file.
+///
+/// Appends `?cnt=0` (or `&cnt=0` if the URL already has a `?` separator) when
+/// `cnt=` is not present. The IA-specific `…/file.jp2&ext=jpg` quirk (an
+/// `&ext=` segment without a preceding `?`) is preserved as part of the path —
+/// in that case we still append `?cnt=0`.
+///
+/// If the URL already includes any `cnt=` value it is preserved as-is, since
+/// archive.org's view-counter is suppressed by the *presence* of the `cnt`
+/// parameter — to re-enable view counting the parameter must be omitted
+/// entirely.
+pub(crate) fn ensure_cnt_zero(url: &str) -> String {
+    if url.contains("?cnt=") || url.contains("&cnt=") {
+        return url.to_string();
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}cnt=0")
+}
+
 /// Fetch a response from archive.org with auth, manual redirect following, and SSRF guard.
 ///
 /// Handles:
@@ -191,12 +220,20 @@ pub struct FileDownloadResult {
 /// - SSRF guard: only follows redirects to *.archive.org or the configured host
 /// - HTML error page stripping
 /// - Optional resume via Range header
+/// - View-counter suppression via `cnt=0` (see `count_views`)
+///
+/// When `count_views` is `false` (the default for every internal caller) the
+/// URL is rewritten through [`ensure_cnt_zero`] to suppress archive.org's
+/// public view counter. Set `count_views = true` to leave the URL untouched —
+/// archive.org only counts a view when the `cnt` parameter is absent
+/// entirely.
 ///
 /// Returns the raw response for callers to consume (stream to disk or collect to bytes).
 pub(crate) async fn fetch_response(
     client: &IaClient,
     url: &str,
     resume_from: Option<u64>,
+    count_views: bool,
 ) -> Result<reqwest::Response> {
     // Build auth header if credentials are available.
     let auth_value = client
@@ -210,8 +247,17 @@ pub(crate) async fn fetch_response(
     // Authorization header is preserved. archive.org redirects /download/
     // to data-node hosts (ia800XXX.us.archive.org), and reqwest strips
     // Authorization on redirect by default.
+    //
+    // Inject `cnt=0` on the initial URL (unless the caller opted in to view
+    // counting) so archive.org does not count the request against the
+    // public view counter. Redirected URLs from data nodes are not modified
+    // (the view counter lives on archive.org).
     let max_redirects = 10;
-    let mut current_url = url.to_string();
+    let mut current_url = if count_views {
+        url.to_string()
+    } else {
+        ensure_cnt_zero(url)
+    };
     let mut resp = None;
 
     for _ in 0..=max_redirects {
@@ -431,7 +477,7 @@ pub async fn download_file(
         });
     }
 
-    let response = fetch_response(client, &url, resume_from).await?;
+    let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
     let status = response.status();
 
     // If we asked for a Range but got 200 (not 206), the server ignored our
@@ -2484,5 +2530,114 @@ mod tests {
             verifying_idx < skipped_idx,
             "Verifying must precede Skipped: {seen:?}"
         );
+    }
+
+    /// All download requests must send `cnt=0` to suppress the archive.org
+    /// view-counter. Verified by gating the wiremock response on the
+    /// `query_param("cnt", "0")` matcher — if the param is missing the
+    /// request returns 404 and the test fails.
+    #[tokio::test]
+    async fn download_sends_cnt_zero_query_param() {
+        use wiremock::matchers::query_param;
+
+        let mock_server = MockServer::start().await;
+        let body = b"counted? no.";
+
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test.txt"))
+            .and(query_param("cnt", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("Last-Modified", "Thu, 01 Jan 2024 00:00:00 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test.txt", body.len() as u64);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .expect("download should succeed when cnt=0 is sent");
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+    }
+
+    #[test]
+    fn ensure_cnt_zero_appends_when_no_query() {
+        assert_eq!(
+            ensure_cnt_zero("https://archive.org/download/item/file.txt"),
+            "https://archive.org/download/item/file.txt?cnt=0"
+        );
+    }
+
+    #[test]
+    fn ensure_cnt_zero_appends_when_query_present() {
+        assert_eq!(
+            ensure_cnt_zero("https://archive.org/download/item/file.txt?foo=bar"),
+            "https://archive.org/download/item/file.txt?foo=bar&cnt=0"
+        );
+    }
+
+    #[test]
+    fn ensure_cnt_zero_does_not_duplicate() {
+        let already = "https://archive.org/download/item/file.txt?cnt=0";
+        assert_eq!(ensure_cnt_zero(already), already);
+        let already_mid = "https://archive.org/download/item/file.txt?foo=bar&cnt=0";
+        assert_eq!(ensure_cnt_zero(already_mid), already_mid);
+    }
+
+    /// Zip member converted URLs use the quirky `…/file.jp2&ext=jpg` form
+    /// (an `&ext=` segment without a preceding `?`). We treat that as
+    /// "no query string" and append `?cnt=0`, preserving the existing
+    /// `&ext=` segment in the path.
+    #[test]
+    fn ensure_cnt_zero_with_ia_ext_quirk() {
+        assert_eq!(
+            ensure_cnt_zero("https://archive.org/download/item/zip.zip/path/file.jp2&ext=jpg"),
+            "https://archive.org/download/item/zip.zip/path/file.jp2&ext=jpg?cnt=0"
+        );
+    }
+
+    /// `count_views: true` must omit the `cnt` parameter entirely so
+    /// archive.org records the view. (Sending `cnt=1` would still
+    /// suppress counting — the counter is gated on *absence* of `cnt`.)
+    #[tokio::test]
+    async fn download_with_count_views_omits_cnt_param() {
+        use wiremock::matchers::query_param_is_missing;
+
+        let mock_server = MockServer::start().await;
+        let body = b"counted!";
+
+        // Match only when `cnt` is absent from the query string. Any cnt
+        // value (including cnt=0) means our opt-out is broken.
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test.txt"))
+            .and(query_param_is_missing("cnt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test.txt", body.len() as u64);
+
+        let opts = DownloadOpts {
+            count_views: true,
+            ..Default::default()
+        };
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .expect("download with count_views=true should omit cnt entirely");
+        assert_eq!(result.status, DownloadStatus::Complete);
     }
 }

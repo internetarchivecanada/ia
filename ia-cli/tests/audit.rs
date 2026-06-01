@@ -110,9 +110,11 @@ async fn setup_mock(server: &MockServer, identifier: &str, body: &str) {
 }
 
 async fn setup_schema_mock(server: &MockServer) {
+    // The metadata API serves the schema wrapped in a `result` envelope.
+    let body = format!(r#"{{"result":{}}}"#, sample_schema_json());
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+        .and(path("/metadata/ia-metadata/schema"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .mount(server)
         .await;
 }

@@ -94,7 +94,9 @@ pub async fn fetch_scandata(
 
     // Use fetch_response for auth headers + redirect following with auth
     // preservation (reqwest strips Authorization on redirect by default).
-    let response = crate::download::fetch_response(client, &url, None).await?;
+    // count_views=false → inject cnt=0 so scandata fetches don't increment
+    // the public view counter for the parent item.
+    let response = crate::download::fetch_response(client, &url, None, false).await?;
 
     let body = response.text().await.map_err(|e| IaError::Http {
         status: 0,

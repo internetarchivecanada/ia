@@ -61,14 +61,29 @@ pub struct SchemaData {
     pub files_schema: Vec<SchemaField>,
 }
 
-/// Fetch the metadata schema from the ia-metadata item on archive.org.
+/// Envelope returned by the metadata API for a JSON-pointer subpath
+/// (`/metadata/<id>/<element>`): the requested element is wrapped in `result`.
+#[derive(Debug, Deserialize)]
+struct SchemaEnvelope {
+    result: SchemaData,
+}
+
+/// Fetch the metadata schema from the `ia-metadata` item on archive.org.
 ///
-/// Downloads and parses `ia-metadata_schema.json` which contains both
-/// item-level (`metadata_schema`) and file-level (`files_schema`) field
-/// definitions.
+/// Uses the metadata API (`/metadata/ia-metadata/schema`) rather than a
+/// `/download/` GET. The metadata API does not increment the public view
+/// counter and returns the schema directly, wrapped in a `result` envelope.
+/// Contains both item-level (`metadata_schema`) and file-level
+/// (`files_schema`) field definitions.
 pub async fn fetch_schema(client: &IaClient) -> crate::Result<SchemaData> {
-    let url = client.url("/download/ia-metadata/ia-metadata_schema.json");
-    let resp = client.http().get(&url).send().await?;
+    let url = client.url("/metadata/ia-metadata/schema");
+
+    let mut req = client.http().get(&url);
+    if let Some(auth) = crate::auth::s3_auth_value(client.config()) {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().await?;
+
     let status = resp.status();
     if !status.is_success() {
         return Err(IaError::Http {
@@ -77,8 +92,8 @@ pub async fn fetch_schema(client: &IaClient) -> crate::Result<SchemaData> {
         });
     }
     let body = resp.text().await.map_err(reqwest_middleware::Error::from)?;
-    let data: SchemaData = serde_json::from_str(&body)?;
-    Ok(data)
+    let envelope: SchemaEnvelope = serde_json::from_str(&body)?;
+    Ok(envelope.result)
 }
 
 #[cfg(test)]
@@ -176,6 +191,11 @@ mod tests {
 
     // -- fetch_schema integration tests --
 
+    /// The metadata API wraps the requested element in a `result` envelope.
+    fn sample_schema_envelope_json() -> String {
+        format!(r#"{{"result":{}}}"#, sample_schema_json())
+    }
+
     fn mock_config(server_uri: &str) -> crate::config::IaConfig {
         let mut config = crate::config::IaConfig::default();
         let host = server_uri
@@ -195,8 +215,8 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/download/ia-metadata/ia-metadata_schema.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
+            .and(path("/metadata/ia-metadata/schema"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_envelope_json()))
             .mount(&mock_server)
             .await;
 
@@ -214,7 +234,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+            .and(path("/metadata/ia-metadata/schema"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&mock_server)
             .await;

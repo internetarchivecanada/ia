@@ -55,7 +55,8 @@ fn download_subcommand_help() {
         .success()
         .stdout(predicate::str::contains("--glob"))
         .stdout(predicate::str::contains("--jobs"))
-        .stdout(predicate::str::contains("--checksum"));
+        .stdout(predicate::str::contains("--checksum"))
+        .stdout(predicate::str::contains("--count-views"));
 }
 
 #[test]
