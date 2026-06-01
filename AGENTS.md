@@ -76,3 +76,4 @@ Global flags — do not reuse in subcommands:
 - S3 metadata headers: underscores become double-dashes, non-ASCII wrapped in `uri()`
 - Metadata write POST: form-encoded (`-target`, `-patch`, `priority`, `access`, `secret`), not JSON
 - Metadata write uses RFC 6902 JSON Patch (test/add/replace/remove ops)
+- All `/download/` GETs send `cnt=0` to suppress the public view counter — injected centrally in `download::fetch_response` (and in `ai::ia_config::fetch_ai_config`, which bypasses it). Helper: `download::ensure_cnt_zero`. Opt-out: `DownloadOpts::count_views = true` (CLI: `ia download --count-views`) omits the `cnt` parameter entirely — archive.org only counts views when `cnt` is absent.

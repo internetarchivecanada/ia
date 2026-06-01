@@ -102,6 +102,15 @@ pub struct DownloadArgs {
     #[arg(long)]
     dry_run: bool,
 
+    /// Increment archive.org's public view counter on each downloaded file.
+    ///
+    /// By default `ia` sends `cnt=0` with every download request so bulk
+    /// downloads do not inflate item view statistics. Pass `--count-views`
+    /// to omit the parameter entirely; archive.org only counts a view when
+    /// `cnt` is absent — `cnt=1` (or any other value) also suppresses it.
+    #[arg(long)]
+    count_views: bool,
+
     /// Download items matching a search query (downloads each result)
     #[arg(short = 's', long, conflicts_with = "itemlist")]
     search: Option<String>,
@@ -412,6 +421,7 @@ pub async fn run(
         no_timestamps: args.no_timestamps,
         dry_run: args.dry_run,
         filter: filter.clone(),
+        count_views: args.count_views,
     };
 
     let opts = make_opts(base_destdir.clone());

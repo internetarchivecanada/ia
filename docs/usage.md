@@ -45,6 +45,7 @@ ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 | `-R, --retries <N>` | Max retries per file (default: 5) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
+| `--count-views` | Increment archive.org's public view counter (off by default) |
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
@@ -75,6 +76,13 @@ ia download nasa --dry-run
 # Download with JSON output (for scripts/agents)
 ia download nasa --json
 ```
+
+> **Note:** All download requests (single-file, batch, zip listings, scandata,
+> and AI-config fetches) include `cnt=0` as a query parameter so they do not
+> increment the public view counter on archive.org. Pass `--count-views` on
+> `ia download` to omit the parameter and have your downloads counted toward
+> public view statistics — archive.org only records a view when `cnt` is
+> absent entirely; `cnt=1` (or any other value) also suppresses counting.
 
 ### `ia search`
 

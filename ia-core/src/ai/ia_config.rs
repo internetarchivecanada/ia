@@ -96,11 +96,11 @@ pub async fn fetch_ai_config(client: &IaClient, collection_id: &str) -> Result<I
         IaError::NotFound(format!("no AI config found in collection {collection_id}"))
     })?;
 
-    let url = client.url(&format!(
+    let url = crate::download::ensure_cnt_zero(&client.url(&format!(
         "/download/{}/{}",
         collection_id,
         urlencoding::encode(&config_file),
-    ));
+    )));
 
     debug!(
         collection = collection_id,
@@ -587,5 +587,56 @@ mod tests {
 
         let err = load_ai_config_from_file(&path).unwrap_err();
         assert!(err.to_string().contains("expected")); // serde parse error
+    }
+
+    /// `fetch_ai_config` bypasses `download::fetch_response` but the AI
+    /// config download must still suppress view-counting via `cnt=0`.
+    #[tokio::test]
+    async fn fetch_ai_config_sends_cnt_zero() {
+        use crate::config::IaConfig;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Item metadata: one AI Config JSON file.
+        let metadata = serde_json::json!({
+            "created": 0,
+            "metadata": { "identifier": "ai-coll" },
+            "files": [
+                { "name": "ai-coll-config.json", "format": "AI Config JSON" }
+            ]
+        });
+        Mock::given(method("GET"))
+            .and(path("/metadata/ai-coll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .mount(&server)
+            .await;
+
+        // Download must include cnt=0; otherwise the mock returns 404.
+        let config_body = serde_json::json!({
+            "result": default_ai_config().result,
+        });
+        Mock::given(method("GET"))
+            .and(path("/download/ai-coll/ai-coll-config.json"))
+            .and(query_param("cnt", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(config_body))
+            .mount(&server)
+            .await;
+
+        let host = server
+            .uri()
+            .strip_prefix("http://")
+            .unwrap_or(&server.uri())
+            .to_string();
+        let mut config = IaConfig::default();
+        config.general.host = host;
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let fetched = fetch_ai_config(&client, "ai-coll")
+            .await
+            .expect("fetch_ai_config should succeed when cnt=0 is sent");
+        assert_eq!(fetched.result.model_name, "gpt-5-nano");
     }
 }

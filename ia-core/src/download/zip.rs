@@ -43,7 +43,9 @@ pub async fn list_zip_contents(
 
     // Use fetch_response for auth headers + redirect following with auth
     // preservation (reqwest strips Authorization on redirect by default).
-    let response = super::fetch_response(client, &url, None).await?;
+    // count_views=false → inject cnt=0 so zip listings/members don't
+    // increment the public view counter for the parent item.
+    let response = super::fetch_response(client, &url, None, false).await?;
 
     let html = response.text().await.map_err(|e| IaError::Http {
         status: 0,
@@ -70,7 +72,9 @@ pub async fn download_zip_member(
         zip_filename, member_path, "downloading zip member"
     );
 
-    let response = super::fetch_response(client, &url, None).await?;
+    // count_views=false → inject cnt=0 so zip listings/members don't
+    // increment the public view counter for the parent item.
+    let response = super::fetch_response(client, &url, None, false).await?;
 
     response
         .bytes()
@@ -104,7 +108,9 @@ pub async fn download_zip_member_converted(
         zip_filename, member_path, ext, "downloading converted zip member"
     );
 
-    let response = super::fetch_response(client, &url, None).await?;
+    // count_views=false → inject cnt=0 so zip listings/members don't
+    // increment the public view counter for the parent item.
+    let response = super::fetch_response(client, &url, None, false).await?;
 
     response
         .bytes()
@@ -432,5 +438,69 @@ mod tests {
             extra: HashMap::new(),
         }];
         assert_eq!(find_jp2_zip("item", &files), None);
+    }
+
+    fn mock_config(server_uri: &str) -> crate::config::IaConfig {
+        let mut config = crate::config::IaConfig::default();
+        let host = server_uri
+            .strip_prefix("http://")
+            .or_else(|| server_uri.strip_prefix("https://"))
+            .unwrap_or(server_uri);
+        config.general.host = host.to_string();
+        config.general.secure = false;
+        config
+    }
+
+    /// Zip directory listing must send `cnt=0` to suppress view-counting.
+    #[tokio::test]
+    async fn list_zip_contents_sends_cnt_zero() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/item.zip/"))
+            .and(query_param("cnt", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<tr><td><a href="/download/test-item/item.zip/file.txt">file.txt</a><td>2024<td id="size">10</tr>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let client = crate::IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let entries = list_zip_contents(&client, "test-item", "item.zip")
+            .await
+            .expect("list_zip_contents should succeed when cnt=0 is sent");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// `download_zip_member_converted` builds URLs with IA's `&ext=` quirk
+    /// (no preceding `?`). Verify `cnt=0` is still sent as a proper query
+    /// parameter and the `&ext=` segment is preserved in the path.
+    #[tokio::test]
+    async fn download_zip_member_converted_sends_cnt_zero() {
+        use wiremock::matchers::{method, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            // wiremock decodes the request path; the `&ext=jpg` lives in the
+            // path (not the query) because of IA's quirky URL form, so the
+            // matched path includes it verbatim.
+            .and(wiremock::matchers::path(
+                "/download/item/zip.zip/page.jp2&ext=jpg",
+            ))
+            .and(query_param("cnt", "0"))
+            // `ext` must NOT appear as a query parameter — it stays in the path.
+            .and(query_param_is_missing("ext"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xff, 0xd8]))
+            .mount(&server)
+            .await;
+
+        let client = crate::IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let bytes = download_zip_member_converted(&client, "item", "zip.zip", "page.jp2", "jpg")
+            .await
+            .expect("converted zip member download should succeed with cnt=0");
+        assert_eq!(bytes, vec![0xff, 0xd8]);
     }
 }

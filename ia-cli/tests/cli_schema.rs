@@ -3,8 +3,11 @@ use serde_json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Schema as served by the metadata API (`/metadata/ia-metadata/schema`):
+/// the schema is wrapped in a `result` envelope.
 fn sample_schema_json() -> &'static str {
     r#"{
+      "result": {
         "metadata_schema": [
             {
                 "field": "title",
@@ -53,6 +56,7 @@ fn sample_schema_json() -> &'static str {
                 "definition": "Name of the file"
             }
         ]
+      }
     }"#
 }
 
@@ -60,7 +64,7 @@ fn sample_schema_json() -> &'static str {
 async fn schema_table_hides_internal_by_default() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -79,7 +83,7 @@ async fn schema_table_hides_internal_by_default() {
 async fn schema_table_shows_internal_with_flag() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -104,7 +108,7 @@ async fn schema_table_shows_internal_with_flag() {
 async fn schema_detail_shows_all_properties() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -130,7 +134,7 @@ async fn schema_detail_shows_all_properties() {
 async fn schema_detail_unknown_field_fails() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -154,7 +158,7 @@ async fn schema_detail_unknown_field_fails() {
 async fn schema_detail_json_outputs_single_object() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -184,7 +188,7 @@ async fn schema_detail_json_outputs_single_object() {
 async fn schema_required_filter() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -212,7 +216,7 @@ async fn schema_required_filter() {
 async fn schema_files_flag() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -242,7 +246,7 @@ async fn schema_files_flag() {
 async fn schema_json_outputs_array() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -270,7 +274,7 @@ async fn schema_json_outputs_array() {
 async fn schema_defined_by_filter() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -300,7 +304,7 @@ async fn schema_defined_by_filter() {
 async fn schema_repeatable_filter() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -328,7 +332,7 @@ async fn schema_repeatable_filter() {
 async fn schema_edit_access_filter() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -358,7 +362,7 @@ async fn schema_edit_access_filter() {
 async fn schema_detail_case_insensitive() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -379,7 +383,7 @@ async fn schema_detail_case_insensitive() {
 async fn schema_detail_unknown_field_json_error() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
@@ -409,7 +413,7 @@ async fn schema_detail_unknown_field_json_error() {
 async fn schema_empty_filter_result() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/download/ia-metadata/ia-metadata_schema.json"))
+        .and(path("/metadata/ia-metadata/schema"))
         .respond_with(ResponseTemplate::new(200).set_body_string(sample_schema_json()))
         .mount(&server)
         .await;
