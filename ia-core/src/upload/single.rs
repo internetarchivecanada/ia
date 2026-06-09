@@ -158,7 +158,7 @@ pub async fn upload_file(
 
     // Pre-compute metadata headers (only used on first file)
     let metadata_headers = if is_first_file && !opts.metadata.is_empty() {
-        encode_metadata_headers(&opts.metadata)
+        encode_metadata_headers(&opts.metadata)?
     } else {
         Vec::new()
     };
