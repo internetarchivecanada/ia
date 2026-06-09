@@ -23,8 +23,16 @@ impl RateLimiter {
 
     /// Check if we're rate-limited. If so, wait until resumed.
     pub async fn wait_if_paused(&self) {
-        while self.paused.load(Ordering::Relaxed) {
-            self.notify.notified().await;
+        loop {
+            // Create the Notified future *before* checking the flag, so a
+            // notify_waiters() that fires between the check and the await
+            // is still observed. Checking first loses that wake-up and
+            // deadlocks the waiter (TOCTOU race).
+            let notified = self.notify.notified();
+            if !self.paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -167,6 +175,38 @@ mod tests {
             "took {elapsed:?}, expected ~1s"
         );
         assert!(!rl.is_paused());
+    }
+
+    /// Regression test for a lost-wakeup (TOCTOU) race: if resume fires
+    /// between the waiter's `paused` check and its `Notified` registration,
+    /// the waiter must not block forever. Runs many iterations on a
+    /// multi-threaded runtime to give the race window real parallelism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_racing_with_wait_does_not_lose_wakeup() {
+        for i in 0..50_000u32 {
+            let rl = RateLimiter::new();
+            rl.paused.store(true, Ordering::SeqCst);
+
+            let rl_waiter = rl.clone();
+            let waiter = tokio::spawn(async move {
+                rl_waiter.wait_if_paused().await;
+            });
+
+            // Resume from this thread — races with the waiter's
+            // load/registration on another worker thread. The spin sweep
+            // varies the timing offset so the store+notify lands at
+            // different points within the waiter's execution.
+            for _ in 0..(i % 2000) {
+                std::hint::spin_loop();
+            }
+            rl.paused.store(false, Ordering::SeqCst);
+            rl.notify.notify_waiters();
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("waiter deadlocked on iteration {i}: wake-up lost"))
+                .unwrap();
+        }
     }
 
     #[tokio::test]
