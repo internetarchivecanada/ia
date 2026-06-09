@@ -1,4 +1,4 @@
-use crate::error::{IaError, Result};
+use crate::error::Result;
 use crate::identifier::generate_identifier;
 use std::path::Path;
 
@@ -69,50 +69,79 @@ pub fn write_template_csv<W: std::io::Write>(rows: &[TemplateRow], writer: &mut 
     let mut csv_writer = csv::Writer::from_writer(writer);
 
     // Header
-    csv_writer
-        .write_record([
-            "identifier",
-            "file",
-            "REMOTE_NAME",
-            "mediatype",
-            "collection",
-            "title",
-            "creator",
-            "date",
-            "description",
-            "subject",
-            "language",
-        ])
-        .map_err(|e| IaError::Config(format!("CSV write error: {e}")))?;
+    csv_writer.write_record([
+        "identifier",
+        "file",
+        "REMOTE_NAME",
+        "mediatype",
+        "collection",
+        "title",
+        "creator",
+        "date",
+        "description",
+        "subject",
+        "language",
+    ])?;
 
     // Rows
     for row in rows {
-        csv_writer
-            .write_record([
-                &row.identifier,
-                &row.file,
-                &row.remote_name,
-                &row.mediatype,
-                &row.collection,
-                &row.title,
-                &row.creator,
-                &row.date,
-                &row.description,
-                &row.subject,
-                &row.language,
-            ])
-            .map_err(|e| IaError::Config(format!("CSV write error: {e}")))?;
+        csv_writer.write_record([
+            &row.identifier,
+            &row.file,
+            &row.remote_name,
+            &row.mediatype,
+            &row.collection,
+            &row.title,
+            &row.creator,
+            &row.date,
+            &row.description,
+            &row.subject,
+            &row.language,
+        ])?;
     }
 
-    csv_writer
-        .flush()
-        .map_err(|e| IaError::Config(format!("CSV flush error: {e}")))?;
+    csv_writer.flush()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IaError;
+
+    /// A writer that fails every write with PermissionDenied.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        }
+    }
+
+    #[test]
+    fn csv_write_failure_is_csv_error_with_source() {
+        // I/O failures during CSV writing must not be misclassified as
+        // Config errors, and the source chain must survive for callers.
+        let err =
+            write_template_csv(&[], &mut FailingWriter).expect_err("failing writer must error");
+        assert!(
+            matches!(err, IaError::Csv(_) | IaError::Io(_)),
+            "expected Csv or Io classification, got: {err:?}"
+        );
+        assert!(
+            std::error::Error::source(&err).is_some() || matches!(err, IaError::Io(_)),
+            "source chain must be preserved, got: {err:?}"
+        );
+    }
     use std::fs;
     use tempfile::TempDir;
 

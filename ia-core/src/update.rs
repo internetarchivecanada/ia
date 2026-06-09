@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 ///
 /// Includes retry middleware (3 retries with exponential backoff) so
 /// transient GitHub 5xx errors are handled automatically.
-fn github_client(current_version: &str) -> ClientWithMiddleware {
+fn github_client(current_version: &str) -> crate::Result<ClientWithMiddleware> {
     let raw = crate::client::configure_transport(
         reqwest::Client::builder(),
         crate::client::CONNECT_TIMEOUT,
@@ -17,7 +17,7 @@ fn github_client(current_version: &str) -> ClientWithMiddleware {
     )
     .user_agent(format!("ia/{current_version}"))
     .build()
-    .expect("failed to build HTTP client");
+    .map_err(|e| IaError::Config(format!("failed to build HTTP client: {e}")))?;
 
     let retry_policy = ExponentialBackoff::builder()
         .retry_bounds(
@@ -26,9 +26,9 @@ fn github_client(current_version: &str) -> ClientWithMiddleware {
         )
         .build_with_max_retries(3);
 
-    ClientBuilder::new(raw)
+    Ok(ClientBuilder::new(raw)
         .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-        .build()
+        .build())
 }
 
 /// A GitHub release from the releases API.
@@ -144,7 +144,7 @@ pub async fn list_releases(
     current_version: &str,
     target: &str,
 ) -> crate::Result<Vec<ReleaseInfo>> {
-    let client = github_client(current_version);
+    let client = github_client(current_version)?;
     let mut url = format!("{api_base}/repos/jjjake/ia/releases?page=1");
     let mut all_releases: Vec<GitHubRelease> = Vec::new();
 
@@ -243,7 +243,7 @@ pub async fn fetch_release_by_tag(
     };
 
     let url = format!("{api_base}/repos/jjjake/ia/releases/tags/{tag}");
-    let client = github_client(current_version);
+    let client = github_client(current_version)?;
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -280,7 +280,7 @@ pub async fn fetch_release_by_tag(
 /// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
 pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::Result<UpdateCheck> {
     let url = format!("{api_base}/repos/jjjake/ia/releases/latest");
-    let client = github_client(current_version);
+    let client = github_client(current_version)?;
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -325,7 +325,7 @@ pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::R
 
 /// Download a release asset to a local file path.
 pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> crate::Result<()> {
-    let client = github_client(current_version);
+    let client = github_client(current_version)?;
     let response = client
         .get(url)
         .send()
@@ -423,9 +423,10 @@ async fn download_and_replace(
     }
 
     if !skip_verify {
-        let output = std::process::Command::new(current_exe)
+        let output = tokio::process::Command::new(current_exe)
             .arg("--version")
-            .output();
+            .output()
+            .await;
 
         match output {
             Ok(out) if out.status.success() => {

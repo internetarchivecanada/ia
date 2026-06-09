@@ -107,6 +107,9 @@ pub enum IaError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
+
     #[error("missing required metadata field: {field}")]
     MissingRequiredMetadata { field: String },
 
@@ -170,6 +173,9 @@ impl IaError {
         match self {
             IaError::DiskFull { .. } => true,
             IaError::Io(e) => e.kind() == std::io::ErrorKind::StorageFull,
+            IaError::Csv(e) => {
+                matches!(e.kind(), csv::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+            }
             _ => false,
         }
     }
@@ -224,6 +230,7 @@ impl IaError {
             IaError::CollectionNotFound { .. } => false,
             IaError::InvalidIdentifier { .. } => false,
             IaError::InvalidArgument(_) => false,
+            IaError::Csv(_) => false,
             IaError::MissingRequiredMetadata { .. } => false,
             IaError::CheckLimitFailed { .. } => true, // conservative: treat as overloaded
             IaError::FileTooLarge { .. } => false,
@@ -370,6 +377,7 @@ impl IaError {
                 "invalid_identifier"
             }
             IaError::InvalidArgument(_) => "invalid_argument",
+            IaError::Csv(_) => "csv_error",
             IaError::MissingRequiredMetadata { field } => {
                 extra.insert("field".into(), field.clone().into());
                 "missing_required_metadata"

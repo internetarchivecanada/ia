@@ -209,10 +209,7 @@ fn draw_active_files(f: &mut Frame, area: Rect, state: &TuiState) {
             })
             .unwrap_or(0.0);
 
-        let bar_width = 20;
-        let filled = (progress * bar_width as f64) as usize;
-        let empty = bar_width - filled;
-        let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty));
+        let bar = crate::tui::widgets::progress_bar(progress, 20);
 
         let speed = {
             let secs = fp.started_at.elapsed().as_secs_f64();
