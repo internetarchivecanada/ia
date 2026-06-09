@@ -10,10 +10,14 @@ use tokio::io::AsyncWriteExt;
 /// Includes retry middleware (3 retries with exponential backoff) so
 /// transient GitHub 5xx errors are handled automatically.
 fn github_client(current_version: &str) -> ClientWithMiddleware {
-    let raw = reqwest::Client::builder()
-        .user_agent(format!("ia/{current_version}"))
-        .build()
-        .expect("failed to build HTTP client");
+    let raw = crate::client::configure_transport(
+        reqwest::Client::builder(),
+        crate::client::CONNECT_TIMEOUT,
+        Some(crate::client::READ_TIMEOUT),
+    )
+    .user_agent(format!("ia/{current_version}"))
+    .build()
+    .expect("failed to build HTTP client");
 
     let retry_policy = ExponentialBackoff::builder()
         .retry_bounds(

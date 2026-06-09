@@ -9,6 +9,50 @@ use crate::error::Result;
 use crate::retry::{LoggingRetryStrategy, RetryStats, TimingMiddleware};
 use crate::user_agent::build_user_agent;
 
+/// Maximum time to establish a TCP connection (incl. TLS handshake).
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum idle time between response reads on an established connection.
+///
+/// Applies per read operation and resets after each successful read, so
+/// long streaming *downloads* are fine as long as bytes keep flowing.
+///
+/// CAUTION: the clock is NOT reset by request-body writes — the server is
+/// legitimately silent while a large body uploads, so this must never be
+/// set on a transport that sends streaming/multipart upload bodies (they
+/// would abort once the send exceeds the timeout). Pass `None` for those.
+pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Apply connect/read timeouts to a client builder.
+///
+/// Shared by all transport clients so a stalled connection aborts with a
+/// timeout error instead of hanging its tokio task indefinitely. `read`
+/// must be `None` for transports that send large request bodies (see
+/// [`READ_TIMEOUT`]).
+pub(crate) fn configure_transport(
+    builder: reqwest::ClientBuilder,
+    connect: std::time::Duration,
+    read: Option<std::time::Duration>,
+) -> reqwest::ClientBuilder {
+    let builder = builder.connect_timeout(connect);
+    match read {
+        Some(read) => builder.read_timeout(read),
+        None => builder,
+    }
+}
+
+/// The underlying reqwest transports, split by timeout requirements.
+struct Transports {
+    /// General API transport: archive.org-only redirects, read timeout.
+    api: reqwest::Client,
+    /// Upload transport: archive.org-only redirects, NO read timeout —
+    /// safe for requests that spend a long time sending a body.
+    upload: reqwest::Client,
+    /// Download-auth transport: redirects disabled, read timeout.
+    no_redirect: reqwest::Client,
+    user_agent: String,
+}
+
 /// Error returned when a redirect targets a non-archive.org domain.
 #[derive(Debug)]
 struct RedirectBlockedError(reqwest::Url);
@@ -31,7 +75,14 @@ impl std::error::Error for RedirectBlockedError {}
 #[derive(Clone)]
 pub struct IaClient {
     http: ClientWithMiddleware,
-    /// Raw reqwest client without retry middleware.
+    /// Retry-middleware client over the upload transport (no read
+    /// timeout). For upload-path requests with cloneable bodies:
+    /// multipart part PUTs and S3 control calls (initiate/complete/
+    /// abort/list), whose body sends or server-side processing can
+    /// legitimately exceed the API read timeout.
+    upload_http: ClientWithMiddleware,
+    /// Raw reqwest client without retry middleware (upload transport,
+    /// no read timeout).
     ///
     /// Used by operations that manage their own retry loops (e.g., upload)
     /// and need to send streaming (non-cloneable) request bodies.
@@ -56,16 +107,10 @@ impl IaClient {
         Self::from_config(config)
     }
 
-    /// Build the raw reqwest client with shared settings (headers, pool config).
-    fn build_raw_client(config: &IaConfig) -> Result<(reqwest::Client, reqwest::Client, String)> {
-        let user_agent = build_user_agent(config);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
-
-        // Only follow redirects to *.archive.org domains.
-        // Blocks SSRF and prevents credential leakage if auth is added later.
-        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+    /// Only follow redirects to *.archive.org domains.
+    /// Blocks SSRF and prevents credential leakage if auth is added later.
+    fn archive_redirect_policy() -> reqwest::redirect::Policy {
+        reqwest::redirect::Policy::custom(|attempt| {
             if let Some(host) = attempt.url().host_str() {
                 if host == "archive.org" || host.ends_with(".archive.org") {
                     return attempt.follow();
@@ -73,45 +118,86 @@ impl IaClient {
             }
             let target_url = attempt.url().clone();
             attempt.error(RedirectBlockedError(target_url))
-        });
+        })
+    }
 
-        // HTTP/2 flow-control windows default to 65,535 bytes in hyper (RFC
-        // minimum). At ~40 ms RTT that caps per-stream throughput at ~1.6
-        // MB/s — the actual cause of "slow downloads on fiber." Advertise
-        // large receive windows (16 MB stream, 64 MB connection) and enable
-        // BDP-adaptive windowing so the window grows with real throughput.
-        // TCP_NODELAY eliminates Nagle delays for small control frames.
-        let raw_client = reqwest::Client::builder()
-            .default_headers(headers.clone())
-            .pool_max_idle_per_host(10)
-            .http2_adaptive_window(true)
-            .http2_initial_stream_window_size(16 * 1024 * 1024)
-            .http2_initial_connection_window_size(64 * 1024 * 1024)
-            .tcp_nodelay(true)
-            .redirect(redirect_policy)
-            .build()
-            .map_err(|e| {
-                crate::error::IaError::Config(format!("failed to build HTTP client: {e}"))
-            })?;
-
-        // No-redirect client for download auth: archive.org redirects
-        // /download/ to data nodes, and reqwest strips Authorization on
-        // redirect. We handle redirects manually to preserve auth headers
-        // (equivalent to curl --location-trusted).
-        let no_redirect_client = reqwest::Client::builder()
+    /// Shared builder settings for all transports.
+    ///
+    /// HTTP/2 flow-control windows default to 65,535 bytes in hyper (RFC
+    /// minimum). At ~40 ms RTT that caps per-stream throughput at ~1.6
+    /// MB/s — the actual cause of "slow downloads on fiber." Advertise
+    /// large receive windows (16 MB stream, 64 MB connection) and enable
+    /// BDP-adaptive windowing so the window grows with real throughput.
+    /// TCP_NODELAY eliminates Nagle delays for small control frames.
+    fn base_builder(headers: HeaderMap) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .default_headers(headers)
             .pool_max_idle_per_host(10)
             .http2_adaptive_window(true)
             .http2_initial_stream_window_size(16 * 1024 * 1024)
             .http2_initial_connection_window_size(64 * 1024 * 1024)
             .tcp_nodelay(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| {
-                crate::error::IaError::Config(format!("failed to build no-redirect client: {e}"))
-            })?;
+    }
 
-        Ok((raw_client, no_redirect_client, user_agent))
+    /// Build the underlying reqwest transports with shared settings.
+    ///
+    /// `read_timeout` is applied only to the `api` and `no_redirect`
+    /// transports (request bodies are small; response bodies reset the
+    /// timer per chunk). The `upload` transport gets the connect timeout
+    /// only: reqwest's read-timeout clock is not reset by request-body
+    /// writes, so it would abort any upload whose body takes longer than
+    /// the timeout to send.
+    fn build_transports(
+        config: &IaConfig,
+        connect_timeout: std::time::Duration,
+        read_timeout: std::time::Duration,
+    ) -> Result<Transports> {
+        let user_agent = build_user_agent(config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+
+        let api = configure_transport(
+            Self::base_builder(headers.clone()),
+            connect_timeout,
+            Some(read_timeout),
+        )
+        .redirect(Self::archive_redirect_policy())
+        .build()
+        .map_err(|e| crate::error::IaError::Config(format!("failed to build HTTP client: {e}")))?;
+
+        // Upload transport: NO read timeout (see above).
+        let upload =
+            configure_transport(Self::base_builder(headers.clone()), connect_timeout, None)
+                .redirect(Self::archive_redirect_policy())
+                .build()
+                .map_err(|e| {
+                    crate::error::IaError::Config(format!(
+                        "failed to build upload HTTP client: {e}"
+                    ))
+                })?;
+
+        // No-redirect client for download auth: archive.org redirects
+        // /download/ to data nodes, and reqwest strips Authorization on
+        // redirect. We handle redirects manually to preserve auth headers
+        // (equivalent to curl --location-trusted).
+        let no_redirect = configure_transport(
+            Self::base_builder(headers),
+            connect_timeout,
+            Some(read_timeout),
+        )
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| {
+            crate::error::IaError::Config(format!("failed to build no-redirect client: {e}"))
+        })?;
+
+        Ok(Transports {
+            api,
+            upload,
+            no_redirect,
+            user_agent,
+        })
     }
 
     /// Create a new client with the provided config.
@@ -124,7 +210,7 @@ impl IaClient {
     /// `verbosity` controls diagnostic output detail (0 = dedup warnings,
     /// 1+ = individual events). See [`RetryStats`] for details.
     pub fn from_config_with_verbosity(config: IaConfig, verbosity: u8) -> Result<Self> {
-        let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
+        let transports = Self::build_transports(&config, CONNECT_TIMEOUT, READ_TIMEOUT)?;
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(
@@ -134,25 +220,36 @@ impl IaClient {
             .build_with_max_retries(3);
 
         let stats = Arc::new(RetryStats::new(verbosity));
-        let strategy = LoggingRetryStrategy::new(stats.clone());
 
         // Clone before moving into middleware — reqwest::Client is Arc-based, cheap to clone.
-        let raw_http = raw_client.clone();
+        let raw_http = transports.upload.clone();
 
-        let http = ClientBuilder::new(raw_client)
+        let http = ClientBuilder::new(transports.api)
             .with(TimingMiddleware::new(stats.clone()))
             .with(RetryTransientMiddleware::new_with_policy_and_strategy(
                 retry_policy,
-                strategy,
+                LoggingRetryStrategy::new(stats.clone()),
+            ))
+            .build();
+
+        // Same middleware stack over the upload transport, for upload
+        // requests with cloneable bodies (multipart parts, S3 control
+        // calls) that want retry but must not have a read timeout.
+        let upload_http = ClientBuilder::new(transports.upload)
+            .with(TimingMiddleware::new(stats.clone()))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                LoggingRetryStrategy::new(stats.clone()),
             ))
             .build();
 
         Ok(Self {
             http,
+            upload_http,
             raw_http,
-            no_redirect_http: no_redirect_client,
+            no_redirect_http: transports.no_redirect,
             config,
-            user_agent,
+            user_agent: transports.user_agent,
             retry_stats: stats,
         })
     }
@@ -196,7 +293,18 @@ impl IaClient {
         &self.http
     }
 
-    /// Raw HTTP client without retry middleware.
+    /// Retry-middleware HTTP client over the upload transport.
+    ///
+    /// Like [`Self::http`] but without a read timeout. Use for upload-path
+    /// requests with cloneable bodies — multipart part PUTs and S3 control
+    /// calls — where the body send or server-side processing (e.g.
+    /// assembling a completed multipart upload) can stay silent longer
+    /// than the API read timeout.
+    pub(crate) fn upload_http(&self) -> &ClientWithMiddleware {
+        &self.upload_http
+    }
+
+    /// Raw HTTP client without retry middleware (upload transport).
     ///
     /// Use this for requests with streaming (non-cloneable) bodies, such as
     /// file uploads. The retry middleware requires `Request::try_clone()` to
@@ -233,19 +341,21 @@ impl IaClient {
     /// needs to see raw HTTP responses without middleware intervention.
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
-        let (raw_client, no_redirect_client, user_agent) = Self::build_raw_client(&config)?;
+        let transports = Self::build_transports(&config, CONNECT_TIMEOUT, READ_TIMEOUT)?;
         // Stats are required by the struct but will always be zeros — no
         // TimingMiddleware or LoggingRetryStrategy is wired in this path.
         let stats = Arc::new(RetryStats::new(0));
-        let raw_http = raw_client.clone();
-        let http = ClientBuilder::new(raw_client).build();
+        let raw_http = transports.upload.clone();
+        let http = ClientBuilder::new(transports.api).build();
+        let upload_http = ClientBuilder::new(transports.upload).build();
 
         Ok(Self {
             http,
+            upload_http,
             raw_http,
-            no_redirect_http: no_redirect_client,
+            no_redirect_http: transports.no_redirect,
             config,
-            user_agent,
+            user_agent: transports.user_agent,
             retry_stats: stats,
         })
     }
@@ -289,6 +399,157 @@ impl IaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_timeout_aborts_stalled_response() {
+        // A server that accepts connections but never responds. Without a
+        // read timeout the request would hang forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                // Hold the connection open without writing a response.
+                tokio::spawn(async move {
+                    let _stream = stream;
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+            }
+        });
+
+        let client = configure_transport(
+            reqwest::Client::builder(),
+            std::time::Duration::from_secs(5),
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .build()
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let result = client.get(format!("http://{addr}/")).send().await;
+        let err = result.expect_err("stalled response must time out");
+        assert!(err.is_timeout(), "expected timeout error, got: {err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "request should abort at the read timeout, not hang"
+        );
+    }
+
+    /// Spawn a local server that reads a full 50-byte request body and only
+    /// then responds 200. Returns its address.
+    async fn slow_body_sink() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut total = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                total.extend_from_slice(&buf[..n]);
+                // Headers + full 50-byte body received (5 chunks x 10 bytes).
+                let body_start = total
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4);
+                if body_start.is_some_and(|s| total.len() - s >= 50) {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        addr
+    }
+
+    /// A request body of 5 x 10-byte chunks, 150ms apart (~750ms total).
+    fn slow_body_stream() -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> {
+        futures::stream::unfold(0u32, |i| async move {
+            if i >= 5 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            Some((Ok(vec![b'x'; 10]), i + 1))
+        })
+    }
+
+    /// reqwest's read_timeout clock is NOT reset by request-body writes —
+    /// the server is legitimately silent while a body uploads, so a
+    /// transport used for uploads must not have a read timeout at all.
+    /// The upload transport must allow a body that takes longer to send
+    /// than the API transport's read timeout.
+    #[tokio::test]
+    async fn upload_transport_allows_body_send_longer_than_read_timeout() {
+        let addr = slow_body_sink().await;
+
+        // Build transports with a read timeout far shorter than the
+        // ~750ms body send. Only the API/download transports get it.
+        let transports = IaClient::build_transports(
+            &IaConfig::default(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let result = transports
+            .upload
+            .put(format!("http://{addr}/"))
+            .header("content-length", "50")
+            .body(reqwest::Body::wrap_stream(slow_body_stream()))
+            .send()
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "body should have streamed slowly, took {elapsed:?}"
+        );
+        let resp = result.unwrap_or_else(|e| {
+            panic!("upload taking longer than the API read timeout must succeed, got: {e}")
+        });
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// The API transport, by contrast, must abort a slow body send at its
+    /// read timeout rather than hang — documents why upload requests must
+    /// never go through it.
+    #[tokio::test]
+    async fn api_transport_read_timeout_fires_during_slow_body_send() {
+        let addr = slow_body_sink().await;
+
+        let transports = IaClient::build_transports(
+            &IaConfig::default(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+
+        let result = transports
+            .api
+            .put(format!("http://{addr}/"))
+            .header("content-length", "50")
+            .body(reqwest::Body::wrap_stream(slow_body_stream()))
+            .send()
+            .await;
+
+        let err = result.expect_err("slow body send through API transport should time out");
+        assert!(err.is_timeout(), "expected timeout error, got: {err}");
+    }
+
+    #[test]
+    fn timeout_constants_are_sane() {
+        // Connect should fail fast; read timeout is idle-based so it must
+        // be generous enough for slow servers but bounded.
+        assert!(CONNECT_TIMEOUT <= std::time::Duration::from_secs(60));
+        assert!(READ_TIMEOUT >= std::time::Duration::from_secs(30));
+    }
 
     #[test]
     fn client_from_default_config() {

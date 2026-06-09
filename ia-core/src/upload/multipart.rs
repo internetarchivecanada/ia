@@ -170,7 +170,7 @@ pub async fn initiate_upload(
     let url = format!("{}?uploads=", build_s3_url(client, identifier, key));
 
     let mut req = client
-        .http()
+        .upload_http()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("Content-Length", "0");
@@ -230,7 +230,7 @@ pub async fn upload_part(
     let content_length = body.len();
 
     let resp = client
-        .http()
+        .upload_http()
         .put(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("Content-Length", content_length.to_string())
@@ -291,7 +291,7 @@ pub async fn complete_upload(
 
     let manifest = build_complete_manifest(parts);
     let mut req = client
-        .http()
+        .upload_http()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("Content-Type", "application/xml")
@@ -345,7 +345,7 @@ pub async fn abort_upload(
     );
 
     let resp = client
-        .http()
+        .upload_http()
         .delete(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .send()
@@ -381,7 +381,7 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     let url = format!("{}?uploads=", build_s3_item_url(client, identifier));
 
     let resp = client
-        .http()
+        .upload_http()
         .get(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .send()
@@ -427,7 +427,7 @@ pub async fn list_parts(
     );
 
     let resp = client
-        .http()
+        .upload_http()
         .get(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .send()
