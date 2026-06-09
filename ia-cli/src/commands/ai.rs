@@ -1660,10 +1660,17 @@ async fn run_qa_single(
 
         if !opts.json && opts.quiet == 0 && !opts.compact {
             if promote_result.dry_run {
+                let reason = match promote_result.fields_skipped.first() {
+                    Some((_, reason)) if promote_result.fields_promoted.is_empty() => {
+                        format!(" ({reason})")
+                    }
+                    _ => String::new(),
+                };
                 eprintln!(
-                    "    Would promote {} field(s), skip {}",
+                    "    Would promote {} field(s), skip {}{}",
                     promote_result.fields_promoted.len(),
                     promote_result.fields_skipped.len(),
+                    reason,
                 );
             } else if !promote_result.fields_promoted.is_empty() {
                 eprintln!(
@@ -1671,6 +1678,13 @@ async fn run_qa_single(
                     style("✓").green(),
                     promote_result.fields_promoted.len(),
                     promote_result.fields_promoted.join(", "),
+                );
+            } else if let Some((_, reason)) = promote_result.fields_skipped.first() {
+                eprintln!(
+                    "    {} Skipped promotion of {} field(s): {}",
+                    style("⊘").dim(),
+                    promote_result.fields_skipped.len(),
+                    reason,
                 );
             }
         }

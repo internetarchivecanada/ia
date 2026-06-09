@@ -58,6 +58,28 @@ pub async fn promote_metadata(
     qa_result: &QaResult,
     opts: &PromoteOpts,
 ) -> Result<PromoteResult> {
+    // Gate the whole item on overall confidence first: individually
+    // high-confidence fields must not be promoted from an item whose
+    // overall QA confidence is below the configured threshold.
+    if qa_result.overall_confidence < opts.confidence_threshold {
+        let reason = format!(
+            "overall confidence {:.2} below threshold {:.2}",
+            qa_result.overall_confidence, opts.confidence_threshold
+        );
+        debug!(identifier, %reason, "skipping promotion");
+        return Ok(PromoteResult {
+            identifier: identifier.to_string(),
+            fields_promoted: Vec::new(),
+            fields_skipped: qa_result
+                .fields
+                .keys()
+                .map(|name| (name.clone(), reason.clone()))
+                .collect(),
+            task_id: None,
+            dry_run: opts.dry_run,
+        });
+    }
+
     let mut changes = Vec::new();
     let mut fields_promoted = Vec::new();
     let mut fields_skipped = Vec::new();
@@ -187,6 +209,83 @@ mod tests {
             existing_metadata: None,
             pages_sent: None,
         }
+    }
+
+    /// Client pointed at a local wiremock server — NEVER live archive.org.
+    fn mock_client(server_uri: &str) -> IaClient {
+        let mut config = crate::config::IaConfig::default();
+        let host = server_uri.strip_prefix("http://").unwrap_or(server_uri);
+        config.general.host = host.to_string();
+        config.general.secure = false;
+        config.s3_access = Some("test_access".to_string());
+        config.s3_secret = Some("test_secret".to_string());
+        IaClient::from_config(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn below_overall_confidence_threshold_skips_all_fields() {
+        let server = wiremock::MockServer::start().await;
+        let client = mock_client(&server.uri());
+
+        // All fields individually above min_field_confidence, but the
+        // item's overall confidence is below confidence_threshold —
+        // nothing may be promoted and no write request may be sent.
+        let mut qa = make_qa_result(vec![
+            ("title", FieldVerdict::Correct, 0.95, None),
+            ("date", FieldVerdict::Correct, 0.90, None),
+        ]);
+        qa.overall_confidence = 0.5;
+
+        let opts = PromoteOpts::default(); // confidence_threshold 0.8
+
+        let result = promote_metadata(&client, "test-item", &qa, &opts)
+            .await
+            .expect("below-threshold promote should return Ok, not write");
+
+        assert!(
+            result.fields_promoted.is_empty(),
+            "no fields may be promoted below the overall threshold, got: {:?}",
+            result.fields_promoted
+        );
+        assert_eq!(result.fields_skipped.len(), 2);
+        assert!(
+            result
+                .fields_skipped
+                .iter()
+                .all(|(_, reason)| reason.contains("overall confidence")),
+            "skip reasons should cite overall confidence, got: {:?}",
+            result.fields_skipped
+        );
+        assert_eq!(result.task_id, None);
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no HTTP request may be sent for a below-threshold item"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_overall_confidence_threshold_proceeds() {
+        let server = wiremock::MockServer::start().await;
+        let client = mock_client(&server.uri());
+
+        // overall == threshold should proceed (inclusive bound).
+        let mut qa = make_qa_result(vec![
+            ("title", FieldVerdict::Correct, 0.95, None),
+            ("date", FieldVerdict::Correct, 0.90, None),
+        ]);
+        qa.overall_confidence = 0.8;
+
+        let opts = PromoteOpts {
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let result = promote_metadata(&client, "test-item", &qa, &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.fields_promoted.len(), 2);
+        assert!(result.dry_run);
     }
 
     #[test]
