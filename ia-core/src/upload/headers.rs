@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use urlencoding::encode as url_encode;
 
+use crate::error::{IaError, Result};
+
 /// Check if a string value needs uri() encoding.
 ///
 /// Returns true if the string contains non-ASCII characters, whitespace,
@@ -29,27 +31,47 @@ fn encode_value(value: &str) -> String {
     }
 }
 
+/// Whether `c` may appear in an HTTP header name (RFC 7230 `tchar`).
+fn is_header_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '`' | '|' | '~'
+        )
+}
+
 /// Encode a metadata key for IA S3 headers.
 ///
-/// Replaces underscores with double-dashes per IA convention, then strips
-/// any characters that are invalid in HTTP header names (RFC 7230 token).
-/// This prevents reqwest builder errors when spreadsheet columns contain
-/// spaces, parentheses, slashes, or other non-token characters.
-fn encode_key(key: &str) -> String {
+/// Nothing is ever stripped. The ONLY transformation is the IA-S3
+/// transport encoding: rfc822 header names disallow `_`, so `--` in a
+/// header name is translated back to `_` server-side — we encode `_` as
+/// `--` so the key lands on archive.org exactly as the user submitted it.
+///
+/// Keys containing characters that cannot appear in an HTTP header name
+/// (spaces, slashes, parens, non-ASCII, ...) cannot be transported via
+/// S3 headers at all and are an error — silently mangling them caused
+/// distinct keys to collide and overwrite each other's values.
+fn encode_key(key: &str) -> Result<String> {
+    if key.is_empty() {
+        return Err(IaError::InvalidArgument(
+            "metadata key must not be empty".into(),
+        ));
+    }
     let mut result = String::with_capacity(key.len() * 2);
     for c in key.chars() {
         match c {
             // IA convention: underscores become double-dash in headers
             '_' => result.push_str("--"),
-            // Dashes pass through as-is (valid in HTTP header names)
-            '-' => result.push('-'),
-            // Keep other valid HTTP header name characters
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' => result.push(c),
-            // Strip everything else (spaces, parens, slashes, etc.)
-            _ => {}
+            c if is_header_name_char(c) => result.push(c),
+            c => {
+                return Err(IaError::InvalidArgument(format!(
+                    "metadata key '{key}' contains {c:?}, which cannot appear in an HTTP \
+                     header name; IA S3 metadata keys must use letters, digits, or - . _"
+                )));
+            }
         }
     }
-    result
+    Ok(result)
 }
 
 /// Encode metadata key-value pairs into x-archive-meta headers.
@@ -57,21 +79,31 @@ fn encode_key(key: &str) -> String {
 /// Handles multivalue fields (incrementing index per field name),
 /// underscore-to-double-dash key encoding, and uri() value encoding.
 /// Skips empty values.
-#[must_use = "encoded headers must be used"]
-pub fn encode_metadata_headers(metadata: &[(String, String)]) -> Vec<(String, String)> {
+///
+/// # Errors
+///
+/// Returns [`IaError::InvalidArgument`] for keys that cannot appear in an
+/// HTTP header name (spaces, slashes, non-ASCII, ...).
+pub fn encode_metadata_headers(metadata: &[(String, String)]) -> Result<Vec<(String, String)>> {
     encode_headers_with_prefix(metadata, "meta")
 }
 
 /// Encode file-level metadata into x-archive-filemeta headers.
-#[must_use = "encoded headers must be used"]
-pub fn encode_file_metadata_headers(metadata: &[(String, String)]) -> Vec<(String, String)> {
+///
+/// # Errors
+///
+/// Returns [`IaError::InvalidArgument`] for keys that cannot appear in an
+/// HTTP header name (spaces, slashes, non-ASCII, ...).
+pub fn encode_file_metadata_headers(
+    metadata: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
     encode_headers_with_prefix(metadata, "filemeta")
 }
 
 fn encode_headers_with_prefix(
     metadata: &[(String, String)],
     prefix: &str,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
     let mut result = Vec::new();
     let mut index_counters: HashMap<String, usize> = HashMap::new();
 
@@ -81,14 +113,14 @@ fn encode_headers_with_prefix(
         }
 
         let idx = index_counters.entry(key.clone()).or_insert(0);
-        let header_key = format!("x-archive-{}{:02}-{}", prefix, *idx, encode_key(key));
+        let header_key = format!("x-archive-{}{:02}-{}", prefix, *idx, encode_key(key)?);
         let header_value = encode_value(value);
 
         result.push((header_key, header_value));
         *idx += 1;
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -144,43 +176,80 @@ mod tests {
     }
 
     // -- encode_key tests --
+    //
+    // Contract: nothing is ever stripped. The ONLY transformation is the
+    // IA-S3 transport encoding `_` -> `--` (translated back server-side).
+    // Keys that cannot appear in an HTTP header name are an error, never
+    // silently mangled.
 
     #[test]
-    fn encode_key_strips_spaces() {
-        assert_eq!(encode_key("date created"), "datecreated");
+    fn encode_key_space_is_error() {
+        let err = encode_key("date created").expect_err("space cannot be transported");
+        assert!(err.to_string().contains("date created"), "got: {err}");
     }
 
     #[test]
-    fn encode_key_strips_parens_and_spaces() {
-        assert_eq!(encode_key("date (yyyy)"), "dateyyyy");
+    fn encode_key_parens_are_error() {
+        assert!(encode_key("date (yyyy)").is_err());
     }
 
     #[test]
-    fn encode_key_strips_slashes() {
-        assert_eq!(encode_key("subject/topic"), "subjecttopic");
+    fn encode_key_slash_is_error() {
+        let err = encode_key("subject/topic").expect_err("slash cannot be transported");
+        assert!(err.to_string().contains("subject/topic"), "got: {err}");
+    }
+
+    #[test]
+    fn encode_key_non_ascii_is_error() {
+        assert!(encode_key("año").is_err());
+        assert!(encode_key("日付").is_err());
+    }
+
+    #[test]
+    fn encode_key_empty_is_error() {
+        assert!(encode_key("").is_err());
+    }
+
+    #[test]
+    fn encode_key_token_chars_pass_through_unchanged() {
+        // RFC 7230 token characters are valid in header names — never strip.
+        assert_eq!(encode_key("isbn#13").unwrap(), "isbn#13");
+        assert_eq!(encode_key("price$usd").unwrap(), "price$usd");
+        assert_eq!(encode_key("a+b!c~d").unwrap(), "a+b!c~d");
     }
 
     #[test]
     fn encode_key_dash_passes_through() {
-        assert_eq!(encode_key("my-field.v2"), "my-field.v2");
+        assert_eq!(encode_key("my-field.v2").unwrap(), "my-field.v2");
     }
 
     #[test]
     fn encode_key_underscore_to_double_dash() {
-        assert_eq!(encode_key("my_field"), "my--field");
+        assert_eq!(encode_key("my_field").unwrap(), "my--field");
     }
 
     #[test]
     fn encode_key_dash_vs_underscore() {
         // Dashes stay single, underscores become double-dash
-        assert_eq!(encode_key("date-created_v2"), "date-created--v2");
+        assert_eq!(encode_key("date-created_v2").unwrap(), "date-created--v2");
+    }
+
+    #[test]
+    fn colliding_keys_error_instead_of_overwriting() {
+        // Pre-fix, "date created" silently encoded to "datecreated" and
+        // overwrote the real column. Now the bad key is an error.
+        let result = encode_metadata_headers(&[
+            ("date created".into(), "1988".into()),
+            ("datecreated".into(), "1989".into()),
+        ]);
+        assert!(result.is_err());
     }
 
     // -- encode_metadata_headers tests --
 
     #[test]
     fn simple_single_value() {
-        let headers = encode_metadata_headers(&[("title".into(), "My Item".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "My Item".into())]).unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "x-archive-meta00-title");
         assert_eq!(headers[0].1, "uri(My%20Item)");
@@ -188,13 +257,13 @@ mod tests {
 
     #[test]
     fn no_space_no_encoding() {
-        let headers = encode_metadata_headers(&[("mediatype".into(), "texts".into())]);
+        let headers = encode_metadata_headers(&[("mediatype".into(), "texts".into())]).unwrap();
         assert_eq!(headers[0].1, "texts");
     }
 
     #[test]
     fn underscore_in_key_becomes_double_dash() {
-        let headers = encode_metadata_headers(&[("my_field".into(), "value".into())]);
+        let headers = encode_metadata_headers(&[("my_field".into(), "value".into())]).unwrap();
         assert_eq!(headers[0].0, "x-archive-meta00-my--field");
     }
 
@@ -204,7 +273,8 @@ mod tests {
             ("subject".into(), "rust".into()),
             ("subject".into(), "archive".into()),
             ("subject".into(), "cli".into()),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(headers.len(), 3);
         assert_eq!(headers[0].0, "x-archive-meta00-subject");
         assert_eq!(headers[0].1, "rust");
@@ -220,7 +290,8 @@ mod tests {
             ("title".into(), "Test".into()),
             ("subject".into(), "a".into()),
             ("subject".into(), "b".into()),
-        ]);
+        ])
+        .unwrap();
         let title_h: Vec<_> = headers.iter().filter(|h| h.0.contains("title")).collect();
         let subj_h: Vec<_> = headers.iter().filter(|h| h.0.contains("subject")).collect();
         assert_eq!(title_h.len(), 1);
@@ -235,26 +306,27 @@ mod tests {
         let headers = encode_metadata_headers(&[
             ("title".into(), "".into()),
             ("mediatype".into(), "texts".into()),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "x-archive-meta00-mediatype");
     }
 
     #[test]
     fn non_ascii_uri_encoded() {
-        let headers = encode_metadata_headers(&[("title".into(), "snowman ☃".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "snowman ☃".into())]).unwrap();
         assert_eq!(headers[0].1, "uri(snowman%20%E2%98%83)");
     }
 
     #[test]
     fn cjk_uri_encoded() {
-        let headers = encode_metadata_headers(&[("title".into(), "日本語".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "日本語".into())]).unwrap();
         assert!(headers[0].1.starts_with("uri("));
     }
 
     #[test]
     fn emoji_uri_encoded() {
-        let headers = encode_metadata_headers(&[("title".into(), "🚀".into())]);
+        let headers = encode_metadata_headers(&[("title".into(), "🚀".into())]).unwrap();
         assert!(headers[0].1.starts_with("uri("));
     }
 
@@ -262,7 +334,7 @@ mod tests {
 
     #[test]
     fn file_metadata_uses_filemeta_prefix() {
-        let headers = encode_file_metadata_headers(&[("title".into(), "MyFile".into())]);
+        let headers = encode_file_metadata_headers(&[("title".into(), "MyFile".into())]).unwrap();
         assert_eq!(headers[0].0, "x-archive-filemeta00-title");
     }
 }

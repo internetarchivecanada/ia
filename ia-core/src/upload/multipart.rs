@@ -538,7 +538,7 @@ pub async fn upload_file_multipart(
 
         // Metadata headers (first file only, same as single-PUT path)
         if is_first_file && !opts.metadata.is_empty() {
-            hdrs.extend(encode_metadata_headers(&opts.metadata));
+            hdrs.extend(encode_metadata_headers(&opts.metadata)?);
         }
 
         // x-archive-auto-make-bucket (first file only)

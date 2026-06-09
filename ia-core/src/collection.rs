@@ -185,7 +185,7 @@ async fn create_without_image(
     let (access, secret) = client.require_auth()?;
     let auth_header = format!("LOW {access}:{secret}");
     let s3_url = build_s3_item_url(client, identifier);
-    let metadata_headers = encode_metadata_headers(metadata);
+    let metadata_headers = encode_metadata_headers(metadata)?;
 
     let mut request = client
         .raw_http()
