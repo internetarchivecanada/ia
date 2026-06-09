@@ -951,10 +951,8 @@ fn render_file_line(
                 0.0
             };
 
-            let bar_width = 12usize;
-            let filled = (progress * bar_width as f64) as usize;
-            let empty = bar_width.saturating_sub(filled);
-            let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),);
+            let progress = progress.clamp(0.0, 1.0);
+            let bar = crate::tui::widgets::progress_bar(progress, 12);
 
             let pct = format!("{:.0}%", progress * 100.0);
             let bytes = format!(

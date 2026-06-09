@@ -211,6 +211,28 @@ pub fn format_eta(remaining_bytes: u64, bytes_per_sec: f64) -> String {
     }
 }
 
+/// Render a fixed-width text progress bar (\u{2588} filled, \u{2591} empty).
+///
+/// Clamps `ratio` to `[0.0, 1.0]` — out-of-range ratios happen in
+/// practice when the server reports a wrong Content-Length and
+/// `bytes_downloaded` overshoots the total; without the clamp the
+/// empty-width subtraction underflows (OOM-scale `repeat()` in release,
+/// arithmetic panic in debug). NaN renders as empty.
+#[must_use]
+pub fn progress_bar(ratio: f64, width: usize) -> String {
+    let ratio = if ratio.is_nan() {
+        0.0
+    } else {
+        ratio.clamp(0.0, 1.0)
+    };
+    let filled = ((ratio * width as f64) as usize).min(width);
+    format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(width - filled)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Common panel widgets
 // ---------------------------------------------------------------------------
@@ -841,5 +863,41 @@ mod tests {
             })
             .unwrap();
         // Should not panic with empty history
+    }
+
+    // -- progress_bar --
+
+    #[test]
+    fn progress_bar_basic_fill() {
+        assert_eq!(progress_bar(0.0, 4), "\u{2591}\u{2591}\u{2591}\u{2591}");
+        assert_eq!(progress_bar(0.5, 4), "\u{2588}\u{2588}\u{2591}\u{2591}");
+        assert_eq!(progress_bar(1.0, 4), "\u{2588}\u{2588}\u{2588}\u{2588}");
+    }
+
+    #[test]
+    fn progress_bar_clamps_overshoot() {
+        // bytes_downloaded > total_bytes happens with a wrong Content-Length
+        // from the server; the bar must clamp, not underflow/overflow.
+        let bar = progress_bar(1.5, 20);
+        assert_eq!(bar.chars().count(), 20);
+        assert!(bar.chars().all(|c| c == '\u{2588}'));
+    }
+
+    #[test]
+    fn progress_bar_clamps_negative_and_nan() {
+        assert_eq!(progress_bar(-0.3, 4), "\u{2591}\u{2591}\u{2591}\u{2591}");
+        assert_eq!(
+            progress_bar(f64::NAN, 4),
+            "\u{2591}\u{2591}\u{2591}\u{2591}"
+        );
+        assert_eq!(
+            progress_bar(f64::INFINITY, 4),
+            "\u{2588}\u{2588}\u{2588}\u{2588}"
+        );
+    }
+
+    #[test]
+    fn progress_bar_zero_width() {
+        assert_eq!(progress_bar(0.7, 0), "");
     }
 }

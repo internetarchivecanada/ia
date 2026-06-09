@@ -41,8 +41,7 @@ fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
         .from_reader(data);
 
     let headers: Vec<String> = reader
-        .headers()
-        .map_err(|e| IaError::Config(format!("failed to read CSV headers: {e}")))?
+        .headers()?
         .iter()
         .map(|h| h.trim().to_lowercase())
         .collect();
@@ -50,11 +49,13 @@ fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
     let id_col = headers
         .iter()
         .position(|h| h == "identifier")
-        .ok_or_else(|| IaError::Config("CSV must have an 'identifier' column".into()))?;
+        .ok_or_else(|| {
+            IaError::InvalidArgument("spreadsheet must have an 'identifier' column".into())
+        })?;
 
     let mut records = Vec::new();
     for result in reader.records() {
-        let row = result.map_err(|e| IaError::Config(format!("CSV parse error: {e}")))?;
+        let row = result?;
         let identifier = row.get(id_col).unwrap_or("").trim().to_string();
         if identifier.is_empty() {
             continue;
@@ -411,6 +412,34 @@ fn write_jsonl_file(path: &Path, records: &[SpreadsheetRecord]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_utf8_is_csv_error_not_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.csv");
+        let mut bytes = b"identifier,title\nitem1,".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_spreadsheet(&path).expect_err("invalid UTF-8 must error");
+        assert!(
+            matches!(err, IaError::Csv(_)),
+            "expected Csv classification, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_identifier_column_is_invalid_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noid.csv");
+        std::fs::write(&path, "title,creator\nfoo,bar\n").unwrap();
+
+        let err = read_spreadsheet(&path).expect_err("missing identifier column must error");
+        assert!(
+            matches!(err, IaError::InvalidArgument(_)),
+            "expected InvalidArgument, got: {err:?}"
+        );
+    }
 
     #[test]
     fn read_csv() {
