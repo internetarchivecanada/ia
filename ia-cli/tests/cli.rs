@@ -1832,3 +1832,20 @@ fn metadata_import_resume_only_retries_failed() {
         "should report 1 of 1 failed (only item2 was retried), got: {stderr}"
     );
 }
+
+#[test]
+fn jobs_zero_rejected_at_parse_time() {
+    // clap rejects --jobs 0 before any command logic (or network) runs.
+    ia().args(["--jobs", "0", "search", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be at least 1"));
+}
+
+#[test]
+fn jobs_non_numeric_rejected() {
+    ia().args(["--jobs", "lots", "search", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a number"));
+}

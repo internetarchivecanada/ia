@@ -1556,8 +1556,8 @@ async fn run_export(
     // Adaptive concurrency: when --jobs is omitted, start at 10 and ramp
     // up/down via AIMD. When --jobs N is explicit, use fixed concurrency.
     let limiter = match jobs {
-        Some(n) => ia_core::AdaptiveLimiter::fixed(n),
-        None => ia_core::AdaptiveLimiter::new(10, 2, 200),
+        Some(n) => ia_core::AdaptiveLimiter::fixed(n)?,
+        None => ia_core::AdaptiveLimiter::new(10, 2, 200)?,
     };
 
     let succeeded = Arc::new(AtomicUsize::new(0));

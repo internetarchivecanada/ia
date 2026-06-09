@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+use crate::error::{IaError, Result};
 use crate::rate_limit::RateLimiter;
 
 /// Adaptive concurrency limiter.
@@ -54,6 +55,18 @@ struct Inner {
     backoff_generation: AtomicUsize,
 }
 
+impl std::fmt::Debug for AdaptiveLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaptiveLimiter")
+            .field("target", &self.inner.target.load(Ordering::Relaxed))
+            .field("active", &self.inner.active.load(Ordering::Relaxed))
+            .field("floor", &self.inner.floor)
+            .field("ceiling", &self.inner.ceiling)
+            .field("adaptive", &self.inner.adaptive)
+            .finish()
+    }
+}
+
 /// RAII permit returned by [`AdaptiveLimiter::acquire`].
 ///
 /// Decrements the active count and notifies waiters on drop.
@@ -75,15 +88,28 @@ impl AdaptiveLimiter {
     /// - `floor`: minimum concurrency (never drops below this on backoff)
     /// - `ceiling`: maximum concurrency (never exceeds this on ramp-up)
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `floor == 0`, `initial < floor`, or `initial > ceiling`.
-    pub fn new(initial: usize, floor: usize, ceiling: usize) -> Self {
-        assert!(floor > 0, "floor must be > 0");
-        assert!(initial >= floor, "initial must be >= floor");
-        assert!(initial <= ceiling, "initial must be <= ceiling");
+    /// Returns [`IaError::InvalidArgument`] if `floor == 0`,
+    /// `initial < floor`, or `initial > ceiling`.
+    pub fn new(initial: usize, floor: usize, ceiling: usize) -> Result<Self> {
+        if floor == 0 {
+            return Err(IaError::InvalidArgument(
+                "concurrency floor must be > 0".into(),
+            ));
+        }
+        if initial < floor {
+            return Err(IaError::InvalidArgument(format!(
+                "initial concurrency ({initial}) must be >= floor ({floor})"
+            )));
+        }
+        if initial > ceiling {
+            return Err(IaError::InvalidArgument(format!(
+                "initial concurrency ({initial}) must be <= ceiling ({ceiling})"
+            )));
+        }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 target: AtomicUsize::new(initial),
                 active: AtomicUsize::new(0),
@@ -95,20 +121,24 @@ impl AdaptiveLimiter {
                 successes_since_increase: AtomicUsize::new(0),
                 backoff_generation: AtomicUsize::new(0),
             }),
-        }
+        })
     }
 
     /// Create a fixed-concurrency limiter (no AIMD adjustment).
     ///
     /// Still pauses all workers on 429 via [`on_rate_limited`](Self::on_rate_limited).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `n == 0`.
-    pub fn fixed(n: usize) -> Self {
-        assert!(n > 0, "fixed concurrency must be > 0");
+    /// Returns [`IaError::InvalidArgument`] if `n == 0`.
+    pub fn fixed(n: usize) -> Result<Self> {
+        if n == 0 {
+            return Err(IaError::InvalidArgument(
+                "fixed concurrency must be greater than 0".into(),
+            ));
+        }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 target: AtomicUsize::new(n),
                 active: AtomicUsize::new(0),
@@ -120,7 +150,7 @@ impl AdaptiveLimiter {
                 successes_since_increase: AtomicUsize::new(0),
                 backoff_generation: AtomicUsize::new(0),
             }),
-        }
+        })
     }
 
     /// Acquire a concurrency permit.
@@ -278,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_respects_target() {
-        let lim = AdaptiveLimiter::fixed(2);
+        let lim = AdaptiveLimiter::fixed(2).unwrap();
 
         let _p1 = lim.acquire().await;
         let _p2 = lim.acquire().await;
@@ -290,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn permit_drop_releases_slot() {
-        let lim = AdaptiveLimiter::fixed(1);
+        let lim = AdaptiveLimiter::fixed(1).unwrap();
 
         let p = lim.acquire().await;
         drop(p);
@@ -302,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_success_increases_target() {
-        let lim = AdaptiveLimiter::new(2, 2, 100);
+        let lim = AdaptiveLimiter::new(2, 2, 100).unwrap();
         assert_eq!(lim.target(), 2);
 
         // Need `target` (2) successes to bump by 1.
@@ -321,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_rate_limited_halves_target() {
-        let lim = AdaptiveLimiter::new(20, 2, 200);
+        let lim = AdaptiveLimiter::new(20, 2, 200).unwrap();
         assert_eq!(lim.target(), 20);
 
         lim.on_rate_limited(0, |_, _, _| {}).await;
@@ -339,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_mode_no_aimd() {
-        let lim = AdaptiveLimiter::fixed(10);
+        let lim = AdaptiveLimiter::fixed(10).unwrap();
         assert_eq!(lim.target(), 10);
         assert!(!lim.is_adaptive());
 
@@ -356,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn ceiling_respected() {
-        let lim = AdaptiveLimiter::new(3, 2, 4);
+        let lim = AdaptiveLimiter::new(3, 2, 4).unwrap();
         assert_eq!(lim.target(), 3);
 
         // 3 successes → bump to 4
@@ -374,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn on_rate_limited_pauses_all() {
-        let lim = AdaptiveLimiter::new(10, 2, 200);
+        let lim = AdaptiveLimiter::new(10, 2, 200).unwrap();
 
         // Start a 1-second pause.
         let lim2 = lim.clone();
@@ -403,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_acquire_release() {
-        let lim = AdaptiveLimiter::fixed(5);
+        let lim = AdaptiveLimiter::fixed(5).unwrap();
         let mut handles = Vec::new();
 
         for _ in 0..20 {
@@ -421,32 +451,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "floor must be > 0")]
-    fn zero_floor_panics() {
-        AdaptiveLimiter::new(1, 0, 10);
+    fn zero_floor_is_error() {
+        let err = AdaptiveLimiter::new(1, 0, 10).expect_err("floor 0 must be rejected");
+        assert!(err.to_string().contains("floor"), "got: {err}");
     }
 
     #[test]
-    #[should_panic(expected = "initial must be >= floor")]
-    fn initial_below_floor_panics() {
-        AdaptiveLimiter::new(1, 5, 10);
+    fn initial_below_floor_is_error() {
+        assert!(AdaptiveLimiter::new(1, 5, 10).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "initial must be <= ceiling")]
-    fn initial_above_ceiling_panics() {
-        AdaptiveLimiter::new(20, 2, 10);
+    fn initial_above_ceiling_is_error() {
+        assert!(AdaptiveLimiter::new(20, 2, 10).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "fixed concurrency must be > 0")]
-    fn fixed_zero_panics() {
-        AdaptiveLimiter::fixed(0);
+    fn fixed_zero_is_error() {
+        let err = AdaptiveLimiter::fixed(0).expect_err("concurrency 0 must be rejected");
+        assert!(err.to_string().contains("greater than 0"), "got: {err}");
+    }
+
+    #[test]
+    fn valid_bounds_are_ok() {
+        assert!(AdaptiveLimiter::new(10, 2, 200).is_ok());
+        assert!(AdaptiveLimiter::new(2, 2, 2).is_ok());
+        assert!(AdaptiveLimiter::fixed(1).is_ok());
     }
 
     #[tokio::test]
     async fn on_success_after_backoff_does_not_bump() {
-        let lim = AdaptiveLimiter::new(10, 2, 100);
+        let lim = AdaptiveLimiter::new(10, 2, 100).unwrap();
         assert_eq!(lim.target(), 10);
 
         // 9 successes — one short of the threshold.
@@ -467,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn drain_after_backoff() {
         // After backoff halves target, re-acquiring should respect the new limit.
-        let lim = AdaptiveLimiter::new(10, 2, 100);
+        let lim = AdaptiveLimiter::new(10, 2, 100).unwrap();
 
         // Backoff: halves target to 5.
         lim.on_rate_limited(0, |_, _, _| {}).await;
