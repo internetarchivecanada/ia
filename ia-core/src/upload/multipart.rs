@@ -492,6 +492,15 @@ pub async fn upload_file_multipart(
     size_hint: Option<u64>,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<UploadResult> {
+    if part_size == 0 {
+        return Err(IaError::UploadFailed {
+            identifier: identifier.into(),
+            key: key.into(),
+            message: "part_size must be greater than 0".into(),
+            status: None,
+        });
+    }
+
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 

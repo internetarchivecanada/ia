@@ -767,3 +767,57 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
 }
+
+// ── part_size validation ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn zero_part_size_returns_error_not_panic() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello world");
+
+    // Mocks so the pre-validation code path can proceed as far as the part
+    // computation if validation is missing (instead of failing earlier on
+    // an unmocked request).
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-0</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &UploadOpts::default(),
+        0, // invalid part_size
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("part_size=0 must return an error, not panic");
+    assert!(
+        err.to_string().contains("part_size"),
+        "error should mention part_size, got: {err}"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "validation must reject part_size=0 before any request is sent"
+    );
+}

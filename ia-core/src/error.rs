@@ -104,6 +104,9 @@ pub enum IaError {
     #[error("invalid identifier '{identifier}': {reason}")]
     InvalidIdentifier { identifier: String, reason: String },
 
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("missing required metadata field: {field}")]
     MissingRequiredMetadata { field: String },
 
@@ -184,7 +187,24 @@ impl IaError {
             // Transient — may succeed on retry
             IaError::RateLimited { .. } => true,
             IaError::Network(_) => true,
-            IaError::Io(e) => e.kind() != std::io::ErrorKind::StorageFull,
+            // I/O: only genuinely transient kinds are worth retrying.
+            // Everything else (NotFound, PermissionDenied, InvalidInput,
+            // StorageFull, ...) is permanent — retry loops would spin to
+            // exhaustion and bury the real error.
+            IaError::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+            ),
             IaError::ChecksumMismatch { .. } => true,
             IaError::ResumeFailed { .. } => true,
             // LLM API errors: retry on 429/5xx, not on 4xx
@@ -203,6 +223,7 @@ impl IaError {
             IaError::SpamDetected { .. } => false, // permanent
             IaError::CollectionNotFound { .. } => false,
             IaError::InvalidIdentifier { .. } => false,
+            IaError::InvalidArgument(_) => false,
             IaError::MissingRequiredMetadata { .. } => false,
             IaError::CheckLimitFailed { .. } => true, // conservative: treat as overloaded
             IaError::FileTooLarge { .. } => false,
@@ -348,6 +369,7 @@ impl IaError {
                 extra.insert("reason".into(), reason.clone().into());
                 "invalid_identifier"
             }
+            IaError::InvalidArgument(_) => "invalid_argument",
             IaError::MissingRequiredMetadata { field } => {
                 extra.insert("field".into(), field.clone().into());
                 "missing_required_metadata"
@@ -702,6 +724,51 @@ mod tests {
     fn auth_error_is_not_retryable() {
         let err = IaError::Auth("credentials required".into());
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn permanent_io_error_kinds_are_not_retryable() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::AlreadyExists,
+            ErrorKind::StorageFull,
+            ErrorKind::Unsupported,
+            ErrorKind::ReadOnlyFilesystem,
+        ] {
+            let err = IaError::Io(std::io::Error::new(kind, "test"));
+            assert!(
+                !err.is_retryable(),
+                "{kind:?} is permanent — retrying cannot succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_io_error_kinds_are_retryable() {
+        use std::io::ErrorKind;
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::NotConnected,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            let err = IaError::Io(std::io::Error::new(kind, "test"));
+            assert!(
+                err.is_retryable(),
+                "{kind:?} is transient — retry may succeed"
+            );
+        }
     }
 
     #[test]

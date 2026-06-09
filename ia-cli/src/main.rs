@@ -15,6 +15,15 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
     .literal(clap::builder::styling::AnsiColor::Cyan.on_default().bold())
     .placeholder(clap::builder::styling::AnsiColor::Cyan.on_default());
 
+/// Parse `--jobs`: a positive integer (0 would deadlock every operation).
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if n == 0 {
+        return Err("must be at least 1 (omit --jobs for adaptive concurrency)".to_string());
+    }
+    Ok(n)
+}
+
 #[derive(Parser)]
 #[command(
     name = "ia",
@@ -75,7 +84,7 @@ struct Cli {
     no_resume: bool,
 
     /// Concurrent operations (omit for adaptive concurrency)
-    #[arg(short = 'j', long, global = true, help_heading = "Global Options")]
+    #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 
     /// Suppress output (repeat for more quiet: -q summary only, -qq silent)
