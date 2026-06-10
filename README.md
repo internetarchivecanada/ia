@@ -30,6 +30,10 @@
 
 ---
 
+## How it's built
+
+Written by AI agents (primarily [Claude Code](https://claude.com/claude-code)) under human direction — design, priorities, and acceptance are human; implementation is largely autonomous. Quality is enforced by test-first development and a strict CI gate (tests, clippy, rustfmt, docs, cargo-audit) rather than line-by-line review. Agent involvement is recorded in `Co-Authored-By` commit trailers, so it's auditable in the git history. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full workflow.
+
 ## Install
 
 Download a prebuilt binary from [GitHub Releases](https://github.com/jjjake/ia/releases):

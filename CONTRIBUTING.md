@@ -90,6 +90,25 @@ Link any related issues with `Closes #N` in the PR body.
 - **CLI help**: Every flag and subcommand needs accurate help text.
 - **JSON output**: Every command supports `--json` for structured output.
 
+## AI-Assisted Development
+
+Nearly all implementation in this repository is written by AI agents (primarily
+[Claude Code](https://claude.com/claude-code)). The maintainer writes the designs
+(`docs/plans/`), files the issues, sets priorities, and tests the tool hands-on against
+real archive.org workflows.
+
+Code is not reviewed line-by-line. Correctness rests on process:
+
+- **Test-first development** — tests are written and observed failing before implementation.
+- **Hermetic integration tests** — every HTTP call is mocked (`wiremock`); the test suite
+  sends zero traffic to archive.org.
+- **CI gate on every merge** — tests, `clippy -D warnings`, `rustfmt`, rustdoc
+  `-D warnings`, and `cargo-audit` must all pass.
+
+Agent involvement is recorded per-commit via `Co-Authored-By` trailers. Treat this like
+any young codebase: if something looks wrong, it might be — please
+[open an issue](https://github.com/jjjake/ia/issues).
+
 ## Using AI Coding Tools
 
 This repo includes an [`AGENTS.md`](./AGENTS.md) with project instructions for AI coding
