@@ -17,22 +17,22 @@ Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive
 
 ## Crate Stack
 
-- CLI: `clap` 4 (derive)
-- Async: `tokio` 1 + `futures` 0.3
-- HTTP: `reqwest` 0.12 (rustls-tls) + `reqwest-middleware` + `reqwest-retry`
-- Serialization: `serde` 1 + `serde_json` 1
-- Config: `configparser` 3 — INI format for backwards compat with Python `ia.ini`
-- Errors: `thiserror` 2 (library) + `anyhow` 1 (CLI)
-- Logging: `tracing` 0.1 + `tracing-subscriber` 0.3
-- Console: `indicatif` 0.17 + `console` 0.15 + `comfy-table` 7
+- CLI: `clap` (derive)
+- Async: `tokio` + `futures`
+- HTTP: `reqwest` (rustls-tls) + `reqwest-middleware` + `reqwest-retry`
+- Serialization: `serde` + `serde_json`
+- Config: `configparser` — INI format for backwards compat with Python `ia.ini`
+- Errors: `thiserror` (library) + `anyhow` (CLI)
+- Logging: `tracing` + `tracing-subscriber`
+- Console: `indicatif` + `console` + `comfy-table`
 - TUI: `ratatui` (default feature, `--dashboard` flag)
-- Metadata write: `json-patch` 3 (RFC 6902); `urlencoding` 2
-- Spreadsheet: `calamine` 0.26; `rust_xlsxwriter` 0.79; `csv` 1
-- Upload: `md-5` 0.10
-- Auth: `rpassword` 5
-- Testing: `wiremock` 0.6 + `assert_cmd` 2 + `tempfile` 3
+- Metadata write: `json-patch` (RFC 6902); `urlencoding`
+- Spreadsheet: `calamine`; `rust_xlsxwriter`; `csv`
+- Upload: `md-5`
+- Auth: `rpassword`
+- Testing: `wiremock` + `assert_cmd` + `tempfile`
 
-Don't add crates without asking. Prefer `std`, existing deps, or small focused code. When a new crate is approved, update this list.
+Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't add crates without asking. Prefer `std`, existing deps, or small focused code. When a new crate is approved, update this list.
 
 ## Build
 
@@ -46,7 +46,7 @@ Don't add crates without asking. Prefer `std`, existing deps, or small focused c
 Work happens on feature branches — main is protected by GitHub branch protection.
 
 - For non-trivial work, write a design doc or implementation plan in `docs/plans/` and commit it before implementation code.
-- Helper scripts are available for git worktrees: `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`), `scripts/ia-cleanup <slug>` after merge.
+- Create worktrees with `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`) — it names the branch `<type>/<slug>`, checks for branch collisions, and symlinks untracked `.claude` settings. Clean up after merge with `scripts/ia-cleanup <slug>`.
 - Run `cargo test -p ia-core -p ia-cli` and `cargo clippy -p ia-core -p ia-cli -- -D warnings` before committing.
 - Update CLI help text (`about`, `long_about`, `after_long_help`) when modifying flags or subcommands.
 - When changing user-visible behavior (new flags, commands, or defaults), update: docs/usage.md and README.md.
@@ -76,4 +76,4 @@ Global flags — do not reuse in subcommands:
 - S3 metadata headers: underscores become double-dashes, non-ASCII wrapped in `uri()`
 - Metadata write POST: form-encoded (`-target`, `-patch`, `priority`, `access`, `secret`), not JSON
 - Metadata write uses RFC 6902 JSON Patch (test/add/replace/remove ops)
-- All `/download/` GETs send `cnt=0` to suppress the public view counter — injected centrally in `download::fetch_response` (and in `ai::ia_config::fetch_ai_config`, which bypasses it). Helper: `download::ensure_cnt_zero`. Opt-out: `DownloadOpts::count_views = true` (CLI: `ia download --count-views`) omits the `cnt` parameter entirely — archive.org only counts views when `cnt` is absent.
+- All `/download/` GETs send `cnt=0` to suppress the public view counter; `ia download --count-views` opts out. Details in the doc comments on `download::ensure_cnt_zero` and `download::fetch_response`.
