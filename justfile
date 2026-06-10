@@ -21,3 +21,7 @@ build-release:
 
 # Run all CI checks locally
 ci: fmt-check check test doc
+
+# Push main + tags to the read-only GitLab mirror (requires a 'gitlab' remote)
+mirror:
+    git push gitlab main --tags
