@@ -34,6 +34,7 @@ ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 | `[FILES]...` | Specific files to download from the item |
 | `--itemlist <PATH>` | File containing identifiers (one per line) |
 | `-s, --search <QUERY>` | Download items matching a search query |
+| `-p, --parameters <K=V>` | Extra search parameters (repeatable, used with `--search`) |
 | `-g, --glob <PATTERN>` | Filter files by glob pattern (pipe-separated: `"*.mp4\|*.webm"`) |
 | `-e, --exclude <PATTERN>` | Exclude files matching pattern |
 | `-f, --format <FORMAT>` | Filter by file format (repeatable) |
@@ -46,6 +47,9 @@ ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
 | `--count-views` | Increment archive.org's public view counter (off by default) |
+| `--zip-list <ZIPFILE>` | List files inside a ZIP archive (e.g., `"item_jp2.zip"`) |
+| `--zip-member <ZIPFILE/MEMBER>` | Download a single file from inside a ZIP archive |
+| `--zip-convert <EXT>` | Convert format when downloading a zip member (e.g., `jpg` for JP2 → JPEG; requires `--zip-member`) |
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
@@ -73,6 +77,12 @@ ia download --itemlist items.txt
 # Preview what would be downloaded
 ia download nasa --dry-run
 
+# List the contents of a ZIP archive without downloading it
+ia download myitem --zip-list myitem_jp2.zip
+
+# Extract a single page image from inside a ZIP, converting JP2 to JPEG
+ia download myitem --zip-member "myitem_jp2.zip/myitem_jp2/myitem_0001.jp2" --zip-convert jpg
+
 # Download with JSON output (for scripts/agents)
 ia download nasa --json
 ```
@@ -86,31 +96,47 @@ ia download nasa --json
 
 ### `ia search`
 
-Search the Internet Archive. Uses the scrape API by default, or the full-text search backend with `--fts`.
+Search the Internet Archive. Three backends are available as subcommands; the bare command defaults to the scrape backend.
 
 ```sh
-ia search <QUERY> [OPTIONS]
+ia search <QUERY> [OPTIONS]            # scrape backend (default)
+ia search scrape <QUERY> [OPTIONS]     # scrape API (cursor-based, auto-paginates)
+ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
+ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
-#### Flags
+#### Shared flags (all backends)
 
 | Flag | Description |
 |------|-------------|
 | `<QUERY>` | Search query |
 | `--itemlist` | Output identifiers only (one per line) |
-| `--num-found` | Print count of matching items only |
-| `-s, --sort <FIELD>` | Sort field (repeatable, e.g., `"downloads desc"`) |
-| `-f, --field <FIELD>` | Fields to return (repeatable, default: identifier) |
-| `-n, --count <N>` | Maximum number of results |
-| `-p, --parameters <K=V>` | Extra query parameters (repeatable) |
+| `-n, --num-found` | Print result count only |
+| `-p, --parameters <K=V>` | Extra query parameters (`key:value` or `key=value`, repeatable) |
 | `--timeout <SECS>` | Request timeout in seconds |
-| `--fts` | Use full-text search backend |
-| `--json` | Output results as JSONL (one object per line, returns all fields) |
+| `--json` | Output results as JSONL (one object per line) |
+
+#### `scrape` and `advanced` flags
+
+| Flag | Description |
+|------|-------------|
+| `-s, --sort <FIELD>` | Sort field (repeatable, e.g., `"downloads desc"`) |
+| `-f, --field <FIELD>` | Fields to return (alias: `--fields`; repeatable, default: all) |
+| `-r, --rows <N>` | Results per page (`advanced` only, default: 50) |
+
+#### `fts` flags
+
+| Flag | Description |
+|------|-------------|
+| `--dsl` | Treat the query as raw Elasticsearch DSL |
+| `--scope <SCOPE>` | Index/scope filter |
+| `--size <N>` | Results per scroll batch (default: 1000) |
+| `--from <N>` | Starting offset |
 
 #### Examples
 
 ```sh
-# Search for items in a collection
+# Search for items in a collection (scrape backend)
 ia search "collection:nasa AND mediatype:texts"
 
 # Get identifiers only (useful for piping to ia download)
@@ -119,14 +145,20 @@ ia search "subject:mars" --itemlist
 # Get the number of matching items
 ia search "collection:opensource" --num-found
 
-# Full-text search
-ia search "apollo 11 transcript" --fts
+# Single page of results via the advanced search API
+ia search advanced "mediatype:texts" --rows 10
+
+# Full-text search (searches file contents, not just metadata)
+ia search fts "apollo 11 transcript"
+
+# Full-text search with raw Elasticsearch DSL
+ia search fts --dsl '{"match": {"text": "moon landing"}}'
 
 # Return specific fields, sorted by downloads
 ia search "mediatype:audio" --field identifier --field title --sort "downloads desc"
 
-# Limit results and output as JSON
-ia search "collection:nasa" --count 10 --json
+# Output as JSONL
+ia search "collection:nasa" --json
 
 # Pipe search results into download
 ia search "collection:nasa" --itemlist | xargs ia download
@@ -150,7 +182,8 @@ ia list <IDENTIFIER> [OPTIONS]
 | `--source <TYPE>` | Filter by source type: `original`, `derivative`, `metadata` |
 | `--location` | Print full download URLs |
 | `-a, --all` | Show all file metadata as JSON |
-| `-v, --verbose` | Print column headers |
+| `-V, --headers` | Print column headers |
+| `--json` | Output results as JSON (one object per line) |
 
 #### Examples
 
@@ -159,7 +192,7 @@ ia list <IDENTIFIER> [OPTIONS]
 ia list nasa
 
 # Show specific columns with headers
-ia list nasa --columns name,size,format --verbose
+ia list nasa --columns name,size,format --headers
 
 # Show download URLs for original files
 ia list nasa --source original --location
@@ -206,16 +239,19 @@ ia metadata nasa --formats
 
 #### Writing metadata
 
-Use write flags to modify metadata fields. Write flags are mutually exclusive (use one type per invocation).
+Metadata writes use subcommands. Each takes `-m/--metadata <FIELD:VALUE>` pairs (repeatable):
 
-| Flag | Description |
-|------|-------------|
-| `-m, --modify <K:V>` | Set field to value (repeatable) |
-| `-a, --append <K:V>` | Append to string field (repeatable) |
-| `-A, --append-list <K:V>` | Append to list field (repeatable) |
-| `-I, --insert <K[N]:V>` | Insert at index in list field (repeatable) |
-| `-r, --remove <K:V>` | Remove value from field (repeatable) |
-| `-s, --spreadsheet <PATH>` | Bulk update from file (CSV, TSV, XLSX, ODS, JSONL) |
+| Subcommand | Description |
+|------------|-------------|
+| `modify` | Set fields to new values (replaces existing values) |
+| `append` | Append text to string fields |
+| `append-list` | Append values to list fields (e.g., `subject`, `collection`) |
+| `insert` | Insert at an index in list fields (`field[N]:value` syntax) |
+| `remove` | Remove values from fields |
+
+Passing `-m` on the bare command (`ia metadata <ID> -m <K:V>`) is shorthand for `ia metadata modify`.
+
+Chain multiple operations with `+` to apply them in a single request. Valid operations after `+`: `modify`, `append`, `append-list`, `insert`, `remove`. Shared options (`--target`, `--dry-run`, `--json`, etc.) go before the first `+`.
 
 | Write option | Description |
 |------|-------------|
@@ -227,42 +263,118 @@ Use write flags to modify metadata fields. Write flags are mutually exclusive (u
 
 | Bulk input | Description |
 |------|-------------|
+| `--spreadsheet <PATH>` | Bulk update from file (CSV, TSV, XLSX, ODS, JSONL) — bare command only |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | Use search results as input |
 
 ```sh
-# Set a metadata field
-ia metadata myitem --modify="description:Updated description"
+# Set a metadata field (shorthand for 'ia metadata modify')
+ia metadata myitem -m "description:Updated description"
 
 # Set multiple fields at once
-ia metadata myitem --modify="title:New Title" --modify="subject:science"
+ia metadata modify myitem -m "title:New Title" -m "subject:science"
 
 # Append to a string field
-ia metadata myitem --append="description: (updated 2026)"
+ia metadata append myitem -m "description: (updated 2026)"
 
 # Add a value to a list field (e.g., add a subject tag)
-ia metadata myitem --append-list="subject:astronomy"
+ia metadata append-list myitem -m "subject:astronomy"
 
 # Insert at a specific index in a list
-ia metadata myitem --insert="collection[0]:featured"
+ia metadata insert myitem -m "collection[0]:featured"
 
 # Remove a value from a field
-ia metadata myitem --remove="subject:outdated-tag"
+ia metadata remove myitem -m "subject:outdated-tag"
+
+# Compound: set the title and remove a subject in one request
+ia metadata modify myitem -m "title:New" + remove -m "subject:old-tag"
 
 # Preview changes without writing
-ia metadata myitem --modify="title:New Title" --dry-run
+ia metadata modify myitem -m "title:New Title" --dry-run
 
 # Modify file-level metadata
-ia metadata myitem --target="files/image.jpg" --modify="title:Photo caption"
+ia metadata modify myitem --target "files/image.jpg" -m "title:Photo caption"
 
 # Bulk update from a spreadsheet
 ia metadata --spreadsheet updates.csv
 
 # Bulk modify items from a search query
-ia metadata --search "collection:mybooks" --modify="rights:public domain"
+ia metadata --search "collection:mybooks" -m "rights:public domain"
 
 # Bulk modify items from a file of identifiers
-ia metadata --itemlist items.txt --modify="subject:archived"
+ia metadata --itemlist items.txt -m "subject:archived"
+```
+
+#### `ia metadata export`
+
+Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc.
+
+| Flag | Description |
+|------|-------------|
+| `[FILES]...` | Input files containing identifiers |
+| `--itemlist <PATH>` | Read identifiers from file (one per line) |
+| `--search <QUERY>` | Use search results as input |
+| `-o, --output <PATH>` | Output file (`.csv`, `.tsv`, `.xlsx`, `.jsonl`) |
+| `--pretty` | Pretty-print JSON output |
+
+```sh
+# Export search results as JSONL
+ia metadata export --search "collection:nasa"
+
+# Export to XLSX for editing, then re-import
+ia metadata export --search "collection:nasa" -o data.xlsx
+ia metadata --spreadsheet data.xlsx --dry-run
+
+# Pipe identifiers from another command
+ia search "collection:nasa" -f identifier | ia metadata export
+```
+
+#### `ia metadata audit`
+
+Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations.
+
+| Flag | Description |
+|------|-------------|
+| `<IDENTIFIER>...` | Item identifier(s) |
+| `--itemlist <PATH>` | Read identifiers from file (one per line) |
+| `--search <QUERY>` | Use search results as input |
+| `--field <FIELD>` | Only check specific field(s) (repeatable) |
+| `--required-only` | Only report missing required fields |
+| `-o, --output <PATH>` | Output file (`.csv`, `.tsv`, `.xlsx`, `.jsonl`) |
+| `--json` | Output as JSONL |
+
+```sh
+# Audit a single item
+ia metadata audit myitem
+
+# Audit search results, machine-readable
+ia metadata audit --search "collection:test" --json
+```
+
+#### `ia metadata schema`
+
+Look up Internet Archive metadata field definitions. Shows a table of all user-facing fields by default, or detailed info for a specific field. The schema is fetched live from archive.org.
+
+| Flag | Description |
+|------|-------------|
+| `[FIELD]` | Field name to look up (shows detailed view) |
+| `-f, --files` | Show file-level schema instead of item-level |
+| `--internal` | Include internal-use-only fields (hidden by default) |
+| `--required` | Only show required or recommended fields |
+| `--repeatable` | Only show repeatable fields |
+| `--defined-by <WHO>` | Filter by who defines the field |
+| `--edit-access <WHO>` | Filter by who can edit the field |
+| `--json` | Output as JSON |
+
+```sh
+# List all user-facing metadata fields
+ia metadata schema
+
+# Look up a specific field
+ia metadata schema title
+
+# Show the file-level schema
+ia metadata schema --files
 ```
 
 ### `ia status`
@@ -278,11 +390,20 @@ ia status --joblog <PATH>
 | Flag | Description |
 |------|-------------|
 | `--joblog <PATH>` | Path to job log file (required) |
+| `--failed-items` | Print only identifiers that never succeeded (one per line); exits 1 if any |
+| `--json` | Output as JSON |
 
-#### Example
+#### Examples
 
 ```sh
+# View job log summary
 ia status --joblog downloads.jsonl
+
+# List identifiers that never succeeded
+ia status --joblog uploads.jsonl --failed-items
+
+# Pipe failed identifiers into another command
+ia status --joblog uploads.jsonl --failed-items | ia metadata export
 ```
 
 ### `ia completions`
@@ -350,7 +471,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
 
-#### Subcommands
+#### Batch mode and subcommands
 
 **`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
@@ -482,11 +603,11 @@ Checksum files support both GNU (`hash  filename`) and BSD (`ALG (filename) = ha
 
 #### Spreadsheet mode
 
-`--spreadsheet` accepts the same CSV/TSV/XLSX/ODS/JSONL format as `ia upload import`. Requires `identifier` and `file` columns. Optional hash columns (`md5`, `sha1`, `crc32`) skip local file hashing. Other columns are ignored.
+`--spreadsheet` accepts the same CSV/TSV/XLSX/ODS/JSONL format as `ia upload --spreadsheet`. Requires `identifier` and `file` columns. Optional hash columns (`md5`, `sha1`, `crc32`) skip local file hashing. Other columns are ignored.
 
 ```bash
 # Same spreadsheet used for upload works for verification
-ia upload import upload.csv
+ia upload --spreadsheet upload.csv
 ia verify --spreadsheet upload.csv
 ```
 
@@ -839,88 +960,113 @@ ia update install 0.5.1
 
 ### `ia ai`
 
-AI-assisted metadata cleanup using an LLM. Analyzes item metadata, suggests improvements (typo fixes, date normalization, missing fields, schema conformance), and optionally applies changes. **Experimental.**
+AI tooling for Internet Archive metadata. **Experimental** — only available in builds with the `alpha` feature.
 
 ```sh
-ia ai <IDENTIFIER>... [OPTIONS]
-ia ai undo <JOBLOG>
+ia ai qa <IDENTIFIER>... [OPTIONS]
+ia ai config <show|create|edit> <COLLECTION> [OPTIONS]
 ```
 
-#### Modes
+| Global flag | Description |
+|------|-------------|
+| `--ai-config <PATH>` | Path to a local AI Config JSON file (overrides collection lookup) |
+
+#### `ia ai qa`
+
+Verify AI-extracted metadata using vision-based LLM QA. Fetches AI-extracted metadata for items, downloads page images from the item's JP2 zip, and sends both to a second LLM model for verification. Produces per-field verdicts with confidence scores. With `--promote`, writes confirmed metadata back to the item.
+
+Input sources:
 
 | Flag | Description |
 |------|-------------|
-| *(default)* | Interactive TUI review — approve/reject each suggestion |
-| `--headless` | Auto-accept all suggestions, output JSONL (no TUI) |
-| `--record-only` | TUI review, save to local JSON instead of writing to IA |
-| `--dry-run` | Show suggestions without applying any changes |
-
-#### Input sources
-
-| Flag | Description |
-|------|-------------|
-| `<IDENTIFIER>...` | Item identifier(s) to analyze |
+| `<IDENTIFIER>...` | Item identifier(s) to QA |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
-| `--search <QUERY>` | Use search results as input |
+| `--search <QUERY>` | QA items matching a search query |
+| `-p, --search-parameters <K=V>` | Extra search parameters (repeatable) |
+| `--from-results <PATH>` | Re-process cached QA results from a JSONL file (no LLM calls) |
 
-#### Focus flags
-
-| Flag | Description |
-|------|-------------|
-| `--dates-only` | Only suggest date-related changes |
-| `--titles-only` | Only suggest title changes |
-| `--descriptions-only` | Only suggest description changes |
-| `--missing-fields` | Only fill empty/missing fields |
-| `--schema-fix` | Only fix schema conformance issues |
-| `--typos` | Only fix typos |
-| `--only-fields <FIELDS>` | Only suggest changes to these fields (comma-separated) |
-| `--exclude-fields <FIELDS>` | Never suggest changes to these fields (comma-separated) |
-
-#### LLM configuration
+LLM configuration:
 
 | Flag | Description |
 |------|-------------|
-| `--base-url <URL>` | LLM API base URL (default: OpenAI) |
-| `--api-key <KEY>` | LLM API key (or set `IA_AI_API_KEY` env var, or `[ai] api_key` in ia.ini) |
-| `--model <NAME>` | Model name (default: gpt-4o-mini) |
+| `--model <NAME>` | QA LLM model |
+| `--base-url <URL>` | LLM API base URL |
+| `--api-key <KEY>` | LLM API key |
+| `--provider <NAME>` | `openai` or `anthropic` (auto-detected from base URL if omitted) |
 | `--temperature <FLOAT>` | Sampling temperature (default: 0.2) |
-| `--max-tokens <N>` | Max tokens in response (default: 4096) |
+| `--image-quality <LEVEL>` | Page image resolution: `high`, `medium` (default), `low`, `min` — lower is cheaper |
+| `--image-urls` | Send image URLs to the LLM instead of downloading and base64-encoding |
 
-#### Other flags
+Output and promotion:
 
 | Flag | Description |
 |------|-------------|
-| `--ai-jobs <N>` | Concurrent LLM requests (default: 1) |
-| `--prefetch <N>` | Items to prefetch ahead (default: 5) |
-| `--max-tokens-budget <N>` | Stop after this many total tokens |
-| `-o, --output <PATH>` | Write accepted changes to JSON file (record-only mode) |
-| `--json` | Output results as JSON/JSONL |
-
-#### Subcommands
-
-**`ia ai undo <JOBLOG>`** — Reverse metadata changes from a previous AI session. Reads the joblog, finds successful changes, and applies reverse operations. Supports `--dry-run` and `--json`.
-
-#### Examples
+| `-o, --output <PATH>` | Write results to file(s); format from extension (`.xlsx`, `.jsonl`, `.csv`, `.tsv`); repeatable |
+| `--json` | Output results as JSONL to stdout |
+| `--promote` | Write confirmed metadata to items after QA |
+| `--confidence <FLOAT>` | Min overall confidence for promotion (default: 0.8) |
+| `--min-field-confidence <FLOAT>` | Min per-field confidence (default: 0.6) |
+| `--dry-run` | Show what would be done without making changes |
+| `--estimate` | Estimate cost without processing items |
+| `--print-prompt` | Print the prompt that would be sent to the LLM and exit |
+| `--dashboard` | Interactive TUI for reviewing QA results |
 
 ```sh
-# Interactive review of one item
-ia ai nasa_photo_apollo11
+# QA a single item
+ia ai qa my-item
 
-# Headless batch processing
-ia ai --headless --search "collection:nasa"
+# QA items from a search, output JSONL
+ia ai qa --json --search "collection:theses"
 
-# Dry run — show suggestions without applying
-ia ai --dry-run nasa
+# Save results to XLSX and JSONL in one run
+ia ai qa --search "collection:theses" -o results.xlsx -o results.jsonl
 
-# Focus on date fixes only
-ia ai --dates-only --itemlist items.txt
+# Re-process cached results into XLSX (no LLM calls)
+ia ai qa --from-results results.jsonl -o results.xlsx
 
-# Undo changes from a previous session
-ia ai undo session.jsonl
+# QA and promote confirmed metadata
+ia ai qa --promote --confidence 0.9 item1 item2
 
-# Preview what would be undone
-ia ai undo session.jsonl --dry-run
+# Dry run — show what would be promoted
+ia ai qa --promote --dry-run my-item
+
+# Use the Anthropic API directly
+ia ai qa --base-url https://api.anthropic.com --model claude-sonnet-4-6 item1
+
+# Local model (no API key needed)
+ia ai qa --base-url http://localhost:11434/v1 --model llava:34b item1
 ```
+
+#### `ia ai config`
+
+Read, create, and edit AI Config JSON files stored in collection items. These configs define the LLM model, prompt, page selection, and response schema used by the AI Metadata Extractor derive module.
+
+| Subcommand | Description |
+|------------|-------------|
+| `show <COLLECTION>` | Display the collection's AI config (`--json`) |
+| `create <COLLECTION>` | Create a new AI config (`--from-file`, `--model`, `--prompt`, `--prompt-file`, `--pages`, `--schema-file`, `--dry-run`, `--json`) |
+| `edit <COLLECTION>` | Edit an existing config (`--editor` opens `$EDITOR`; or `--set-model`, `--set-prompt`, `--set-prompt-file`, `--set-pages`) |
+
+```sh
+# Show a collection's AI config
+ia ai config show theses-and-dissertations
+
+# Create with defaults
+ia ai config create my-collection
+
+# Create from a file
+ia ai config create my-collection --from-file config.json
+
+# Edit the config in $EDITOR
+ia ai config edit my-collection --editor
+```
+
+#### `ia ai analyze` / `ia ai undo`
+
+Builds compiled with the `ai-analyze` feature (not part of the standard `alpha` build) also include:
+
+- **`ia ai analyze <IDENTIFIER>...`** — LLM-suggested metadata improvements (typos, dates, missing fields, schema conformance) with interactive review, `--headless` batch mode, and focus flags like `--dates-only` and `--only-fields`.
+- **`ia ai undo <JOBLOG>`** — Reverse metadata changes recorded in a previous session's joblog. Supports `--dry-run` and `--json`.
 
 ## Global options
 
@@ -929,7 +1075,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent file operations (default: 8) |
+| `-j, --jobs <N>` | Concurrent operations (omit for adaptive concurrency; commands without it use 8) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
@@ -1017,7 +1163,7 @@ When `--json` is active:
 - Progress bars, color, and decorative output are suppressed
 - Exit codes are binary: `0` for success, `1` for failure (details in stderr JSON)
 
-Supported on all commands.
+Supported on all commands except `ia completions` (which outputs shell scripts, not data).
 
 ## Architecture
 

@@ -66,15 +66,19 @@ cargo install --path ia-cli
 
 ## Features
 
-- **Download** — concurrent file downloads with resume, checksum verification, glob/format filtering, multi-disk pool, and a full-screen TUI dashboard
+- **Download** — concurrent file downloads with resume, checksum verification, glob/format filtering, multi-disk pool, ZIP-member extraction, HTTP retry diagnostics, and a full-screen TUI dashboard; suppresses archive.org's public view counter by default (`--count-views` to opt back in)
 - **Upload** — single file, batch (from spreadsheet), multipart for large files, automatic resume, streaming progress dashboard
+- **Verify** — confirm local files exist on archive.org with matching checksums (MD5/SHA-1/CRC32)
 - **Search** — three backends: scrape (cursor), advanced (paged), full-text search (scroll)
-- **Metadata** — read, write (modify/append/insert/remove), compound operations (`+` chaining), bulk import/export, schema lookup
+- **List** — file listings with column selection, glob/source filtering, and download URLs
+- **Metadata** — read, write (modify/append/insert/remove), compound operations (`+` chaining), bulk import/export, schema lookup, schema audit
 - **Tasks** — list, submit, rerun, and monitor catalog tasks; view task logs; check rate limits
+- **Collections** — create collection items with metadata and cover images
 - **Config & Auth** — login, credential validation, whoami, cookie/auth header export
 - **Self-update** — check, list versions, install specific releases from GitHub
-- **`--json` on all commands** — structured JSON/JSONL output for scripts, AI agents, and MCP tool servers
-- **Job logging** — JSONL audit trail with automatic resume
+- **Job logging** — JSONL audit trail with automatic resume; `ia status` summarizes results
+- **`--json` everywhere** — structured JSON/JSONL output on every command (except `completions`) for scripts, AI agents, and MCP tool servers
+- **AI QA (alpha)** — vision-based LLM verification of AI-extracted metadata, with cost estimation and promotion of confirmed fields
 
 ## Documentation
 
