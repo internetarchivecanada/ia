@@ -1,7 +1,7 @@
 # Download Security Audit
 
 **Date**: 2026-03-03
-**Status**: Analysis Complete, Fixes Pending
+**Status**: Complete — fixes implemented in PR [#177](https://github.com/jjjake/ia/pull/177) (March 2026): path traversal validation, download size limits, `*.archive.org` redirect policy, symlink detection, and the resume TOCTOU fix
 **Tracking Issue**: [#126](https://github.com/jjjake/ia/issues/126)
 **Related CVE**: [CVE-2025-58438](https://nvd.nist.gov/vuln/detail/CVE-2025-58438) (Python `internetarchive` library)
 
