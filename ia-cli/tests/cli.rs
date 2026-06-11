@@ -912,10 +912,41 @@ fn metadata_export_help_shows_file_input() {
 
 #[test]
 fn metadata_bare_multiple_ids_accepted() {
-    // Multiple positional IDs should be accepted and produce JSONL output
-    ia().args(["metadata", "id1", "id2", "id3"])
-        .assert()
-        .success();
+    // Multiple positional IDs should be accepted and produce JSONL output.
+    //
+    // CRITICAL: this test MUST NOT hit archive.org. A previous version ran
+    // `ia metadata id1 id2 id3` against the live metadata API (read-only GETs
+    // on every test run) and its success depended on archive.org returning
+    // `200 {}` for nonexistent items. We now point `--host` at a wiremock
+    // server that serves the same `{}` responses.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+
+    rt.block_on(async {
+        for id in ["id1", "id2", "id3"] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/metadata/{id}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+                )
+                .mount(&server)
+                .await;
+        }
+    });
+
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+
+    ia().args([
+        "--insecure",
+        "--host",
+        &host,
+        "metadata",
+        "id1",
+        "id2",
+        "id3",
+    ])
+    .assert()
+    .success();
 }
 
 #[test]

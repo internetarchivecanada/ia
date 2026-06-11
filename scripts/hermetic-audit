@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Audit the test suite for non-hermetic tests (tests that touch the real network).
+#
+# Usage: hermetic-audit run  [REV...]   dynamic: run the suite at each revision
+#                                       with outbound HTTP blocked; report failures
+#        hermetic-audit grep [REVS]     static: scan every version of every .rs
+#                                       file ever committed for tests that exercise
+#                                       network code paths without a wiremock mock
+#
+# run mode (authoritative):
+#   For each revision (default: all v* tags + HEAD), checks out a detached temp
+#   worktree and runs `cargo test` with:
+#     - HTTP(S)_PROXY pointed at a dead port (127.0.0.1:1), NO_PROXY=localhost
+#       so wiremock still works — any request leaving the machine fails loudly
+#     - HOME set to an empty temp dir so no real config/credentials are readable
+#     - IA_ACCESS_KEY_ID / IA_SECRET_ACCESS_KEY unset
+#   Any test that needs the real network fails. Failures are listed per revision;
+#   inspect the log to distinguish network attempts (look for "error sending
+#   request", "tcp connect error", live hostnames) from pre-existing breakage.
+#
+#   Caveat: this catches HTTP through reqwest (which honors proxy env vars).
+#   Code using raw sockets would bypass it — there is none in this project today.
+#
+# grep mode (heuristic, candidates for human review):
+#   Walks every commit reachable from REVS (default: --all, i.e. every ref),
+#   collects every unique version of every .rs file that ever existed —
+#   tests/ directories and #[cfg(test)] modules inside src/ alike — and flags
+#   test functions that invoke the CLI binary or construct a client but
+#   contain no mock markers (--host / wiremock / MockServer / mock /
+#   localhost / 127.0.0.1). Output is deduplicated: one line per (file, test)
+#   with the first and last commit where the unmocked version existed.
+#   Expect false positives (tests that exercise only argument parsing never
+#   reach the network) — this mode produces a review list, not a verdict.
+#   Use run mode for ground truth.
+
+set -euo pipefail
+
+MODE="${1:-}"
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+cmd_run() {
+    local revs=("$@")
+    if [[ ${#revs[@]} -eq 0 ]]; then
+        # No mapfile: macOS ships bash 3.2.
+        while IFS= read -r tag; do
+            revs+=("$tag")
+        done < <(git tag --list 'v*' --sort=version:refname)
+        revs+=("HEAD")
+    fi
+
+    local cache="$REPO_ROOT/target/hermetic-audit"
+    local logdir
+    logdir=$(mktemp -d -t hermetic-audit-logs)
+    local fake_home
+    fake_home=$(mktemp -d -t hermetic-audit-home)
+    local failed_revs=()
+
+    echo "Auditing ${#revs[@]} revision(s). Logs: $logdir"
+    echo ""
+
+    for rev in "${revs[@]}"; do
+        local sha
+        sha=$(git rev-parse --short "$rev")
+        local wt
+        wt=$(mktemp -d -t "hermetic-audit-$sha")
+        rmdir "$wt"
+        git worktree add --detach --quiet "$wt" "$rev"
+
+        local log="$logdir/$sha.log"
+        echo "=== $rev ($sha) ==="
+        if (
+            cd "$wt" &&
+            env -u IA_ACCESS_KEY_ID -u IA_SECRET_ACCESS_KEY \
+                HOME="$fake_home" \
+                CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+                RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+                HTTP_PROXY=http://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 \
+                NO_PROXY=localhost,127.0.0.1 \
+                CARGO_TARGET_DIR="$cache" \
+                cargo test --workspace --no-fail-fast >"$log" 2>&1
+        ); then
+            echo "    OK: all tests pass with outbound network blocked"
+        else
+            failed_revs+=("$rev")
+            echo "    FAIL: tests failed with outbound network blocked:"
+            grep -A50 '^failures:$' "$log" | grep -E '^    [a-z_:]+$' | sort -u | sed 's/^/      /'
+            echo "    log: $log"
+        fi
+        git worktree remove --force "$wt"
+    done
+
+    echo ""
+    if [[ ${#failed_revs[@]} -eq 0 ]]; then
+        echo "All audited revisions pass with outbound network blocked."
+    else
+        echo "Revisions with failures (inspect logs to confirm network attempts):"
+        printf '  %s\n' "${failed_revs[@]}"
+        exit 1
+    fi
+}
+
+cmd_grep() {
+    local revs="${1:---all}"
+
+    # Map every unique (blob, path) of every .rs file across history — tests/
+    # dirs AND #[cfg(test)] modules inside src/ — to the commits containing it,
+    # then flag unmocked test fns once per unique blob.
+    local tmpdir
+    tmpdir=$(mktemp -d -t hermetic-audit-grep)
+    local index="$tmpdir/index"   # lines: <commit> <blob> <path>
+
+    git rev-list --reverse "$revs" | while read -r commit; do
+        git ls-tree -r "$commit" 2>/dev/null |
+            awk -v c="$commit" '$2 == "blob" && $4 ~ /\.rs$/ {print c, $3, $4}'
+    done > "$index"
+
+    if [[ ! -s "$index" ]]; then
+        echo "No .rs files found in history of $revs" >&2
+        exit 1
+    fi
+
+    # For each unique blob, list test fns that look network-capable but unmocked.
+    # Test fns end at a closing brace indented 0-4 spaces (top-level in tests/
+    # files, one level deep inside src #[cfg(test)] modules).
+    local flags="$tmpdir/flags"   # lines: <blob> <path> <test_fn>
+    awk '{print $2, $3}' "$index" | sort -u | while read -r blob path; do
+        git cat-file blob "$blob" | awk -v blob="$blob" -v path="$path" '
+            function flush() {
+                # Skip pure help-text tests: --help/-h never reaches the network.
+                # localhost/127.0.0.1 count as mock markers (local listeners).
+                if (body ~ /ia\(\)|cargo_bin|IaClient/ &&
+                    body !~ /--host|wiremock|MockServer|mock|localhost|127\.0\.0\.1/ &&
+                    body !~ /"--help"|"-h"|"help"/) {
+                    print blob, path, name
+                }
+                intest=0
+            }
+            /^[[:space:]]*#\[(tokio::)?test\]/ { intest=1; body=""; name=""; next }
+            intest && name == "" && /fn [a-zA-Z0-9_]+/ {
+                name=$0; sub(/.*fn /,"",name); sub(/\(.*/,"",name)
+            }
+            intest { body = body "\n" $0 }
+            intest && /^[[:space:]]{0,4}\}[[:space:]]*$/ { flush() }
+            END { if (intest) flush() }
+        '
+    done > "$flags"
+
+    if [[ ! -s "$flags" ]]; then
+        echo "No unmocked network-capable test functions found in any .rs file in history."
+        return
+    fi
+
+    # Join back to commits for first/last appearance of each flagged (path, fn).
+    echo "Candidate non-hermetic tests across history (HUMAN REVIEW REQUIRED):"
+    echo ""
+    sort -u -k2,3 "$flags" | while read -r blob path fn; do
+        local first last n
+        first=$(awk -v b="$blob" '$2 == b {print $1; exit}' "$index")
+        last=$(awk -v b="$blob" '$2 == b {c=$1} END {print c}' "$index")
+        n=$(awk -v b="$blob" '$2 == b' "$index" | wc -l | tr -d ' ')
+        printf '%s  %s\n    first %s  last %s  (%s commit(s), blob %s)\n' \
+            "$path" "$fn" \
+            "$(git rev-parse --short "$first")" "$(git rev-parse --short "$last")" \
+            "$n" "$(git rev-parse --short "$blob")"
+    done
+    echo ""
+    echo "Inspect a candidate with: git show <commit>:<path>"
+}
+
+case "$MODE" in
+    run)  shift; cmd_run "$@" ;;
+    grep) shift; cmd_grep "$@" ;;
+    *)
+        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac
