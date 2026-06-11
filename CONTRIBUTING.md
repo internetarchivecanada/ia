@@ -95,15 +95,13 @@ Link any related issues with `Closes #N` in the PR body.
 Nearly all implementation in this repository is written by AI agents (primarily
 [Claude Code](https://claude.com/claude-code)). The maintainer writes the designs
 (`docs/plans/`), files the issues, sets priorities, and tests the tool hands-on against
-real archive.org workflows.
+real archive.org workflows. Code is not reviewed line-by-line; correctness rests on
+process — test-first development, hermetic tests (every HTTP call mocked with
+`wiremock`; zero traffic to archive.org), and a strict CI gate on every merge.
 
-Code is not reviewed line-by-line. Correctness rests on process:
-
-- **Test-first development** — tests are written and observed failing before implementation.
-- **Hermetic integration tests** — every HTTP call is mocked (`wiremock`); the test suite
-  sends zero traffic to archive.org.
-- **CI gate on every merge** — tests, `clippy -D warnings`, `rustfmt`, rustdoc
-  `-D warnings`, and `cargo-audit` must all pass.
+The full explanation — why this approach, the complete safeguard list, and an honest
+record of what has gone wrong and how it was caught — is in
+[How this project is built](docs/ai-development.md).
 
 Agent involvement is recorded per-commit via `Co-Authored-By` trailers. Treat this like
 any young codebase: if something looks wrong, it might be — please
