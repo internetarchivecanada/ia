@@ -2,7 +2,7 @@
 
 This document describes the core design principles behind the `ia` CLI and `ia-core` library. It serves as a reference for contributors, AI agents working on the codebase, and anyone evaluating the project's architecture.
 
-For why this project exists, see [Why Rust?](why-rust.md). For usage examples, see [Usage guide](usage.md).
+For why this project exists, see [Why Rust?](why-rust.md). For how it's developed, see [How this project is built](ai-development.md). For usage examples, see [Usage guide](usage.md).
 
 ## Three audiences
 

@@ -25,14 +25,14 @@
 </p>
 
 <p align="center">
-  <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/usage.md">Usage guide</a>
+  <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/ai-development.md">How it's built</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/usage.md">Usage guide</a>
 </p>
 
 ---
 
 ## How it's built
 
-Written by AI agents (primarily [Claude Code](https://claude.com/claude-code)) under human direction — design, priorities, and acceptance are human; implementation is largely autonomous. Quality is enforced by test-first development and a strict CI gate (tests, clippy, rustfmt, docs, cargo-audit) rather than line-by-line review. Agent involvement is recorded in `Co-Authored-By` commit trailers, so it's auditable in the git history. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full workflow.
+Nearly all implementation is written by AI agents (primarily [Claude Code](https://claude.com/claude-code)) under human direction — an experiment in agent-built software, run in the open. [How this project is built](docs/ai-development.md) explains the approach, the safeguards that stand in for line-by-line review, and — importantly — what has gone wrong so far and how it was caught. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the practical workflow.
 
 ## Install
 
