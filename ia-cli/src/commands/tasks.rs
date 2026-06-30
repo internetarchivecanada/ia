@@ -223,6 +223,12 @@ pub struct SubmitArgs {
     #[arg(long, conflicts_with_all = ["identifier", "itemlist"])]
     pub search: Option<String>,
 
+    /// Extra search parameters for --search (KEY:VALUE or KEY=VALUE, repeatable;
+    /// e.g. --search-parameter sorts='addeddate desc'). Note: -p sets a task
+    /// parameter, not a search parameter.
+    #[arg(long = "search-parameter", value_name = "PARAMETERS")]
+    pub search_parameters: Vec<String>,
+
     /// Batch submit tasks from a spreadsheet (CSV/TSV/XLSX/ODS/JSONL)
     #[arg(long, conflicts_with_all = ["identifier", "itemlist", "search"])]
     pub spreadsheet: Option<std::path::PathBuf>,
@@ -582,7 +588,10 @@ async fn run_submit(
     }
 
     let positional: Vec<String> = args.identifier.iter().cloned().collect();
-    let search_opts = ia_core::search::SearchOpts::default();
+    let search_opts = ia_core::search::SearchOpts {
+        params: crate::commands::search::parse_extra_params(&args.search_parameters)?,
+        ..ia_core::search::SearchOpts::default()
+    };
     let search = args.search.as_deref().map(|q| (q, &search_opts));
     let mut identifiers = crate::identifier::collect_identifiers(
         &positional,

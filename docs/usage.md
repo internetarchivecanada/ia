@@ -34,7 +34,7 @@ ia download <IDENTIFIER>... [FILES]... [OPTIONS]
 | `[FILES]...` | Specific files to download from the item |
 | `--itemlist <PATH>` | File containing identifiers (one per line) |
 | `-s, --search <QUERY>` | Download items matching a search query |
-| `-p, --parameters <K=V>` | Extra search parameters (repeatable, used with `--search`) |
+| `--search-parameter <K=V>` | Extra search parameters (repeatable, used with `--search`) |
 | `-g, --glob <PATTERN>` | Filter files by glob pattern (pipe-separated: `"*.mp4\|*.webm"`) |
 | `-e, --exclude <PATTERN>` | Exclude files matching pattern |
 | `-f, --format <FORMAT>` | Filter by file format (repeatable) |
@@ -266,6 +266,7 @@ Chain multiple operations with `+` to apply them in a single request. Valid oper
 | `--spreadsheet <PATH>` | Bulk update from file (CSV, TSV, XLSX, ODS, JSONL) — bare command only |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | Use search results as input |
+| `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`) |
 
 ```sh
 # Set a metadata field (shorthand for 'ia metadata modify')
@@ -314,12 +315,16 @@ Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLS
 | `[FILES]...` | Input files containing identifiers |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | Use search results as input |
+| `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`) |
 | `-o, --output <PATH>` | Output file (`.csv`, `.tsv`, `.xlsx`, `.jsonl`) |
 | `--pretty` | Pretty-print JSON output |
 
 ```sh
 # Export search results as JSONL
 ia metadata export --search "collection:nasa"
+
+# Sort search results (pass any scrape parameter via -p)
+ia metadata export --search "collection:nasa" --search-parameter sorts="addeddate desc"
 
 # Export to XLSX for editing, then re-import
 ia metadata export --search "collection:nasa" -o data.xlsx
@@ -338,6 +343,7 @@ Audit item metadata against the live Internet Archive schema. Reports type misma
 | `<IDENTIFIER>...` | Item identifier(s) |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | Use search results as input |
+| `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`) |
 | `--field <FIELD>` | Only check specific field(s) (repeatable) |
 | `--required-only` | Only report missing required fields |
 | `-o, --output <PATH>` | Output file (`.csv`, `.tsv`, `.xlsx`, `.jsonl`) |
@@ -693,6 +699,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
+| `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`). Note: `-p` is a raw *task* parameter, not a search parameter. |
 | `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). |
 | `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
 | `--dry-run` | Print what would be submitted without sending |
@@ -982,7 +989,7 @@ Input sources:
 | `<IDENTIFIER>...` | Item identifier(s) to QA |
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | QA items matching a search query |
-| `-p, --search-parameters <K=V>` | Extra search parameters (repeatable) |
+| `--search-parameter <K=V>` | Extra search parameters (repeatable) |
 | `--from-results <PATH>` | Re-process cached QA results from a JSONL file (no LLM calls) |
 
 LLM configuration:

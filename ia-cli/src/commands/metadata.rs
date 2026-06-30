@@ -135,6 +135,11 @@ pub struct BatchInput {
     /// Use search results as input
     #[arg(long, conflicts_with_all = ["identifiers", "itemlist"])]
     pub search: Option<String>,
+
+    /// Extra search parameters for --search (KEY:VALUE or KEY=VALUE, repeatable;
+    /// e.g. --search-parameter sorts='addeddate desc')
+    #[arg(long = "search-parameter", value_name = "PARAMETERS")]
+    pub search_parameters: Vec<String>,
 }
 
 // ─── Subcommands ─────────────────────────────────────────────────────────────
@@ -296,6 +301,11 @@ pub struct ExportArgs {
     /// Use search results as input
     #[arg(long, conflicts_with_all = ["files", "itemlist"])]
     pub search: Option<String>,
+
+    /// Extra search parameters for --search (KEY:VALUE or KEY=VALUE, repeatable;
+    /// e.g. --search-parameter sorts='addeddate desc')
+    #[arg(long = "search-parameter", value_name = "PARAMETERS")]
+    pub search_parameters: Vec<String>,
 
     /// Output file (format inferred from extension: .csv, .tsv, .xlsx, .jsonl)
     #[arg(short = 'o', long)]
@@ -461,6 +471,15 @@ pub struct MetadataArgs {
     /// Use search results as input
     #[arg(long, conflicts_with = "spreadsheet")]
     pub search: Option<String>,
+
+    /// Extra search parameters for --search (KEY:VALUE or KEY=VALUE, repeatable;
+    /// e.g. --search-parameter sorts='addeddate desc')
+    #[arg(
+        long = "search-parameter",
+        value_name = "PARAMETERS",
+        conflicts_with = "spreadsheet"
+    )]
+    pub search_parameters: Vec<String>,
 
     /// Check if item exists (exit code 0/1)
     #[arg(short = 'e', long)]
@@ -639,6 +658,7 @@ pub async fn run(
                     identifiers: args.identifiers,
                     itemlist: args.itemlist,
                     search: args.search,
+                    search_parameters: args.search_parameters,
                 };
                 let write = WriteOpts {
                     metadata: args.metadata,
@@ -679,6 +699,7 @@ pub async fn run(
                     identifiers: args.identifiers,
                     itemlist: args.itemlist,
                     search: args.search,
+                    search_parameters: args.search_parameters,
                 };
                 let identifiers = collect_identifiers_from_batch(&input, client).await?;
                 if identifiers.is_empty() {
@@ -1097,13 +1118,15 @@ async fn run_audit(
 ) -> Result<()> {
     let identifiers = collect_identifiers_from_batch(&args.input, client).await?;
     if identifiers.is_empty() {
-        bail!(
+        bail!(crate::identifier::empty_input_message(
+            args.input.search.as_deref(),
+            args.input.itemlist.as_deref(),
             "No input provided. Pass identifiers, --search, or pipe via stdin.\n\
              Examples:\n  \
              ia metadata audit myitem\n  \
              ia metadata audit --search \"collection:test\"\n  \
-             ia metadata audit --itemlist ids.txt"
-        );
+             ia metadata audit --itemlist ids.txt",
+        ));
     }
 
     // Fetch schema once.
@@ -1357,7 +1380,10 @@ async fn collect_identifiers_from_export(
 
     // Search
     if let Some(ref query) = args.search {
-        let opts = SearchOpts::default();
+        let opts = SearchOpts {
+            params: crate::commands::search::parse_extra_params(&args.search_parameters)?,
+            ..SearchOpts::default()
+        };
         let mut stream = ia_core::search::scrape(client, query, &opts);
         while let Some(result) = stream.next().await {
             let item = result.context("search failed")?;
@@ -1386,15 +1412,17 @@ async fn collect_identifiers_from_export(
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
 
-    // Better error when no input at all
+    // Better error when no input at all (and clearer when --search matched nothing)
     if ids.is_empty() {
-        bail!(
+        bail!(crate::identifier::empty_input_message(
+            args.search.as_deref(),
+            args.itemlist.as_deref(),
             "No input provided. Pass files, --search, or pipe identifiers via stdin.\n\
              Examples:\n  \
              ia metadata export items.csv\n  \
              ia metadata export --search \"collection:nasa\"\n  \
-             echo id1 | ia metadata export"
-        );
+             echo id1 | ia metadata export",
+        ));
     }
 
     Ok(ids)
@@ -2054,7 +2082,11 @@ async fn run_write_inner(
     // Collect identifiers
     let mut identifiers = collect_identifiers_from_batch(&input, client).await?;
     if identifiers.is_empty() {
-        bail!("no identifiers provided");
+        bail!(crate::identifier::empty_input_message(
+            input.search.as_deref(),
+            input.itemlist.as_deref(),
+            "no identifiers provided",
+        ));
     }
 
     // Auto-resume: skip items already successfully modified in this joblog
@@ -2685,7 +2717,10 @@ async fn collect_identifiers_from_batch(
     }
 
     if let Some(ref query) = input.search {
-        let opts = SearchOpts::default();
+        let opts = SearchOpts {
+            params: crate::commands::search::parse_extra_params(&input.search_parameters)?,
+            ..SearchOpts::default()
+        };
         let mut stream = ia_core::search::scrape(client, query, &opts);
         while let Some(result) = stream.next().await {
             let item = result.context("search failed")?;

@@ -1175,7 +1175,7 @@ async fn multi_disk_resume_skips_existing_items() {
     );
 }
 
-// ─── --parameters tests ─────────────────────────────────────────────────────
+// ─── --search-parameter tests ────────────────────────────────────────────────
 
 #[test]
 fn download_search_rejects_bad_parameter_format() {
@@ -1186,12 +1186,12 @@ fn download_search_rejects_bad_parameter_format() {
             "download",
             "--search",
             "collection:test",
-            "--parameters",
+            "--search-parameter",
             "badparam",
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains("expected key:value or key=value"));
+        .stderr(predicates::str::contains("KEY=VALUE or KEY:VALUE"));
 }
 
 /// `--search` with positional file names downloads only those names per item.

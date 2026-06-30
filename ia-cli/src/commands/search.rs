@@ -388,9 +388,7 @@ pub(crate) fn parse_extra_params(parameters: &[String]) -> Result<Vec<(String, S
                 .split_once('=')
                 .or_else(|| p.split_once(':'))
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid --parameters value (expected KEY=VALUE or KEY:VALUE): {p}"
-                    )
+                    anyhow::anyhow!("invalid parameter (expected KEY=VALUE or KEY:VALUE): {p}")
                 })?;
             Ok((k.to_string(), v.to_string()))
         })
