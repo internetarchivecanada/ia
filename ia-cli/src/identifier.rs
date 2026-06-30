@@ -69,6 +69,33 @@ pub fn dedup_identifiers(ids: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Build a clear message for when identifier collection produced nothing.
+///
+/// Distinguishes an input source that yielded zero results (a `--search` query
+/// that matched nothing, an empty `--itemlist`) from the case where no input
+/// source was given at all. This stops commands from reporting the misleading
+/// "No input provided" when a search simply matched nothing.
+///
+/// `no_source_help` is the command-specific guidance (usage examples) shown only
+/// when no input source was provided.
+#[must_use]
+pub fn empty_input_message(
+    search: Option<&str>,
+    itemlist: Option<&Path>,
+    no_source_help: &str,
+) -> String {
+    if let Some(query) = search {
+        format!(
+            "search returned 0 results for '{query}'.\n\
+             Verify the query — e.g. `ia search scrape '{query}'`."
+        )
+    } else if let Some(path) = itemlist {
+        format!("no identifiers found in --itemlist {}", path.display())
+    } else {
+        no_source_help.to_string()
+    }
+}
+
 /// Collect identifiers from exactly one source, validate, and deduplicate.
 ///
 /// Priority:
@@ -240,6 +267,35 @@ mod tests {
         ];
         let result = dedup_identifiers(input);
         assert_eq!(result, vec!["bbb", "aaa", "ccc"]);
+    }
+
+    // ─── empty_input_message ──────────────────────────────────────────
+
+    #[test]
+    fn empty_message_names_search_query_and_not_no_input() {
+        let msg = empty_input_message(Some("collection:radio4all"), None, "NO SOURCE HELP");
+        assert!(
+            msg.contains("0 results for 'collection:radio4all'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("ia search scrape"), "got: {msg}");
+        assert!(
+            !msg.contains("NO SOURCE HELP"),
+            "search branch must not show no-source help: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_message_names_itemlist_file() {
+        let msg = empty_input_message(None, Some(Path::new("ids.txt")), "NO SOURCE HELP");
+        assert!(msg.contains("--itemlist ids.txt"), "got: {msg}");
+        assert!(!msg.contains("NO SOURCE HELP"), "got: {msg}");
+    }
+
+    #[test]
+    fn empty_message_falls_back_to_help_when_no_source() {
+        let msg = empty_input_message(None, None, "NO SOURCE HELP");
+        assert_eq!(msg, "NO SOURCE HELP");
     }
 
     // ─── collect_identifiers (itemlist integration) ───────────────────

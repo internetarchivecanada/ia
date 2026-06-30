@@ -115,8 +115,8 @@ pub struct DownloadArgs {
     #[arg(short = 's', long, conflicts_with = "itemlist")]
     search: Option<String>,
 
-    /// Extra search parameters (key:value or key=value, repeatable)
-    #[arg(short = 'p', long = "parameters", value_name = "PARAMETERS")]
+    /// Extra search parameters for --search (key:value or key=value, repeatable)
+    #[arg(long = "search-parameter", value_name = "PARAMETERS")]
     search_parameters: Vec<String>,
 
     /// Full-screen dashboard mode
@@ -151,22 +151,14 @@ fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
     }
 }
 
-/// Parse `--parameters` into a [`SearchOpts`] with extra params.
+/// Parse `--search-parameter` values into a [`SearchOpts`] with extra params.
+///
+/// Delegates to the shared parser so all `--search` commands behave identically.
 fn search_opts_from_params(params: &[String]) -> Result<SearchOpts> {
-    let mut opts = SearchOpts::default();
-    for param in params {
-        let (key, value) = param
-            .split_once(':')
-            .or_else(|| param.split_once('='))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid parameter '{}': expected key:value or key=value",
-                    param
-                )
-            })?;
-        opts.params.push((key.to_string(), value.to_string()));
-    }
-    Ok(opts)
+    Ok(SearchOpts {
+        params: crate::commands::search::parse_extra_params(params)?,
+        ..SearchOpts::default()
+    })
 }
 
 /// Collect all identifiers from args, --itemlist file, --search, and stdin.

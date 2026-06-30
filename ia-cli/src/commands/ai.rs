@@ -168,7 +168,7 @@ pub struct QaArgs {
     pub search: Option<String>,
 
     /// Extra search parameters (key:value or key=value, repeatable)
-    #[arg(short = 'p', long)]
+    #[arg(long = "search-parameter")]
     pub search_parameters: Vec<String>,
 
     // --- QA LLM configuration ---
@@ -366,6 +366,9 @@ pub struct AnalyzeArgs {
     pub itemlist: Option<PathBuf>,
     #[arg(long)]
     pub search: Option<String>,
+    /// Extra search parameters for --search (key:value or key=value, repeatable)
+    #[arg(long = "search-parameter")]
+    pub search_parameters: Vec<String>,
     #[arg(long)]
     pub headless: bool,
     #[arg(long)]
@@ -1945,7 +1948,10 @@ async fn run_analyze(
         );
     }
 
-    let search_opts = SearchOpts::default();
+    let search_opts = SearchOpts {
+        params: crate::commands::search::parse_extra_params(&args.search_parameters)?,
+        ..SearchOpts::default()
+    };
     let search = args.search.as_deref().map(|q| (q, &search_opts));
     let identifiers = crate::identifier::collect_identifiers(
         &args.identifiers,
@@ -1955,7 +1961,11 @@ async fn run_analyze(
     )
     .await?;
     if identifiers.is_empty() {
-        bail!("no identifiers to process");
+        bail!(crate::identifier::empty_input_message(
+            args.search.as_deref(),
+            args.itemlist.as_deref(),
+            "no identifiers to process",
+        ));
     }
 
     let base_config = client.config().ai.clone().unwrap_or_default();
