@@ -287,10 +287,9 @@ fn try_parse_bsd_multi(line: &str) -> Option<(String, String, HashAlgorithm)> {
         (HashAlgorithm::Md5, Some(32), rest)
     } else if let Some(rest) = line.strip_prefix("SHA1 (") {
         (HashAlgorithm::Sha1, Some(40), rest)
-    } else if let Some(rest) = line.strip_prefix("CRC32 (") {
-        (HashAlgorithm::Crc32, Some(8), rest)
     } else {
-        return None;
+        let rest = line.strip_prefix("CRC32 (")?;
+        (HashAlgorithm::Crc32, Some(8), rest)
     };
 
     let (filename, hash_part) = rest.split_once(") = ")?;

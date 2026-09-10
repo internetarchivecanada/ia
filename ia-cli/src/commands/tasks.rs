@@ -1188,7 +1188,7 @@ async fn submit_with_retry(
                 if quiet == 0 {
                     eprintln!(
                         "Rate limited for {}. Retrying in {}s... ({retries}/{max_retries})",
-                        &submission.identifier,
+                        submission.identifier,
                         wait.as_secs()
                     );
                 }
