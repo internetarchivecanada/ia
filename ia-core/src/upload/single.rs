@@ -1,4 +1,4 @@
-use crate::error::{IaError, Result};
+use crate::error::{format_error_chain, IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
 use crate::upload::checksum::compute_file_md5_async;
 use crate::upload::headers::encode_metadata_headers;
@@ -465,22 +465,6 @@ async fn poll_check_limit(
     })
 }
 
-/// Format a full error chain, walking `.source()` to capture all causes.
-///
-/// reqwest errors often wrap inner causes (e.g., "builder error" wraps
-/// "invalid header value"). This function produces a message like:
-/// `"builder error: invalid header value: \x01 is not visible ASCII"`
-fn format_error_chain(err: &dyn std::error::Error) -> String {
-    let mut chain = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        chain.push_str(": ");
-        chain.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    chain
-}
-
 /// Encode bytes as base64 (standard alphabet, with padding).
 ///
 /// Used for Content-MD5 header value. Avoids adding the `base64` crate
@@ -527,38 +511,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    // -- format_error_chain tests --
-
-    #[test]
-    fn format_error_chain_single_error() {
-        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
-        let chain = format_error_chain(&err);
-        assert_eq!(chain, "file missing");
-    }
-
-    #[test]
-    fn format_error_chain_nested_errors() {
-        // Simulate a nested error chain: outer wraps inner
-        #[derive(Debug)]
-        struct Outer {
-            source: std::io::Error,
-        }
-        impl std::fmt::Display for Outer {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "builder error")
-            }
-        }
-        impl std::error::Error for Outer {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                Some(&self.source)
-            }
-        }
-
-        let inner = std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid header value");
-        let outer = Outer { source: inner };
-        let chain = format_error_chain(&outer);
-        assert_eq!(chain, "builder error: invalid header value");
-    }
+    // format_error_chain is tested in crate::error
 
     #[test]
     fn base64_encode_empty() {

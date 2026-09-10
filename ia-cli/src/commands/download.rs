@@ -16,8 +16,7 @@ use ia_core::download::{
     collect_batch_results, BatchDownloadResult, DownloadOpts, DownloadProgress, DownloadStatus,
     FileDownloadResult, ItemDownloadResult,
 };
-use ia_core::error::IaError;
-use ia_core::error::Result as IaResult;
+use ia_core::error::{format_error_chain, IaError, Result as IaResult};
 use ia_core::files::FileFilter;
 use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
@@ -761,7 +760,7 @@ async fn download_batch_with_pool(
                     // Stream error (e.g. search pagination failure) — record
                     // as a failed item. Unreachable for Vec-backed streams.
                     Err(e) => {
-                        let msg = e.to_string();
+                        let msg = format_error_chain(&e);
                         if let Some(ref jl) = joblog {
                             jl.write(
                                 &JoblogEntry::new("download", "<search>", "").error(&msg, 0),
@@ -796,15 +795,15 @@ async fn download_batch_with_pool(
                 let item = match ia_core::metadata::get(&client, &identifier).await {
                     Ok(item) => item,
                     Err(e) => {
-                        warn!(item = %identifier, error = %e, "failed to fetch metadata");
+                        let msg = format_error_chain(&e);
+                        warn!(item = %identifier, error = %msg, "failed to fetch metadata");
                         if let Some(ref jl) = joblog {
                             jl.write(
-                                &JoblogEntry::new("download", &identifier, "")
-                                    .error(&e.to_string(), 0),
+                                &JoblogEntry::new("download", &identifier, "").error(&msg, 0),
                             );
                         }
                         if let Some(ref bd) = batch_display {
-                            bd.on_item_error(&identifier, &e.to_string());
+                            bd.on_item_error(&identifier, &msg);
                         }
                         return Err((identifier, e));
                     }
@@ -821,15 +820,15 @@ async fn download_batch_with_pool(
                     match pool_guard.assign_item(&identifier, estimated_size) {
                         Ok(dest) => dest.to_path_buf(),
                         Err(e) => {
-                            warn!(item = %identifier, error = %e, "skipping item: no disk space");
+                            let msg = format_error_chain(&e);
+                            warn!(item = %identifier, error = %msg, "skipping item: no disk space");
                             if let Some(ref jl) = joblog {
                                 jl.write(
-                                    &JoblogEntry::new("download", &identifier, "")
-                                        .error(&e.to_string(), 0),
+                                    &JoblogEntry::new("download", &identifier, "").error(&msg, 0),
                                 );
                             }
                             if let Some(ref bd) = batch_display {
-                                bd.on_item_error(&identifier, &e.to_string());
+                                bd.on_item_error(&identifier, &msg);
                             }
                             return Err((identifier, e));
                         }
@@ -866,11 +865,12 @@ async fn download_batch_with_pool(
                 };
 
                 let emit_error = |id: &str, e: &IaError| {
+                    let msg = format_error_chain(e);
                     if let Some(ref jl) = joblog {
-                        jl.write(&JoblogEntry::new("download", id, "").error(&e.to_string(), 0));
+                        jl.write(&JoblogEntry::new("download", id, "").error(&msg, 0));
                     }
                     if let Some(ref bd) = batch_display {
-                        bd.on_item_error(id, &e.to_string());
+                        bd.on_item_error(id, &msg);
                     }
                 };
 
@@ -1111,15 +1111,13 @@ async fn download_batch_items(
                         Ok(result)
                     }
                     Err(e) => {
-                        warn!(identifier = %identifier, error = %e, "item download failed");
+                        let msg = format_error_chain(&e);
+                        warn!(identifier = %identifier, error = %msg, "item download failed");
                         if let Some(ref jl) = joblog {
-                            jl.write(
-                                &JoblogEntry::new("download", &identifier, "")
-                                    .error(&e.to_string(), 0),
-                            );
+                            jl.write(&JoblogEntry::new("download", &identifier, "").error(&msg, 0));
                         }
                         if let Some(ref bd) = batch_display {
-                            bd.on_item_error(&identifier, &e.to_string());
+                            bd.on_item_error(&identifier, &msg);
                         }
                         Err((identifier, e))
                     }
