@@ -574,44 +574,104 @@ pub async fn download_file(
 
     let mut bytes_downloaded = resume_from.unwrap_or(0);
     let mut last_progress_at = bytes_downloaded;
-    let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(reqwest_middleware::Error::from)?;
-        output.write_all(&chunk).await?;
-        if let Some(h) = hasher.as_mut() {
-            use md5::Digest;
-            h.update(&chunk);
-        }
-        bytes_downloaded += chunk.len() as u64;
+    // Stream-level retry budget. `reqwest-retry` only sees the initial
+    // response status; once we start reading the body it's on us.
+    // Real-world incident (us-supreme-court, 2026-04-22): 39 body-stream
+    // decode errors bypassed the middleware entirely, dropping items the
+    // server would have happily served a few seconds later.
+    const MAX_STREAM_RETRIES: usize = 3;
+    let mut stream_attempt: usize = 0;
+    let mut response = response;
 
-        // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
-        if let Some(expected) = file.size {
-            let max_allowed = expected + (expected / 10).max(1024);
-            if bytes_downloaded > max_allowed {
-                drop(output);
-                let _ = fs::remove_file(&part_path).await;
-                return Err(IaError::DownloadTooLarge {
-                    file: file.name.clone(),
-                    expected,
-                    received: bytes_downloaded,
-                });
+    'stream_retry: loop {
+        let mut stream = response.bytes_stream();
+
+        loop {
+            let chunk = match stream.next().await {
+                Some(Ok(c)) => c,
+                Some(Err(stream_err)) => {
+                    let m_err = reqwest_middleware::Error::from(stream_err);
+                    // Any error after successful response headers is a
+                    // body-phase failure — connection drop, incomplete
+                    // message, decode error, or stream timeout. They all
+                    // share a remedy: sleep briefly, re-request with Range.
+                    if stream_attempt < MAX_STREAM_RETRIES {
+                        stream_attempt += 1;
+                        // Flush buffered bytes to disk so the .part file size
+                        // matches `bytes_downloaded` — the Range offset for
+                        // the retry request.
+                        output.flush().await?;
+                        let backoff = std::time::Duration::from_millis(
+                            500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
+                        );
+                        warn!(
+                            file = %file.name,
+                            attempt = stream_attempt,
+                            max = MAX_STREAM_RETRIES,
+                            bytes_downloaded,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %crate::error::format_error_chain(&m_err),
+                            "body-stream error, retrying with Range",
+                        );
+                        tokio::time::sleep(backoff).await;
+                        let new_resp =
+                            fetch_response(client, &url, Some(bytes_downloaded), opts.count_views)
+                                .await?;
+                        // If the server ignores Range and returns 200, the
+                        // safe thing is to surface the original error rather
+                        // than try to splice a full-file stream onto an
+                        // existing `.part` offset.
+                        if new_resp.status() == reqwest::StatusCode::OK && bytes_downloaded > 0 {
+                            return Err(IaError::ResumeFailed {
+                                file: file.name.clone(),
+                                reason: "server ignored Range header on retry".to_string(),
+                            });
+                        }
+                        response = new_resp;
+                        continue 'stream_retry;
+                    }
+                    return Err(IaError::Network(m_err));
+                }
+                None => break,
+            };
+
+            output.write_all(&chunk).await?;
+            if let Some(h) = hasher.as_mut() {
+                use md5::Digest;
+                h.update(&chunk);
+            }
+            bytes_downloaded += chunk.len() as u64;
+
+            // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
+            if let Some(expected) = file.size {
+                let max_allowed = expected + (expected / 10).max(1024);
+                if bytes_downloaded > max_allowed {
+                    drop(output);
+                    let _ = fs::remove_file(&part_path).await;
+                    return Err(IaError::DownloadTooLarge {
+                        file: file.name.clone(),
+                        expected,
+                        received: bytes_downloaded,
+                    });
+                }
+            }
+
+            // Rate-limit progress updates to every 256KB to reduce lock contention
+            if let Some(p) = progress {
+                if bytes_downloaded - last_progress_at >= 256 * 1024 {
+                    p(DownloadProgress {
+                        identifier: identifier.to_string(),
+                        file_name: file.name.clone(),
+                        bytes_downloaded,
+                        total_bytes: file.size,
+                        status: DownloadStatus::Downloading,
+                    });
+                    last_progress_at = bytes_downloaded;
+                }
             }
         }
-
-        // Rate-limit progress updates to every 256KB to reduce lock contention
-        if let Some(p) = progress {
-            if bytes_downloaded - last_progress_at >= 256 * 1024 {
-                p(DownloadProgress {
-                    identifier: identifier.to_string(),
-                    file_name: file.name.clone(),
-                    bytes_downloaded,
-                    total_bytes: file.size,
-                    status: DownloadStatus::Downloading,
-                });
-                last_progress_at = bytes_downloaded;
-            }
-        }
+        break;
     }
 
     output.flush().await?;
@@ -2530,6 +2590,129 @@ mod tests {
             verifying_idx < skipped_idx,
             "Verifying must precede Skipped: {seen:?}"
         );
+    }
+
+    /// A body-stream error mid-download (e.g. connection drop after headers)
+    /// bypasses the middleware retry, which only inspects response status.
+    /// The stream-level retry wrapper should catch the error, sleep briefly,
+    /// and re-issue the request with `Range: bytes={bytes_downloaded}-`
+    /// using the existing `.part` file.
+    ///
+    /// Simulated with a raw TCP listener because wiremock's hyper server
+    /// refuses to send a response whose Content-Length doesn't match its
+    /// body — the error surfaces as a pre-response connection drop rather
+    /// than a mid-body drop. A raw listener lets us ship valid headers and
+    /// then close the connection after a partial body.
+    #[tokio::test]
+    async fn stream_error_retries_with_range_and_completes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let full_body: Vec<u8> = (0..32u8).collect();
+        let full_len = full_body.len() as u64;
+        let chopped_at: u64 = 12;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_body = full_body.clone();
+
+        let server_handle = tokio::spawn(async move {
+            // Helper: read the HTTP request until "\r\n\r\n" to extract
+            // interesting headers (we only care about presence of Range).
+            async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+                let mut buf = vec![0u8; 4096];
+                let mut acc = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).to_string()
+            }
+
+            // Accept 1: full response headers promising 32 bytes, but close
+            // the socket after sending only 12 bytes of body.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-length: {full_len}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     accept-ranges: bytes\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream
+                    .write_all(&server_body[..chopped_at as usize])
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                drop(stream); // abrupt close mid-body
+            }
+
+            // Accept 2: Range request; honor it with 206 + remaining bytes.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut stream).await;
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains(&format!("range: bytes={chopped_at}-")),
+                    "expected Range header on retry, got:\n{req}"
+                );
+                let remainder = &server_body[chopped_at as usize..];
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     content-length: {}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     content-range: bytes {chopped_at}-{end}/{full_len}\r\n\
+                     connection: close\r\n\
+                     \r\n",
+                    remainder.len(),
+                    end = full_len - 1,
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(remainder).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("data.bin", full_len);
+        // md5 of bytes 0..32:
+        //   python -c "import hashlib;print(hashlib.md5(bytes(range(32))).hexdigest())"
+        file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
+
+        let result = download_file(
+            &client,
+            "flaky-item",
+            &file,
+            dir.path(),
+            &DownloadOpts {
+                checksum: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("download should succeed after retry");
+
+        assert_eq!(result.bytes, full_len);
+        let got = std::fs::read(dir.path().join("data.bin")).unwrap();
+        assert_eq!(got, full_body, "final file should contain full body");
+
+        server_handle.await.unwrap();
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org

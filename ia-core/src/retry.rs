@@ -186,6 +186,22 @@ impl RetryStats {
     }
 }
 
+/// Whether this `reqwest::Error` represents a transient body-read / decode
+/// failure that can be retried once the response has been returned.
+///
+/// The retry middleware (`reqwest-retry`) only sees the initial response
+/// status and send-level transport failures. Once it hands the response off
+/// to caller code, any failure reading the body (`bytes_stream`, `.json`,
+/// `.text`, `.bytes`) bypasses the middleware entirely — `is_body()` and
+/// `is_decode()` cover those cases. Request-level timeouts that fire after
+/// a successful response header are also worth retrying here.
+///
+/// Returns `false` for definite connection/transport errors that the
+/// middleware should have already handled.
+pub fn is_retryable_body_error(err: &reqwest::Error) -> bool {
+    err.is_body() || err.is_decode() || err.is_timeout()
+}
+
 /// Parse the `Retry-After` header as a number of seconds.
 ///
 /// Returns `None` if the header is missing or its value is not a valid

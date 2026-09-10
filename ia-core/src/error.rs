@@ -164,6 +164,32 @@ pub enum IaError {
 
 pub type Result<T> = std::result::Result<T, IaError>;
 
+/// Format a full error chain, walking `.source()` to capture all causes.
+///
+/// reqwest errors often hide the useful detail in a chained cause:
+/// `IaError::Network` is `#[error(transparent)]`, so its `to_string()` renders
+/// only `"error decoding response body"`. The underlying cause
+/// (e.g. `"error reading a body from connection: unexpected EOF"`) lives in
+/// `source()` and is otherwise lost.
+///
+/// Produces `"<top>: <cause1>: <cause2>"`.
+pub fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_str = cause.to_string();
+        // Avoid duplicating segments when a transparent wrapper repeats its
+        // inner message (thiserror's `#[error(transparent)]` can surface the
+        // same string at two levels of the chain).
+        if !chain.ends_with(&cause_str) {
+            chain.push_str(": ");
+            chain.push_str(&cause_str);
+        }
+        source = cause.source();
+    }
+    chain
+}
+
 impl IaError {
     /// Whether this error indicates a disk-full condition.
     ///
@@ -460,6 +486,88 @@ mod tests {
     fn not_found_displays_identifier() {
         let err = IaError::NotFound("nasa".to_string());
         assert_eq!(err.to_string(), "item not found: nasa");
+    }
+
+    #[test]
+    fn format_error_chain_single_error() {
+        let err = IaError::NotFound("nasa".to_string());
+        let chain = format_error_chain(&err);
+        assert_eq!(chain, "item not found: nasa");
+    }
+
+    #[test]
+    fn format_error_chain_walks_sources() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "unexpected EOF during chunk size line")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Middle(Inner);
+        impl std::fmt::Display for Middle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error reading a body from connection")
+            }
+        }
+        impl std::error::Error for Middle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        #[derive(Debug)]
+        struct Top(Middle);
+        impl std::fmt::Display for Top {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Top {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Top(Middle(Inner));
+        assert_eq!(
+            format_error_chain(&err),
+            "error decoding response body: error reading a body from connection: unexpected EOF during chunk size line",
+        );
+    }
+
+    #[test]
+    fn format_error_chain_deduplicates_transparent_wrappers() {
+        // A `#[error(transparent)]` wrapper reports its source's Display as
+        // its own, so walking the chain would duplicate the segment without
+        // dedup. Simulate that shape.
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Transparent(Inner);
+        impl std::fmt::Display for Transparent {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body") // same as inner
+            }
+        }
+        impl std::error::Error for Transparent {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Transparent(Inner);
+        assert_eq!(format_error_chain(&err), "error decoding response body");
     }
 
     #[test]
