@@ -343,10 +343,7 @@ pub fn parse_llm_changes(content: &str) -> Vec<MetadataChange> {
         .filter_map(|v| {
             let field = v.get("field")?.as_str()?.to_string();
             let new_value = v.get("new_value").cloned()?;
-            let old_value =
-                v.get("old_value")
-                    .cloned()
-                    .and_then(|v| if v.is_null() { None } else { Some(v) });
+            let old_value = v.get("old_value").cloned().filter(|v| !v.is_null());
             let reason = v
                 .get("reason")
                 .and_then(|r| r.as_str())
