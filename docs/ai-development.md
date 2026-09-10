@@ -3,7 +3,7 @@
 Nearly everything in this repository was written by AI agents (primarily Claude Code), directed by me ([@jjjake](https://github.com/jjjake)).
 This document is no exception. It was co-written with the same agents that built the tool: the experience and opinions are mine, the drafting was shared, and the technical details (commit counts, PR numbers, etc.) were pulled by the agents from the git history and issue tracker, where anyone can verify them.
 
-This project is a true experiment.
+This project is an experiment.
 It's an attempt at building a next-generation archive.org tool using agentic coding tools to develop faster, keep maintenance manageable, and support future agent-first tools that interact with archive.org.
 It is just an experiment, and there is no commitment to a public release.
 This document is meant to share my experience with developing like this, what has worked, and what has gone wrong so far.

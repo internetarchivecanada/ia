@@ -156,8 +156,29 @@ fn value_taking_global_flags() -> Vec<String> {
         .collect()
 }
 
+/// Restore the default `SIGPIPE` disposition.
+///
+/// Rust ignores `SIGPIPE` by default, which turns a closed downstream pipe
+/// (e.g. `ia metadata export ... | head`) into an I/O error that `println!`
+/// then panics on ("failed printing to stdout: Broken pipe"). Resetting to
+/// `SIG_DFL` lets the process terminate quietly on `SIGPIPE` like a
+/// conventional Unix CLI.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: called once at startup before any output is written; installing
+    // the default handler for SIGPIPE has no memory-safety implications.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    reset_sigpipe();
+
     // Pre-scan argv for compound metadata operations (+ separator)
     // before clap parsing, since clap would choke on bare + tokens.
     let raw_args: Vec<String> = std::env::args().collect();
