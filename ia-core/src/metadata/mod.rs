@@ -4,7 +4,7 @@ pub mod schema;
 pub mod write;
 
 pub use audit::{audit_item, AuditResult, Finding, FindingKind, Severity};
-pub use read::{exists, get};
+pub use read::{exists, get, get_with_params};
 pub use schema::{fetch_schema, SchemaData, SchemaField};
 pub use write::{
     compute_compound_patch, compute_patch, extract_target_metadata, modify, modify_compound,

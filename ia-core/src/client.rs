@@ -364,6 +364,19 @@ impl IaClient {
         crate::metadata::get(self, identifier).await
     }
 
+    /// Fetch item metadata, appending extra query parameters to the request.
+    ///
+    /// Use this to pass parameters the metadata API understands — most notably
+    /// `dark_ok=1`, which (together with S3 auth) is required to read the
+    /// metadata of a dark item.
+    pub async fn get_item_with_params(
+        &self,
+        identifier: &str,
+        params: &[(String, String)],
+    ) -> Result<crate::types::ItemMetadata> {
+        crate::metadata::get_with_params(self, identifier, params).await
+    }
+
     pub async fn item_exists(&self, identifier: &str) -> Result<bool> {
         crate::metadata::exists(self, identifier).await
     }

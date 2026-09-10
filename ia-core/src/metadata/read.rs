@@ -7,9 +7,26 @@ use crate::types::ItemMetadata;
 /// Sends S3 auth headers when credentials are configured, which is
 /// required for accessing private/dark items.
 pub async fn get(client: &IaClient, identifier: &str) -> Result<ItemMetadata> {
+    get_with_params(client, identifier, &[]).await
+}
+
+/// Fetch full metadata for an item, appending extra query parameters.
+///
+/// Sends S3 auth headers when credentials are configured, which is
+/// required for accessing private/dark items. Extra parameters are appended
+/// to the query string — e.g. `dark_ok=1` is required (in addition to auth)
+/// for the metadata API to return the metadata of a dark item.
+pub async fn get_with_params(
+    client: &IaClient,
+    identifier: &str,
+    params: &[(String, String)],
+) -> Result<ItemMetadata> {
     let url = client.url(&format!("/metadata/{identifier}"));
 
     let mut req = client.http().get(&url);
+    if !params.is_empty() {
+        req = req.query(params);
+    }
     if let Some(auth) = crate::auth::s3_auth_value(client.config()) {
         req = req.header("Authorization", auth);
     }
@@ -98,6 +115,42 @@ mod tests {
         assert_eq!(item.files.len(), 1);
         assert_eq!(item.files[0].name, "test.pdf");
         assert_eq!(item.files[0].size, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn get_with_params_sends_query_params() {
+        use wiremock::matchers::query_param;
+
+        let mock_server = MockServer::start().await;
+
+        // The mock only matches when dark_ok=1 is present on the query string,
+        // so a passing test proves the param was actually sent.
+        Mock::given(method("GET"))
+            .and(path("/metadata/dark-item"))
+            .and(query_param("dark_ok", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {
+                    "identifier": "dark-item",
+                    "title": "Dark Item",
+                    "mediatype": "audio"
+                },
+                "is_dark": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let params = vec![("dark_ok".to_string(), "1".to_string())];
+        let item = get_with_params(&client, "dark-item", &params)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            item.metadata.identifier.as_ref().map(|v| v.first()),
+            Some("dark-item")
+        );
+        assert!(item.is_dark);
     }
 
     #[tokio::test]

@@ -34,3 +34,10 @@ stairs/
 test-upload-data/
 .superpowers/
 QA-TEST-PLAN.md
+PRIORITIES.md
+drafts/
+reviews/
+ai-qa-tmp-test/
+internetarchive.log
+test-ai-config.json
+*_metadata.csv

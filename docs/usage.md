@@ -222,6 +222,7 @@ By default, `ia metadata` displays the full metadata JSON for an item.
 | `-e, --exists` | Check if item exists (exit code 0=yes, 1=no) |
 | `-F, --formats` | List available file formats |
 | `--pretty` | Pretty-print JSON output |
+| `-p, --parameters <K=V>` | Extra query parameters sent with each metadata request (`key:value` or `key=value`, repeatable; e.g. `-p dark_ok=1` to read dark items) |
 
 ```sh
 # View metadata for an item
@@ -235,6 +236,9 @@ ia metadata nasa --exists
 
 # List file formats in an item
 ia metadata nasa --formats
+
+# Read a dark item (requires auth + dark_ok=1)
+ia metadata DARK-item -p dark_ok=1
 ```
 
 #### Writing metadata
@@ -316,6 +320,7 @@ Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLS
 | `--itemlist <PATH>` | Read identifiers from file (one per line) |
 | `--search <QUERY>` | Use search results as input |
 | `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`) |
+| `-p, --parameters <K=V>` | Extra query parameters sent with each metadata request (`key:value` or `key=value`, repeatable; e.g. `-p dark_ok=1` to export dark items) |
 | `-o, --output <PATH>` | Output file (`.csv`, `.tsv`, `.xlsx`, `.jsonl`) |
 | `--pretty` | Pretty-print JSON output |
 
@@ -323,8 +328,11 @@ Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLS
 # Export search results as JSONL
 ia metadata export --search "collection:nasa"
 
-# Sort search results (pass any scrape parameter via -p)
+# Sort search results (pass any scrape parameter via --search-parameter)
 ia metadata export --search "collection:nasa" --search-parameter sorts="addeddate desc"
+
+# Export dark items (requires auth + dark_ok=1 on each metadata request)
+ia metadata export --itemlist dark-ids.txt -p dark_ok=1
 
 # Export to XLSX for editing, then re-import
 ia metadata export --search "collection:nasa" -o data.xlsx

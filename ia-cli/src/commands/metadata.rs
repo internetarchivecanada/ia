@@ -307,6 +307,11 @@ pub struct ExportArgs {
     #[arg(long = "search-parameter", value_name = "PARAMETERS")]
     pub search_parameters: Vec<String>,
 
+    /// Extra query parameters sent with each metadata request (KEY:VALUE or
+    /// KEY=VALUE, repeatable; e.g. -p dark_ok=1 to read dark items)
+    #[arg(short = 'p', long = "parameters", value_name = "PARAMETERS")]
+    pub parameters: Vec<String>,
+
     /// Output file (format inferred from extension: .csv, .tsv, .xlsx, .jsonl)
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
@@ -480,6 +485,16 @@ pub struct MetadataArgs {
         conflicts_with = "spreadsheet"
     )]
     pub search_parameters: Vec<String>,
+
+    /// Extra query parameters sent with each metadata request (KEY:VALUE or
+    /// KEY=VALUE, repeatable; e.g. -p dark_ok=1 to read dark items)
+    #[arg(
+        short = 'p',
+        long = "parameters",
+        value_name = "PARAMETERS",
+        conflicts_with = "spreadsheet"
+    )]
+    pub parameters: Vec<String>,
 
     /// Check if item exists (exit code 0/1)
     #[arg(short = 'e', long)]
@@ -692,6 +707,9 @@ pub async fn run(
                 bail!("--target requires -m or a write subcommand");
             }
 
+            // Extra query params sent with each metadata GET (e.g. dark_ok=1).
+            let read_params = crate::commands::search::parse_extra_params(&args.parameters)?;
+
             // Batch read: --search / --itemlist / stdin
             let has_batch_input = args.search.is_some() || args.itemlist.is_some();
             if has_batch_input || (args.identifiers.is_empty() && !std::io::stdin().is_terminal()) {
@@ -718,10 +736,24 @@ pub async fn run(
                 }
 
                 if args.exists {
-                    return run_exists_multi(client, &identifiers, args.json, ctx.jobs).await;
+                    return run_exists_multi(
+                        client,
+                        &identifiers,
+                        args.json,
+                        ctx.jobs,
+                        &read_params,
+                    )
+                    .await;
                 }
                 if args.formats {
-                    return run_formats_multi(client, &identifiers, args.json, ctx.jobs).await;
+                    return run_formats_multi(
+                        client,
+                        &identifiers,
+                        args.json,
+                        ctx.jobs,
+                        &read_params,
+                    )
+                    .await;
                 }
                 return run_read_multi(
                     client,
@@ -730,6 +762,7 @@ pub async fn run(
                     args.json,
                     ctx.quiet,
                     ctx.jobs,
+                    &read_params,
                 )
                 .await;
             }
@@ -761,6 +794,7 @@ pub async fn run(
                     args.formats,
                     args.pretty,
                     args.json,
+                    &read_params,
                 )
                 .await
             } else {
@@ -771,6 +805,7 @@ pub async fn run(
                     args.json,
                     ctx.quiet,
                     ctx.jobs,
+                    &read_params,
                 )
                 .await
             }
@@ -787,6 +822,7 @@ async fn run_read(
     formats: bool,
     pretty: bool,
     json: bool,
+    params: &[(String, String)],
 ) -> Result<()> {
     if exists {
         let item_exists = client
@@ -808,7 +844,7 @@ async fn run_read(
     }
 
     let item = client
-        .get_item(identifier)
+        .get_item_with_params(identifier, params)
         .await
         .context(format!("failed to fetch metadata for {identifier}"))?;
 
@@ -843,18 +879,21 @@ async fn run_read_multi(
     _json: bool,
     quiet: u8,
     jobs: usize,
+    params: &[(String, String)],
 ) -> Result<()> {
     let total = identifiers.len();
     let client = Arc::new(client.clone());
     let counter = Arc::new(AtomicUsize::new(0));
+    let params: Arc<Vec<(String, String)>> = Arc::new(params.to_vec());
 
     let mut stream = stream::iter(identifiers.iter().cloned())
         .map(|id| {
             let client = client.clone();
             let counter = counter.clone();
+            let params = params.clone();
             async move {
                 let item = client
-                    .get_item(&id)
+                    .get_item_with_params(&id, &params)
                     .await
                     .context(format!("failed to fetch metadata for {id}"))?;
                 let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -887,18 +926,25 @@ async fn run_exists_multi(
     identifiers: &[String],
     json: bool,
     jobs: usize,
+    params: &[(String, String)],
 ) -> Result<()> {
     let client = Arc::new(client.clone());
+    let params: Arc<Vec<(String, String)>> = Arc::new(params.to_vec());
     let mut any_missing = false;
 
     let mut stream = stream::iter(identifiers.iter().cloned())
         .map(|id| {
             let client = client.clone();
+            let params = params.clone();
             async move {
-                let exists = client
-                    .item_exists(&id)
-                    .await
-                    .context(format!("failed to check existence of {id}"))?;
+                let exists = match client.get_item_with_params(&id, &params).await {
+                    Ok(_) => true,
+                    Err(ia_core::IaError::NotFound(_)) => false,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e))
+                            .context(format!("failed to check existence of {id}"))
+                    }
+                };
                 Ok::<_, anyhow::Error>((id, exists))
             }
         })
@@ -928,15 +974,18 @@ async fn run_formats_multi(
     identifiers: &[String],
     _json: bool,
     jobs: usize,
+    params: &[(String, String)],
 ) -> Result<()> {
     let client = Arc::new(client.clone());
+    let params: Arc<Vec<(String, String)>> = Arc::new(params.to_vec());
 
     let mut stream = stream::iter(identifiers.iter().cloned())
         .map(|id| {
             let client = client.clone();
+            let params = params.clone();
             async move {
                 let item = client
-                    .get_item(&id)
+                    .get_item_with_params(&id, &params)
                     .await
                     .context(format!("failed to fetch metadata for {id}"))?;
                 let mut fmts: Vec<String> =
@@ -1537,6 +1586,11 @@ async fn run_export(
 ) -> Result<()> {
     let mut identifiers = collect_identifiers_from_export(&args, client).await?;
 
+    // Extra query params sent with each metadata GET (e.g. dark_ok=1 for dark items).
+    let export_params: Arc<Vec<(String, String)>> = Arc::new(
+        crate::commands::search::parse_extra_params(&args.parameters)?,
+    );
+
     // Auto-resume: skip items already successfully exported in this joblog
     let skip_set: HashSet<String> = if let Some(ref path) = joblog_path {
         if path.exists() {
@@ -1657,6 +1711,7 @@ async fn run_export(
             let client = feeder_client.clone();
             let lim = feeder_limiter.clone();
             let tx = tx.clone();
+            let params = export_params.clone();
 
             tokio::spawn(async move {
                 let req_start = Instant::now();
@@ -1664,7 +1719,7 @@ async fn run_export(
                 let mut permit = Some(permit);
 
                 let result = loop {
-                    match client.get_item(&identifier).await {
+                    match client.get_item_with_params(&identifier, &params).await {
                         Ok(item) => {
                             lim.on_success();
                             break Ok(item);
