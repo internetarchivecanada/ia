@@ -2,14 +2,13 @@
 
 ## Context
 
-Jake's colleague a colleague at archive.org has built a mature AI metadata extraction system at archive.org:
+A separate team at archive.org has built an AI metadata extraction system:
 - **AI Config JSON** — stored in collection items, defines LLM model, prompt, page selection, and response schema
 - **Extracted Metadata JSON** — stored per-item, contains extracted metadata + provenance (model, tokens, cost)
 - **AI Metadata Extractor derive module** — runs as IA task during republishing, sends page images to LLM
-- **Operating at scale** on items with poor or missing metadata
-- Web UIs exist: config editor (`the config editor`) and metadata review/promote (`the metadata editor`)
+- Internal web UIs exist for editing configs and for reviewing/promoting extracted metadata
 
-The `ia ai` command needs to be **recentered around the extraction system's ecosystem** — using the same config format, reading extraction results, and providing CLI-native QA + review capabilities. The existing standalone analyze mode gets shelved behind a feature flag for future "live extraction" work.
+The `ia ai` command needs to be **recentered around that system** — using the same config format, reading extraction results, and providing CLI-native QA + review capabilities. The existing standalone analyze mode gets shelved behind a feature flag for future "live extraction" work.
 
 **Top priorities:**
 1. AI agent QA of extraction results (two-model consensus: extraction LLM + QA LLM)

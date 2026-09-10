@@ -5,7 +5,7 @@ This document is no exception. It was co-written with the same agents that built
 
 This project is an experiment.
 It's an attempt at building a next-generation archive.org tool using agentic coding tools to develop faster, keep maintenance manageable, and support future agent-first tools that interact with archive.org.
-It is just an experiment, and there is no commitment to a public release.
+It is just an experiment, published as one.
 This document is meant to share my experience with developing like this, what has worked, and what has gone wrong so far.
 Why build a new tool at all, rather than improving the Python one, is covered in [Why Rust?](why-rust.md). This document is about how it's being built.
 
@@ -66,7 +66,7 @@ HTTP_PROXY=http://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 NO_PROXY=localhost,
 
 — and any test that depends on the real network fails. Running exactly that check while writing this document found one more non-hermetic test (read-only GETs to archive.org, missed by both the review and [#343](https://github.com/jjjake/ia/pull/343)), fixed in [#375](https://github.com/jjjake/ia/pull/375) along with a [`scripts/hermetic-audit`](../scripts/hermetic-audit) script that automates the check and scans every version of the test code ever committed. One known gap remains: the check can't see requests a test tolerates failing, and a handful of read-only export tests still send those ([#376](https://github.com/jjjake/ia/issues/376)).
 
-What I take from this record: the first-pass code is good but not trustworthy on its own; the review, audit, and careful hands-on manual testing layer has real teeth; and the gap between those is exactly why this project is labeled alpha and not public.
+What I take from this record: the first-pass code is good but not trustworthy on its own; the review, audit, and careful hands-on manual testing layer has real teeth; and the gap between those is exactly why this project is labeled alpha.
 
 ## Known weaknesses
 

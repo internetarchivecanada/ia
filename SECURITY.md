@@ -6,8 +6,8 @@
 
 Instead, please report vulnerabilities through one of:
 
-- [GitHub Security Advisory](https://github.com/jjjake/ia/security/advisories/new)
-- Email: (open an advisory if unsure)
+- [GitHub Security Advisory](https://github.com/internetarchivecanada/ia/security/advisories/new)
+- Email: info@archive.org
 
 We will respond within 48 hours and work with you on a fix.
 

@@ -8,8 +8,6 @@
 
 **Tech Stack:** `reqwest-middleware` (Middleware trait), `reqwest-retry` (RetryableStrategy trait), `async-trait`, `tracing`, atomics for lock-free counters.
 
-**Design spec:** `docs/plans/2026-04-06-http-diagnostics-design.md`
-
 ---
 
 ## File Structure

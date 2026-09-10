@@ -8,8 +8,6 @@
 
 **Tech Stack:** tokio mpsc channels, futures::stream::FuturesUnordered, indicatif (stderr progress), serde_json (JSONL output), existing ia-core metadata::get() + search::scrape() + joblog
 
-**Design doc:** `docs/plans/2026-02-21-bulk-metadata-design.md`
-
 ---
 
 ### Task 1: Update MetadataArgs to Accept Multiple Identifiers

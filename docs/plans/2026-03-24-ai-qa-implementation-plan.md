@@ -302,7 +302,7 @@ Update `error.rs`: add variants, `is_retryable()`, `to_json_error()`.
 - QA --promote write verification
 
 ### Manual testing
-- Run against real items with extracted metadata (e.g., my-item)
+- Run against real items with extracted metadata
 - Verify config resolution walks collection chain correctly
 - Test with different LLM providers (OpenAI, Anthropic)
 - Test zip member download with various JP2 archives

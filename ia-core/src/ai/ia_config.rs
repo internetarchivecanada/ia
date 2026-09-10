@@ -2,7 +2,7 @@
 //! page selection, and response schema for AI metadata extraction.
 //!
 //! Format on archive.org: "AI Config JSON"
-//! Compatible with the extraction system's `the config editor` web UI.
+//! Compatible with the archive.org AI metadata extraction config format.
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -269,7 +269,7 @@ pub async fn delete_ai_config(client: &IaClient, collection_id: &str) -> Result<
     Ok(())
 }
 
-/// Sensible defaults matching the config editor.
+/// Sensible defaults matching the archive.org extraction config defaults.
 pub fn default_ai_config() -> IaAiConfig {
     IaAiConfig {
         result: IaAiConfigResult {
