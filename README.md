@@ -25,7 +25,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/ai-development.md">How it's built</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/usage.md">Usage guide</a>
+  <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/ai-development.md">How it's built</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/usage.md">Usage guide</a> · <a href="docs/showcase.md">Showcase</a>
 </p>
 
 ---
