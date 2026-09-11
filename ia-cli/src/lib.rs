@@ -128,6 +128,9 @@ enum Commands {
     Verify(commands::verify::VerifyArgs),
     /// Generate shell completions for bash, zsh, fish, etc.
     Completions(commands::completions::CompletionsArgs),
+
+    /// Generate roff man pages from the command tree
+    Man(commands::man::ManArgs),
     /// Configure credentials and settings
     #[command(visible_alias = "co")]
     Config(commands::config::ConfigArgs),
@@ -204,6 +207,10 @@ pub async fn run() -> Result<()> {
         Commands::Completions(args) => {
             let mut cmd = Cli::command();
             return commands::completions::run(args, &mut cmd);
+        }
+        Commands::Man(args) => {
+            let cmd = Cli::command();
+            return commands::man::run(args, &cmd);
         }
         #[cfg(feature = "self-update")]
         Commands::Update(args) => {
@@ -312,6 +319,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Verify(args) => commands::verify::run(&client, args, cli.quiet, jobs).await?,
         Commands::Completions(_) => unreachable!("handled above"),
+        Commands::Man(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
         #[cfg(feature = "self-update")]
         Commands::Update(_) => unreachable!("handled above"),

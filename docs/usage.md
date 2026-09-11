@@ -450,6 +450,41 @@ ia completions bash > ~/.local/share/bash-completion/completions/ia
 ia completions zsh > ~/.local/share/zsh/site-functions/_ia
 ```
 
+### `ia man`
+
+Generate roff man pages from the command tree. One page per command, named the
+way `git` and `cargo` name theirs — so `man ia-cli-metadata-modify` works.
+
+Pre-built pages are attached to each [release](https://github.com/internetarchivecanada/ia/releases)
+as `ia-cli-man.tar.gz`; this command regenerates them from the binary you have.
+
+```sh
+ia man [OPTIONS]
+```
+
+#### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--out-dir <DIR>` | Write one page per command into this directory (created if absent). Without it, the top-level page is printed to stdout |
+| `--rename <NAME>` | Override the command name used in generated pages |
+
+Page names are hyphenated (`ia-cli-metadata-modify.1`) while the SYNOPSIS shows
+the real invocation (`ia-cli metadata modify`), matching `git-rebase(1)`.
+
+#### Examples
+
+```sh
+# Write the full page tree to a directory
+ia man --out-dir man/
+
+# Install system-wide
+sudo ia man --out-dir /usr/local/share/man/man1/
+
+# Print just the top-level page
+ia man > ia-cli.1
+```
+
 ### `ia upload`
 
 Upload files to the Internet Archive. Supports single-file, multi-file, directory, and stdin uploads. Batch uploads from spreadsheets and template generation are available as subcommands.
