@@ -7,7 +7,7 @@ use tempfile::{NamedTempFile, TempDir};
 /// All tests in this file exercise CLI argument parsing, validation, and local-only operations.
 /// None of them send any HTTP requests.
 fn ia_with_config(config: &NamedTempFile) -> Command {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.arg("--config-file")
         .arg(config.path())
         // Prevent the binary from picking up real env-var credentials
@@ -453,7 +453,7 @@ fn upload_spreadsheet_csv_dry_run() {
 
 #[test]
 fn upload_clobber_flag_accepted() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -462,7 +462,7 @@ fn upload_clobber_flag_accepted() {
 
 #[test]
 fn upload_checksum_file_flag_accepted() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -471,7 +471,7 @@ fn upload_checksum_file_flag_accepted() {
 
 #[test]
 fn upload_multipart_flag_accepted() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -480,7 +480,7 @@ fn upload_multipart_flag_accepted() {
 
 #[test]
 fn upload_spreadsheet_flag_shown_in_help() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -515,7 +515,7 @@ fn upload_multipart_dry_run_succeeds() {
 
 #[test]
 fn upload_help_shows_subcommands() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -531,7 +531,7 @@ fn upload_help_shows_subcommands() {
 
 #[test]
 fn upload_help_shows_spreadsheet_options() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()
@@ -543,7 +543,7 @@ fn upload_help_shows_spreadsheet_options() {
 
 #[test]
 fn upload_template_help_shows_options() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "template", "--help"])
         .assert()
         .success()
@@ -557,7 +557,7 @@ fn upload_template_help_shows_options() {
 
 #[test]
 fn upload_cleanup_help_shows_options() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "cleanup", "--help"])
         .assert()
         .success()
@@ -569,7 +569,7 @@ fn upload_cleanup_help_shows_options() {
 
 #[test]
 fn upload_help_shows_cleanup_subcommand() {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args(["upload", "--help"])
         .assert()
         .success()

@@ -48,13 +48,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            binary: ia
+            binary: ia-cli
           - target: aarch64-apple-darwin
             os: macos-latest
-            binary: ia
+            binary: ia-cli
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            binary: ia.exe
+            binary: ia-cli.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -97,10 +97,10 @@ jobs:
           mkdir -p release
           for dir in artifacts/ia-*/; do
             target=$(basename "$dir" | sed 's/^ia-//')
-            if [ -f "$dir/ia.exe" ]; then
-              cp "$dir/ia.exe" "release/ia-${target}.exe"
-            elif [ -f "$dir/ia" ]; then
-              cp "$dir/ia" "release/ia-${target}"
+            if [ -f "$dir/ia-cli.exe" ]; then
+              cp "$dir/ia-cli.exe" "release/ia-${target}.exe"
+            elif [ -f "$dir/ia-cli" ]; then
+              cp "$dir/ia-cli" "release/ia-${target}"
               chmod +x "release/ia-${target}"
             fi
           done

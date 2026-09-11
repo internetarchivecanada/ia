@@ -38,18 +38,20 @@ Nearly all implementation is written by AI agents (primarily [Claude Code](https
 
 Download a prebuilt binary from [GitHub Releases](https://github.com/internetarchivecanada/ia/releases):
 
-| Platform | Binary |
-|----------|--------|
+| Platform | Asset |
+|----------|-------|
 | Linux (x86_64) | `ia-x86_64-unknown-linux-musl` |
 | macOS (Apple Silicon) | `ia-aarch64-apple-darwin` |
 | Windows (x86_64) | `ia-x86_64-pc-windows-msvc.exe` |
 
 ```sh
 # Example: Linux
-curl -L -o ia https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
-chmod +x ia
-sudo mv ia /usr/local/bin/
+curl -L -o ia-cli https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
+chmod +x ia-cli
+sudo mv ia-cli /usr/local/bin/
 ```
+
+The binary is `ia-cli`, not `ia` — the Python [`internetarchive`](https://github.com/jjjake/internetarchive) client already provides `ia`. Examples in these docs use `ia`; alias it with `alias ia=ia-cli`, and `ia-cli completions zsh --rename ia` generates matching completions. `ia-cli` may shorten to `ia` later, but that isn't promised.
 
 <details>
 <summary>Build from source</summary>
@@ -84,7 +86,7 @@ cargo install --path ia-cli
 
 See the [usage guide](docs/usage.md) for quick start examples, configuration, and advanced features.
 
-Run `ia --help` or `ia <command> --help` for built-in documentation.
+Run `ia-cli --help` or `ia-cli <command> --help` for built-in documentation.
 
 ## Contributing
 

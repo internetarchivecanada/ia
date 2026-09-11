@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [[bin]]
-name = "ia"
+name = "ia-cli"
 path = "src/main.rs"
 
 [dependencies]

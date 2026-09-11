@@ -23,7 +23,7 @@ pub struct CompletionsArgs {
 }
 
 pub fn run(args: CompletionsArgs, cmd: &mut clap::Command) -> Result<()> {
-    let name = args.rename.as_deref().unwrap_or("ia");
+    let name = args.rename.as_deref().unwrap_or("ia-cli");
     clap_complete::generate(args.shell, cmd, name, &mut std::io::stdout());
     Ok(())
 }

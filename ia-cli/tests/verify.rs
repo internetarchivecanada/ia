@@ -8,11 +8,11 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn ia_cmd() -> Command {
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
 }
 
 fn ia_with_config(config: &NamedTempFile) -> Command {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.arg("--config-file")
         .arg(config.path())
         .env_remove("IA_S3_ACCESS")

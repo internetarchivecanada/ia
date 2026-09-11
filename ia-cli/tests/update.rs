@@ -4,7 +4,7 @@ mod without_feature {
     use predicates::prelude::*;
 
     fn ia() -> Command {
-        assert_cmd::cargo_bin_cmd!("ia")
+        assert_cmd::cargo_bin_cmd!("ia-cli")
     }
 
     /// When built without the self-update feature (the default for tests),
@@ -40,7 +40,7 @@ mod with_feature {
     use predicates::prelude::*;
 
     fn ia() -> Command {
-        assert_cmd::cargo_bin_cmd!("ia")
+        assert_cmd::cargo_bin_cmd!("ia-cli")
     }
 
     // --- install: below-minimum version floor ---
