@@ -3,7 +3,7 @@
 **Date**: 2026-02-20
 **Author**: Jake (jjjake)
 **Status**: Approved
-**Repo**: `jjjake/ia` (private)
+**Repo**: `internetarchivecanada/ia` (private)
 
 ## Overview
 
@@ -35,7 +35,7 @@ A full Rust port of the [internetarchive](https://github.com/jjjake/internetarch
 ### Project Structure
 
 ```
-ia/                          # GitHub: jjjake/ia (private)
+ia/                          # GitHub: internetarchivecanada/ia (private)
 ├── Cargo.toml               # Workspace root
 ├── CLAUDE.md                # Claude Code instructions + safety rules
 ├── docs/
@@ -72,7 +72,7 @@ ia/                          # GitHub: jjjake/ia (private)
 │           └── ...
 ```
 
-Desktop GUI is developed separately at [jjjake/ia-gui](https://github.com/jjjake/ia-gui), consuming `ia-core` as a git dependency.
+Desktop GUI is developed separately at [internetarchivecanada/ia-gui](https://github.com/internetarchivecanada/ia-gui), consuming `ia-core` as a git dependency.
 
 ### Approach: Client + Typed Operations (B → C)
 
@@ -448,7 +448,7 @@ These are enforced via CLAUDE.md and git hooks:
 1. **No writes to archive.org** — No upload, delete, metadata modify, or any POST/PUT to IA services
 2. **No authentication** — No reading or using IA credentials (S3 keys, cookies)
 3. **GitHub user `jjjake`** — Always verify before `gh` or `git push` commands
-4. **Private repo `jjjake/ia`** — All pushes go here only
+4. **Private repo `internetarchivecanada/ia`** — All pushes go here only
 5. **User-Agent required** — Every request to archive.org includes proper identification
 
 ## Key Design Decisions

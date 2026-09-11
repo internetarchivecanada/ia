@@ -31,7 +31,7 @@ A cargo feature `self-update` controls whether `ia update` exists:
 
 ## Version Check
 
-1. `GET https://api.github.com/repos/jjjake/ia/releases/latest`
+1. `GET https://api.github.com/repos/internetarchivecanada/ia/releases/latest`
    - Headers: `Accept: application/vnd.github+json`, `User-Agent: ia/{version}`
    - No authentication needed (60 req/hr unauthenticated rate limit is sufficient)
 2. Parse `tag_name` (e.g. `"v0.4.4"`), strip `v` prefix, parse as semver

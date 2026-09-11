@@ -1,8 +1,8 @@
 # Download Security Audit
 
 **Date**: 2026-03-03
-**Status**: Complete — fixes implemented in PR [#177](https://github.com/jjjake/ia/pull/177) (March 2026): path traversal validation, download size limits, `*.archive.org` redirect policy, symlink detection, and the resume TOCTOU fix
-**Tracking Issue**: [#126](https://github.com/jjjake/ia/issues/126)
+**Status**: Complete — fixes implemented in PR [#177](https://github.com/internetarchivecanada/ia/pull/177) (March 2026): path traversal validation, download size limits, `*.archive.org` redirect policy, symlink detection, and the resume TOCTOU fix
+**Tracking Issue**: [#126](https://github.com/internetarchivecanada/ia/issues/126)
 **Related CVE**: [CVE-2025-58438](https://nvd.nist.gov/vuln/detail/CVE-2025-58438) (Python `internetarchive` library)
 
 ## Background
@@ -293,5 +293,5 @@ Progress counters use `u64` (max ~18 exabytes). Not a practical risk.
 - [GHSA-wx3r-v6h7-frjp (GitHub Advisory)](https://github.com/advisories/GHSA-wx3r-v6h7-frjp)
 - [Fix commit cba2d45](https://github.com/jjjake/internetarchive/commit/cba2d459e10a9489fb35caeba0b03e80f5f5d7c2)
 - [Python library issue #717 (regression from fix)](https://github.com/jjjake/internetarchive/issues/717)
-- [Rust port issue #126 (security audit)](https://github.com/jjjake/ia/issues/126)
+- [Rust port issue #126 (security audit)](https://github.com/internetarchivecanada/ia/issues/126)
 - [Snyk advisory](https://security.snyk.io/vuln/SNYK-PYTHON-INTERNETARCHIVE-12549189)

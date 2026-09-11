@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
+/// The GitHub repository self-update queries for releases.
+///
+/// Single source of truth: the three API call sites below and every test
+/// fixture build their paths from this, so moving the repo is a one-line
+/// change here rather than a find-and-replace across the file.
+pub const GITHUB_REPO: &str = "internetarchivecanada/ia";
+
 /// Build a configured HTTP client for GitHub API requests.
 ///
 /// Includes retry middleware (3 retries with exponential backoff) so
@@ -145,7 +152,7 @@ pub async fn list_releases(
     target: &str,
 ) -> crate::Result<Vec<ReleaseInfo>> {
     let client = github_client(current_version)?;
-    let mut url = format!("{api_base}/repos/jjjake/ia/releases?page=1");
+    let mut url = format!("{api_base}/repos/{GITHUB_REPO}/releases?page=1");
     let mut all_releases: Vec<GitHubRelease> = Vec::new();
 
     loop {
@@ -242,7 +249,7 @@ pub async fn fetch_release_by_tag(
         format!("v{version}")
     };
 
-    let url = format!("{api_base}/repos/jjjake/ia/releases/tags/{tag}");
+    let url = format!("{api_base}/repos/{GITHUB_REPO}/releases/tags/{tag}");
     let client = github_client(current_version)?;
     let response = client
         .get(&url)
@@ -279,7 +286,7 @@ pub async fn fetch_release_by_tag(
 ///
 /// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
 pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::Result<UpdateCheck> {
-    let url = format!("{api_base}/repos/jjjake/ia/releases/latest");
+    let url = format!("{api_base}/repos/{GITHUB_REPO}/releases/latest");
     let client = github_client(current_version)?;
     let response = client
         .get(&url)
@@ -602,12 +609,12 @@ mod tests {
             "assets": [
                 {
                     "name": "ia-aarch64-apple-darwin",
-                    "browser_download_url": "https://github.com/jjjake/ia/releases/download/v0.4.4/ia-aarch64-apple-darwin",
+                    "browser_download_url": "https://github.com/internetarchivecanada/ia/releases/download/v0.4.4/ia-aarch64-apple-darwin",
                     "size": 12345678
                 },
                 {
                     "name": "ia-x86_64-unknown-linux-musl",
-                    "browser_download_url": "https://github.com/jjjake/ia/releases/download/v0.4.4/ia-x86_64-unknown-linux-musl",
+                    "browser_download_url": "https://github.com/internetarchivecanada/ia/releases/download/v0.4.4/ia-x86_64-unknown-linux-musl",
                     "size": 23456789
                 }
             ]
@@ -671,7 +678,9 @@ mod tests {
     async fn check_for_update_newer_version() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/latest"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -696,7 +705,9 @@ mod tests {
     async fn check_for_update_already_current() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/latest"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v0.4.3",
@@ -715,7 +726,9 @@ mod tests {
     async fn check_for_update_api_error() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/latest"
+            )))
             .respond_with(wiremock::ResponseTemplate::new(403))
             .mount(&mock_server)
             .await;
@@ -773,7 +786,7 @@ mod tests {
         let fake_binary = b"new-binary-content";
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases/latest")))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -835,16 +848,18 @@ mod tests {
 
     #[test]
     fn parse_next_link_extracts_next_url() {
-        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=2>; rel="next", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        let header = r#"<https://api.github.com/repos/internetarchivecanada/ia/releases?page=2>; rel="next", <https://api.github.com/repos/internetarchivecanada/ia/releases?page=5>; rel="last""#;
         assert_eq!(
             parse_next_link(header),
-            Some("https://api.github.com/repos/jjjake/ia/releases?page=2".to_string())
+            Some(
+                "https://api.github.com/repos/internetarchivecanada/ia/releases?page=2".to_string()
+            )
         );
     }
 
     #[test]
     fn parse_next_link_returns_none_without_next() {
-        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=1>; rel="prev", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        let header = r#"<https://api.github.com/repos/internetarchivecanada/ia/releases?page=1>; rel="prev", <https://api.github.com/repos/internetarchivecanada/ia/releases?page=5>; rel="last""#;
         assert_eq!(parse_next_link(header), None);
     }
 
@@ -856,9 +871,9 @@ mod tests {
     #[tokio::test]
     async fn list_releases_returns_sorted_versions() {
         let mock_server = wiremock::MockServer::start().await;
-        let page2_url = format!("{}/repos/jjjake/ia/releases?page=2", mock_server.uri());
+        let page2_url = format!("{}/repos/{GITHUB_REPO}/releases?page=2", mock_server.uri());
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases")))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -872,7 +887,7 @@ mod tests {
             .await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases")))
             .and(wiremock::matchers::query_param("page", "2"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -900,7 +915,7 @@ mod tests {
     async fn list_releases_filters_below_minimum() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases")))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -923,7 +938,7 @@ mod tests {
     async fn list_releases_detects_missing_asset() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases")))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -945,7 +960,7 @@ mod tests {
     async fn fetch_release_by_tag_success() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v1.2.3"))
+            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases/tags/v1.2.3")))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"tag_name": "v1.2.3", "assets": [{"name": "ia-test-target", "browser_download_url": "https://example.com/ia-test", "size": 100}]}),
             ))
@@ -963,9 +978,9 @@ mod tests {
     async fn fetch_release_by_tag_not_found() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/repos/jjjake/ia/releases/tags/v99.99.99",
-            ))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/tags/v99.99.99"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(404)
                     .set_body_json(serde_json::json!({"message": "Not Found"})),
@@ -985,7 +1000,9 @@ mod tests {
     async fn perform_update_no_matching_asset() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/latest"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -1042,9 +1059,9 @@ mod tests {
         let fake_binary = b"new-version-binary";
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/repos/jjjake/ia/releases/tags/v99.0.0",
-            ))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/tags/v99.0.0"
+            )))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"tag_name": "v99.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": format!("{}/download/ia-test-target", mock_server.uri()), "size": fake_binary.len()}]}),
             ))
@@ -1080,9 +1097,9 @@ mod tests {
     async fn install_version_no_matching_asset() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/repos/jjjake/ia/releases/tags/v99.0.0",
-            ))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/tags/v99.0.0"
+            )))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"tag_name": "v99.0.0", "assets": [{"name": "ia-other-target", "browser_download_url": "https://example.com/other", "size": 100}]}),
             ))
@@ -1112,9 +1129,9 @@ mod tests {
     async fn install_version_not_found() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(
-                "/repos/jjjake/ia/releases/tags/v99.99.99",
-            ))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/tags/v99.99.99"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(404)
                     .set_body_json(serde_json::json!({"message": "Not Found"})),

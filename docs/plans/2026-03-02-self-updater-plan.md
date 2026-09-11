@@ -358,12 +358,12 @@ mod tests {
             "assets": [
                 {
                     "name": "ia-aarch64-apple-darwin",
-                    "browser_download_url": "https://github.com/jjjake/ia/releases/download/v0.4.4/ia-aarch64-apple-darwin",
+                    "browser_download_url": "https://github.com/internetarchivecanada/ia/releases/download/v0.4.4/ia-aarch64-apple-darwin",
                     "size": 12345678
                 },
                 {
                     "name": "ia-x86_64-unknown-linux-musl",
-                    "browser_download_url": "https://github.com/jjjake/ia/releases/download/v0.4.4/ia-x86_64-unknown-linux-musl",
+                    "browser_download_url": "https://github.com/internetarchivecanada/ia/releases/download/v0.4.4/ia-x86_64-unknown-linux-musl",
                     "size": 23456789
                 }
             ]
@@ -516,7 +516,7 @@ Add to the `#[cfg(test)] mod tests` block:
     async fn check_for_update_newer_version() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/latest"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -541,7 +541,7 @@ Add to the `#[cfg(test)] mod tests` block:
     async fn check_for_update_already_current() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/latest"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v0.4.3",
@@ -560,7 +560,7 @@ Add to the `#[cfg(test)] mod tests` block:
     async fn check_for_update_api_error() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/latest"))
             .respond_with(wiremock::ResponseTemplate::new(403))
             .mount(&mock_server)
             .await;
@@ -591,7 +591,7 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// `api_base` allows overriding the GitHub API URL for testing (pass wiremock URL).
 /// In production, pass `GITHUB_API_BASE`.
 pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::Result<UpdateCheck> {
-    let url = format!("{api_base}/repos/jjjake/ia/releases/latest");
+    let url = format!("{api_base}/repos/internetarchivecanada/ia/releases/latest");
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
@@ -819,7 +819,7 @@ Add to the `mod tests` block:
 
         // Mock the release API
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/latest"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -863,7 +863,7 @@ Add to the `mod tests` block:
     async fn perform_update_no_matching_asset() {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/latest"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/latest"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",

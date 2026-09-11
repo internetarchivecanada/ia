@@ -3,7 +3,7 @@
 **Date**: 2026-03-03
 **Status**: Ready for Implementation
 **Audit Doc**: `docs/security/2026-03-03-download-security-audit.md`
-**Parent Issue**: [#126](https://github.com/jjjake/ia/issues/126)
+**Parent Issue**: [#126](https://github.com/internetarchivecanada/ia/issues/126)
 
 ## Overview
 

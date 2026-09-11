@@ -9,8 +9,8 @@
 </pre>
 
 <p align="center">
-  <a href="https://github.com/jjjake/ia/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/jjjake/ia/ci.yml?branch=main&label=CI" alt="CI status"></a>
-  <a href="https://github.com/jjjake/ia/releases/latest"><img src="https://img.shields.io/github/v/release/jjjake/ia" alt="Release"></a>
+  <a href="https://github.com/internetarchivecanada/ia/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/internetarchivecanada/ia/ci.yml?branch=main&label=CI" alt="CI status"></a>
+  <a href="https://github.com/internetarchivecanada/ia/releases/latest"><img src="https://img.shields.io/github/v/release/internetarchivecanada/ia" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Alpha status">
 </p>
@@ -36,7 +36,7 @@ Nearly all implementation is written by AI agents (primarily [Claude Code](https
 
 ## Install
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/jjjake/ia/releases):
+Download a prebuilt binary from [GitHub Releases](https://github.com/internetarchivecanada/ia/releases):
 
 | Platform | Binary |
 |----------|--------|
@@ -46,7 +46,7 @@ Download a prebuilt binary from [GitHub Releases](https://github.com/jjjake/ia/r
 
 ```sh
 # Example: Linux
-curl -L -o ia https://github.com/jjjake/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
+curl -L -o ia https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
 chmod +x ia
 sudo mv ia /usr/local/bin/
 ```
@@ -57,7 +57,7 @@ sudo mv ia /usr/local/bin/
 Requires [Rust](https://www.rust-lang.org/tools/install) 1.85+.
 
 ```sh
-git clone https://github.com/jjjake/ia.git
+git clone https://github.com/internetarchivecanada/ia.git
 cd ia
 cargo install --path ia-cli
 ```

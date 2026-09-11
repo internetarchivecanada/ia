@@ -44,7 +44,7 @@ Being precise here matters, because overclaiming is how trust gets overdrawn.
 
 **Not language guarantees** (process, not Rust):
 
-- **Path traversal.** The Python library had a critical path-traversal CVE in downloads ([CVE-2025-58438](https://nvd.nist.gov/vuln/detail/CVE-2025-58438), fixed in 5.5.1). The Rust port initially needed the same guards — a dedicated [security audit](security/2026-03-03-download-security-audit.md) found and fixed them ([#177](https://github.com/jjjake/ia/pull/177)) before any release. Rust didn't prevent that bug class; the audit did.
+- **Path traversal.** The Python library had a critical path-traversal CVE in downloads ([CVE-2025-58438](https://nvd.nist.gov/vuln/detail/CVE-2025-58438), fixed in 5.5.1). The Rust port initially needed the same guards — a dedicated [security audit](security/2026-03-03-download-security-audit.md) found and fixed them ([#177](https://github.com/internetarchivecanada/ia/pull/177)) before any release. Rust didn't prevent that bug class; the audit did.
 - **Logic bugs.** Rust can't tell you that a documented confidence threshold is never enforced. Tests, reviews, and audits do that — see [How this project is built](ai-development.md).
 
 **Came along with the rewrite** (honestly: achievable in Python too, with rich/textual and friends — these are benefits of starting fresh, not arguments for Rust):

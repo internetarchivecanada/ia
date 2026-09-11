@@ -1,6 +1,6 @@
 # Download Output Redesign
 
-**Issue:** [#27](https://github.com/jjjake/ia/issues/27)
+**Issue:** [#27](https://github.com/internetarchivecanada/ia/issues/27)
 **Date:** 2026-02-20
 
 ## Problem

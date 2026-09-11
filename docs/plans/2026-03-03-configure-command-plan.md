@@ -1787,7 +1787,7 @@ Verify all subcommands are listed and help text is readable.
 
 ## GitHub Issues to Create
 
-Create these issues on `jjjake/ia` before starting implementation:
+Create these issues on `internetarchivecanada/ia` before starting implementation:
 
 1. **Add `ia-core` auth module** — Login via xauthn API, credential validation, netrc parsing (Tasks 1-2, 5-6)
 2. **Add config file writing support** — write_config_file() with merge and permissions (Task 3)
