@@ -1,5 +1,7 @@
 # Usage
 
+For a quick tour of highlights, see the [Showcase](./showcase.md).
+
 ## Quick start
 
 ```sh
