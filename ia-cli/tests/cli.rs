@@ -189,6 +189,71 @@ fn completions_subcommand_help() {
 }
 
 #[test]
+fn man_prints_root_page_to_stdout() {
+    ia().arg("man")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".TH ia-cli 1"))
+        .stdout(predicate::str::contains("Internet Archive command"));
+}
+
+#[test]
+fn man_out_dir_writes_the_whole_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    ia().args(["man", "--out-dir"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    // One page per command, named the way git and cargo name theirs.
+    for page in [
+        "ia-cli.1",
+        "ia-cli-download.1",
+        "ia-cli-metadata.1",
+        "ia-cli-metadata-modify.1",
+        "ia-cli-config-print-cookies.1",
+    ] {
+        assert!(
+            dir.path().join(page).is_file(),
+            "expected generated man page {page}"
+        );
+    }
+
+    // clap's built-in `help` subcommand has no page worth generating.
+    assert!(!dir.path().join("ia-cli-help.1").exists());
+}
+
+#[test]
+fn man_page_title_is_hyphenated_but_synopsis_is_the_real_invocation() {
+    // `man ia-cli-metadata-modify` is the page name, but what you type is
+    // `ia-cli metadata modify`. git-rebase(1) makes the same distinction, and
+    // getting it wrong would document a command that cannot be run.
+    let dir = tempfile::tempdir().unwrap();
+    ia().args(["man", "--out-dir"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let page = std::fs::read_to_string(dir.path().join("ia-cli-metadata-modify.1")).unwrap();
+    assert!(
+        page.contains(".TH ia-cli-metadata-modify 1"),
+        "page title should be the hyphenated page name"
+    );
+    assert!(
+        page.contains(r"ia\-cli metadata modify"),
+        "synopsis should show the space-separated invocation, got:\n{page}"
+    );
+}
+
+#[test]
+fn man_rename_overrides_the_command_name() {
+    ia().args(["man", "--rename", "ia"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".TH ia 1"));
+}
+
+#[test]
 fn short_flags_work() {
     ia().args(["-i", "-H", "test.archive.org", "download", "--help"])
         .assert()

@@ -5,6 +5,7 @@ pub mod completions;
 pub mod config;
 pub mod download;
 pub mod list;
+pub mod man;
 pub mod metadata;
 pub mod search;
 pub mod status;
