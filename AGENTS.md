@@ -13,7 +13,7 @@ Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive
 
 - **Cargo workspace**: `ia-core` (library) + `ia-cli` (binary with TUI)
 - `IaClient` wraps `reqwest::Client` with middleware retry stack
-- `ia-core` is a standalone library also consumed by [ia-gui](https://github.com/jjjake/ia-gui). Public API changes must consider external consumers.
+- `ia-core` is a standalone library also consumed by [ia-gui](https://github.com/internetarchivecanada/ia-gui). Public API changes must consider external consumers.
 
 ## Crate Stack
 

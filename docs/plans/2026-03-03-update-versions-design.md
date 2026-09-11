@@ -125,8 +125,8 @@ pub async fn install_version(
 
 ### GitHub API Usage
 
-- **List:** `GET /repos/jjjake/ia/releases` — paginated (30/page), follow `Link: rel="next"` header. Parse all pages, filter by floor, sort by semver.
-- **Install:** `GET /repos/jjjake/ia/releases/tags/v{version}` — single release by tag. Avoids fetching all releases to find one. 404 → `UpdateVersionNotFound`.
+- **List:** `GET /repos/internetarchivecanada/ia/releases` — paginated (30/page), follow `Link: rel="next"` header. Parse all pages, filter by floor, sort by semver.
+- **Install:** `GET /repos/internetarchivecanada/ia/releases/tags/v{version}` — single release by tag. Avoids fetching all releases to find one. 404 → `UpdateVersionNotFound`.
 - **Rate limits:** 60 req/hr unauthenticated. Listing takes 2-3 requests, installing takes 2. Well within limits.
 
 ### New Error Variants (ia-core/src/error.rs)

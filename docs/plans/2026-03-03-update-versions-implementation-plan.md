@@ -296,9 +296,9 @@ Add in `mod tests` in `ia-core/src/update.rs`:
         let mock_server = wiremock::MockServer::start().await;
 
         // Page 1 — returns Link header pointing to page 2
-        let page2_url = format!("{}/repos/jjjake/ia/releases?page=2", mock_server.uri());
+        let page2_url = format!("{}/repos/internetarchivecanada/ia/releases?page=2", mock_server.uri());
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases"))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -319,7 +319,7 @@ Add in `mod tests` in `ia-core/src/update.rs`:
 
         // Page 2 — no Link header (last page)
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases"))
             .and(wiremock::matchers::query_param("page", "2"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -357,7 +357,7 @@ Add in `mod tests` in `ia-core/src/update.rs`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases"))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -389,7 +389,7 @@ Add in `mod tests` in `ia-core/src/update.rs`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases"))
             .and(wiremock::matchers::query_param("page", "1"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
@@ -445,7 +445,7 @@ pub async fn list_releases(
 ) -> crate::Result<Vec<ReleaseInfo>> {
     let client = reqwest::Client::new();
     let mut all_releases: Vec<GitHubRelease> = Vec::new();
-    let mut url = format!("{api_base}/repos/jjjake/ia/releases?page=1");
+    let mut url = format!("{api_base}/repos/internetarchivecanada/ia/releases?page=1");
 
     loop {
         let response = client
@@ -556,7 +556,7 @@ Add in `mod tests`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v1.2.3"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/tags/v1.2.3"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v1.2.3",
@@ -582,7 +582,7 @@ Add in `mod tests`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.99.99"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/tags/v99.99.99"))
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_json(
                 serde_json::json!({"message": "Not Found"}),
             ))
@@ -622,7 +622,7 @@ pub async fn fetch_release_by_tag(
     } else {
         format!("v{version}")
     };
-    let url = format!("{api_base}/repos/jjjake/ia/releases/tags/{tag}");
+    let url = format!("{api_base}/repos/internetarchivecanada/ia/releases/tags/{tag}");
     let client = reqwest::Client::new();
     let response = client
         .get(&url)
@@ -705,7 +705,7 @@ Add in `mod tests`:
         let fake_binary = b"new-version-binary";
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.0.0"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/tags/v99.0.0"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -751,7 +751,7 @@ Add in `mod tests`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.0.0"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/tags/v99.0.0"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({
                     "tag_name": "v99.0.0",
@@ -790,7 +790,7 @@ Add in `mod tests`:
         let mock_server = wiremock::MockServer::start().await;
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/repos/jjjake/ia/releases/tags/v99.99.99"))
+            .and(wiremock::matchers::path("/repos/internetarchivecanada/ia/releases/tags/v99.99.99"))
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_json(
                 serde_json::json!({"message": "Not Found"}),
             ))
@@ -1370,17 +1370,17 @@ Add in `mod tests`:
 ```rust
     #[test]
     fn parse_next_link_extracts_url() {
-        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=2>; rel="next", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        let header = r#"<https://api.github.com/repos/internetarchivecanada/ia/releases?page=2>; rel="next", <https://api.github.com/repos/internetarchivecanada/ia/releases?page=5>; rel="last""#;
         let next = parse_next_link(header);
         assert_eq!(
             next,
-            Some("https://api.github.com/repos/jjjake/ia/releases?page=2".to_string())
+            Some("https://api.github.com/repos/internetarchivecanada/ia/releases?page=2".to_string())
         );
     }
 
     #[test]
     fn parse_next_link_returns_none_when_no_next() {
-        let header = r#"<https://api.github.com/repos/jjjake/ia/releases?page=1>; rel="prev", <https://api.github.com/repos/jjjake/ia/releases?page=5>; rel="last""#;
+        let header = r#"<https://api.github.com/repos/internetarchivecanada/ia/releases?page=1>; rel="prev", <https://api.github.com/repos/internetarchivecanada/ia/releases?page=5>; rel="last""#;
         let next = parse_next_link(header);
         assert!(next.is_none());
     }

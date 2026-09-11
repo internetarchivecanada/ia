@@ -16,7 +16,7 @@
 
 **Purpose:** Track all work before writing code. Each issue must have labels, description, and reference to the design doc.
 
-Create these issues on `jjjake/ia`:
+Create these issues on `internetarchivecanada/ia`:
 
 ### Issue 1: `ia search` — Split into backend subcommands (scrape, advanced, fts)
 

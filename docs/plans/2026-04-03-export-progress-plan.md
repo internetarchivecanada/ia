@@ -670,4 +670,4 @@ If clippy or fmt complains, fix and re-run.
 cd /Users/jake/github/jjjake/worktrees/export-joblog && git push
 ```
 
-The PR at https://github.com/jjjake/ia/pull/301 will be updated with the new commits.
+The PR at https://github.com/internetarchivecanada/ia/pull/301 will be updated with the new commits.

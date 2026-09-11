@@ -37,7 +37,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "AGPL-3.0"
-repository = "https://github.com/jjjake/ia"
+repository = "https://github.com/internetarchivecanada/ia"
 ```
 
 **Step 2: Create ia-core/Cargo.toml**

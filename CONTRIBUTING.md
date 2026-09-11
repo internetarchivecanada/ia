@@ -26,7 +26,7 @@ ia/
   docs/plans/      Design docs and implementation plans
 ```
 
-`ia-core` is also consumed as a library by [ia-gui](https://github.com/jjjake/ia-gui).
+`ia-core` is also consumed as a library by [ia-gui](https://github.com/internetarchivecanada/ia-gui).
 
 ## Workflow
 
@@ -105,7 +105,7 @@ record of what has gone wrong and how it was caught — is in
 
 Agent involvement is recorded per-commit via `Co-Authored-By` trailers. Treat this like
 any young codebase: if something looks wrong, it might be — please
-[open an issue](https://github.com/jjjake/ia/issues).
+[open an issue](https://github.com/internetarchivecanada/ia/issues).
 
 ## Using AI Coding Tools
 
