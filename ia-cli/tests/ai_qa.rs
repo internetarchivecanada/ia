@@ -8,7 +8,7 @@ use std::fs;
 use tempfile::NamedTempFile;
 
 fn ia() -> Command {
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     // Remove env vars that might interfere
     cmd.env_remove("IA_S3_ACCESS")
         .env_remove("IA_S3_SECRET")

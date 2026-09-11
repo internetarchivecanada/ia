@@ -11,7 +11,7 @@ fn config_show_displays_json() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -46,7 +46,7 @@ fn config_show_json_mode() {
     writeln!(f, "[general]").unwrap();
     writeln!(f, "host = archive.org").unwrap();
 
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),
@@ -73,7 +73,7 @@ fn config_show_secrets_flag() {
     writeln!(f, "[cookies]").unwrap();
     writeln!(f, "logged-in-sig = secret-sig").unwrap();
 
-    let mut cmd = assert_cmd::cargo_bin_cmd!("ia");
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.args([
         "--config-file",
         ini_path.to_str().unwrap(),

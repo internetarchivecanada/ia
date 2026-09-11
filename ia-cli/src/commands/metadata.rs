@@ -2361,7 +2361,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
             }
             bail!(
                 "missing required argument: <FILE>\n\
-                 Usage: ia metadata --spreadsheet <FILE> [OPTIONS]\n\n\
+                 Pass a spreadsheet path with --spreadsheet <FILE>\n\n\
                  To apply metadata to identifiers from stdin, use modify:\n  \
                  ... | ia metadata modify -m key:value"
             );

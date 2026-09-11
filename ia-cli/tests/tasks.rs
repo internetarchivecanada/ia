@@ -8,7 +8,7 @@ use std::io::Write;
 use tempfile;
 
 fn ia_cmd() -> Command {
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
 }
 
 #[tokio::test]

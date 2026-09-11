@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn ia() -> Command {
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
 }
 
 fn status_json_with_joblog(joblog_content: &str) -> assert_cmd::assert::Assert {

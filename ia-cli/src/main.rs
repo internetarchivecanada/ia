@@ -26,7 +26,7 @@ fn parse_jobs(s: &str) -> Result<usize, String> {
 
 #[derive(Parser)]
 #[command(
-    name = "ia",
+    name = "ia-cli",
     version,
     about = "Internet Archive command-line tool",
     long_about = "A command-line tool for interacting with the Internet Archive (archive.org).\n\

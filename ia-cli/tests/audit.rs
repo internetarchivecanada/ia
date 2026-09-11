@@ -127,7 +127,7 @@ async fn audit_clean_item_shows_no_findings() {
 
     let host = server.uri().replace("http://", "");
     // Clean item: no findings reported to stderr, exit 0
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -147,7 +147,7 @@ async fn audit_detects_repeatability_violation() {
     setup_mock(&server, "bad-date", item_with_date_array_json()).await;
 
     let host = server.uri().replace("http://", "");
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -169,7 +169,7 @@ async fn audit_detects_missing_required() {
     setup_mock(&server, "missing-fields", item_missing_required_json()).await;
 
     let host = server.uri().replace("http://", "");
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -191,7 +191,7 @@ async fn audit_json_output() {
     setup_mock(&server, "bad-date", item_with_date_array_json()).await;
 
     let host = server.uri().replace("http://", "");
-    let output = assert_cmd::cargo_bin_cmd!("ia")
+    let output = assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -221,7 +221,7 @@ async fn audit_csv_output() {
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("audit.csv");
 
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -249,7 +249,7 @@ async fn audit_field_filter() {
     setup_mock(&server, "bad-date", item_with_date_array_json()).await;
 
     let host = server.uri().replace("http://", "");
-    let output = assert_cmd::cargo_bin_cmd!("ia")
+    let output = assert_cmd::cargo_bin_cmd!("ia-cli")
         .args([
             "--host",
             &host,
@@ -278,7 +278,7 @@ async fn audit_no_input_shows_help() {
     setup_schema_mock(&server).await;
 
     let host = server.uri().replace("http://", "");
-    assert_cmd::cargo_bin_cmd!("ia")
+    assert_cmd::cargo_bin_cmd!("ia-cli")
         .args(["--host", &host, "--insecure", "metadata", "audit"])
         .assert()
         .failure()
