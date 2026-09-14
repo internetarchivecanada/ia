@@ -375,8 +375,9 @@ pub async fn submit_task(
         body[key] = serde_json::json!(value);
     }
 
+    // Not client.http(): a retried submission queues the task twice.
     let mut req = client
-        .http()
+        .api_no_retry()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("content-type", "application/json")
@@ -386,7 +387,7 @@ pub async fn submit_task(
         req = req.header("X-Accept-Reduced-Priority", "1");
     }
 
-    let resp = req.send().await?;
+    let resp = req.send().await.map_err(reqwest_middleware::Error::from)?;
     let status = resp.status();
     if status.as_u16() == 429 {
         let retry_after = resp
@@ -438,14 +439,16 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         "task_id": task_id,
     });
 
+    // Not client.http(): a retried rerun queues the task twice.
     let resp = client
-        .http()
+        .api_no_retry()
         .put(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("content-type", "application/json")
         .body(serde_json::to_vec(&body)?)
         .send()
-        .await?;
+        .await
+        .map_err(reqwest_middleware::Error::from)?;
 
     let status = resp.status();
     if status.as_u16() == 429 {
@@ -661,6 +664,56 @@ mod tests {
         config.s3_access = Some("test_access".to_string());
         config.s3_secret = Some("test_secret".to_string());
         config
+    }
+
+    /// A 5xx on task submission must not be retried.
+    ///
+    /// The Tasks API can queue the task and then fail the response. The retry
+    /// middleware replays any 5xx, which would queue it a second time, and
+    /// nothing downstream can tell the difference. `expect(1)` is the whole
+    /// point of the test: it fails if the request is sent twice.
+    #[tokio::test]
+    async fn submit_task_is_not_retried_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/services/tasks.php"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let submission = TaskSubmission {
+            identifier: "my-item".to_string(),
+            cmd: "derive".to_string(),
+            args: None,
+            comment: None,
+            priority: None,
+            reduced_priority: false,
+            extra_params: Vec::new(),
+        };
+
+        let result = submit_task(&client, &submission).await;
+        assert!(result.is_err(), "503 should surface as an error");
+        // MockServer verifies expect(1) on drop.
+    }
+
+    /// Same reasoning for rerun: replaying a PUT queues the task twice.
+    #[tokio::test]
+    async fn rerun_task_is_not_retried_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/services/tasks.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = rerun_task(&client, 123456789).await;
+        assert!(result.is_err(), "500 should surface as an error");
     }
 
     #[tokio::test]

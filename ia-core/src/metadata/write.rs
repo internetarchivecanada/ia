@@ -377,8 +377,10 @@ pub async fn modify_compound(
     );
 
     let post_url = client.url(&format!("/metadata/{identifier}"));
+    // Not client.http(): a 5xx can arrive after the patch was applied, and a
+    // middleware retry would apply it twice.
     let mut request = client
-        .http()
+        .api_no_retry()
         .post(&post_url)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body);
@@ -387,7 +389,10 @@ pub async fn modify_compound(
         request = request.header("X-Accept-Reduced-Priority", "1");
     }
 
-    let response = request.send().await?;
+    let response = request
+        .send()
+        .await
+        .map_err(reqwest_middleware::Error::from)?;
     let status = response.status();
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1004,6 +1009,46 @@ mod tests {
             ],
             "server": "ia000000.us.archive.org"
         })
+    }
+
+    /// A 5xx on the metadata POST must not be retried.
+    ///
+    /// archive.org can apply the JSON Patch and then fail the response. The
+    /// retry middleware replays any 5xx, which applies the patch twice — for
+    /// an `add` on a repeatable field that silently duplicates a value, and
+    /// nothing downstream can detect it. `expect(1)` fails if the request is
+    /// sent more than once.
+    #[tokio::test]
+    async fn metadata_post_is_not_retried_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_item_metadata()))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New Title"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+
+        let result = modify(&client, &req).await;
+        assert!(result.is_err(), "503 should surface as an error");
+        // MockServer verifies expect(1) on drop.
     }
 
     #[tokio::test]

@@ -89,6 +89,12 @@ pub struct IaClient {
     /// The retry middleware requires cloneable requests, which conflicts
     /// with `Body::wrap_stream()` and `Body::from(tokio::fs::File)`.
     raw_http: reqwest::Client,
+    /// Raw reqwest client on the API transport, without retry middleware.
+    ///
+    /// For requests that must not be replayed: a 5xx can arrive after the
+    /// server already applied the change, so an automatic retry would apply
+    /// it twice.
+    api_no_retry: reqwest::Client,
     /// Client with redirects disabled, for requests that need to preserve
     /// the `Authorization` header across redirects (equivalent to curl's
     /// `--location-trusted`). archive.org redirects `/download/` requests
@@ -223,6 +229,7 @@ impl IaClient {
 
         // Clone before moving into middleware — reqwest::Client is Arc-based, cheap to clone.
         let raw_http = transports.upload.clone();
+        let api_no_retry = transports.api.clone();
 
         let http = ClientBuilder::new(transports.api)
             .with(TimingMiddleware::new(stats.clone()))
@@ -247,6 +254,7 @@ impl IaClient {
             http,
             upload_http,
             raw_http,
+            api_no_retry,
             no_redirect_http: transports.no_redirect,
             config,
             user_agent: transports.user_agent,
@@ -315,6 +323,22 @@ impl IaClient {
         &self.raw_http
     }
 
+    /// API-transport client with **no retry middleware**, for non-idempotent
+    /// requests.
+    ///
+    /// [`Self::http`] retries any 5xx. That is correct for reads and wrong for
+    /// writes: archive.org can apply a metadata patch or queue a catalog task
+    /// and *then* fail the response, so replaying the request applies it a
+    /// second time. A duplicated `add` on a repeatable field or a duplicate
+    /// task is not something the caller can detect after the fact.
+    ///
+    /// Same transport as [`Self::http`] (connect and read timeouts), only
+    /// without the retry layer. Callers needing retries must implement their
+    /// own with idempotency handled explicitly, as the upload path does.
+    pub(crate) fn api_no_retry(&self) -> &reqwest::Client {
+        &self.api_no_retry
+    }
+
     /// HTTP client with redirects disabled, for manual redirect handling.
     ///
     /// Use this for requests that need to preserve the `Authorization`
@@ -346,6 +370,7 @@ impl IaClient {
         // TimingMiddleware or LoggingRetryStrategy is wired in this path.
         let stats = Arc::new(RetryStats::new(0));
         let raw_http = transports.upload.clone();
+        let api_no_retry = transports.api.clone();
         let http = ClientBuilder::new(transports.api).build();
         let upload_http = ClientBuilder::new(transports.upload).build();
 
@@ -353,6 +378,7 @@ impl IaClient {
             http,
             upload_http,
             raw_http,
+            api_no_retry,
             no_redirect_http: transports.no_redirect,
             config,
             user_agent: transports.user_agent,

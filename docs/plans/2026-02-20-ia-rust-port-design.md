@@ -72,7 +72,7 @@ ia/                          # GitHub: internetarchivecanada/ia
 │           └── ...
 ```
 
-Desktop GUI is developed separately at internetarchivecanada/ia-gui (separate repo, not yet public), consuming `ia-core` as a git dependency.
+Desktop GUI is developed separately at jjjake/ia-gui (separate repo, not yet public), consuming `ia-core` as a git dependency.
 
 ### Approach: Client + Typed Operations (B → C)
 
