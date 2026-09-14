@@ -1,7 +1,5 @@
 # Batch Input Validation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Enforce mutual exclusivity between identifier sources (`--search`, `--itemlist`, positional args, stdin) across all batch commands, reject invalid identifiers early, and consolidate duplicated collection logic into a shared function.
 
 **Architecture:** New shared module `ia-cli/src/identifier.rs` with a single `collect_identifiers()` function. Clap `conflicts_with_all` attributes provide parse-time enforcement; the shared function provides runtime enforcement as belt-and-suspenders. Each command's custom collect function is replaced with a call to the shared one.

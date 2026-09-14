@@ -39,7 +39,7 @@ Being precise here matters, because overclaiming is how trust gets overdrawn.
 **Language guarantees** (hold by construction):
 
 - **No data races.** Concurrent download/upload workers are safe because the borrow checker enforces exclusive access at compile time.
-- **No silently swallowed failures.** Errors are typed (`IaError`), and exhaustive `match` means adding a new error variant forces every call site to handle it.
+- **Typed, exhaustive errors.** Errors are typed (`IaError`), and exhaustive `match` means adding a new error variant forces every match site to handle it. This does not stop code from discarding a `Result`; catching that is review, not the compiler.
 - **No null-reference or use-after-free bugs.** Whole bug classes fail compilation instead of reaching review.
 
 **Not language guarantees** (process, not Rust):

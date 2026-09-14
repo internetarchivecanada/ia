@@ -1,7 +1,5 @@
 # `ia config` Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add `ia config` command with subcommands for authentication setup, config viewing, and credential utilities.
 
 **Architecture:** New `auth.rs` module in ia-core handles IA auth API calls. Existing `config.rs` gains write support. New `commands/config.rs` in ia-cli provides the CLI layer with six subcommands (`login`, `show`, `check`, `whoami`, `print-cookies`, `print-auth`). This is the first command to use sub-subcommands.

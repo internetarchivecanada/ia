@@ -1,7 +1,5 @@
 # Upload Phase 3 Review Fixes Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Address all 13 findings from the PR #223 code review — 1 critical, 7 important, 5 suggestions.
 
 **Architecture:** Targeted fixes across `ia-core` (API types, progress callback, stream body) and `ia-cli` (TUI state, widgets, polling, tests). No new modules — all changes are edits to existing files.

@@ -1211,7 +1211,7 @@ ia search "collection:nasa" --json | ia download --itemlist /dev/stdin
 When `--json` is active:
 
 - **stdout** emits JSON (single object) or JSONL (one object per line for streaming/batch operations)
-- **stderr** emits structured error JSON: `{"error": {"code": "...", "message": "..."}}`
+- **stderr** emits structured error JSON, `{"error": {"code": "...", "message": "..."}}`, on some commands; others still print plain error text. Rely on the exit code until this is unified.
 - Progress bars, color, and decorative output are suppressed
 - Exit codes are binary: `0` for success, `1` for failure (details in stderr JSON)
 

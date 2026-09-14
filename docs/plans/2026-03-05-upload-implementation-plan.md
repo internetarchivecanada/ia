@@ -1,7 +1,5 @@
 # Upload Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Implement `ia upload` — single item upload, batch import from spreadsheet, and template generation — with robust 503 handling, checksum verification, and 100-continue support.
 
 **Architecture:** Module directory `ia-core/src/upload/` with separate files for types, headers, validation, rate limiting, single file upload, item upload, batch upload, and template generation. CLI command in `ia-cli/src/commands/upload.rs`. Function-based public API with option structs, consistent with existing download and metadata modules.

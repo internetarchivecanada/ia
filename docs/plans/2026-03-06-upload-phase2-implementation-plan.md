@@ -1,7 +1,5 @@
 # Upload Phase 2 (Multipart + Resume) Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add multipart upload with automatic resume and a cleanup subcommand to `ia upload`, enabling reliable uploads of large files (>5 GB) over unreliable connections.
 
 **Architecture:** New `upload/multipart.rs` module implements the S3 multipart protocol (initiate, upload parts, complete, abort, resume). The existing `upload_file()` in `single.rs` dispatches to multipart when `opts.multipart` is true. The CLI gains a `--multipart` flag and an unhidden `cleanup` subcommand. All state for resume lives server-side (no local state files).

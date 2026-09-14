@@ -1,7 +1,5 @@
 # `ia collection create` Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Add `ia collection create` command that creates Internet Archive collections via S3 PUT with required metadata guardrails, optional image upload, and arbitrary extra metadata.
 
 **Architecture:** `create_collection()` in `ia-core/src/collection.rs` has two paths: (1) with image — delegates to existing `upload::upload_file()` with collection-appropriate `UploadOpts` (gets retry, rate-limit, progress for free); (2) without image — thin zero-body PUT using shared URL builders, auth, header encoding, and S3 error parsing. CLI in `ia-cli/src/commands/collection.rs` uses enum-based subcommand routing.

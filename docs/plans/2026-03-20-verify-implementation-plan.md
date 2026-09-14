@@ -1,7 +1,5 @@
 # `ia verify` Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Implement `ia verify`, a read-only command that asserts local files exist on archive.org with matching checksums and exits non-zero if any file can't be verified.
 
 **Architecture:** New `ia-core/src/verify.rs` module handles verification logic. New `ia-cli/src/commands/verify.rs` handles CLI parsing and output. Extends existing `upload/checksum.rs` with multi-algorithm parsing via a new `parse_checksums_multi()` function. Adds `sha1` and `crc32fast` crates for non-MD5 hash computation.
@@ -2702,7 +2700,6 @@ Closes #TBD
 - [ ] Integration tests: wiremock metadata mocking, all verification modes
 - [ ] CLI tests: argument validation, exit codes, output formats, glob/format/source filtering
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
 ```

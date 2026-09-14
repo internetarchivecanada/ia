@@ -1,7 +1,5 @@
 # ia Rust Port — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Build a concurrent, beautifully-designed Rust CLI for downloading from the Internet Archive, backed by a clean library crate.
 
 **Architecture:** Cargo workspace with `ia-core` (library) and `ia-cli` (binary). `IaClient` wraps `reqwest::Client`; operation modules provide typed functions. See `docs/plans/2026-02-20-ia-rust-port-design.md`.

@@ -1,7 +1,5 @@
 # CLI Subcommand Review Fixes — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Fix all issues surfaced in the PR #189 code review: search parameter bugs, missing FTS num_found, export file output, missing tests, and error handling.
 
 **Architecture:** Changes span ia-core (search opts, FTS num_found, spreadsheet writer) and ia-cli (search subcommands, metadata export, ai error handling). All changes are additive — no breaking API changes.

@@ -1,7 +1,5 @@
 # Upload Auto-Resume Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make batch uploads auto-resume from joblog by default, skipping files with successful entries.
 
 **Architecture:** New `successful_files(entries, op)` in `joblog.rs` returns `HashSet<(String, String)>` of succeeded `(item, file)` pairs. `upload_item()` and `upload_batch()` accept an optional skip set. CLI builds the set from the joblog on startup. `--no-resume` global flag opts out.

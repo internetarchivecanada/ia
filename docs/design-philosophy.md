@@ -36,7 +36,7 @@ The project is a [Cargo workspace](https://doc.rust-lang.org/book/ch14-03-cargo-
 - **`ia-core`** — the library. HTTP client, API types, download engine, search backends, metadata read/write, error types. This is a real library with a public API, not CLI internals exposed through `pub`.
 - **`ia-cli`** — the CLI. A thin presentation layer that parses arguments, calls `ia-core` functions, and formats output for humans or machines.
 
-A separate desktop GUI built with [Slint](https://slint.dev/), not yet public, consumes `ia-core` as an external dependency, which is how the library is kept usable independently of the CLI. Any Rust project can do the same — `ia-core` is designed as a standalone library for third-party consumers, not just the CLI's internals.
+A separate desktop GUI built with [Slint](https://slint.dev/), not yet public, consumes `ia-core` as an external dependency, which is how the library is kept usable independently of the CLI. Any Rust project can do the same as a git dependency (`ia-core` is not yet published to crates.io) — it is designed as a standalone library for third-party consumers, not just the CLI's internals.
 
 This separation matters: the CLI is one consumer of the library, not the library itself. If you need in-process Rust integration — building a custom tool, embedding IA access in a larger system — `ia-core` is the right dependency. The CLI is for everything else.
 
@@ -46,7 +46,7 @@ The CLI has two output modes, toggled by a `--json` flag on each subcommand:
 
 **Human mode** (default): Colored text, progress bars, tables, spinners. Designed for terminals. Inspired by [uv](https://github.com/astral-sh/uv)'s clean, informative style.
 
-**Machine mode** (`--json`): Structured data on stdout, structured errors on stderr. No progress bars, no color, no decorative output.
+**Machine mode** (`--json`): Structured data on stdout, structured errors on stderr (not yet on every command; see below). No progress bars, no color, no decorative output.
 
 Both modes emit the same underlying data. The difference is presentation, not content.
 
@@ -80,7 +80,7 @@ Errors are typed (`IaError` enum with `thiserror`) and carry stable string codes
 
 Exit codes are binary: `0` (success) or `1` (any failure). Error details live in the structured stderr output, not in exit code values. This keeps programmatic matching simple — check the exit code for pass/fail, parse stderr JSON for details.
 
-In human mode, errors are printed as readable messages with color. In machine mode, the same information is emitted as JSON on stderr.
+In human mode, errors are printed as readable messages with color. In machine mode the intent is the same information as JSON on stderr. As of September 2026 only some commands do this; the others still print the plain error text, so scripts should treat the exit code as the reliable signal until that is unified.
 
 See the [agent-friendly output design](plans/2026-02-23-agent-friendly-output-design.md) for the full error code table.
 

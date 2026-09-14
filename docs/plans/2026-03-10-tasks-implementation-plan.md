@@ -1,7 +1,5 @@
 # `ia tasks` Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Implement a full-featured `ia tasks` CLI command with list, submit, log, rerun, and rate-limit subcommands.
 
 **Architecture:** Expand `ia-core/src/tasks.rs` with new functions (list_tasks, submit_task, rerun_task, get_task_log, get_rate_limit, wait_for_task) and types, then add `ia-cli/src/commands/tasks.rs` with clap subcommand routing. Batch submit reuses the existing `BatchInput` + `collect_identifiers_from_batch` pattern from `metadata.rs`.

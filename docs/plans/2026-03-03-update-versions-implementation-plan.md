@@ -1,7 +1,5 @@
 # Update Version Listing & Installation — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Expand `ia update` with `list` and `install` subcommands for version browsing and specific version installation.
 
 **Architecture:** Optional subcommand enum on `UpdateArgs` preserves backward compat. New core functions (`list_releases`, `install_version`) handle GitHub API pagination and per-tag fetching. A hardcoded `MIN_INSTALLABLE_VERSION` floor prevents installing pre-feature versions.

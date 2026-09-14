@@ -1,7 +1,5 @@
 # `ia metadata schema` Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add an `ia metadata schema` subcommand that fetches, filters, and displays the IA metadata schema in table or detail format.
 
 **Architecture:** New `schema.rs` module in `ia-core/src/metadata/` for types and fetching. CLI args and display logic added to `ia-cli/src/commands/metadata.rs`. Live fetch from `archive.org/download/ia-metadata/ia-metadata_schema.json`, no caching.

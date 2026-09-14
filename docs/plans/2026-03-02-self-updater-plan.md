@@ -1,7 +1,5 @@
 # Self-Updater (`ia update`) Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add `ia update` command that checks GitHub Releases for new versions and replaces the binary in-place, gated behind a compile-time `self-update` feature flag.
 
 **Architecture:** Build script emits the target triple as `IA_TARGET`. Core update logic lives in `ia-core/src/update.rs` (types, version check, asset matching, download, replace). CLI command in `ia-cli/src/commands/update.rs` handles args and output. Feature flag `self-update` gates the entire subcommand.

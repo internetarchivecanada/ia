@@ -1,7 +1,5 @@
 # Export Progress Display — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Replace the bare `\rFetched N/M items` counter in metadata export with an indicatif progress bar, capped inline error display, and color-coded summary stats — consistent with download/upload output.
 
 **Architecture:** All changes in two files: make icon/bar constants public in `output.rs`, then rewrite the display logic in `run_export()` in `metadata.rs`. The progress bar tracks items (not bytes), errors are shown inline up to a cap of 5, and a summary block prints at the end using the existing separator/color conventions.
@@ -670,4 +668,4 @@ If clippy or fmt complains, fix and re-run.
 cd ~/github/jjjake/worktrees/export-joblog && git push
 ```
 
-The PR at https://github.com/internetarchivecanada/ia/pull/301 will be updated with the new commits.
+The PR at #301 (development tracker, not published) will be updated with the new commits.

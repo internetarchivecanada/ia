@@ -1,7 +1,5 @@
 # `--print-prompt` and `--image-urls` Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Add `--print-prompt` and `--image-urls` flags to `ia ai qa`, plus an improved QA system prompt.
 
 **Architecture:** Three independent changes to ia-core (new `MessageContent::image_url()` constructor, `PageImages` enum in `qa.rs`, `page_image_url()` in `ai/zip.rs`) plus CLI wiring in `commands/ai.rs`. The improved system prompt is a constant replacement in `qa.rs`.

@@ -1,7 +1,5 @@
 # PR #255 Tasks Fixes — Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Fix bugs, add missing features, and add missing tests identified in review of PR #255 (`feat/tasks-command`).
 
 **Architecture:** All changes are on the existing `fix/tasks-fixes` branch (branched from `feat/tasks-command`). Changes touch `ia-core/src/tasks.rs` (types + functions), `ia-core/src/error.rs` (no changes needed — `RateLimited` already exists), `ia-cli/src/commands/tasks.rs` (CLI flags + validation + spinner), `ia-cli/src/tui/upload_app.rs` (optimize query), and `ia-cli/tests/tasks.rs` (new tests). Design doc updated.
