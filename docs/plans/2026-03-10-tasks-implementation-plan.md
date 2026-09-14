@@ -10,7 +10,7 @@
 
 **Spec:** `docs/plans/2026-03-10-tasks-command-design.md`
 
-**Worktree:** `/Users/jake/github/jjjake/worktrees/tasks-command`
+**Worktree:** `~/github/jjjake/worktrees/tasks-command`
 
 ---
 

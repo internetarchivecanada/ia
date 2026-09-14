@@ -11,8 +11,9 @@ where the output itself is the point; long output is trimmed with a `# …` mark
 
 ## 1. Know the schema before you touch it
 
-`ia` ships the Internet Archive metadata schema inside the binary — every user-facing
-field, whether it's required, repeatable, and who controls it.
+`ia` fetches the Internet Archive metadata schema from the `ia-metadata` item and shows
+it in the terminal — every user-facing field, whether it's required, repeatable, and who
+controls it.
 
 ```
 $ ia metadata schema
@@ -104,12 +105,12 @@ HTTP: 17 requests · p50 366 ms · p95 748 ms
 ## 4. Compose across commands — concurrent read *and* write
 
 The same inputs (`--search`, `--itemlist`, stdin) drive both export and edit, and both
-fan out concurrently across items. Identifiers pipe straight through — `ia search`
-emits them, `ia metadata export` reads them, no `-f` plumbing required.
+fan out concurrently across items. Identifiers pipe straight through — `ia search --itemlist`
+emits one per line, `ia metadata export` reads them from stdin.
 
 ```
 # Export the metadata of a whole collection to a spreadsheet
-$ ia search "collection:mybooks" | ia metadata export -o out.xlsx
+$ ia search "collection:mybooks" --itemlist | ia metadata export -o out.xlsx
 
 # Or edit every match in one fanned-out, atomic-per-item pass
 $ ia metadata --search "collection:mybooks" -m "rights:public domain" --dry-run
@@ -168,7 +169,7 @@ Interrupt-safe batch upload (same joblog / auto-resume model as download), multi
 large files, streaming progress.
 
 ```
-$ ia upload template -o items.csv   # edit to add files + metadata
+$ ia upload template ./photos -o items.csv   # edit to add metadata
 $ ia upload --spreadsheet items.csv
 # interrupt, re-run the same command — completed files skip automatically
 ```

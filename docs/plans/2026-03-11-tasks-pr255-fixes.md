@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, reqwest, wiremock (tests), clap (CLI), indicatif (spinner), comfy-table (table output)
 
-**Worktree:** `/Users/jake/github/jjjake/worktrees/tasks-fixes`
+**Worktree:** `~/github/jjjake/worktrees/tasks-fixes`
 
 ---
 

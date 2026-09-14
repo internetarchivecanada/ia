@@ -37,7 +37,7 @@ pub const ICON_DRY_RUN: &str = "⊘";
 
 - [ ] **Step 2: Verify compilation**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo check`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo check`
 Expected: clean compilation, no errors.
 
 - [ ] **Step 3: Commit**
@@ -101,7 +101,7 @@ const MAX_INLINE_ERRORS: usize = 5;
 
 - [ ] **Step 3: Verify compilation**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo check`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo check`
 Expected: warnings about unused imports (that's fine — we'll use them in the next task).
 
 - [ ] **Step 4: Commit**
@@ -539,12 +539,12 @@ to just nothing (delete the line). The progress bar message handles this now.
 
 - [ ] **Step 9: Verify compilation**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo check`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo check`
 Expected: clean compilation.
 
 - [ ] **Step 10: Run cargo fmt**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo fmt --all`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo fmt --all`
 
 - [ ] **Step 11: Commit**
 
@@ -571,7 +571,7 @@ Replace bare 'Fetched N/M items' counter with:
 
 The test currently checks that the joblog is non-empty and contains `"op":"export"`. This still works — no changes needed. Verify:
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo test -p ia-cli --test cli -- metadata_export_writes_joblog -v`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo test -p ia-cli --test cli -- metadata_export_writes_joblog -v`
 Expected: PASS
 
 - [ ] **Step 2: Add a test for progress bar output on stderr**
@@ -638,7 +638,7 @@ fn metadata_export_quiet_suppresses_progress() {
 
 - [ ] **Step 5: Run the new tests**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && cargo test -p ia-cli --test cli -- metadata_export_ -v`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && cargo test -p ia-cli --test cli -- metadata_export_ -v`
 Expected: all `metadata_export_*` tests PASS.
 
 - [ ] **Step 6: Commit**
@@ -657,7 +657,7 @@ suppresses progress bar but preserves summary."
 
 - [ ] **Step 1: Run full CI**
 
-Run: `cd /Users/jake/github/jjjake/worktrees/export-joblog && just ci`
+Run: `cd ~/github/jjjake/worktrees/export-joblog && just ci`
 Expected: fmt-check, clippy, all tests, docs all pass.
 
 - [ ] **Step 2: Fix any issues**
@@ -667,7 +667,7 @@ If clippy or fmt complains, fix and re-run.
 - [ ] **Step 3: Push and update PR**
 
 ```bash
-cd /Users/jake/github/jjjake/worktrees/export-joblog && git push
+cd ~/github/jjjake/worktrees/export-joblog && git push
 ```
 
 The PR at https://github.com/internetarchivecanada/ia/pull/301 will be updated with the new commits.
