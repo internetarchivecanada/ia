@@ -91,11 +91,13 @@ pub struct IaClient {
     /// The retry middleware requires cloneable requests, which conflicts
     /// with `Body::wrap_stream()` and `Body::from(tokio::fs::File)`.
     raw_http: reqwest::Client,
-    /// API transport with timing middleware but **no retry layer**.
+    /// API transport that retries connect failures only.
     ///
     /// For requests that must not be replayed: a 5xx can arrive after the
-    /// server already applied the change, so an automatic retry would apply
-    /// it twice. Timing is kept so writes still appear in `-v` diagnostics.
+    /// server already applied the change, so retrying it would apply the
+    /// change twice. A failure to connect is different — the request never
+    /// reached the server — so that alone is retried. Timing is kept so
+    /// writes still appear in `-v` diagnostics.
     api_no_retry: ClientWithMiddleware,
     /// Client with redirects disabled, for requests that need to preserve
     /// the `Authorization` header across redirects (equivalent to curl's
@@ -241,10 +243,16 @@ impl IaClient {
             ))
             .build();
 
-        // Timing but no retry: writes must not be replayed, and dropping the
-        // middleware entirely would also drop them from the diagnostics.
+        // Writes must not be replayed on a 5xx, but a connection that was
+        // never established never reached the server, so retrying that is
+        // safe and dropping it would be a regression against the retrying
+        // client. Timing is kept so writes still appear in -v diagnostics.
         let api_no_retry = ClientBuilder::new(api_for_writes)
             .with(TimingMiddleware::new(stats.clone()))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
+            ))
             .build();
 
         // Same middleware stack over the upload transport, for upload
