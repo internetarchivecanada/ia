@@ -14,7 +14,7 @@ Optionally, enable the local pre-commit hook to prevent accidental commits to ma
 git config core.hooksPath scripts/hooks
 ```
 
-This is a convenience — GitHub branch protection is what actually guards main.
+This is a convenience; GitHub branch protection on main is the real guard.
 
 ## Project Structure
 
@@ -26,11 +26,11 @@ ia/
   docs/plans/      Design docs and implementation plans
 ```
 
-`ia-core` is also consumed as a library by [ia-gui](https://github.com/internetarchivecanada/ia-gui).
+`ia-core` is also consumed as a library by a separate desktop GUI project, which is not yet public.
 
 ## Workflow
 
-Work happens on feature branches — main is protected by GitHub branch protection.
+Work happens on feature branches. main accepts only pull requests, enforced by GitHub branch protection since the repository became public.
 
 ### Plan
 
@@ -137,4 +137,4 @@ These apply to all contributors — human or AI:
 - **Never commit secrets.**
 - **Never commit to main.** Use a feature branch.
 
-See the full safety rules in [`AGENTS.md`](./AGENTS.md#safety-rules).
+See the full safety rules in [`AGENTS.md`](./AGENTS.md#safety).

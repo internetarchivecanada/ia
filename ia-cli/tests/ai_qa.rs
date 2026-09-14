@@ -10,8 +10,8 @@ use tempfile::NamedTempFile;
 fn ia() -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     // Remove env vars that might interfere
-    cmd.env_remove("IA_S3_ACCESS")
-        .env_remove("IA_S3_SECRET")
+    cmd.env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("IA_AI_API_KEY")
         .env_remove("IA_AI_QA_API_KEY")
@@ -29,7 +29,7 @@ fn ia_with_config(config: &NamedTempFile) -> Command {
 
 fn empty_config() -> NamedTempFile {
     let f = NamedTempFile::new().unwrap();
-    fs::write(f.path(), "").unwrap();
+    fs::write(f.path(), "[general]\nhost = 127.0.0.1:1\n").unwrap();
     f
 }
 

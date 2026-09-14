@@ -25,15 +25,15 @@ ia metadata nasa
 Download files from one or more Internet Archive items.
 
 ```sh
-ia download <IDENTIFIER>... [FILES]... [OPTIONS]
+ia download [IDENTIFIER] [FILES]... [OPTIONS]
 ```
 
 #### Flags
 
 | Flag | Description |
 |------|-------------|
-| `<IDENTIFIER>...` | Item identifier(s) to download |
-| `[FILES]...` | Specific files to download from the item |
+| `[IDENTIFIER]` | Item identifier to download. Omit it in batch mode (`--search`, `--itemlist`, or identifiers piped on stdin) |
+| `[FILES]...` | Specific files to download. In batch mode, applied to every item; `{identifier}` is substituted per item |
 | `--itemlist <PATH>` | File containing identifiers (one per line) |
 | `-s, --search <QUERY>` | Download items matching a search query |
 | `--search-parameter <K=V>` | Extra search parameters (repeatable, used with `--search`) |
@@ -67,8 +67,8 @@ ia download nasa --glob "*.jpg"
 # Download only original files in MP4 format
 ia download nasa --source original --format "MPEG4"
 
-# Download multiple items
-ia download item1 item2 item3
+# Download several items (one identifier per line on stdin)
+printf 'item1\nitem2\nitem3\n' | ia download
 
 # Batch download from a search query with 16 parallel downloads
 ia download --search "collection:nasa AND mediatype:image" --jobs 16
@@ -163,7 +163,7 @@ ia search "mediatype:audio" --field identifier --field title --sort "downloads d
 ia search "collection:nasa" --json
 
 # Pipe search results into download
-ia search "collection:nasa" --itemlist | xargs ia download
+ia search "collection:nasa" --itemlist | ia download
 ```
 
 ### `ia list`
@@ -1224,6 +1224,6 @@ The project is a Cargo workspace with two crates:
 - **ia-core** -- Library crate with the client, API types, download engine, search backends, and utilities. Designed as a standalone library for external consumers.
 - **ia-cli** -- Binary crate with the CLI interface, progress display, and TUI dashboard
 
-A desktop GUI ([ia-gui](https://github.com/internetarchivecanada/ia-gui)) is developed separately and consumes `ia-core` as a library dependency.
+A desktop GUI is developed separately (not yet public) and consumes `ia-core` as a library dependency.
 
 See [the design doc](plans/2026-02-20-ia-rust-port-design.md) for full architectural details.

@@ -1,8 +1,36 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::sync::OnceLock;
+use tempfile::NamedTempFile;
 
-fn ia() -> Command {
+/// Config shared by every test in this file: no credentials, and a host that
+/// refuses connections. Nothing here can reach archive.org, even on a machine
+/// whose real `ia.ini` holds keys. Tests that need HTTP start a wiremock server
+/// and pass `--host`, which overrides this.
+fn hermetic_config() -> &'static NamedTempFile {
+    static CONFIG: OnceLock<NamedTempFile> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let f = NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "[general]\nhost = 127.0.0.1:1\n").unwrap();
+        f
+    })
+}
+
+/// Bare `ia-cli` command with no config of its own. Only for tests that
+/// exercise `--config-file` itself; everything else uses `ia()`.
+fn ia_unconfigured() -> Command {
     assert_cmd::cargo_bin_cmd!("ia-cli")
+}
+
+/// Build an `ia-cli` command that cannot load real credentials or reach the
+/// real host. See `hermetic_config`.
+fn ia() -> Command {
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    cmd.arg("--config-file")
+        .arg(hermetic_config().path())
+        .env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY");
+    cmd
 }
 
 fn status_json_with_joblog(joblog_content: &str) -> assert_cmd::assert::Assert {
@@ -154,14 +182,15 @@ fn global_options_before_subcommand() {
 
 #[test]
 fn config_file_flag_accepts_path() {
-    ia().args([
-        "--config-file",
-        "/nonexistent/path.ini",
-        "download",
-        "--help",
-    ])
-    .assert()
-    .success();
+    ia_unconfigured()
+        .args([
+            "--config-file",
+            "/nonexistent/path.ini",
+            "download",
+            "--help",
+        ])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -1744,9 +1773,6 @@ fn metadata_modify_resume_only_retries_failed() {
     let ids = dir.path().join("ids.txt");
     std::fs::write(&ids, "item1\nitem2\n").unwrap();
 
-    let empty_cfg = dir.path().join("empty.ini");
-    std::fs::write(&empty_cfg, "").unwrap();
-
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(wiremock::MockServer::start());
     let item2_json = serde_json::json!({
@@ -1786,8 +1812,6 @@ fn metadata_modify_resume_only_retries_failed() {
             "--insecure",
             "--host",
             &host,
-            "--config-file",
-            empty_cfg.to_str().unwrap(),
             "metadata",
             "modify",
             "--itemlist",
@@ -1862,9 +1886,6 @@ fn metadata_import_resume_only_retries_failed() {
     let csv = dir.path().join("data.csv");
     std::fs::write(&csv, "identifier,title\nitem1,First\nitem2,Second\n").unwrap();
 
-    let empty_cfg = dir.path().join("empty.ini");
-    std::fs::write(&empty_cfg, "").unwrap();
-
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(wiremock::MockServer::start());
     let item2_json = serde_json::json!({
@@ -1904,8 +1925,6 @@ fn metadata_import_resume_only_retries_failed() {
             "--insecure",
             "--host",
             &host,
-            "--config-file",
-            empty_cfg.to_str().unwrap(),
             "metadata",
             "--spreadsheet",
             csv.to_str().unwrap(),

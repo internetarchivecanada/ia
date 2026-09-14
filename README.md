@@ -79,8 +79,8 @@ cargo install --path ia-cli
 - **Config & Auth** — login, credential validation, whoami, cookie/auth header export
 - **Self-update** — check, list versions, install specific releases from GitHub
 - **Job logging** — JSONL audit trail with automatic resume; `ia status` summarizes results
-- **`--json` everywhere** — structured JSON/JSONL output on every command (except `completions`) for scripts, AI agents, and MCP tool servers
-- **AI QA (alpha)** — vision-based LLM verification of AI-extracted metadata, with cost estimation and promotion of confirmed fields
+- **`--json` everywhere** — structured JSON/JSONL output on every command (except `completions` and `man`) for scripts, AI agents, and MCP tool servers
+- **AI QA (alpha)** — vision-based LLM verification of AI-extracted metadata, with cost estimation and promotion of confirmed fields. Not in release binaries; build with `--features alpha`
 
 ## Documentation
 

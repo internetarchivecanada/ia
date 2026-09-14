@@ -7,7 +7,7 @@ labels: bug
 ## Environment
 
 - OS:
-- ia version (`ia --version`):
+- ia-cli version (`ia-cli --version`):
 - Rust version (if built from source):
 
 ## Description
