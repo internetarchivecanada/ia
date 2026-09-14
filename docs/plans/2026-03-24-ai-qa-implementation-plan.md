@@ -104,12 +104,12 @@ Logic:
   "qa_model": "claude-sonnet-4-6",
   "fields": {
     "title": {
-      "extracted_value": "Untersuchungen zur Diagnostik",
+      "extracted_value": "Studies on an Example Topic",
       "verdict": "correct",
       "confidence": 0.95
     },
     "creator": {
-      "extracted_value": ["Leutenegger-Aster, M."],
+      "extracted_value": ["Example, A."],
       "verdict": "correct",
       "confidence": 0.90
     },
@@ -121,7 +121,7 @@ Logic:
       "note": "Year on cover page reads 1988, not 1987"
     },
     "department": {
-      "extracted_value": "Veterinär-Medizinische Fakultät",
+      "extracted_value": "Example Faculty",
       "verdict": "uncertain",
       "confidence": 0.60,
       "note": "Department name not clearly visible in provided images"
@@ -248,11 +248,11 @@ Three-panel layout using shared TUI framework (Dashboard trait):
 | Model: gpt-5-nano -> claude-sonnet-4-6 (QA) | Cost: $0.12               |
 +- Extracted Metadata ---------------+- QA Results ------------------------+
 |                                    |                                     |
-| title: "Untersuchungen zur..."     | V title         0.95  correct      |
-| creator: ["Leutenegger-Aste..."]   | V creator       0.90  correct      |
+| title: "Studies on an Exam..."     | V title         0.95  correct      |
+| creator: ["Example, A."]           | V creator       0.90  correct      |
 | date: "1987"                       | V date          0.98  correct      |
-| institution: "Universitat Zu..."   | V institution   0.92  correct      |
-| department: "Veterinar-Med..."     | ? department    0.60  uncertain    |
+| institution: "Example Univers..."  | V institution   0.92  correct      |
+| department: "Example Faculty"      | ? department    0.60  uncertain    |
 | language: "German"                 | V language       0.99  correct      |
 +------------------------------------+-------------------------------------+
 | [a]ccept all [p]romote [e]dit [s]kip [j/k] navigate [q]uit              |

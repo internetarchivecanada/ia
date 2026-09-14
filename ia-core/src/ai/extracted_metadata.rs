@@ -87,12 +87,12 @@ mod tests {
                     "total_cost": "0.00095150$"
                 },
                 "metadata": {
-                    "title": "Untersuchungen zur Diagnostik",
-                    "creator": ["Leutenegger-Aster, M."],
+                    "title": "Studies on an Example Topic",
+                    "creator": ["Example, A."],
                     "date": "1987",
                     "language": "German",
-                    "institution": "Universität Zürich",
-                    "department": "Veterinär-Medizinische Fakultät"
+                    "institution": "Example University",
+                    "department": "Example Faculty"
                 }
             }
         }"#;
@@ -103,7 +103,7 @@ mod tests {
         assert_eq!(parsed.result.ai_request_info.total_cost, "0.00095150$");
         assert_eq!(
             parsed.result.metadata.get("title").unwrap(),
-            "Untersuchungen zur Diagnostik"
+            "Studies on an Example Topic"
         );
         assert_eq!(parsed.result.metadata.len(), 6);
 
