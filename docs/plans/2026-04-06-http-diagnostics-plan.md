@@ -1,7 +1,5 @@
 # HTTP Diagnostics Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Add global HTTP diagnostic infrastructure (retry stats, timing, verbosity) so users can see rate-limiting and latency data, starting with metadata export.
 
 **Architecture:** New `retry.rs` module in ia-core owns all counters and tracing events. `LoggingRetryStrategy` replaces the default retry classifier. `TimingMiddleware` wraps the retry layer to capture wall-clock latency. CLI replaces `--debug` with `--verbose` (`-v`/`-vv`/`-vvv`) and prints a retry summary at end of metadata export.

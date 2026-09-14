@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) 1.85+
+- [Rust](https://www.rust-lang.org/tools/install) 1.88+
 - [GitHub CLI](https://cli.github.com/) (`gh`) — authenticated
 - Git 2.20+
 

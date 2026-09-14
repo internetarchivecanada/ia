@@ -1,7 +1,5 @@
 # Compound Metadata Operations — Review Fixes Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Fix all issues identified in the PR #200 code review: insert multi-index bug, argv false-positive detection, ChangeGroup type safety, parameter proliferation, dead code, and missing tests.
 
 **Architecture:** Six tasks, ordered by dependency. Task 1 converts `ChangeGroup` from tuple alias to struct (foundational change touching both crates). Task 2 fixes the insert multi-index bug. Task 3 fixes false-positive argv detection. Task 4 consolidates parameters and eliminates duplication. Task 5 moves imports to top-of-file. Task 6 removes dead `--spreadsheet` reference and adds missing test.

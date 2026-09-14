@@ -1,7 +1,5 @@
 # CLI Subcommand Restructuring — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Restructure `ia metadata`, `ia search`, and `ia ai` commands to use sub-subcommands, following the pattern established by `ia config`.
 
 **Architecture:** Each restructured command gets a `Command` enum (via `#[derive(Subcommand)]`) dispatching to focused subcommand structs. Shared options use `#[command(flatten)]` to avoid duplication. Bare forms (`ia metadata ID`, `ia search 'query'`, `ia ai ID`) are preserved via `subcommand_required = false` with fallback positional args.
@@ -1374,7 +1372,6 @@ Closes #N
 - [ ] `ia search fts --help` shows --dsl, --scope, --size, --from
 - [ ] `ia metadata modify --help` shows -m/--metadata but NOT --exists
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
 ```

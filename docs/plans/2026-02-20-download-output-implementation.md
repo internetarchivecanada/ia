@@ -1,7 +1,5 @@
 # Download Output Redesign Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Redesign download output — rich inline by default, rename `--tui` to `--dashboard`, add useful stats (speeds, disk space, error counts).
 
 **Architecture:** The ia-core download module already provides callback-based progress events (`DownloadProgress` / `DownloadStatus`). All changes are in ia-cli: improve the `DownloadDisplay` in `output.rs`, rename + un-gate the TUI in `commands/download.rs` and `Cargo.toml`, and extend the ratatui dashboard in `tui/` with batch support and new panels.

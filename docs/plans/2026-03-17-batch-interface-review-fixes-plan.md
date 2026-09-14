@@ -1,7 +1,5 @@
 # Batch Interface Review Fixes — Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Fix 3 issues found in PR #269 review: consolidate identifier operations into `ia-core/src/identifier.rs`, change tasks submit `cmd` to `--cmd` flag, and make JSONL parsing consistent across all commands.
 
 **Architecture:** Move `validate_identifier`, `sanitize_identifier`, `generate_identifier`, and `parse_identifier_line` from 3 scattered locations into a new `ia-core/src/identifier.rs` module. Update all callers. Change tasks submit to use `--cmd` flag (eliminating heuristic normalization). Use `parse_identifier_line` in all `collect_identifiers` functions.
@@ -186,8 +184,6 @@ git commit -m "refactor: move validate_identifier to ia-core/src/identifier.rs
 Create dedicated identifier module consolidating identifier operations.
 Start with validate_identifier moved from upload/validate.rs. Update
 all callers: upload/item.rs, upload/batch.rs, collection.rs.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -449,8 +445,6 @@ bool) for decoupling from template types.
 
 Add 7 direct unit tests for generate_identifier and a coherence test
 verifying sanitize output always passes validate.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -590,8 +584,6 @@ ia-core/src/identifier.rs. This makes it available to all commands
 that need to parse identifiers from stdin or itemlist files.
 
 Add test for malformed JSON fallback behavior.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -770,8 +762,6 @@ ai commands with the shared parse_identifier_line from ia_core::identifier.
 This fixes: ia search --json | ia metadata modify silently using raw
 JSON strings as identifiers. All commands now consistently handle both
 plain text and JSONL input for --itemlist files and stdin.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -853,8 +843,6 @@ the looks_like_task_cmd heuristic, and the normalize_submit_args
 function. Any task command string now works with --itemlist/--search.
 
 Clap enforces --cmd is required unless --spreadsheet is provided.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
@@ -1064,8 +1052,6 @@ Update all 10 submit tests to use --cmd flag syntax. Delete the
 deprecated arg order test (no deprecation bridge needed — positional
 cmd was never released). Add regression test for custom command names
 with --itemlist. Update docs/usage.md examples.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 ```
 
 ---

@@ -1,7 +1,5 @@
 # CLI Help Text Redesign Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Improve CLI help text with colored output, layered -h/--help, descriptive long_about text, real-world examples, and clearer option descriptions for a broad audience (developers, librarians, archivists, students).
 
 **Architecture:** Pure clap attributes approach. A shared `Styles` constant colors structural elements. `long_about` and `after_long_help` (via `color-print` crate's `cstr!` macro) provide the extended help tier. All changes are to existing files — no new modules.

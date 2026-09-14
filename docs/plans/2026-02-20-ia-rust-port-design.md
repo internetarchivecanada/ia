@@ -3,7 +3,7 @@
 **Date**: 2026-02-20
 **Author**: Jake (jjjake)
 **Status**: Approved
-**Repo**: `internetarchivecanada/ia` (private)
+**Repo**: `internetarchivecanada/ia`
 
 ## Overview
 
@@ -35,7 +35,7 @@ A full Rust port of the [internetarchive](https://github.com/jjjake/internetarch
 ### Project Structure
 
 ```
-ia/                          # GitHub: internetarchivecanada/ia (private)
+ia/                          # GitHub: internetarchivecanada/ia
 ├── Cargo.toml               # Workspace root
 ├── CLAUDE.md                # Claude Code instructions + safety rules
 ├── docs/
@@ -72,7 +72,7 @@ ia/                          # GitHub: internetarchivecanada/ia (private)
 │           └── ...
 ```
 
-Desktop GUI is developed separately at [internetarchivecanada/ia-gui](https://github.com/internetarchivecanada/ia-gui), consuming `ia-core` as a git dependency.
+Desktop GUI is developed separately at internetarchivecanada/ia-gui (separate repo, not yet public), consuming `ia-core` as a git dependency.
 
 ### Approach: Client + Typed Operations (B → C)
 

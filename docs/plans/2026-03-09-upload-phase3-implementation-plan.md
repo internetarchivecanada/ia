@@ -1,7 +1,5 @@
 # Upload Phase 3 (Dashboard) Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Build a ratatui TUI dashboard for `ia upload` and `ia upload import`, powered by a shared trait-based TUI framework that both download and upload dashboards use.
 
 **Architecture:** Refactor the existing download TUI (`tui/app.rs` + `tui/ui.rs`) into a trait-based `Dashboard` framework with shared event loop, terminal lifecycle, and common widgets. Migrate the download dashboard onto it. Then build the upload dashboard as a second implementation. Add byte-level upload progress via an async body wrapper, and a minimal read-only Tasks API client for the S3 Tasks panel.

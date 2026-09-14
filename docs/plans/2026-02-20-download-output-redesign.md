@@ -1,6 +1,6 @@
 # Download Output Redesign
 
-**Issue:** [#27](https://github.com/internetarchivecanada/ia/issues/27)
+**Issue:** [#27](#27 (development tracker, not published))
 **Date:** 2026-02-20
 
 ## Problem

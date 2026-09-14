@@ -56,7 +56,7 @@ The binary is `ia-cli`, not `ia` — the Python [`internetarchive`](https://gith
 <details>
 <summary>Build from source</summary>
 
-Requires [Rust](https://www.rust-lang.org/tools/install) 1.85+.
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.88+.
 
 ```sh
 git clone https://github.com/internetarchivecanada/ia.git

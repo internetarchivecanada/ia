@@ -1,7 +1,5 @@
 # Metadata Shorthand Refinements Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Refine PR #297's metadata shorthand with cleaner help text, robust `--target` detection, batch `--exists`/`--formats` support, stdin filtering, and integration tests.
 
 **Architecture:** All changes are in `ia-cli/src/commands/metadata.rs` (struct + dispatch logic) and `ia-cli/tests/cli.rs` (integration tests). No ia-core changes needed — `parse_identifier_line` already filters empty lines, `item_exists` and `get_item` already exist.

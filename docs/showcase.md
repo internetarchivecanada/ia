@@ -95,7 +95,6 @@ summary reports what completed, throughput, free space, and HTTP timing:
 ```
 ────────────────────────────────────────────────────
 15/15 items (15 done)
-1.88 GiB · 1.75 GiB/s · 1s
 .: 19.13 GiB free
 HTTP: 17 requests · p50 366 ms · p95 748 ms
 ```
@@ -145,8 +144,8 @@ The multi-disk pool spreads files across volumes by free space; auto-resume mean
 re-running the same command picks up exactly where an interrupted run left off.
 
 ```
-$ ia download --search "collection:mycollection" --destdir /vol/a --destdir /vol/b
-$ ia status   # see results and any failures
+$ ia download --search "collection:mycollection" --destdir /vol/a --destdir /vol/b --joblog dl.jsonl
+$ ia status --joblog dl.jsonl   # see results and any failures
 ```
 
 ---

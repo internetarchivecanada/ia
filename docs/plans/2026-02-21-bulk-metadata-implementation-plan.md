@@ -1,7 +1,5 @@
 # Bulk Metadata Fetching Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Extend `ia metadata` to fetch metadata for multiple items concurrently, outputting JSONL to stdout with live progress on stderr.
 
 **Architecture:** Channel-based pipeline — producers (args, itemlist, search, stdin) feed identifiers into a bounded `tokio::mpsc::channel(256)`, a consumer pool fetches metadata concurrently (semaphore-bounded), results stream to stdout as JSONL.

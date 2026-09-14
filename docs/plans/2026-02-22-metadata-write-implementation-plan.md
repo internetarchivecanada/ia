@@ -1,7 +1,5 @@
 # Metadata Write Support — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add metadata write support (`metadata::modify()`) to ia-core and `ia metadata --modify` CLI, enabling the `ia ai` command prerequisite.
 
 **Architecture:** Diff-based approach matching Python `internetarchive` library. Fetch current metadata, apply desired changes to a copy, compute RFC 6902 JSON Patch via `json-patch` crate, POST patch to IA metadata API with S3 auth in request body. All tests mocked with wiremock.

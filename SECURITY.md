@@ -17,7 +17,7 @@ This project implements several security measures:
 
 - **SSRF protection:** Redirect domain restriction to `*.archive.org` — prevents auth header leakage to external hosts
 - **Auth header handling:** No-redirect client preserves auth headers for archive.org redirects without leaking to third parties
-- **Path traversal prevention:** Download paths are validated and sanitized (CVE-2025-58438 equivalent caught pre-release)
+- **Path traversal prevention:** Download paths are validated and sanitized (CVE-2025-58438 equivalent caught before public release)
 - **Upload validation:** Symlink detection, identifier sanitization, dotfile skipping
 - **Mock-only write tests:** Live archive.org is never modified in automated tests
 - **Dependency auditing:** `cargo audit` runs as a CI job on every pull request

@@ -1,7 +1,5 @@
 # Polish & Review Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Thoroughly review and polish the existing codebase — focusing on core functionality (upload, metadata), recent PRs (#255 tasks, #258 collection create), documentation completeness, error quality, test coverage, and public API surface.
 
 **Architecture:** Nine tasks in two phases. Phase 1 (Tasks 1-5) is cross-cutting polish: docs, deprecation migration, error review, test gaps, and API surface. Phase 2 (Tasks 6-9) is deep code reviews of the four major modules, ordered by importance. Each task produces concrete fixes committed on a branch.
@@ -423,7 +421,7 @@ Smaller feature (567 lines core + 169 lines CLI + 263 lines tests). Review with 
 
 ## Execution Notes
 
-**Resource budget:** Nine tasks designed for ~50% weekly Claude Code usage. Phase 1 (Tasks 1-5) is cheaper and mechanical. Phase 2 (Tasks 6-9) is token-intensive — deep reads of large files. Prioritization if budget runs tight:
+**Resource budget:** Nine tasks sized for about half a week of agent time. Phase 1 (Tasks 1-5) is cheaper and mechanical. Phase 2 (Tasks 6-9) is token-intensive — deep reads of large files. Prioritization if budget runs tight:
 
 **Phase 1 — do all of these first (cheap, high ROI):**
 1. **Task 1** (usage.md) — missing docs are user-facing

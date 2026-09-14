@@ -1,7 +1,5 @@
 # Progress Display Consolidation Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Unify upload and download progress output using shared style constants and helpers so they look and feel identical, preventing future drift.
 
 **Architecture:** Add shared style constants/helpers to `output.rs`, add `Enumerated` variant to `UploadProgressStatus` in ia-core, then refactor all display structs to use shared helpers. Upload display gets rewritten to match download's aggregate bar pattern. BatchDisplay simplified to drop per-file bars.

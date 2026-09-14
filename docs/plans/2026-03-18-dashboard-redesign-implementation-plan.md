@@ -1,7 +1,5 @@
 # Dashboard Redesign Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Redesign the upload dashboard as an interactive, multi-tab mission control with dense data, vi-like navigation, archive.org visual identity, and S3 task monitoring.
 
 **Architecture:** The existing `UploadDashboard` is replaced by a new multi-tab dashboard that implements the existing `Dashboard` trait from `framework.rs`. Each tab implements a `TabView` trait. Shared state (`S3TaskState`, `JoblogState`) is extracted into dedicated modules. The existing `UploadTuiState` and `run_dashboard_sync` event loop are reused unchanged.

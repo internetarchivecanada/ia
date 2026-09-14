@@ -3,7 +3,7 @@
 **Date**: 2026-02-23
 **Author**: Jake (jjjake)
 **Status**: Approved
-**Repo**: `internetarchivecanada/ia` (private)
+**Repo**: `internetarchivecanada/ia`
 
 ## Motivation
 

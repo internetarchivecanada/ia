@@ -36,7 +36,7 @@ Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't 
 
 ## Build
 
-- Rust 1.85 — pin `comfy-table` to 7.1.x and `wiremock` to 0.6.2 (later versions require let chains)
+- Rust 1.88 minimum (`rust-version` in Cargo.toml); `Cargo.lock` is authoritative for dependency versions
 - `Cargo.lock` is tracked (binary crate)
 - `reqwest-middleware` doesn't expose `.json()` — use `.header("content-type", ...).body(serde_json::to_vec(...))`
 - Every HTTP request must include User-Agent: `ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}`
@@ -55,7 +55,7 @@ Work happens on feature branches. main accepts only pull requests, enforced by G
 
 Every command supports `--json` as a subcommand flag. Design doc: `docs/plans/2026-02-23-agent-friendly-output-design.md`
 
-- `--json` → stdout becomes JSON/JSONL, stderr becomes `{"error": {"code": "...", "message": "..."}}`
+- `--json` → stdout becomes JSON/JSONL. Errors on stderr should be `{"error": {"code": "...", "message": "..."}}`; today only some commands do this and the rest print the plain error text. Unifying it is open work; route new error paths through `IaError::to_json_error`.
 - Exit codes: 0/1 only. Details in stderr JSON.
 - `--json` suppresses progress bars, color, and decorative output
 - `--json --dashboard` is mutually exclusive

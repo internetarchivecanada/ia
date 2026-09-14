@@ -1,7 +1,5 @@
 # Metadata Export Redesign — Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Make `ia md export` accept files (CSV, TSV, XLSX, ODS, JSONL, plain text) as positional args, and extend bare `ia md` to accept multiple identifiers with concurrent JSONL output.
 
 **Architecture:** Split identifier collection into two paths — `collect_identifiers_from_export` (files + search + stdin) for `export`, and the existing `collect_identifiers_from_batch` (IDs + --itemlist + --search + stdin) for write commands. Add a `read_identifiers_from_file` helper in `ia-core/src/spreadsheet.rs` that extracts just the `identifier` column. Extend bare `ia md id1 id2 ...` to support multiple IDs with `-j` concurrency.
