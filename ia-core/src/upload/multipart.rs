@@ -167,7 +167,7 @@ pub async fn initiate_upload(
     extra_headers: &[(String, String)],
 ) -> Result<String> {
     let (access, secret) = client.require_auth()?;
-    let url = format!("{}?uploads=", build_s3_url(client, identifier, key));
+    let url = format!("{}?uploads", build_s3_url(client, identifier, key));
 
     let mut req = client
         .upload_http()
@@ -209,9 +209,13 @@ pub async fn initiate_upload(
     })
 }
 
-/// Upload a single part. Returns the ETag from the response.
+/// Upload a single part. Returns the ETag for the completion manifest.
 ///
 /// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
+///
+/// IA's S3 does not return an `ETag` header on part PUTs; its completion
+/// check compares the manifest entry against the part's MD5. When the header
+/// is absent, the quoted hex MD5 of the body is used instead.
 pub async fn upload_part(
     client: &IaClient,
     identifier: &str,
@@ -228,6 +232,10 @@ pub async fn upload_part(
         upload_id,
     );
     let content_length = body.len();
+    let local_md5 = {
+        use md5::{Digest, Md5};
+        format!("\"{:x}\"", Md5::digest(&body))
+    };
 
     let resp = client
         .upload_http()
@@ -258,17 +266,13 @@ pub async fn upload_part(
         });
     }
 
-    // Extract ETag from response headers
-    resp.headers()
+    // Prefer the server's ETag; IA omits it, so fall back to the local MD5.
+    Ok(resp
+        .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .ok_or_else(|| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("upload part {part_number}: missing ETag in response"),
-            status: None,
-        })
+        .unwrap_or(local_md5))
 }
 
 /// Complete a multipart upload by sending the manifest.
@@ -376,9 +380,12 @@ pub async fn abort_upload(
 /// List all in-progress multipart uploads for an item.
 ///
 /// `GET /{identifier}?uploads`
+///
+/// Returns an empty list when the item does not exist yet (`NoSuchBucket`),
+/// so callers can fall through to a fresh initiate on a new item.
 pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<MultipartUploadInfo>> {
     let (access, secret) = client.require_auth()?;
-    let url = format!("{}?uploads=", build_s3_item_url(client, identifier));
+    let url = format!("{}?uploads", build_s3_item_url(client, identifier));
 
     let resp = client
         .upload_http()
@@ -396,7 +403,18 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        let msg = parse_s3_error(&body)
+        let s3_err = parse_s3_error(&body);
+        // A brand-new item has no bucket yet, so there is nothing in progress
+        // to list. Treat that as an empty result; the initiate POST that
+        // follows carries x-archive-auto-make-bucket and creates the item.
+        if s3_err.as_ref().is_some_and(|e| e.code == "NoSuchBucket") {
+            tracing::debug!(
+                identifier,
+                "item does not exist yet; no multipart uploads to resume"
+            );
+            return Ok(Vec::new());
+        }
+        let msg = s3_err
             .map(|e| format!("{}: {}", e.code, e.message))
             .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
         return Err(IaError::UploadFailed {
@@ -581,6 +599,7 @@ pub async fn upload_file_multipart(
         }
         None => {
             let id = initiate_upload(client, identifier, key, &extra_headers).await?;
+            tracing::debug!(identifier, key, upload_id = %id, "initiated multipart upload");
             (id, Vec::new())
         }
     };
@@ -615,8 +634,19 @@ pub async fn upload_file_multipart(
         let mut part_retries = 0u32;
         let etag = loop {
             let data = read_file_range(file, offset, this_part_size).await?;
+            tracing::debug!(
+                identifier,
+                key,
+                part = part_num,
+                of = part_count,
+                bytes = this_part_size,
+                "uploading part"
+            );
             match upload_part(client, identifier, key, &upload_id, part_num, data).await {
-                Ok(etag) => break etag,
+                Ok(etag) => {
+                    tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
+                    break etag;
+                }
                 Err(e) => {
                     // Check if retryable: 5xx status codes are transient
                     let is_retryable = matches!(
