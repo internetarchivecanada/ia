@@ -15,7 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn empty_config() -> NamedTempFile {
     let f = NamedTempFile::new().unwrap();
-    fs::write(f.path(), "").unwrap();
+    fs::write(f.path(), "[general]\nhost = 127.0.0.1:1\n").unwrap();
     f
 }
 
@@ -23,8 +23,8 @@ fn ia_with_config(config: &NamedTempFile) -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.arg("--config-file")
         .arg(config.path())
-        .env_remove("IA_S3_ACCESS")
-        .env_remove("IA_S3_SECRET");
+        .env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY");
     cmd
 }
 

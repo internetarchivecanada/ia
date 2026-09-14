@@ -589,9 +589,13 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Create a default client suitable for dry-run tests (no HTTP needed).
+    /// Client for dry-run tests. Dry-run still fetches item metadata for resume
+    /// detection, so point it at a port that refuses connections rather than at
+    /// archive.org; the code path tolerates the failure.
     fn dry_run_client() -> crate::IaClient {
-        crate::IaClient::from_config(crate::IaConfig::default()).unwrap()
+        let mut config = crate::IaConfig::default();
+        config.general.host = "127.0.0.1:1".to_string();
+        crate::IaClient::from_config(config).unwrap()
     }
 
     /// Build opts for resume tests: dry_run + no_collection_check to avoid HTTP.

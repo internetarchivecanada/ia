@@ -11,15 +11,16 @@ fn ia_with_config(config: &NamedTempFile) -> Command {
     cmd.arg("--config-file")
         .arg(config.path())
         // Prevent the binary from picking up real env-var credentials
-        .env_remove("IA_S3_ACCESS")
-        .env_remove("IA_S3_SECRET");
+        .env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY");
     cmd
 }
 
-/// Create an empty config file (no credentials, no sections).
+/// Config with no credentials and a host that refuses connections, so no test
+/// in this file can reach archive.org. Tests that need HTTP pass `--host` to a mock.
 fn empty_config() -> NamedTempFile {
     let f = NamedTempFile::new().unwrap();
-    fs::write(f.path(), "").unwrap();
+    fs::write(f.path(), "[general]\nhost = 127.0.0.1:1\n").unwrap();
     f
 }
 
