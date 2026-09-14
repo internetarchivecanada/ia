@@ -17,26 +17,59 @@
 
 <p align="center">
   A fast, concurrent command-line tool for the <a href="https://archive.org">Internet Archive</a>, written in Rust.<br>
-  Single binary, no dependencies. Built for humans, AI agents, and machine consumers.
+  One static binary, no runtime. Structured output on every command.
 </p>
 
 <p align="center">
-  <b>This project is in alpha. Bugs may exist and the CLI interface may change between releases. Use caution with write operations (upload, metadata modify).</b>
-</p>
-
-<p align="center">
-  <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/ai-development.md">How it's built</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/usage.md">Usage guide</a> · <a href="docs/showcase.md">Showcase</a>
+  <a href="docs/usage.md">Usage</a> · <a href="docs/showcase.md">Showcase</a> · <a href="docs/why-rust.md">Why Rust?</a> · <a href="docs/design-philosophy.md">Design philosophy</a> · <a href="docs/ai-development.md">How it's built</a>
 </p>
 
 ---
 
-## How it's built
+**Alpha.** Interfaces may change between releases. Take care with writes; `upload`, `metadata modify` and `tasks submit` all accept `--dry-run`.
 
-Nearly all implementation is written by AI agents (primarily [Claude Code](https://claude.com/claude-code)) under human direction — an experiment in agent-built software, run in the open. [How this project is built](docs/ai-development.md) explains the approach, the safeguards that stand in for line-by-line review, and — importantly — what has gone wrong so far and how it was caught. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the practical workflow.
+Nearly all of the implementation is written by AI agents under human direction.
+
+## Quick start
+
+```sh
+ia download nasa                            # fetch an item
+ia search "collection:nasa" --json          # JSONL, one object per line
+ia metadata nasa --json | jq .metadata      # pipe into anything
+ia metadata my-item -m "title:New" --dry-run
+```
+
+The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install) to alias it.
+
+`ia --help` lists every command. `ia <command> --help` documents that command in full, with examples. That is the reference, and it ships with the binary.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `download` | Concurrent downloads with resume, checksum verification, glob/format filters, multi-disk pool, ZIP-member extraction, TUI dashboard |
+| `upload` | Single file or batch from a spreadsheet; multipart for large files, automatic resume |
+| `metadata` | Read and write, compound `+` operations in one request, bulk import/export, schema lookup and audit |
+| `search` | Three backends: scrape (cursor), advanced (paged), full-text (scroll) |
+| `list` | File listings with column selection, filters, and download URLs |
+| `verify` | Confirm local files exist remotely with matching checksums (MD5/SHA-1/CRC32) |
+| `tasks` | List, submit, rerun and monitor catalog tasks; logs and rate limits |
+| `collection` | Create collection items with metadata and cover images |
+| `config` | Login, credential checks, cookie and auth-header export |
+| `status` | Summarize a joblog: what succeeded, what failed |
+| `update` | Check for, list, and install releases |
+
+## For scripts and agents
+
+`--json` works on every command. Output is JSONL, one object per line, with errors as structured JSON on stderr. Exit codes are meaningful.
+
+`--dry-run` previews any write. `--joblog <file>` records each operation, and re-running the same command resumes instead of starting over. Concurrency is adaptive by default; `-j N` pins it.
+
+Flags and their behavior are documented in `--help` at every level, so there is no need to read these docs to drive the tool.
 
 ## Install
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/internetarchivecanada/ia/releases):
+Download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases):
 
 | Platform | Asset |
 |----------|-------|
@@ -51,7 +84,9 @@ chmod +x ia-cli
 sudo mv ia-cli /usr/local/bin/
 ```
 
-The binary is `ia-cli`, not `ia` — the Python [`internetarchive`](https://github.com/jjjake/internetarchive) client already provides `ia`. Examples in these docs use `ia`; alias it with `alias ia=ia-cli`, and `ia-cli completions zsh --rename ia` generates matching completions. `ia-cli` may shorten to `ia` later, but that isn't promised.
+The binary is `ia-cli`, not `ia`, because the Python [`internetarchive`](https://github.com/jjjake/internetarchive) client already provides `ia`. Examples in these docs use `ia`; alias it with `alias ia=ia-cli`, and `ia-cli completions zsh --rename ia` generates matching completions. `ia-cli` may shorten to `ia` later, but that isn't promised.
+
+The Python client remains maintained and is the stable option; [Why Rust?](docs/why-rust.md) explains what this does differently and what it trades away.
 
 <details>
 <summary>Build from source</summary>
@@ -66,31 +101,9 @@ cargo install --path ia-cli
 
 </details>
 
-## Features
-
-- **Download** — concurrent file downloads with resume, checksum verification, glob/format filtering, multi-disk pool, ZIP-member extraction, HTTP retry diagnostics, and a full-screen TUI dashboard; suppresses archive.org's public view counter by default (`--count-views` to opt back in)
-- **Upload** — single file, batch (from spreadsheet), multipart for large files, automatic resume, streaming progress dashboard
-- **Verify** — confirm local files exist on archive.org with matching checksums (MD5/SHA-1/CRC32)
-- **Search** — three backends: scrape (cursor), advanced (paged), full-text search (scroll)
-- **List** — file listings with column selection, glob/source filtering, and download URLs
-- **Metadata** — read, write (modify/append/insert/remove), compound operations (`+` chaining), bulk import/export, schema lookup, schema audit
-- **Tasks** — list, submit, rerun, and monitor catalog tasks; view task logs; check rate limits
-- **Collections** — create collection items with metadata and cover images
-- **Config & Auth** — login, credential validation, whoami, cookie/auth header export
-- **Self-update** — check, list versions, install specific releases from GitHub
-- **Job logging** — JSONL audit trail with automatic resume; `ia status` summarizes results
-- **`--json` everywhere** — structured JSON/JSONL output on every command (except `completions` and `man`) for scripts, AI agents, and MCP tool servers
-- **AI QA (alpha)** — vision-based LLM verification of AI-extracted metadata, with cost estimation and promotion of confirmed fields. Not in release binaries; build with `--features alpha`
-
-## Documentation
-
-See the [usage guide](docs/usage.md) for quick start examples, configuration, and advanced features.
-
-Run `ia-cli --help` or `ia-cli <command> --help` for built-in documentation.
-
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup, workflow, and code conventions.
+See [CONTRIBUTING.md](./CONTRIBUTING.md). If you're thinking of sending code, open an issue first.
 
 ## License
 
