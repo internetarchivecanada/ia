@@ -28,7 +28,7 @@
 
 **Alpha.** Interfaces may change between releases. Take care with writes; `upload`, `metadata modify` and `tasks submit` all accept `--dry-run`.
 
-Nearly all of the implementation is written by AI agents under human direction. [How it's built](docs/ai-development.md) covers the safeguards, what has gone wrong, and how it was caught.
+Nearly all of the implementation is written by AI agents under human direction.
 
 ## Quick start
 
@@ -39,9 +39,9 @@ ia metadata nasa --json | jq .metadata      # pipe into anything
 ia metadata my-item -m "title:New" --dry-run
 ```
 
-`ia --help` lists every command. `ia <command> --help` documents that command in full, with examples. That is the reference, and it ships with the binary.
+The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install) to alias it.
 
-[Showcase](docs/showcase.md) is a short tour with real output. [Usage](docs/usage.md) covers configuration and longer workflows.
+`ia --help` lists every command. `ia <command> --help` documents that command in full, with examples. That is the reference, and it ships with the binary.
 
 ## Commands
 
