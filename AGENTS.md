@@ -43,7 +43,7 @@ Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't 
 
 ## Workflow
 
-Work happens on feature branches — main is protected by GitHub branch protection.
+Work happens on feature branches. main accepts only pull requests, enforced by GitHub branch protection since the repository became public.
 
 - For non-trivial work, write a design doc or implementation plan in `docs/plans/` and commit it before implementation code.
 - Create worktrees with `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`) — it names the branch `<type>/<slug>`, checks for branch collisions, and symlinks untracked `.claude` settings. Clean up after merge with `scripts/ia-cleanup <slug>`.

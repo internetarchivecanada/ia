@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, clap 4, reqwest, csv, serde_json, wiremock (tests). New dep: `rust_xlsxwriter` for XLSX export.
 
-**Worktree:** `/Users/jake/github/internetarchivecanada/ia/.claude/worktrees/refactor-cli-subcommands/`
+**Worktree:** `~/github/internetarchivecanada/ia/.claude/worktrees/refactor-cli-subcommands/`
 
 ---
 
@@ -54,7 +54,7 @@ async fn advanced_search_uses_rows_param() {
 
 **Step 2: Run test to verify it fails**
 
-Run: `cd /Users/jake/github/internetarchivecanada/ia/.claude/worktrees/refactor-cli-subcommands; cargo test -p ia-core advanced_search_uses_rows_param -- --nocapture`
+Run: `cd ~/github/internetarchivecanada/ia/.claude/worktrees/refactor-cli-subcommands; cargo test -p ia-core advanced_search_uses_rows_param -- --nocapture`
 Expected: FAIL — `rows` field doesn't exist on SearchOpts yet.
 
 **Step 3: Add `rows` field and update `advanced()`**

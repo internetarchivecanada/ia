@@ -4,7 +4,7 @@
 
 **Goal:** Fix all 20 issues found in the code review of PR #219 — 6 missing features, 3 critical bugs, 5 important bugs, 6 UX improvements. Every fix must include tests.
 
-**Architecture:** All changes are in the existing `feat/upload` worktree at `/Users/jake/github/internetarchivecanada/ia/.claude/worktrees/feat/upload`. The worktree has ia-core (library) and ia-cli (binary). Upload modules live in `ia-core/src/upload/`. CLI command is `ia-cli/src/commands/upload.rs`. All write-operation tests use wiremock mocks — NEVER send live requests to archive.org.
+**Architecture:** All changes are in the existing `feat/upload` worktree at `~/github/internetarchivecanada/ia/.claude/worktrees/feat/upload`. The worktree has ia-core (library) and ia-cli (binary). Upload modules live in `ia-core/src/upload/`. CLI command is `ia-cli/src/commands/upload.rs`. All write-operation tests use wiremock mocks — NEVER send live requests to archive.org.
 
 **Tech Stack:** Rust 1.85, tokio 1, reqwest 0.12 (via reqwest-middleware), wiremock 0.6.2, serde 1, clap 4, md-5 0.10, indicatif 0.17.
 

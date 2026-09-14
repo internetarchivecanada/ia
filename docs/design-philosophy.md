@@ -24,7 +24,7 @@ A long-term goal of this project is for the Rust CLI to serve both of those role
 
 - **Language-agnostic.** Any language that can spawn a process and read stdout can use it. No Python dependency, no version conflicts, no FFI bindings.
 - **Always up to date.** One binary ships all IA API knowledge — S3 quirks, rate limiting, retry logic, three search backends, metadata patch format. Consumers don't re-implement any of it.
-- **Stable contract.** `--json` output shapes and `--help` text form a stable interface. Changes are versioned and documented.
+- **Stable contract.** `--json` output shapes and `--help` text are the interface. While the project is alpha they may change between releases; changes are called out in release notes.
 - **Composable.** Pipe JSONL through `jq`, feed it to another command, or parse it in any language's JSON library.
 
 There are trade-offs. Process spawning has higher latency than an in-process function call. You lose in-process callbacks and streaming iterators. For those cases, the Rust library (`ia-core`) exists and powers both the CLI and the [desktop GUI](https://github.com/internetarchivecanada/ia-gui) (separate repo). But for the common patterns — searching, downloading, reading metadata, modifying metadata — the CLI with `--json` is often the simpler path.

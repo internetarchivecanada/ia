@@ -1369,7 +1369,7 @@ If help text needs adjustments, fix and commit.
 
 **Files:**
 - Modify: `CLAUDE.md`
-- Modify: `/Users/jake/.claude/projects/-Users-jake-github-jjjake-ia/memory/MEMORY.md`
+- Modify: `~/.claude/projects/-Users-jake-github-jjjake-ia/memory/MEMORY.md`
 
 **Step 1: Update CLAUDE.md**
 

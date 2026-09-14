@@ -9,7 +9,7 @@ Instead, please report vulnerabilities through one of:
 - [GitHub Security Advisory](https://github.com/internetarchivecanada/ia/security/advisories/new)
 - Email: info@archive.org
 
-We will respond within 48 hours and work with you on a fix.
+This is a one-maintainer project. Expect a first response within a week; we will work with you on a fix.
 
 ## Security Practices
 
@@ -20,7 +20,7 @@ This project implements several security measures:
 - **Path traversal prevention:** Download paths are validated and sanitized (CVE-2025-58438 equivalent caught pre-release)
 - **Upload validation:** Symlink detection, identifier sanitization, dotfile skipping
 - **Mock-only write tests:** Live archive.org is never modified in automated tests
-- **Dependency auditing:** `cargo audit` runs in CI via `rustsec/audit-check`
+- **Dependency auditing:** `cargo audit` runs as a CI job on every pull request
 
 ## Supported Versions
 
