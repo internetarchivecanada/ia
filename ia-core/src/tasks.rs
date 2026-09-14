@@ -387,7 +387,7 @@ pub async fn submit_task(
         req = req.header("X-Accept-Reduced-Priority", "1");
     }
 
-    let resp = req.send().await.map_err(reqwest_middleware::Error::from)?;
+    let resp = req.send().await?;
     let status = resp.status();
     if status.as_u16() == 429 {
         let retry_after = resp
@@ -447,8 +447,7 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         .header("content-type", "application/json")
         .body(serde_json::to_vec(&body)?)
         .send()
-        .await
-        .map_err(reqwest_middleware::Error::from)?;
+        .await?;
 
     let status = resp.status();
     if status.as_u16() == 429 {
@@ -694,8 +693,11 @@ mod tests {
             extra_params: Vec::new(),
         };
 
-        let result = submit_task(&client, &submission).await;
-        assert!(result.is_err(), "503 should surface as an error");
+        let err = submit_task(&client, &submission).await.unwrap_err();
+        assert!(
+            matches!(err, IaError::Http { status: 503, .. }),
+            "expected the 503 to surface as IaError::Http, got: {err:?}"
+        );
         // MockServer verifies expect(1) on drop.
     }
 
@@ -712,8 +714,11 @@ mod tests {
             .await;
 
         let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let result = rerun_task(&client, 123456789).await;
-        assert!(result.is_err(), "500 should surface as an error");
+        let err = rerun_task(&client, 123456789).await.unwrap_err();
+        assert!(
+            matches!(err, IaError::Http { status: 500, .. }),
+            "expected the 500 to surface as IaError::Http, got: {err:?}"
+        );
     }
 
     #[tokio::test]

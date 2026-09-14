@@ -69,7 +69,9 @@ impl std::error::Error for RedirectBlockedError {}
 ///
 /// Wraps a `reqwest::Client` with IA-specific configuration:
 /// - Connection pooling and keep-alive (unlike Python's Connection: close)
-/// - Automatic retry with exponential backoff for 429/5xx
+/// - Automatic retry with exponential backoff for 5xx on idempotent
+///   requests; metadata writes and task submission are exempt, because a
+///   5xx can arrive after the server already applied the change
 /// - Retry-After header respect
 /// - Proper User-Agent identification
 #[derive(Clone)]
@@ -89,12 +91,12 @@ pub struct IaClient {
     /// The retry middleware requires cloneable requests, which conflicts
     /// with `Body::wrap_stream()` and `Body::from(tokio::fs::File)`.
     raw_http: reqwest::Client,
-    /// Raw reqwest client on the API transport, without retry middleware.
+    /// API transport with timing middleware but **no retry layer**.
     ///
     /// For requests that must not be replayed: a 5xx can arrive after the
     /// server already applied the change, so an automatic retry would apply
-    /// it twice.
-    api_no_retry: reqwest::Client,
+    /// it twice. Timing is kept so writes still appear in `-v` diagnostics.
+    api_no_retry: ClientWithMiddleware,
     /// Client with redirects disabled, for requests that need to preserve
     /// the `Authorization` header across redirects (equivalent to curl's
     /// `--location-trusted`). archive.org redirects `/download/` requests
@@ -229,7 +231,7 @@ impl IaClient {
 
         // Clone before moving into middleware — reqwest::Client is Arc-based, cheap to clone.
         let raw_http = transports.upload.clone();
-        let api_no_retry = transports.api.clone();
+        let api_for_writes = transports.api.clone();
 
         let http = ClientBuilder::new(transports.api)
             .with(TimingMiddleware::new(stats.clone()))
@@ -237,6 +239,12 @@ impl IaClient {
                 retry_policy,
                 LoggingRetryStrategy::new(stats.clone()),
             ))
+            .build();
+
+        // Timing but no retry: writes must not be replayed, and dropping the
+        // middleware entirely would also drop them from the diagnostics.
+        let api_no_retry = ClientBuilder::new(api_for_writes)
+            .with(TimingMiddleware::new(stats.clone()))
             .build();
 
         // Same middleware stack over the upload transport, for upload
@@ -297,6 +305,15 @@ impl IaClient {
     }
 
     /// The underlying HTTP client (for operation modules).
+    ///
+    /// Retries any 5xx. That is correct for reads and wrong for writes: a
+    /// 5xx can arrive after the server already applied the change, and the
+    /// replay applies it twice. Non-idempotent operations inside this crate
+    /// use a separate handle without the retry layer.
+    ///
+    /// Callers outside the crate should prefer the operation functions
+    /// (`metadata::modify`, `tasks::submit_task`) over building requests on
+    /// this client directly; they handle this correctly already.
     pub fn http(&self) -> &ClientWithMiddleware {
         &self.http
     }
@@ -313,6 +330,10 @@ impl IaClient {
     }
 
     /// Raw HTTP client without retry middleware (upload transport).
+    ///
+    /// Note this covers only streaming uploads. The multipart control calls
+    /// (initiate, complete, abort) still go through [`Self::upload_http`] and
+    /// are retried on 5xx.
     ///
     /// Use this for requests with streaming (non-cloneable) bodies, such as
     /// file uploads. The retry middleware requires `Request::try_clone()` to
@@ -335,7 +356,7 @@ impl IaClient {
     /// Same transport as [`Self::http`] (connect and read timeouts), only
     /// without the retry layer. Callers needing retries must implement their
     /// own with idempotency handled explicitly, as the upload path does.
-    pub(crate) fn api_no_retry(&self) -> &reqwest::Client {
+    pub(crate) fn api_no_retry(&self) -> &ClientWithMiddleware {
         &self.api_no_retry
     }
 
@@ -370,8 +391,9 @@ impl IaClient {
         // TimingMiddleware or LoggingRetryStrategy is wired in this path.
         let stats = Arc::new(RetryStats::new(0));
         let raw_http = transports.upload.clone();
-        let api_no_retry = transports.api.clone();
+        let api_for_writes = transports.api.clone();
         let http = ClientBuilder::new(transports.api).build();
+        let api_no_retry = ClientBuilder::new(api_for_writes).build();
         let upload_http = ClientBuilder::new(transports.upload).build();
 
         Ok(Self {

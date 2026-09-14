@@ -389,10 +389,7 @@ pub async fn modify_compound(
         request = request.header("X-Accept-Reduced-Priority", "1");
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(reqwest_middleware::Error::from)?;
+    let response = request.send().await?;
     let status = response.status();
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -403,6 +400,17 @@ pub async fn modify_compound(
             .and_then(|v| v.parse::<u64>().ok());
         return Err(IaError::RateLimited {
             retry_after: retry_after.unwrap_or(30),
+        });
+    }
+
+    // Check the status before decoding. The body of a 5xx is not a
+    // ModifyResponse, so decoding first turns "503 Service Unavailable" into
+    // "error decoding response body" and loses the status entirely.
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message: body,
         });
     }
 
@@ -1046,8 +1054,14 @@ mod tests {
             reduced_priority: false,
         };
 
-        let result = modify(&client, &req).await;
-        assert!(result.is_err(), "503 should surface as an error");
+        // Assert the *status*, not merely that it failed: before the status
+        // check above this returned a body-decode error and a bare is_err()
+        // would have passed on the wrong error.
+        let err = modify(&client, &req).await.unwrap_err();
+        assert!(
+            matches!(err, IaError::Http { status: 503, .. }),
+            "expected the 503 to surface as IaError::Http, got: {err:?}"
+        );
         // MockServer verifies expect(1) on drop.
     }
 

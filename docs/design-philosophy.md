@@ -64,7 +64,7 @@ The Python `internetarchive` library sets `Connection: close` on every request a
 
 - **Connection pooling and keep-alive.** The Python library sets `Connection: close` on every request, forcing a fresh TCP+TLS handshake per file. The Rust client reuses connections, which adds up fast when downloading thousands of small files.
 - **Byte-range resume.** Interrupted downloads continue where they left off via `Range` headers. The completed file's checksum is verified against server metadata.
-- **Retry with backoff.** Transient failures (5xx, timeouts) are retried automatically with exponential backoff via `reqwest-middleware`.
+- **Retry with backoff.** Transient failures (5xx, timeouts) are retried automatically with exponential backoff via `reqwest-middleware`. Non-idempotent requests (metadata writes, task submission and rerun) are exempt: a 5xx can arrive after the server applied the change, so replaying it would apply the change twice.
 - **Rate limit coordination.** When the server returns `429 Too Many Requests`, a shared `RateLimiter` pauses all concurrent workers — not just the one that got throttled. Downloads resume together when the cooldown expires.
 - **`Expect: 100-continue`** for uploads. Avoids sending a large request body only to get a 4xx rejection.
 

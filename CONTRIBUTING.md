@@ -69,7 +69,7 @@ After merge, `scripts/ia-cleanup <slug>` removes the worktree and local branch.
   cargo clippy -p ia-core -p ia-cli -- -D warnings
   ```
 - If you have [just](https://github.com/casey/just) installed, `just ci` runs all CI checks
-  (format, clippy, test, doc) locally in one command.
+  (format, clippy, test, doc, audit) locally in one command.
 
 ### Open a PR
 
