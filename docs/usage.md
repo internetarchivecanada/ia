@@ -1224,6 +1224,6 @@ The project is a Cargo workspace with two crates:
 - **ia-core** -- Library crate with the client, API types, download engine, search backends, and utilities. Designed as a standalone library for external consumers.
 - **ia-cli** -- Binary crate with the CLI interface, progress display, and TUI dashboard
 
-A desktop GUI ([ia-gui](https://github.com/internetarchivecanada/ia-gui)) is developed separately and consumes `ia-core` as a library dependency.
+A desktop GUI is developed separately (not yet public) and consumes `ia-core` as a library dependency.
 
 See [the design doc](plans/2026-02-20-ia-rust-port-design.md) for full architectural details.

@@ -26,7 +26,7 @@ ia/
   docs/plans/      Design docs and implementation plans
 ```
 
-`ia-core` is also consumed as a library by [ia-gui](https://github.com/internetarchivecanada/ia-gui).
+`ia-core` is also consumed as a library by a separate desktop GUI project, which is not yet public.
 
 ## Workflow
 
