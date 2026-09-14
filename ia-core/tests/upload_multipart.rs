@@ -104,7 +104,9 @@ async fn upload_part_success() {
 }
 
 #[tokio::test]
-async fn upload_part_missing_etag_fails() {
+async fn upload_part_missing_etag_falls_back_to_body_md5() {
+    // IA's S3 returns no ETag header on part PUTs; the completion check
+    // compares against the part's MD5, so that is what we must report.
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -124,8 +126,10 @@ async fn upload_part_missing_etag_fails() {
         1,
         b"data".to_vec(),
     )
-    .await;
-    assert!(result.is_err());
+    .await
+    .unwrap();
+    // md5("data") = 8d777f385d3dfec8815d20f7496026dc, quoted like an S3 ETag
+    assert_eq!(result, "\"8d777f385d3dfec8815d20f7496026dc\"");
 }
 
 // ── Complete ────────────────────────────────────────────────────────────
@@ -685,6 +689,121 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
     .unwrap();
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn upload_file_multipart_new_item_no_such_bucket_starts_fresh() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let f = temp_file(b"hello");
+
+    // List uploads on a brand-new item: IA S3 returns 404 NoSuchBucket.
+    // This must be treated as "nothing to resume", not as a failure.
+    Mock::given(method("GET"))
+        .and(path("/new-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    // Falls through to fresh initiate, which carries auto-make-bucket
+    Mock::given(method("POST"))
+        .and(path("/new-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .and(header("x-archive-auto-make-bucket", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>fresh-123</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/new-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"e1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/new-item/data.bin"))
+        .and(query_param("uploadId", "fresh-123"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "new-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn upload_file_multipart_list_uploads_other_error_still_fails() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let f = temp_file(b"hello");
+
+    // Any error other than NoSuchBucket from the list call is still fatal.
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("AccessDenied"), "{err}");
 }
 
 #[tokio::test]
