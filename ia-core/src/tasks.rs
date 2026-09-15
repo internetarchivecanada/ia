@@ -390,12 +390,7 @@ pub async fn submit_task(
     let resp = req.send().await?;
     let status = resp.status();
     if status.as_u16() == 429 {
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let retry_after = crate::retry::extract_retry_after(resp.headers()).unwrap_or(0);
         return Err(IaError::RateLimited { retry_after });
     }
     if !status.is_success() {
@@ -451,12 +446,7 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
 
     let status = resp.status();
     if status.as_u16() == 429 {
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let retry_after = crate::retry::extract_retry_after(resp.headers()).unwrap_or(0);
         return Err(IaError::RateLimited { retry_after });
     }
     if !status.is_success() {

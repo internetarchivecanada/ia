@@ -393,11 +393,7 @@ pub async fn modify_compound(
     let status = response.status();
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         return Err(IaError::RateLimited {
             retry_after: retry_after.unwrap_or(30),
         });
