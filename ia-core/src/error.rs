@@ -212,6 +212,13 @@ impl IaError {
     /// errors, disk full) where retrying would just waste time.
     /// Returns `true` for transient failures (server errors, network issues,
     /// rate limits, checksum mismatches) that may succeed on retry.
+    ///
+    /// Retryable is not the same as safe to replay. A 5xx is transient, but
+    /// the server may have applied a write before failing the response, so
+    /// resending a metadata patch or a task submission can apply it twice.
+    /// Callers deciding whether to resend a *non-idempotent* request need
+    /// that judgement separately; this answers only whether the failure looks
+    /// temporary.
     pub fn is_retryable(&self) -> bool {
         match self {
             // HTTP 4xx client errors are permanent (except 429 rate-limit)

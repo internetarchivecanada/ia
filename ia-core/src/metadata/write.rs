@@ -377,8 +377,10 @@ pub async fn modify_compound(
     );
 
     let post_url = client.url(&format!("/metadata/{identifier}"));
+    // Not client.http(): a 5xx can arrive after the patch was applied, and a
+    // middleware retry would apply it twice.
     let mut request = client
-        .http()
+        .api_no_retry()
         .post(&post_url)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body);
@@ -391,13 +393,20 @@ pub async fn modify_compound(
     let status = response.status();
 
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         return Err(IaError::RateLimited {
             retry_after: retry_after.unwrap_or(30),
+        });
+    }
+
+    // Check the status before decoding. The body of a 5xx is not a
+    // ModifyResponse, so decoding first turns "503 Service Unavailable" into
+    // "error decoding response body" and loses the status entirely.
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message: body,
         });
     }
 
@@ -1004,6 +1013,52 @@ mod tests {
             ],
             "server": "ia000000.us.archive.org"
         })
+    }
+
+    /// A 5xx on the metadata POST must not be retried.
+    ///
+    /// archive.org can apply the JSON Patch and then fail the response. The
+    /// retry middleware replays any 5xx, which applies the patch twice — for
+    /// an `add` on a repeatable field that silently duplicates a value, and
+    /// nothing downstream can detect it. `expect(1)` fails if the request is
+    /// sent more than once.
+    #[tokio::test]
+    async fn metadata_post_is_not_retried_on_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_item_metadata()))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let req = ModifyRequest {
+            identifier: "test-item".to_string(),
+            changes: vec![("title".to_string(), serde_json::json!("New Title"))],
+            op: MetadataOp::Set,
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+
+        // Assert the *status*, not merely that it failed: before the status
+        // check above this returned a body-decode error and a bare is_err()
+        // would have passed on the wrong error.
+        let err = modify(&client, &req).await.unwrap_err();
+        assert!(
+            matches!(err, IaError::Http { status: 503, .. }),
+            "expected the 503 to surface as IaError::Http, got: {err:?}"
+        );
+        // MockServer verifies expect(1) on drop.
     }
 
     #[tokio::test]

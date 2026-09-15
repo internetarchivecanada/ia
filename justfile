@@ -19,8 +19,8 @@ audit:
 build-release:
     cargo build -p ia-cli --release --features self-update
 
-# Run all CI checks locally
-ci: fmt-check check test doc
+# Run all CI checks locally (same jobs as .github/workflows/ci.yml)
+ci: fmt-check check test doc audit
 
 # Push main + tags to the read-only GitLab mirror (requires a 'gitlab' remote)
 mirror:

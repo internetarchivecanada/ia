@@ -72,7 +72,7 @@ ia/                          # GitHub: internetarchivecanada/ia
 │           └── ...
 ```
 
-Desktop GUI is developed separately at internetarchivecanada/ia-gui (separate repo, not yet public), consuming `ia-core` as a git dependency.
+Desktop GUI is developed separately at jjjake/ia-gui (separate repo, not yet public), consuming `ia-core` as a git dependency.
 
 ### Approach: Client + Typed Operations (B → C)
 
@@ -105,7 +105,7 @@ pub struct IaClient {
 Key improvements over Python:
 - **Keep-alive by default** (Python sets `Connection: close`)
 - **Connection pooling** via reqwest's built-in pool
-- **HTTP-level retry** via `reqwest-middleware` + `reqwest-retry` for 429/5xx on all requests
+- **HTTP-level retry** via `reqwest-middleware` + `reqwest-retry` for 5xx on idempotent requests. Metadata writes and task submission retry connect failures only: a 5xx can arrive after the server applied the change, so replaying it would apply the change twice
 - **`Retry-After` header respected** globally on all requests
 - **100-continue** for uploads (future) via hyper
 - **Application-level retry** via `backon` for S3 overload logic (future)

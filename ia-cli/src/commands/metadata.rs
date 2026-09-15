@@ -20,6 +20,7 @@ use comfy_table::{Cell, Color, Table};
 use crate::output::{
     format_bytes, print_retry_summary, BAR_WIDTH, ICON_ERROR, ICON_SUCCESS, PROGRESS_CHARS,
 };
+use ia_core::error::format_error_chain;
 use ia_core::identifier::parse_identifier_line;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::metadata::write::{
@@ -2263,7 +2264,7 @@ async fn run_write_inner(
                         .await;
                     }
                     Err(IaError::NoChanges { .. }) => break ModifyOutcome::NoChanges,
-                    Err(e) => break ModifyOutcome::Error(e.to_string()),
+                    Err(e) => break ModifyOutcome::Error(format_error_chain(&e)),
                 }
             };
 
@@ -2531,7 +2532,7 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
                         .await;
                     }
                     Err(IaError::NoChanges { .. }) => break ModifyOutcome::NoChanges,
-                    Err(e) => break ModifyOutcome::Error(e.to_string()),
+                    Err(e) => break ModifyOutcome::Error(format_error_chain(&e)),
                 }
             };
 

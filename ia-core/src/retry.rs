@@ -257,6 +257,51 @@ impl RetryableStrategy for LoggingRetryStrategy {
     }
 }
 
+/// Retry strategy for non-idempotent requests: connect failures only.
+///
+/// Metadata writes and task submissions must never be replayed on a 5xx,
+/// because the server can apply the change and then fail the response. A
+/// connection that was never established is different: the request did not
+/// reach the server, so there is nothing to apply twice and retrying is
+/// safe.
+///
+/// Anything that got as far as a response, or failed after the connection
+/// was up, returns `None` and surfaces to the caller.
+pub struct ConnectOnlyRetryStrategy {
+    stats: Arc<RetryStats>,
+}
+
+impl ConnectOnlyRetryStrategy {
+    /// Create a new strategy backed by the given stats.
+    pub fn new(stats: Arc<RetryStats>) -> Self {
+        Self { stats }
+    }
+}
+
+impl RetryableStrategy for ConnectOnlyRetryStrategy {
+    fn handle(
+        &self,
+        res: &Result<reqwest::Response, reqwest_middleware::Error>,
+    ) -> Option<Retryable> {
+        match res {
+            // A response arrived. Whatever its status, the server saw the
+            // request, so replaying it risks applying the write twice.
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if status >= 500 {
+                    self.stats
+                        .record_server_error(status, response.url().path());
+                }
+                None
+            }
+            Err(reqwest_middleware::Error::Reqwest(e)) if e.is_connect() => {
+                Some(Retryable::Transient)
+            }
+            Err(_) => None,
+        }
+    }
+}
+
 /// Middleware that measures wall-clock time per logical request (including retries).
 ///
 /// Sits outside the retry middleware in the stack, so it captures the total
@@ -291,6 +336,56 @@ impl reqwest_middleware::Middleware for TimingMiddleware {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── ConnectOnlyRetryStrategy ─────────────────────────────────────────────
+
+    /// A connection that was never established is safe to replay: the request
+    /// did not reach the server, so there is nothing to apply twice.
+    #[tokio::test]
+    async fn connect_only_retries_a_connect_failure() {
+        // Port 1 on loopback: nothing listens, so this is a genuine connect
+        // error rather than a synthesised one.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("connecting to a dead port should fail");
+        assert!(err.is_connect(), "expected a connect error, got: {err:?}");
+
+        let strategy = ConnectOnlyRetryStrategy::new(Arc::new(RetryStats::new(0)));
+        let decision = strategy.handle(&Err(reqwest_middleware::Error::Reqwest(err)));
+
+        assert!(
+            matches!(decision, Some(Retryable::Transient)),
+            "connect failures must be retried"
+        );
+    }
+
+    /// A 5xx means the server saw the request. Replaying it could apply a
+    /// metadata patch or queue a task a second time.
+    #[tokio::test]
+    async fn connect_only_does_not_retry_a_server_error() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .post(server.uri())
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status().as_u16(), 503);
+
+        let strategy = ConnectOnlyRetryStrategy::new(Arc::new(RetryStats::new(0)));
+        let decision = strategy.handle(&Ok(response));
+
+        assert!(
+            decision.is_none(),
+            "a 5xx must not be retried on a write path"
+        );
+    }
 
     // ── Task 1: RetryStats core ──────────────────────────────────────────────
 
