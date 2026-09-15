@@ -169,8 +169,9 @@ pub async fn initiate_upload(
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads", build_s3_url(client, identifier, key));
 
+    // Not upload_http(): a retried initiate leaves an orphaned upload.
     let mut req = client
-        .upload_http()
+        .upload_no_retry()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("Content-Length", "0");
@@ -294,8 +295,10 @@ pub async fn complete_upload(
     );
 
     let manifest = build_complete_manifest(parts);
+    // Not upload_http(): a retried complete gets NoSuchUpload, reporting a
+    // successful upload as failed.
     let mut req = client
-        .upload_http()
+        .upload_no_retry()
         .post(&url)
         .header("Authorization", format!("LOW {access}:{secret}"))
         .header("Content-Type", "application/xml")
