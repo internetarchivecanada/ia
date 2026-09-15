@@ -83,6 +83,12 @@ pub struct IaClient {
     /// abort/list), whose body sends or server-side processing can
     /// legitimately exceed the API read timeout.
     upload_http: ClientWithMiddleware,
+    /// Upload transport (no read timeout) retrying connect failures only.
+    ///
+    /// For the multipart control calls that must not be replayed: initiating
+    /// twice leaves an orphaned upload, and completing twice reports a
+    /// successful upload as failed.
+    upload_no_retry: ClientWithMiddleware,
     /// Raw reqwest client without retry middleware (upload transport,
     /// no read timeout).
     ///
@@ -258,6 +264,7 @@ impl IaClient {
         // Same middleware stack over the upload transport, for upload
         // requests with cloneable bodies (multipart parts, S3 control
         // calls) that want retry but must not have a read timeout.
+        let upload_for_writes = transports.upload.clone();
         let upload_http = ClientBuilder::new(transports.upload)
             .with(TimingMiddleware::new(stats.clone()))
             .with(RetryTransientMiddleware::new_with_policy_and_strategy(
@@ -266,9 +273,21 @@ impl IaClient {
             ))
             .build();
 
+        // Upload transport without the 5xx replay, for the non-idempotent
+        // multipart control calls. Connect failures never reached the server
+        // and stay retryable.
+        let upload_no_retry = ClientBuilder::new(upload_for_writes)
+            .with(TimingMiddleware::new(stats.clone()))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
+            ))
+            .build();
+
         Ok(Self {
             http,
             upload_http,
+            upload_no_retry,
             raw_http,
             api_no_retry,
             no_redirect_http: transports.no_redirect,
@@ -337,11 +356,25 @@ impl IaClient {
         &self.upload_http
     }
 
+    /// Upload transport that retries connect failures only.
+    ///
+    /// For multipart control calls that must not be replayed. Initiating
+    /// twice leaves an upload that is never completed, which consumes
+    /// storage until `ia upload cleanup` aborts it; completing twice gets
+    /// `NoSuchUpload` on the second attempt, so a successful upload is
+    /// reported as failed.
+    ///
+    /// Part PUTs stay on [`Self::upload_http`]. They are retried by the
+    /// explicit loop in `upload_file_multipart`, which is safe because a part
+    /// number identifies the part, so re-sending overwrites it.
+    pub(crate) fn upload_no_retry(&self) -> &ClientWithMiddleware {
+        &self.upload_no_retry
+    }
+
     /// Raw HTTP client without retry middleware (upload transport).
     ///
-    /// Note this covers only streaming uploads. The multipart control calls
-    /// (initiate, complete, abort) still go through [`Self::upload_http`] and
-    /// are retried on 5xx.
+    /// Note this covers only streaming uploads. Multipart part PUTs go through
+    /// `upload_http`, and `upload_file_multipart` retries them itself.
     ///
     /// Use this for requests with streaming (non-cloneable) bodies, such as
     /// file uploads. The retry middleware requires `Request::try_clone()` to
@@ -402,11 +435,14 @@ impl IaClient {
         let api_for_writes = transports.api.clone();
         let http = ClientBuilder::new(transports.api).build();
         let api_no_retry = ClientBuilder::new(api_for_writes).build();
+        let upload_for_writes = transports.upload.clone();
         let upload_http = ClientBuilder::new(transports.upload).build();
+        let upload_no_retry = ClientBuilder::new(upload_for_writes).build();
 
         Ok(Self {
             http,
             upload_http,
+            upload_no_retry,
             raw_http,
             api_no_retry,
             no_redirect_http: transports.no_redirect,

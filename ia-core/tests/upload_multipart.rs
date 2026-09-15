@@ -940,3 +940,72 @@ async fn zero_part_size_returns_error_not_panic() {
         "validation must reject part_size=0 before any request is sent"
     );
 }
+
+// ── Non-idempotent multipart calls must not be replayed ──────────────────────
+//
+// The retry middleware treats every 5xx as transient, which is wrong for
+// initiate and complete: the server may have acted before the response
+// failed. `expect(1)` is what enforces that they are sent once.
+//
+// Part PUTs are different and keep retrying, via the explicit loop in
+// upload_file_multipart rather than the middleware. That is safe because a
+// part number identifies the part, so re-sending overwrites it.
+// upload_file_multipart_part_retry_on_503 already covers that path.
+
+/// A 5xx on initiate must not be retried.
+///
+/// IA may create the upload and then fail the response. A replay creates a
+/// second upload that nothing will ever complete, consuming storage until
+/// `ia upload cleanup` aborts it.
+#[tokio::test]
+async fn initiate_upload_is_not_retried_on_server_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/large-file.zip"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Must be a retrying client: test_client() uses from_config_no_retry, so
+    // with that this test would pass whether or not the fix is present.
+    let client = retrying_client(&server);
+    let result = multipart::initiate_upload(&client, "test-item", "large-file.zip", &[]).await;
+    assert!(result.is_err(), "503 should surface as an error");
+    // MockServer verifies expect(1) on drop.
+}
+
+/// A 5xx on complete must not be retried.
+///
+/// If the completion applied and only the response failed, the replay gets
+/// NoSuchUpload and a finished upload is reported as failed.
+#[tokio::test]
+async fn complete_upload_is_not_retried_on_server_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("uploadId", "upload-123"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retrying_client(&server);
+    let parts = vec![(1, "\"etag1\"".to_string())];
+    let result =
+        multipart::complete_upload(&client, "test-item", "file.zip", "upload-123", &parts, true)
+            .await;
+    assert!(result.is_err(), "500 should surface as an error");
+}
+fn retrying_client(server: &MockServer) -> IaClient {
+    let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = host_port;
+    config.general.secure = false;
+    IaClient::from_config(config).unwrap()
+}
