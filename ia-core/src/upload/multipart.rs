@@ -10,7 +10,6 @@
 
 use super::retry::{send_with_retry, S3RetryCtx};
 use crate::error::{IaError, Result};
-use crate::upload::s3_error::{parse_s3_error, strip_xml};
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
 
@@ -406,34 +405,40 @@ pub async fn abort_upload(
         upload_id,
     );
 
-    let resp = client
-        .upload_http()
-        .delete(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("abort multipart: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("abort multipart failed: {msg}"),
-            status: Some(status.as_u16()),
-        });
-    }
+    let ctx = idempotent_ctx(identifier, key);
+    send_with_retry(&ctx, "abort multipart", || {
+        client
+            .upload_http()
+            .delete(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await?;
     Ok(())
 }
+
+/// Retry context for the idempotent S3 calls: abort, and the two listings.
+///
+/// They carry no progress of their own and need no special reasoning about
+/// replay, but they must not silently lose the retries they had while the
+/// middleware was doing it for them. `list_uploads` in particular is the
+/// resume check, the first request of a multipart upload, so a transient
+/// 503 there would otherwise fail the whole transfer.
+fn idempotent_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
+    S3RetryCtx {
+        identifier,
+        key,
+        retries: IDEMPOTENT_RETRIES,
+        retry_sleep: IDEMPOTENT_RETRY_SLEEP,
+        bytes_sent: 0,
+        total_bytes: 0,
+        progress: None,
+    }
+}
+
+/// Matches what the retry middleware used to give these calls.
+const IDEMPOTENT_RETRIES: u32 = 3;
+const IDEMPOTENT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -445,45 +450,33 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let resp = client
-        .upload_http()
-        .get(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: String::new(),
-            message: format!("list multipart uploads: {e}"),
-            status: None,
-        })?;
+    let ctx = idempotent_ctx(identifier, "");
+    let result = send_with_retry(&ctx, "list multipart uploads", || {
+        client
+            .upload_http()
+            .get(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let s3_err = parse_s3_error(&body);
+    match result {
+        Ok(sent) => {
+            let body = sent.response.text().await.unwrap_or_default();
+            Ok(parse_list_uploads_response(&body))
+        }
         // A brand-new item has no bucket yet, so there is nothing in progress
         // to list. Treat that as an empty result; the initiate POST that
         // follows carries x-archive-auto-make-bucket and creates the item.
-        if s3_err.as_ref().is_some_and(|e| e.code == "NoSuchBucket") {
+        Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
             tracing::debug!(
                 identifier,
                 "item does not exist yet; no multipart uploads to resume"
             );
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
-        let msg = s3_err
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: String::new(),
-            message: format!("list multipart uploads: {msg}"),
-            status: Some(status.as_u16()),
-        });
+        Err(f) => Err(f.error),
     }
-
-    Ok(parse_list_uploads_response(&body))
 }
 
 /// List completed parts for a multipart upload.
@@ -502,32 +495,16 @@ pub async fn list_parts(
         upload_id,
     );
 
-    let resp = client
-        .upload_http()
-        .get(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("list parts: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("list parts: {msg}"),
-            status: Some(status.as_u16()),
-        });
-    }
+    let ctx = idempotent_ctx(identifier, key);
+    let sent = send_with_retry(&ctx, "list parts", || {
+        client
+            .upload_http()
+            .get(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await?;
+    let body = sent.response.text().await.unwrap_or_default();
 
     Ok(parse_list_parts_response(&body))
 }
