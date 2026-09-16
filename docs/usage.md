@@ -516,7 +516,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB) |
-| `--retries <N>` | Retry attempts per file (default: 10) |
+| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10) |
 | `--retry-sleep <SECS>` | Sleep between retries in seconds (default: 30) |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |

@@ -64,7 +64,9 @@ The Python `internetarchive` library sets `Connection: close` on every request a
 
 - **Connection pooling and keep-alive.** The Python library sets `Connection: close` on every request, forcing a fresh TCP+TLS handshake per file. The Rust client reuses connections, which adds up fast when downloading thousands of small files.
 - **Byte-range resume.** Interrupted downloads continue where they left off via `Range` headers. The completed file's checksum is verified against server metadata.
-- **Retry with backoff.** Transient failures (5xx, timeouts) are retried automatically with exponential backoff via `reqwest-middleware`. Non-idempotent requests (metadata writes, task submission and rerun) are exempt: a 5xx can arrive after the server applied the change, so replaying it would apply the change twice.
+- **Retry with backoff.** Two policies, because the two kinds of endpoint fail differently.
+  - Uploads go to IA-S3, which answers throttling with `503 SlowDown` — the request was refused and nothing was applied, so replaying it is safe. Every IA-S3 request is retried on that basis, classified by the S3 error code in the response body and falling back to the HTTP status only when the body isn't an S3 error. `--retries` and `--retry-sleep` set the budget.
+  - Everything else retries 5xx and timeouts with exponential backoff via `reqwest-middleware`, except non-idempotent requests (metadata writes, task submission and rerun), which retry connect failures only: there a 5xx can arrive after the server applied the change, so replaying it would apply the change twice.
 - **Rate limit coordination.** When the server returns `429 Too Many Requests`, a shared `RateLimiter` pauses all concurrent workers — not just the one that got throttled. Downloads resume together when the cooldown expires.
 - **`Expect: 100-continue`** for uploads. Avoids sending a large request body only to get a 4xx rejection.
 
