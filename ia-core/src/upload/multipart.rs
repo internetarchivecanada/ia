@@ -12,6 +12,7 @@ use super::retry::{send_with_retry, S3RetryCtx};
 use crate::error::{IaError, Result};
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
+use bytes::Bytes;
 
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
@@ -235,6 +236,7 @@ pub async fn upload_part(
     part_number: u32,
     body: Vec<u8>,
 ) -> Result<String> {
+    let body = Bytes::from(body);
     upload_part_with_retry(
         client,
         &S3RetryCtx {
@@ -256,16 +258,17 @@ pub async fn upload_part(
 
 /// Upload one part, retrying per the shared IA-S3 policy.
 ///
-/// The body is cloned per attempt because reqwest takes it by value. That is
-/// one extra copy of a part only when a retry actually happens; the
-/// alternative, re-reading the slice from disk each time, costs an I/O round
-/// trip on every attempt including the common single-attempt case.
+/// The body is a `Bytes` so that rebuilding the request on each attempt is a
+/// refcount bump, not a copy of the part. Holding the part across the backoff
+/// is deliberate: re-reading it from disk would cost an I/O round trip on
+/// every attempt, including the common single-attempt case, and the caller
+/// already has the buffer in hand.
 pub(crate) async fn upload_part_with_retry(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
     upload_id: &str,
     part_number: u32,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> Result<(String, u32)> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
@@ -694,33 +697,37 @@ pub async fn upload_file_multipart(
             total_bytes: file_size,
             progress: progress.clone(),
         };
-        let etag = match upload_part_with_retry(client, &ctx, &upload_id, part_num, data).await {
-            Ok((etag, attempts)) => {
-                // attempts counts the first try, so retries is one fewer.
-                total_retries += attempts.saturating_sub(1);
-                tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
-                etag
-            }
-            Err(e) => {
-                tracing::warn!(
-                    identifier,
-                    key,
-                    part_num,
-                    "multipart part failed, aborting upload"
-                );
-                if let Err(abort_err) = abort_upload(client, identifier, key, &upload_id).await {
+        let etag =
+            match upload_part_with_retry(client, &ctx, &upload_id, part_num, Bytes::from(data))
+                .await
+            {
+                Ok((etag, attempts)) => {
+                    // attempts counts the first try, so retries is one fewer.
+                    total_retries += attempts.saturating_sub(1);
+                    tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
+                    etag
+                }
+                Err(e) => {
                     tracing::warn!(
                         identifier,
                         key,
-                        %upload_id,
-                        error = %abort_err,
-                        "failed to abort multipart upload after part failure — \
-                         run `ia upload cleanup` to clean up orphaned uploads"
+                        part_num,
+                        "multipart part failed, aborting upload"
                     );
+                    if let Err(abort_err) = abort_upload(client, identifier, key, &upload_id).await
+                    {
+                        tracing::warn!(
+                            identifier,
+                            key,
+                            %upload_id,
+                            error = %abort_err,
+                            "failed to abort multipart upload after part failure — \
+                             run `ia upload cleanup` to clean up orphaned uploads"
+                        );
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
 
         completed_parts.push((part_num, etag));
     }

@@ -58,9 +58,10 @@ impl From<S3Failure> for IaError {
 
 /// Send an IA-S3 request, retrying per [`should_retry_s3`].
 ///
-/// `send` must build and send the request afresh on each call. Rebuilding is
-/// what lets a part PUT re-read its slice from disk per attempt instead of
-/// holding a 100 MiB buffer across the backoff.
+/// `send` must build and send the request afresh on each call, because a
+/// `reqwest::Request` is consumed by sending. Bodies should be cheap to
+/// clone: part PUTs pass a `Bytes`, so each attempt bumps a refcount rather
+/// than copying the part.
 ///
 /// Returns the first successful response, or the error from the final
 /// attempt. `context` names the operation for the error message, e.g.
