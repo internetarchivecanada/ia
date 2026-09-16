@@ -349,11 +349,8 @@ pub async fn upload_file(
                         None => format!("HTTP {status}: {}", strip_xml(&body_text)),
                     };
 
-                    // Only retry if the S3 error is classified as retryable
-                    let should_retry = s3_err.as_ref().map_or(
-                        status.is_server_error(), // fallback: retry 5xx
-                        |e| e.is_retryable(),
-                    );
+                    // Same policy as every other IA-S3 request.
+                    let should_retry = crate::upload::s3_error::should_retry_s3(status, &body_text);
 
                     if should_retry && retries < opts.retries {
                         tracing::debug!(

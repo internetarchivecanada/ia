@@ -105,10 +105,10 @@ pub struct IaClient {
 Key improvements over Python:
 - **Keep-alive by default** (Python sets `Connection: close`)
 - **Connection pooling** via reqwest's built-in pool
-- **HTTP-level retry** via `reqwest-middleware` + `reqwest-retry` for 5xx on idempotent requests. Metadata writes and task submission retry connect failures only: a 5xx can arrive after the server applied the change, so replaying it would apply the change twice
+- **HTTP-level retry** via `reqwest-middleware` + `reqwest-retry` for 5xx on idempotent requests. Metadata writes and task submission (and rerun) retry connect failures only: a 5xx can arrive after the server applied the change, so replaying it would apply the change twice
 - **`Retry-After` header respected** globally on all requests
 - **100-continue** for uploads (future) via hyper
-- **Application-level retry** via `backon` for S3 overload logic (future)
+- **Application-level retry** for IA-S3 in `upload::retry::send_with_retry`, used by every upload request: single-file PUT, multipart initiate, part PUT, complete, abort, and the two listings. It classifies on the S3 error code (`upload::s3_error::should_retry_s3`) rather than the HTTP status, because `503 SlowDown` means the request was refused. The upload transport carries no retry middleware, so nothing stacks on top of it
 
 ### URL Construction
 

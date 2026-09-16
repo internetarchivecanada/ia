@@ -255,15 +255,16 @@ impl IaClient {
             ))
             .build();
 
-        // Same middleware stack over the upload transport, for upload
-        // requests with cloneable bodies (multipart parts, S3 control
-        // calls) that want retry but must not have a read timeout.
+        // Upload transport: timing only, no retry layer.
+        //
+        // Every IA-S3 request retries through upload::retry::send_with_retry,
+        // which classifies on the S3 error <Code> rather than the HTTP
+        // status. Leaving the middleware here too would stack the two: a
+        // part PUT would get 4 middleware attempts inside each of `retries`
+        // application attempts, so `--retries 10` would mean 44 PUTs of a
+        // 100 MiB part, and UploadResult.retries would under-report by 4x.
         let upload_http = ClientBuilder::new(transports.upload)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
-                retry_policy,
-                LoggingRetryStrategy::new(stats.clone()),
-            ))
             .build();
 
         Ok(Self {

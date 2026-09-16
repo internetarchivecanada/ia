@@ -180,7 +180,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per file
+    /// Retry attempts per IA-S3 request (per part with --multipart)
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -307,7 +307,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per file
+    /// Retry attempts per IA-S3 request (per part with --multipart)
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
