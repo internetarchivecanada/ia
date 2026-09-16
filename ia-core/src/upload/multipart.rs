@@ -161,26 +161,16 @@ use super::{build_s3_item_url, build_s3_url};
 /// `x-archive-auto-make-bucket`, `x-archive-queue-derive`, and other
 /// item-creation headers to the initiate request. IA S3 only accepts
 /// metadata at item creation time, so these headers must be sent here.
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn initiate_upload(
     client: &IaClient,
     identifier: &str,
     key: &str,
     extra_headers: &[(String, String)],
 ) -> Result<String> {
-    initiate_upload_with_retry(
-        client,
-        &S3RetryCtx {
-            identifier,
-            key,
-            retries: 0,
-            retry_sleep: std::time::Duration::ZERO,
-            bytes_sent: 0,
-            total_bytes: 0,
-            progress: None,
-        },
-        extra_headers,
-    )
-    .await
+    initiate_upload_with_retry(client, &default_ctx(identifier, key), extra_headers).await
 }
 
 /// Begin a multipart upload, retrying per the shared IA-S3 policy.
@@ -228,6 +218,9 @@ pub(crate) async fn initiate_upload_with_retry(
 /// IA's S3 does not return an `ETag` header on part PUTs; its completion
 /// check compares the manifest entry against the part's MD5. When the header
 /// is absent, the quoted hex MD5 of the body is used instead.
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn upload_part(
     client: &IaClient,
     identifier: &str,
@@ -237,23 +230,13 @@ pub async fn upload_part(
     body: Vec<u8>,
 ) -> Result<String> {
     let body = Bytes::from(body);
-    upload_part_with_retry(
-        client,
-        &S3RetryCtx {
-            identifier,
-            key,
-            retries: 0,
-            retry_sleep: std::time::Duration::ZERO,
-            bytes_sent: 0,
-            total_bytes: body.len() as u64,
-            progress: None,
-        },
-        upload_id,
-        part_number,
-        body,
-    )
-    .await
-    .map(|(etag, _attempts)| etag)
+    let ctx = S3RetryCtx {
+        total_bytes: body.len() as u64,
+        ..default_ctx(identifier, key)
+    };
+    upload_part_with_retry(client, &ctx, upload_id, part_number, body)
+        .await
+        .map(|(etag, _attempts)| etag)
 }
 
 /// Upload one part, retrying per the shared IA-S3 policy.
@@ -308,6 +291,9 @@ pub(crate) async fn upload_part_with_retry(
 /// Complete a multipart upload by sending the manifest.
 ///
 /// `POST /{identifier}/{key}?uploadId={ID}` with XML body
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn complete_upload(
     client: &IaClient,
     identifier: &str,
@@ -318,15 +304,7 @@ pub async fn complete_upload(
 ) -> Result<()> {
     complete_upload_with_retry(
         client,
-        &S3RetryCtx {
-            identifier,
-            key,
-            retries: 0,
-            retry_sleep: std::time::Duration::ZERO,
-            bytes_sent: 0,
-            total_bytes: 0,
-            progress: None,
-        },
+        &default_ctx(identifier, key),
         upload_id,
         parts,
         keep_old_version,
@@ -408,7 +386,7 @@ pub async fn abort_upload(
         upload_id,
     );
 
-    let ctx = idempotent_ctx(identifier, key);
+    let ctx = default_ctx(identifier, key);
     send_with_retry(&ctx, "abort multipart", || {
         client
             .upload_http()
@@ -420,28 +398,31 @@ pub async fn abort_upload(
     Ok(())
 }
 
-/// Retry context for the idempotent S3 calls: abort, and the two listings.
+/// Retry context for S3 calls that have no caller-supplied budget: the
+/// public `initiate_upload`, `upload_part` and `complete_upload` wrappers,
+/// plus `abort_upload` and the two listings.
 ///
-/// They carry no progress of their own and need no special reasoning about
-/// replay, but they must not silently lose the retries they had while the
-/// middleware was doing it for them. `list_uploads` in particular is the
+/// These carry no progress of their own, but they must not silently lose the
+/// retries they had while the middleware was doing it for them. The public
+/// wrappers are consumed outside this workspace, where a signature that
+/// still compiles would otherwise hide the loss. `list_uploads` is the
 /// resume check, the first request of a multipart upload, so a transient
 /// 503 there would otherwise fail the whole transfer.
-fn idempotent_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
+fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
     S3RetryCtx {
         identifier,
         key,
-        retries: IDEMPOTENT_RETRIES,
-        retry_sleep: IDEMPOTENT_RETRY_SLEEP,
+        retries: DEFAULT_RETRIES,
+        retry_sleep: DEFAULT_RETRY_SLEEP,
         bytes_sent: 0,
         total_bytes: 0,
         progress: None,
     }
 }
 
-/// Matches what the retry middleware used to give these calls.
-const IDEMPOTENT_RETRIES: u32 = 3;
-const IDEMPOTENT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
+/// Matches the attempt count the retry middleware used to give these calls.
+const DEFAULT_RETRIES: u32 = 3;
+const DEFAULT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -453,7 +434,7 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let ctx = idempotent_ctx(identifier, "");
+    let ctx = default_ctx(identifier, "");
     let result = send_with_retry(&ctx, "list multipart uploads", || {
         client
             .upload_http()
@@ -498,7 +479,7 @@ pub async fn list_parts(
         upload_id,
     );
 
-    let ctx = idempotent_ctx(identifier, key);
+    let ctx = default_ctx(identifier, key);
     let sent = send_with_retry(&ctx, "list parts", || {
         client
             .upload_http()

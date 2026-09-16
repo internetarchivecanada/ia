@@ -73,6 +73,46 @@ async fn initiate_upload_403_fails() {
     assert!(result.is_err());
 }
 
+/// The public wrapper retries with the default budget. It used to get this
+/// from the middleware; with that layer gone, a wrapper built with
+/// `retries: 0` would compile unchanged for external callers and silently
+/// fail on IA's most common response.
+#[tokio::test]
+async fn public_initiate_upload_retries_a_throttle() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string(
+                "<Error><Code>SlowDown</Code><Message>Reduce rate</Message></Error>",
+            ),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>upload-id-2</UploadId>\
+             </InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let result = multipart::initiate_upload(&client, "test-item", "file.zip", &[]).await;
+
+    // Count first: if the unwrap below panics, wiremock only logs a missed
+    // `expect` instead of failing the test.
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(result.unwrap(), "upload-id-2");
+}
+
 // ── Upload Part ─────────────────────────────────────────────────────────
 
 #[tokio::test]
