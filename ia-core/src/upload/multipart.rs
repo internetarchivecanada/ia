@@ -170,7 +170,9 @@ pub async fn initiate_upload(
     key: &str,
     extra_headers: &[(String, String)],
 ) -> Result<String> {
-    initiate_upload_with_retry(client, &default_ctx(identifier, key), extra_headers).await
+    initiate_upload_with_retry(client, &default_ctx(identifier, key), extra_headers)
+        .await
+        .map(|(id, _attempts)| id)
 }
 
 /// Begin a multipart upload, retrying per the shared IA-S3 policy.
@@ -183,7 +185,7 @@ pub(crate) async fn initiate_upload_with_retry(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
     extra_headers: &[(String, String)],
-) -> Result<String> {
+) -> Result<(String, u32)> {
     let (access, secret) = client.require_auth()?;
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!("{}?uploads", build_s3_url(client, identifier, key));
@@ -201,14 +203,16 @@ pub(crate) async fn initiate_upload_with_retry(
     })
     .await?;
 
+    let attempts = sent.attempts;
     let body = sent.response.text().await.unwrap_or_default();
 
-    parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
+    let id = parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
         identifier: identifier.into(),
         key: key.into(),
         message: "initiate response missing UploadId".into(),
         status: None,
-    })
+    })?;
+    Ok((id, attempts))
 }
 
 /// Upload a single part. Returns the ETag for the completion manifest.
@@ -311,6 +315,7 @@ pub async fn complete_upload(
         None,
     )
     .await
+    .map(|_attempts| ())
 }
 
 /// Finish a multipart upload, retrying per the shared IA-S3 policy.
@@ -332,7 +337,7 @@ pub(crate) async fn complete_upload_with_retry(
     parts: &[(u32, String)],
     keep_old_version: bool,
     expected_size: Option<u64>,
-) -> Result<()> {
+) -> Result<u32> {
     let (access, secret) = client.require_auth()?;
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!(
@@ -357,7 +362,7 @@ pub(crate) async fn complete_upload_with_retry(
     .await;
 
     match result {
-        Ok(_) => Ok(()),
+        Ok(sent) => Ok(sent.attempts),
         // NoSuchUpload after a retry may mean an earlier attempt applied and
         // only its response was lost: a completed upload is no longer in
         // progress. The retry alone does not prove that, because every
@@ -373,7 +378,7 @@ pub(crate) async fn complete_upload_with_retry(
                     attempts = f.attempts,
                     "completion applied on an earlier attempt; object is present"
                 );
-                Ok(())
+                Ok(f.attempts)
             } else {
                 tracing::warn!(
                     identifier,
@@ -675,6 +680,9 @@ pub async fn upload_file_multipart(
         hdrs
     };
 
+    // Retries across every request of this upload, for UploadResult.
+    let mut total_retries = 0u32;
+
     let (upload_id, mut completed_parts) = match upload_id {
         Some(id) => {
             tracing::info!(
@@ -691,7 +699,9 @@ pub async fn upload_file_multipart(
             (id, parts)
         }
         None => {
-            let id = initiate_upload_with_retry(client, &control_ctx, &extra_headers).await?;
+            let (id, attempts) =
+                initiate_upload_with_retry(client, &control_ctx, &extra_headers).await?;
+            total_retries += attempts.saturating_sub(1);
             tracing::debug!(identifier, key, upload_id = %id, "initiated multipart upload");
             (id, Vec::new())
         }
@@ -699,7 +709,6 @@ pub async fn upload_file_multipart(
 
     // Compute part boundaries
     let part_count = file_size.div_ceil(part_size).max(1) as u32;
-    let mut total_retries = 0u32;
 
     // Upload each part
     for part_num in 1..=part_count {
@@ -786,7 +795,7 @@ pub async fn upload_file_multipart(
 
     // Complete the multipart upload
     let keep_old_version = !opts.no_backup;
-    complete_upload_with_retry(
+    let completion_attempts = complete_upload_with_retry(
         client,
         &control_ctx,
         &upload_id,
@@ -795,6 +804,7 @@ pub async fn upload_file_multipart(
         Some(file_size),
     )
     .await?;
+    total_retries += completion_attempts.saturating_sub(1);
 
     // Report completion
     if let Some(ref cb) = progress {
