@@ -225,7 +225,7 @@ pub(crate) fn ensure_cnt_zero(url: &str) -> String {
 /// "bytes 13-21/*"   -> None
 /// ```
 #[must_use]
-pub(crate) fn parse_content_range_total(value: &str) -> Option<u64> {
+fn parse_content_range_total(value: &str) -> Option<u64> {
     let (unit, range_and_total) = value.trim().split_once(' ')?;
     if !unit.eq_ignore_ascii_case("bytes") {
         return None;
@@ -240,10 +240,8 @@ pub(crate) fn parse_content_range_total(value: &str) -> Option<u64> {
 /// itself, so its own size is recorded before the final bytes exist and
 /// never matches what the server sends. Nothing else is exempt.
 #[must_use]
-pub(crate) fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
-    file_name.len() == identifier.len() + "_files.xml".len()
-        && file_name.starts_with(identifier)
-        && file_name.ends_with("_files.xml")
+fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
+    file_name.strip_prefix(identifier) == Some("_files.xml")
 }
 
 /// Fail before writing anything when a 206's `Content-Range` total disagrees
@@ -2826,6 +2824,126 @@ mod tests {
         assert_eq!(result.bytes, full_len);
         let got = std::fs::read(dir.path().join("data.bin")).unwrap();
         assert_eq!(got, full_body, "final file should contain full body");
+
+        server_handle.await.unwrap();
+    }
+
+    /// The Content-Range check must also cover the Range re-request that the
+    /// body-stream retry sends. wiremock always sets a correct Content-Length,
+    /// so the first response's mid-body drop needs the raw listener.
+    #[tokio::test]
+    async fn stream_retry_response_with_wrong_total_fails_permanently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let full_body: Vec<u8> = (0..32u8).collect();
+        let full_len = full_body.len() as u64;
+        let chopped_at: u64 = 12;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_body = full_body.clone();
+
+        let server_handle = tokio::spawn(async move {
+            async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+                let mut buf = vec![0u8; 4096];
+                let mut acc = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).to_string()
+            }
+
+            // Accept 1: promise 32 bytes, send 12, close.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-length: {full_len}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     accept-ranges: bytes\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream
+                    .write_all(&server_body[..chopped_at as usize])
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                drop(stream);
+            }
+
+            // Accept 2: the Range re-request. Answer 206 but claim the file
+            // is 40 bytes long, not 32. The client may hang up without
+            // reading the body, so write errors are ignored here.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut stream).await;
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains(&format!("range: bytes={chopped_at}-")),
+                    "expected Range header on retry, got:\n{req}"
+                );
+                let remainder = &server_body[chopped_at as usize..];
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     content-length: {}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     content-range: bytes {chopped_at}-{end}/40\r\n\
+                     connection: close\r\n\
+                     \r\n",
+                    remainder.len(),
+                    end = full_len - 1,
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(remainder).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", full_len);
+
+        let result = download_file(
+            &client,
+            "flaky-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 32);
+                assert_eq!(server_size, 40);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        // The first response's 12 bytes were flushed before the re-request;
+        // nothing from the second response was written.
+        let part = std::fs::read(dir.path().join("data.bin.part")).unwrap();
+        assert_eq!(part, &full_body[..chopped_at as usize]);
+        assert!(!dir.path().join("data.bin").exists());
 
         server_handle.await.unwrap();
     }
