@@ -1193,15 +1193,33 @@ async fn initiate_retries_on_slowdown_then_succeeds() {
     server.verify().await;
 }
 
+/// Mount a metadata response for test-item listing the given files.
+async fn mock_item_files(server: &MockServer, files: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": files
+        })))
+        .mount(server)
+        .await;
+}
+
 /// The completion applied and the response was lost. The retry gets
-/// NoSuchUpload, because a completed upload is no longer in progress. That
-/// is success, not failure: the alternative is reporting a finished upload
-/// as failed and re-uploading the whole file on the next run, since
-/// list_uploads cannot see a completed upload either.
+/// NoSuchUpload, because a completed upload is no longer in progress. A
+/// retry alone does not prove that: every retry trigger (a dropped
+/// connection, a 503 SlowDown) means the earlier attempt was NOT applied.
+/// So NoSuchUpload after a retry is success only when the item's metadata
+/// shows the object at the expected size.
 #[tokio::test]
-async fn complete_treats_no_such_upload_after_a_retry_as_success() {
+async fn complete_no_such_upload_after_a_retry_is_success_when_the_object_exists() {
     let server = MockServer::start().await;
     mock_resume_empty_and_initiate(&server, "mp-4").await;
+    mock_item_files(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "11", "md5": "5eb63bbbe01eeed093cb22bb8f5acdc3"}]),
+    )
+    .await;
 
     Mock::given(method("PUT"))
         .and(path("/test-item/data.bin"))
@@ -1246,9 +1264,78 @@ async fn complete_treats_no_such_upload_after_a_retry_as_success() {
         None,
     )
     .await
-    .expect("NoSuchUpload after a retry means the completion already landed");
+    .expect("NoSuchUpload after a retry, with the object present, is a completed upload");
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+/// Same sequence, but the object is not there: the upload id vanished for
+/// another reason (expired, or aborted by a concurrent `ia upload cleanup`).
+/// Reporting Uploaded here would be a lie, and with --delete-after-upload
+/// it would delete the only copy of a file that was never stored.
+#[tokio::test]
+async fn complete_no_such_upload_after_a_retry_fails_when_the_object_is_missing() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-4b").await;
+    mock_item_files(
+        &server,
+        serde_json::json!([{"name": "other.bin", "size": "3"}]),
+    )
+    .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4b"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4b"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let mut opts = fast_opts(3);
+    opts.delete_after_upload = true;
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("the object never landed, so this is a failure");
+    assert!(
+        err.to_string().contains("NoSuchUpload"),
+        "error should name the S3 code: {err}"
+    );
+    assert!(
+        f.path().exists(),
+        "--delete-after-upload must not delete a file that was never stored"
+    );
 }
 
 /// On the *first* attempt NoSuchUpload means what it says — an unknown or

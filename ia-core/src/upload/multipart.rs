@@ -308,6 +308,7 @@ pub async fn complete_upload(
         upload_id,
         parts,
         keep_old_version,
+        None,
     )
     .await
 }
@@ -330,6 +331,7 @@ pub(crate) async fn complete_upload_with_retry(
     upload_id: &str,
     parts: &[(u32, String)],
     keep_old_version: bool,
+    expected_size: Option<u64>,
 ) -> Result<()> {
     let (access, secret) = client.require_auth()?;
     let (identifier, key) = (ctx.identifier, ctx.key);
@@ -356,17 +358,57 @@ pub(crate) async fn complete_upload_with_retry(
 
     match result {
         Ok(_) => Ok(()),
+        // NoSuchUpload after a retry may mean an earlier attempt applied and
+        // only its response was lost: a completed upload is no longer in
+        // progress. The retry alone does not prove that, because every
+        // retry trigger (a dropped connection, a 503 SlowDown) means the
+        // earlier attempt was not applied. So ask the item whether the
+        // object is actually there before calling this a success.
         Err(f) if f.code.as_deref() == Some("NoSuchUpload") && f.attempts > 1 => {
-            tracing::debug!(
-                identifier,
-                key,
-                %upload_id,
-                attempts = f.attempts,
-                "completion already applied on an earlier attempt; treating NoSuchUpload as success"
-            );
-            Ok(())
+            if object_landed(client, identifier, key, expected_size).await {
+                tracing::debug!(
+                    identifier,
+                    key,
+                    %upload_id,
+                    attempts = f.attempts,
+                    "completion applied on an earlier attempt; object is present"
+                );
+                Ok(())
+            } else {
+                tracing::warn!(
+                    identifier,
+                    key,
+                    %upload_id,
+                    attempts = f.attempts,
+                    "upload id is gone and the object is not in the item; the upload did not complete"
+                );
+                Err(f.error)
+            }
         }
         Err(f) => Err(f.error),
+    }
+}
+
+/// Whether the item's metadata lists `key`, at `expected_size` when known.
+///
+/// Used only to disambiguate a `NoSuchUpload` after a retried completion.
+/// A metadata fetch failure counts as "not there": the caller then reports
+/// the completion as failed, which is the conservative outcome.
+async fn object_landed(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    expected_size: Option<u64>,
+) -> bool {
+    match client.get_item(identifier).await {
+        Ok(item) => item
+            .files
+            .iter()
+            .any(|f| f.name == key && expected_size.is_none_or(|want| f.size == Some(want))),
+        Err(e) => {
+            tracing::debug!(identifier, key, error = %e, "could not fetch item metadata to confirm completion");
+            false
+        }
     }
 }
 
@@ -726,6 +768,7 @@ pub async fn upload_file_multipart(
         &upload_id,
         &completed_parts,
         keep_old_version,
+        Some(file_size),
     )
     .await?;
 
