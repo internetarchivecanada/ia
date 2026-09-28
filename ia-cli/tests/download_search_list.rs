@@ -26,6 +26,10 @@ fn empty_config() -> NamedTempFile {
 }
 
 /// Standard metadata response for a test item with two files.
+///
+/// The sizes match the bodies the download tests serve ("fake pdf content"
+/// is 16 bytes, "fake metadata" is 13): a download whose byte count differs
+/// from the metadata size is a retryable failure, not a success.
 fn metadata_response() -> serde_json::Value {
     json!({
         "metadata": {
@@ -39,7 +43,7 @@ fn metadata_response() -> serde_json::Value {
                 "name": "test.pdf",
                 "source": "original",
                 "format": "Text PDF",
-                "size": "12345",
+                "size": "16",
                 "md5": "d41d8cd98f00b204e9800998ecf8427e",
                 "mtime": "1700000000"
             },
@@ -47,7 +51,7 @@ fn metadata_response() -> serde_json::Value {
                 "name": "test_meta.xml",
                 "source": "metadata",
                 "format": "Metadata",
-                "size": "500",
+                "size": "13",
                 "md5": "abc123",
                 "mtime": "1700000001"
             }
@@ -1063,13 +1067,13 @@ async fn download_single_destdir_creates_dir() {
     // Mock the file downloads
     Mock::given(method("GET"))
         .and(path("/download/test-item/test.pdf"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake pdf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake pdf content"))
         .mount(&mock_server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/download/test-item/test_meta.xml"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"<metadata/>"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake metadata"))
         .mount(&mock_server)
         .await;
 
