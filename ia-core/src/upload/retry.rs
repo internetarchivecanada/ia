@@ -13,9 +13,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use reqwest_retry::{default_on_request_failure, Retryable};
+
 use super::s3_error::{parse_s3_error, should_retry_s3, strip_xml};
 use super::types::{UploadProgress, UploadProgressStatus};
-use crate::error::IaError;
+use crate::error::{format_error_chain, IaError};
 
 /// What a retrying S3 call needs to know to report itself.
 pub(crate) struct S3RetryCtx<'a> {
@@ -82,14 +84,25 @@ where
         let response = match send().await {
             Ok(r) => r,
             Err(e) => {
-                // Transport-level failure. A connection that was never
-                // established never reached the server, so it is safe to
-                // replay; anything else surfaces.
-                let is_connect = matches!(
-                    &e,
-                    reqwest_middleware::Error::Reqwest(re) if re.is_connect()
-                );
-                if is_connect && attempt <= ctx.retries {
+                // Transport-level failure. Classified the way the retry
+                // middleware classified it before this loop replaced it:
+                // connect failures, timeouts, resets, and a connection
+                // closed before the response (hyper IncompleteMessage) are
+                // transient. Every request here is safe to replay: a part
+                // PUT overwrites the same part number, the listings and the
+                // abort are idempotent, and initiate/complete already accept
+                // this exposure for 5xx responses.
+                let transient =
+                    matches!(default_on_request_failure(&e), Some(Retryable::Transient));
+                let cause = format_error_chain(&e);
+                if transient && attempt <= ctx.retries {
+                    tracing::warn!(
+                        identifier = ctx.identifier,
+                        key = ctx.key,
+                        attempt,
+                        error = %cause,
+                        "transport error, retrying {context}"
+                    );
                     report_backoff(ctx);
                     tokio::time::sleep(ctx.retry_sleep).await;
                     continue;
@@ -98,7 +111,7 @@ where
                     error: IaError::UploadFailed {
                         identifier: ctx.identifier.into(),
                         key: ctx.key.into(),
-                        message: format!("{context}: {e}"),
+                        message: describe_attempts(&format!("{context}: {cause}"), attempt),
                         status: None,
                     },
                     code: None,
@@ -141,12 +154,23 @@ where
             error: IaError::UploadFailed {
                 identifier: ctx.identifier.into(),
                 key: ctx.key.into(),
-                message: format!("{context} failed: {detail}"),
+                message: describe_attempts(&format!("{context} failed: {detail}"), attempt),
                 status: Some(status.as_u16()),
             },
             code: parsed.map(|e| e.code),
             attempts: attempt,
         });
+    }
+}
+
+/// Append the attempt count to a final error message when there was more
+/// than one attempt, so the user can tell a first-try failure from an
+/// exhausted budget.
+fn describe_attempts(message: &str, attempts: u32) -> String {
+    if attempts > 1 {
+        format!("{message} (after {attempts} attempts)")
+    } else {
+        message.to_string()
     }
 }
 

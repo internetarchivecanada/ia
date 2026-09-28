@@ -1296,3 +1296,98 @@ async fn complete_surfaces_no_such_upload_on_the_first_attempt() {
         "a first-attempt NoSuchUpload is a real failure"
     );
 }
+
+// ── Transport-level failures ─────────────────────────────────────────────
+//
+// wiremock cannot close a socket mid-exchange, so these use a raw listener.
+
+/// A server that reads one full HTTP request from a connection.
+async fn read_full_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 8192];
+    let mut acc = Vec::new();
+    let mut body_len: Option<usize> = None;
+    let mut header_end: Option<usize> = None;
+    loop {
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        acc.extend_from_slice(&buf[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                let head = String::from_utf8_lossy(&acc[..pos]).to_ascii_lowercase();
+                body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok());
+            }
+        }
+        if let (Some(he), Some(bl)) = (header_end, body_len) {
+            if acc.len() >= he + bl {
+                break;
+            }
+        }
+    }
+    acc
+}
+
+fn tcp_client(port: u16) -> IaClient {
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = format!("127.0.0.1:{port}");
+    config.general.secure = false;
+    IaClient::from_config(config).unwrap()
+}
+
+/// A connection that closes after the request was written, before any
+/// response, is what a reset or a dropped keep-alive looks like to hyper
+/// (IncompleteMessage). The middleware this branch removed retried it; the
+/// shared policy must too, or one blip on one part aborts a whole upload.
+#[tokio::test]
+async fn part_put_retries_when_the_connection_closes_before_a_response() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        // Connection 1: read the whole PUT, then hang up without answering.
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_full_request(&mut stream).await;
+            assert!(
+                req.starts_with(b"PUT "),
+                "first request should be the part PUT"
+            );
+            drop(stream);
+        }
+        // Connection 2: the retry. Answer it properly.
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_full_request(&mut stream).await;
+            assert!(req.starts_with(b"PUT "), "retry should be the same PUT");
+            let resp = "HTTP/1.1 200 OK\r\netag: \"etag-retry\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    let client = tcp_client(port);
+    let etag = multipart::upload_part(
+        &client,
+        "test-item",
+        "data.bin",
+        "up-1",
+        1,
+        b"hello world".to_vec(),
+    )
+    .await
+    .expect("a closed connection is transient and must be retried");
+
+    assert_eq!(etag, "\"etag-retry\"");
+    server.await.unwrap();
+}
