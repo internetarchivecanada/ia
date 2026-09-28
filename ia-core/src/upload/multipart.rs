@@ -421,15 +421,23 @@ pub async fn abort_upload(
     key: &str,
     upload_id: &str,
 ) -> Result<()> {
+    abort_upload_with_ctx(client, &default_ctx(identifier, key), upload_id).await
+}
+
+/// Abort a multipart upload with the caller's retry budget.
+pub(crate) async fn abort_upload_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+) -> Result<()> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let ctx = default_ctx(identifier, key);
-    send_with_retry(&ctx, "abort multipart", || {
+    send_with_retry(ctx, "abort multipart", || {
         client
             .upload_http()
             .delete(&url)
@@ -440,16 +448,15 @@ pub async fn abort_upload(
     Ok(())
 }
 
-/// Retry context for S3 calls that have no caller-supplied budget: the
-/// public `initiate_upload`, `upload_part` and `complete_upload` wrappers,
-/// plus `abort_upload` and the two listings.
+/// Retry context for the public S3 wrappers, which take no caller-supplied
+/// budget: `initiate_upload`, `upload_part`, `complete_upload`,
+/// `abort_upload`, `list_uploads` and `list_parts`.
 ///
 /// These carry no progress of their own, but they must not silently lose the
-/// retries they had while the middleware was doing it for them. The public
-/// wrappers are consumed outside this workspace, where a signature that
-/// still compiles would otherwise hide the loss. `list_uploads` is the
-/// resume check, the first request of a multipart upload, so a transient
-/// 503 there would otherwise fail the whole transfer.
+/// retries they had while the middleware was doing it for them. The wrappers
+/// are consumed outside this workspace, where a signature that still
+/// compiles would otherwise hide the loss. Inside `upload_file_multipart`
+/// every call uses the caller's `--retries`/`--retry-sleep` instead.
 fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
     S3RetryCtx {
         identifier,
@@ -473,11 +480,19 @@ const DEFAULT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(
 /// Returns an empty list when the item does not exist yet (`NoSuchBucket`),
 /// so callers can fall through to a fresh initiate on a new item.
 pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<MultipartUploadInfo>> {
+    list_uploads_with_ctx(client, &default_ctx(identifier, "")).await
+}
+
+/// List in-progress uploads with the caller's retry budget.
+pub(crate) async fn list_uploads_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+) -> Result<Vec<MultipartUploadInfo>> {
+    let identifier = ctx.identifier;
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let ctx = default_ctx(identifier, "");
-    let result = send_with_retry(&ctx, "list multipart uploads", || {
+    let result = send_with_retry(ctx, "list multipart uploads", || {
         client
             .upload_http()
             .get(&url)
@@ -514,15 +529,23 @@ pub async fn list_parts(
     key: &str,
     upload_id: &str,
 ) -> Result<Vec<PartInfo>> {
+    list_parts_with_ctx(client, &default_ctx(identifier, key), upload_id).await
+}
+
+/// List completed parts with the caller's retry budget.
+pub(crate) async fn list_parts_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+) -> Result<Vec<PartInfo>> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let ctx = default_ctx(identifier, key);
-    let sent = send_with_retry(&ctx, "list parts", || {
+    let sent = send_with_retry(ctx, "list parts", || {
         client
             .upload_http()
             .get(&url)
@@ -617,7 +640,7 @@ pub async fn upload_file_multipart(
     }
 
     // Try to resume an existing upload
-    let (upload_id, existing_parts) = try_resume(client, identifier, key).await?;
+    let (upload_id, existing_parts) = try_resume(client, &control_ctx).await?;
 
     // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
     let extra_headers = {
@@ -737,7 +760,8 @@ pub async fn upload_file_multipart(
                         part_num,
                         "multipart part failed, aborting upload"
                     );
-                    if let Err(abort_err) = abort_upload(client, identifier, key, &upload_id).await
+                    if let Err(abort_err) =
+                        abort_upload_with_ctx(client, &control_ctx, &upload_id).await
                     {
                         tracing::warn!(
                             identifier,
@@ -816,18 +840,17 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
 /// If multiple uploads exist for the same key, returns the most recent one.
 async fn try_resume(
     client: &IaClient,
-    identifier: &str,
-    key: &str,
+    ctx: &S3RetryCtx<'_>,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
-    let uploads = list_uploads(client, identifier).await?;
+    let uploads = list_uploads_with_ctx(client, ctx).await?;
 
     // Find uploads matching this key, take the most recent
     // Take the last matching upload (most recent, S3 returns chronological order)
-    let matching = uploads.iter().rfind(|u| u.key == key);
+    let matching = uploads.iter().rfind(|u| u.key == ctx.key);
 
     match matching {
         Some(info) => {
-            let parts = list_parts(client, identifier, key, &info.upload_id).await?;
+            let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
             Ok((Some(info.upload_id.clone()), parts))
         }
         None => Ok((None, Vec::new())),
