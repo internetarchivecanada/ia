@@ -795,9 +795,14 @@ pub async fn upload_file_multipart(
 
     // Complete the multipart upload
     let keep_old_version = !opts.no_backup;
+    // Every byte has been sent by now; a backoff here must say so.
+    let completion_ctx = S3RetryCtx {
+        bytes_sent: file_size,
+        ..control_ctx
+    };
     let completion_attempts = complete_upload_with_retry(
         client,
-        &control_ctx,
+        &completion_ctx,
         &upload_id,
         &completed_parts,
         keep_old_version,

@@ -104,7 +104,7 @@ where
                         error = %cause,
                         "transport error, retrying {context}"
                     );
-                    report_backoff(ctx);
+                    report_backoff(ctx, UploadProgressStatus::Retrying);
                     tokio::time::sleep(ctx.retry_sleep).await;
                     continue;
                 }
@@ -153,7 +153,17 @@ where
                 %status,
                 "retrying {context}"
             );
-            report_backoff(ctx);
+            // A throttle (429, or IA's 503 SlowDown) is a rate-limit wait;
+            // anything else retryable is a plain retry. The progress bar
+            // shows different text for the two.
+            let throttled = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+            let phase = if throttled {
+                UploadProgressStatus::WaitingRateLimit
+            } else {
+                UploadProgressStatus::Retrying
+            };
+            report_backoff(ctx, phase);
             tokio::time::sleep(ctx.retry_sleep).await;
             continue;
         }
@@ -188,15 +198,16 @@ fn describe_attempts(message: &str, attempts: u32) -> String {
     }
 }
 
-/// Tell the caller's UI that the request is sleeping before another attempt.
-fn report_backoff(ctx: &S3RetryCtx<'_>) {
+/// Tell the caller's UI that the request is sleeping before another attempt,
+/// and why: `WaitingRateLimit` after a throttle, `Retrying` otherwise.
+fn report_backoff(ctx: &S3RetryCtx<'_>, status: UploadProgressStatus) {
     if let Some(ref cb) = ctx.progress {
         cb(UploadProgress {
             identifier: ctx.identifier.into(),
             key: ctx.key.into(),
             bytes_sent: ctx.bytes_sent,
             total_bytes: ctx.total_bytes,
-            status: UploadProgressStatus::WaitingRateLimit,
+            status,
         });
     }
 }
