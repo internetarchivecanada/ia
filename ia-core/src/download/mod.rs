@@ -716,7 +716,10 @@ pub async fn download_file(
             }
             bytes_downloaded += chunk.len() as u64;
 
-            // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
+            // Early exit for a grossly oversized body (10% over, min 1 KB)
+            // so a runaway response cannot fill the disk. Any smaller
+            // discrepancy is caught by the exact count check after the
+            // stream ends, which keeps .part instead of deleting it.
             if let Some(expected) = file.size {
                 let max_allowed = expected + (expected / 10).max(1024);
                 if bytes_downloaded > max_allowed {
@@ -749,6 +752,26 @@ pub async fn download_file(
 
     output.flush().await?;
     drop(output);
+
+    // The stream ended. Refuse to rename a file whose byte count differs
+    // from the item metadata. The .part file is deliberately kept: the error
+    // is retryable and the next attempt resumes it with Range. This runs
+    // before the md5 comparison because that path deletes .part.
+    if let Some(expected) = file.size {
+        if bytes_downloaded != expected && !is_size_unknowable(identifier, &file.name) {
+            warn!(
+                file = %file.name,
+                expected,
+                received = bytes_downloaded,
+                "byte count differs from item metadata; keeping .part for resume"
+            );
+            return Err(IaError::DownloadSizeMismatch {
+                file: file.name.clone(),
+                expected,
+                received: bytes_downloaded,
+            });
+        }
+    }
 
     // Post-download checksum comparison using the inline-computed hash.
     if let Some(hasher) = hasher {
@@ -1805,10 +1828,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_allows_slightly_oversized_response() {
+    async fn slightly_oversized_response_is_a_size_mismatch() {
         let mock_server = MockServer::start().await;
-        // File metadata says 100 bytes. Max = 100 + max(10, 1024) = 1124.
-        // Sending 105 bytes (5% over) should succeed.
+        // File metadata says 100 bytes. The mid-stream too-large abort only
+        // fires past 100 + max(10, 1024) = 1124, so 105 bytes stream to the
+        // end; the exact count check then refuses to rename it into place.
         let body = vec![b'Y'; 105];
 
         Mock::given(method("GET"))
@@ -1829,11 +1853,21 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(result.status, DownloadStatus::Complete);
-        assert_eq!(result.bytes, 105);
+        match result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(expected, 100);
+                assert_eq!(received, 105);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        // Unlike the gross-oversize abort, the bytes are kept for inspection
+        // and resume; nothing is renamed into place.
+        assert!(dir.path().join("normal.txt.part").exists());
+        assert!(!dir.path().join("normal.txt").exists());
     }
 
     #[test]
@@ -2010,10 +2044,16 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(result.status, DownloadStatus::Complete);
+        // The Range request was already sent before the symlink was noticed,
+        // so the 206 body (9 bytes) lands at offset 0 of a fresh .part. That
+        // is not the 23-byte file, and it must not be renamed into place.
+        assert!(
+            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(!dir.path().join("ranged.txt").exists());
 
         // The symlink target should NOT have been modified
         let target_content = std::fs::read_to_string(&target_file).unwrap();
@@ -3048,5 +3088,247 @@ mod tests {
 
         assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(result.bytes, 30);
+    }
+
+    // -- post-stream byte-count check (#12) --
+
+    /// Mount the two responses a short-then-resumed download sees: a 200
+    /// carrying only the first 20 of 32 bytes, and a 206 for the Range
+    /// request that follows with the remaining 12. wiremock tries mocks in
+    /// mount order, so the Range-only mock goes first.
+    async fn mount_short_then_range(mock_server: &MockServer, item: &str, name: &str) -> Vec<u8> {
+        use wiremock::matchers::header_exists;
+        let full: Vec<u8> = (0..32u8).collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/{name}")))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(full[20..].to_vec())
+                    .insert_header("Content-Range", "bytes 20-31/32"),
+            )
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full[..20].to_vec()))
+            .mount(mock_server)
+            .await;
+        full
+    }
+
+    #[tokio::test]
+    async fn short_body_keeps_part_and_returns_retryable_error() {
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(r) => panic!("expected an error, got {r:?}"),
+        };
+        assert!(
+            matches!(
+                err,
+                IaError::DownloadSizeMismatch {
+                    expected: 32,
+                    received: 20,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(err.is_retryable());
+        let part = std::fs::read(dir.path().join("disk.img.part")).unwrap();
+        assert_eq!(part, &full[..20]);
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    #[tokio::test]
+    async fn short_body_then_rerun_resumes_and_completes() {
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+        assert!(matches!(first, Err(IaError::DownloadSizeMismatch { .. })));
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.status, DownloadStatus::Complete);
+        assert_eq!(second.bytes, 32);
+        let got = std::fs::read(dir.path().join("disk.img")).unwrap();
+        assert_eq!(got, full);
+        assert!(!dir.path().join("disk.img.part").exists());
+
+        // Exactly two requests: the short 200 and one Range request.
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+        let range = requests[1]
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(range, "bytes=20-");
+    }
+
+    #[tokio::test]
+    async fn short_body_recovers_through_outer_retry_loop() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "short-item", "disk.img").await;
+
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("short-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("disk.img", 32)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries: 1,
+            ..Default::default()
+        };
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let result =
+            download_item_with_metadata(&client, "short-item", &item, &opts, semaphore, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        let got = std::fs::read(dir.path().join("short-item/disk.img")).unwrap();
+        assert_eq!(got, full);
+    }
+
+    #[tokio::test]
+    async fn short_body_with_checksum_keeps_part() {
+        let mock_server = MockServer::start().await;
+        mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // test_file_meta carries an md5 that cannot match 20 bytes of data.
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts {
+                checksum: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+
+        // The size check runs before the md5 check, which would have deleted
+        // the .part file.
+        assert!(
+            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(dir.path().join("disk.img.part").exists());
+    }
+
+    #[tokio::test]
+    async fn file_without_size_is_unaffected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/nosize.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'Z'; 20]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("nosize.bin", 0);
+        file.size = None;
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn files_xml_size_mismatch_is_ignored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test-item_files.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'<'; 20]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test-item_files.xml", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 20);
     }
 }
