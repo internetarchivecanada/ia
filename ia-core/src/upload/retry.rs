@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use reqwest_retry::{default_on_request_failure, Retryable};
 
+use super::check_limit::is_spam_response;
 use super::s3_error::{parse_s3_error, should_retry_s3, strip_xml};
 use super::types::{UploadProgress, UploadProgressStatus};
 use crate::error::{format_error_chain, IaError};
@@ -130,6 +131,19 @@ where
 
         // Consume the body once: it is needed both to classify and to report.
         let body = response.text().await.unwrap_or_default();
+
+        // IA's spam rejection is a plain-text 503 with no S3 <Code>. The
+        // status fallback would retry it for the whole budget; it is
+        // permanent, and the single-file path already treats it as such.
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && is_spam_response(&body) {
+            return Err(S3Failure {
+                error: IaError::SpamDetected {
+                    identifier: ctx.identifier.into(),
+                },
+                code: None,
+                attempts: attempt,
+            });
+        }
 
         if should_retry_s3(status, &body) && attempt <= ctx.retries {
             tracing::debug!(

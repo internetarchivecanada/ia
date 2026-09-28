@@ -1478,3 +1478,268 @@ async fn part_put_retries_when_the_connection_closes_before_a_response() {
     assert_eq!(etag, "\"etag-retry\"");
     server.await.unwrap();
 }
+
+// ── Shared-policy behaviours pinned after review ─────────────────────────
+
+/// IA's spam rejection is a plain-text 503 with no S3 <Code>. The status
+/// fallback would retry it as a transient 5xx for the whole budget; the
+/// single-file path returns SpamDetected at once, and so must this one.
+#[tokio::test]
+async fn initiate_spam_rejection_is_not_retried() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "<html><body>Your upload appears to be spam. Please contact info@archive.org.</body></html>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &retrying_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(5),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ia_core::IaError::SpamDetected { .. })),
+        "got {result:?}"
+    );
+    server.verify().await;
+}
+
+/// The resume check is the first request of every multipart upload. It must
+/// use the budget the user asked for, not a fixed one.
+#[tokio::test]
+async fn resume_check_uses_the_configured_retry_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .expect(6) // 1 initial + 5 retries
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &retrying_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(5),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(result.is_err());
+    server.verify().await;
+}
+
+/// Mount a mock that answers once with a 503 SlowDown, then a second mock
+/// that answers every later request with `ok`.
+async fn mock_slowdown_then(
+    server: &MockServer,
+    m: &str,
+    p: &str,
+    param: (&str, &str),
+    ok: ResponseTemplate,
+) {
+    Mock::given(method(m))
+        .and(path(p))
+        .and(query_param(param.0, param.1))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method(m))
+        .and(path(p))
+        .and(query_param(param.0, param.1))
+        .respond_with(ok)
+        .mount(server)
+        .await;
+}
+
+/// UploadResult.retries is what the joblog and --json report. With retry
+/// now application-level for every request, it must count the control
+/// calls too, not only the parts.
+#[tokio::test]
+async fn retries_counts_control_call_attempts() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploads", ""),
+        ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-6</UploadId></InitiateMultipartUploadResult>",
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploadId", "mp-6"),
+        ResponseTemplate::new(200),
+    )
+    .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &retrying_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(
+        result.retries, 2,
+        "one initiate retry plus one complete retry"
+    );
+}
+
+/// A backoff after a throttle is a rate-limit wait; a backoff after any
+/// other failure is a plain retry. The progress bar prints different text
+/// for the two, so the events must say which one happened, and the event
+/// for the completion call must carry the bytes actually sent.
+#[tokio::test]
+async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
+    use ia_core::upload::{UploadProgress, UploadProgressStatus};
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-7").await;
+
+    // Part: 500 InternalError once (retryable, not a throttle), then 200.
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string(
+                "<Error><Code>InternalError</Code><Message>oops</Message></Error>",
+            ),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+    // Complete: 503 SlowDown once (a throttle), then 200.
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploadId", "mp-7"),
+        ResponseTemplate::new(200),
+    )
+    .await;
+
+    let events: Arc<Mutex<Vec<UploadProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let progress: Arc<dyn Fn(UploadProgress) + Send + Sync> =
+        Arc::new(move |p| sink.lock().unwrap().push(p));
+
+    let f = temp_file(b"hello world");
+    multipart::upload_file_multipart(
+        &retrying_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        Some(progress),
+    )
+    .await
+    .unwrap();
+
+    let events = events.lock().unwrap();
+    let retrying: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.status, UploadProgressStatus::Retrying))
+        .collect();
+    let waiting: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.status, UploadProgressStatus::WaitingRateLimit))
+        .collect();
+    assert_eq!(
+        retrying.len(),
+        1,
+        "one Retrying for the InternalError: {events:#?}"
+    );
+    assert_eq!(retrying[0].bytes_sent, 0, "part 1 starts at offset 0");
+    assert_eq!(
+        waiting.len(),
+        1,
+        "one WaitingRateLimit for the SlowDown: {events:#?}"
+    );
+    assert_eq!(
+        waiting[0].bytes_sent, 11,
+        "completion backoff reports the whole file as sent"
+    );
+}
