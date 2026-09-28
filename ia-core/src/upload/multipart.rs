@@ -442,15 +442,30 @@ pub(crate) async fn abort_upload_with_ctx(
         upload_id,
     );
 
-    send_with_retry(ctx, "abort multipart", || {
+    let result = send_with_retry(ctx, "abort multipart", || {
         client
             .upload_http()
             .delete(&url)
             .header("Authorization", format!("LOW {access}:{secret}"))
             .send()
     })
-    .await?;
-    Ok(())
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        // Already gone (completed, expired, or aborted by another run). The
+        // caller wanted it gone; `ia upload cleanup --abort-all` must not
+        // stop at the first upload that no longer exists.
+        Err(f) if f.code.as_deref() == Some("NoSuchUpload") => {
+            tracing::debug!(
+                identifier = ctx.identifier,
+                key = ctx.key,
+                %upload_id,
+                "multipart upload already gone; nothing to abort"
+            );
+            Ok(())
+        }
+        Err(f) => Err(f.error),
+    }
 }
 
 /// Retry context for the public S3 wrappers, which take no caller-supplied

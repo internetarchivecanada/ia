@@ -17,6 +17,11 @@ fn temp_file(content: &[u8]) -> NamedTempFile {
 }
 
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
+///
+/// Built with `from_config`, the way production builds one, so every test
+/// here observes the real middleware stack. A client without middleware
+/// cannot tell whether a retry layer was stacked back onto the upload
+/// transport; a test asserting an attempt count would pass regardless.
 fn test_client(server: &MockServer) -> IaClient {
     let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
     let mut config = IaConfig::default();
@@ -24,7 +29,7 @@ fn test_client(server: &MockServer) -> IaClient {
     config.s3_secret = Some("test-secret".into());
     config.general.host = host_port;
     config.general.secure = false;
-    IaClient::from_config_no_retry(config).unwrap()
+    IaClient::from_config(config).unwrap()
 }
 
 // ── Initiate ────────────────────────────────────────────────────────────
@@ -1011,21 +1016,6 @@ async fn mock_resume_empty_and_initiate(server: &MockServer, upload_id: &str) {
         .await;
 }
 
-/// A client built the way production builds one, with middleware.
-///
-/// `test_client` uses `from_config_no_retry`, so it cannot observe anything
-/// the middleware does or does not do. Any test asserting an attempt *count*
-/// has to use this one or it passes no matter what the middleware is doing.
-fn retrying_client(server: &MockServer) -> IaClient {
-    let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
-    let mut config = IaConfig::default();
-    config.s3_access = Some("test-access".into());
-    config.s3_secret = Some("test-secret".into());
-    config.general.host = host_port;
-    config.general.secure = false;
-    IaClient::from_config(config).unwrap()
-}
-
 fn fast_opts(retries: u32) -> UploadOpts {
     UploadOpts {
         verify: false,
@@ -1104,7 +1094,7 @@ async fn part_retries_exactly_the_configured_budget() {
 
     let f = temp_file(b"hello world");
     let _ = multipart::upload_file_multipart(
-        &retrying_client(&server),
+        &test_client(&server),
         "test-item",
         f.path(),
         "data.bin",
@@ -1510,7 +1500,7 @@ async fn initiate_spam_rejection_is_not_retried() {
 
     let f = temp_file(b"hello world");
     let result = multipart::upload_file_multipart(
-        &retrying_client(&server),
+        &test_client(&server),
         "test-item",
         f.path(),
         "data.bin",
@@ -1549,7 +1539,7 @@ async fn resume_check_uses_the_configured_retry_budget() {
 
     let f = temp_file(b"hello world");
     let result = multipart::upload_file_multipart(
-        &retrying_client(&server),
+        &test_client(&server),
         "test-item",
         f.path(),
         "data.bin",
@@ -1636,7 +1626,7 @@ async fn retries_counts_control_call_attempts() {
 
     let f = temp_file(b"hello world");
     let result = multipart::upload_file_multipart(
-        &retrying_client(&server),
+        &test_client(&server),
         "test-item",
         f.path(),
         "data.bin",
@@ -1704,7 +1694,7 @@ async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
 
     let f = temp_file(b"hello world");
     multipart::upload_file_multipart(
-        &retrying_client(&server),
+        &test_client(&server),
         "test-item",
         f.path(),
         "data.bin",
@@ -1742,4 +1732,49 @@ async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
         waiting[0].bytes_sent, 11,
         "completion backoff reports the whole file as sent"
     );
+}
+
+// ── Abort ────────────────────────────────────────────────────────────────
+
+/// `ia upload cleanup --abort-all` aborts every listed upload in turn. One
+/// that vanished between the listing and the DELETE is not a failure, and
+/// must not stop the loop.
+#[tokio::test]
+async fn abort_of_a_vanished_upload_is_not_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    multipart::abort_upload(&test_client(&server), "test-item", "data.bin", "gone")
+        .await
+        .expect("an already-gone upload is already aborted");
+    server.verify().await;
+}
+
+/// The public abort wrapper keeps the default budget, so a throttle on the
+/// DELETE is retried.
+#[tokio::test]
+async fn abort_retries_a_throttle() {
+    let server = MockServer::start().await;
+    mock_slowdown_then(
+        &server,
+        "DELETE",
+        "/test-item/data.bin",
+        ("uploadId", "mp-8"),
+        ResponseTemplate::new(204),
+    )
+    .await;
+
+    multipart::abort_upload(&test_client(&server), "test-item", "data.bin", "mp-8")
+        .await
+        .expect("a throttled abort retries and succeeds");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
 }
