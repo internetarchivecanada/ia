@@ -59,9 +59,10 @@ impl S3Error {
 
 /// Whether an IA-S3 response should be retried.
 ///
-/// The single source of truth for every upload request: single-file PUTs,
-/// multipart part PUTs, and the multipart control calls. They are the same
-/// protocol against the same endpoint, so they get the same policy.
+/// The single classifier for every upload request: the single-file PUT loop
+/// in `upload::single` and the multipart loop in `upload::retry` both decide
+/// with this. They are the same protocol against the same endpoint, so they
+/// get the same policy.
 ///
 /// Decided on the S3 error `<Code>` when the body is a parseable S3 error,
 /// because the code says what actually happened and the status does not. IA

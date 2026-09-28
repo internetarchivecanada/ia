@@ -1,14 +1,18 @@
-//! The retry policy for IA-S3 requests.
+//! The retry policy for IA-S3 multipart requests.
 //!
-//! Every upload request goes through [`send_with_retry`]: single-file PUTs,
-//! multipart part PUTs, and the multipart control calls. They speak the same
-//! protocol to the same endpoint, so they get one policy in one place rather
-//! than a copy per call site that drifts.
+//! Every multipart request goes through [`send_with_retry`]: initiate, part
+//! PUTs, complete, abort, and the two listings. They speak the same protocol
+//! to the same endpoint, so they get one policy in one place rather than a
+//! copy per call site that drifts. The single-file PUT in `upload::single`
+//! keeps its own loop, because its body streams from disk and cannot be
+//! rebuilt by a closure; it shares the classifier below.
 //!
-//! Retryability is decided by [`should_retry_s3`], which reads the S3 error
-//! `<Code>` rather than the HTTP status. IA returns 503 both for `SlowDown`
-//! (throttled, never applied, retry is right) and for real faults, so status
-//! alone cannot tell those apart.
+//! Retryability of a response is decided by [`should_retry_s3`], which reads
+//! the S3 error `<Code>` rather than the HTTP status. IA returns 503 both for
+//! `SlowDown` (throttled, never applied, retry is right) and for real faults,
+//! so status alone cannot tell those apart. Transport failures are classified
+//! the way the retry middleware classified them: connect errors, timeouts,
+//! resets, and a connection closed before the response are transient.
 
 use std::future::Future;
 use std::sync::Arc;
