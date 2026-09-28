@@ -33,7 +33,22 @@ pub(crate) struct S3RetryCtx<'a> {
     pub progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 }
 
+impl std::fmt::Debug for S3RetryCtx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3RetryCtx")
+            .field("identifier", &self.identifier)
+            .field("key", &self.key)
+            .field("retries", &self.retries)
+            .field("retry_sleep", &self.retry_sleep)
+            .field("bytes_sent", &self.bytes_sent)
+            .field("total_bytes", &self.total_bytes)
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
+}
+
 /// Outcome of a retrying S3 request.
+#[derive(Debug)]
 pub(crate) struct S3Response {
     pub response: reqwest::Response,
     /// Attempts made, counting the first. 1 means it succeeded immediately.
@@ -43,8 +58,9 @@ pub(crate) struct S3Response {
 /// A request that ran out of attempts or hit a non-retryable condition.
 ///
 /// Carries the S3 error `<Code>` and the attempt count so callers can act on
-/// the specific failure. `complete_upload` needs both: `NoSuchUpload` means
-/// "already completed" only if we know a previous attempt was sent.
+/// the specific failure. `complete_upload` needs both: `NoSuchUpload` after a
+/// retry is worth checking against the item, on the first attempt it is not.
+#[derive(Debug)]
 pub(crate) struct S3Failure {
     pub error: IaError,
     /// S3 error `<Code>`, when the body was a parseable S3 error.
