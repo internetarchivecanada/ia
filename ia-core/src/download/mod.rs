@@ -212,6 +212,40 @@ pub(crate) fn ensure_cnt_zero(url: &str) -> String {
     format!("{url}{sep}cnt=0")
 }
 
+/// Extract the complete length from a `Content-Range` header value.
+///
+/// Accepts the two forms RFC 9110 allows for the `bytes` unit,
+/// `bytes <first>-<last>/<complete-length>` and `bytes */<complete-length>`,
+/// and returns `None` when the complete length is `*` (the server does not
+/// know it), when the unit is not `bytes`, or when the value does not parse.
+///
+/// ```text
+/// "bytes 13-21/22"  -> Some(22)
+/// "bytes */22"      -> Some(22)
+/// "bytes 13-21/*"   -> None
+/// ```
+#[must_use]
+pub(crate) fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (unit, range_and_total) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (_range, total) = range_and_total.trim().rsplit_once('/')?;
+    total.trim().parse().ok()
+}
+
+/// Whether a file's metadata `size` cannot be trusted by construction.
+///
+/// `{identifier}_files.xml` lists every file in the item, including
+/// itself, so its own size is recorded before the final bytes exist and
+/// never matches what the server sends. Nothing else is exempt.
+#[must_use]
+pub(crate) fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
+    file_name.len() == identifier.len() + "_files.xml".len()
+        && file_name.starts_with(identifier)
+        && file_name.ends_with("_files.xml")
+}
+
 /// Fetch a response from archive.org with auth, manual redirect following, and SSRF guard.
 ///
 /// Handles:
@@ -2822,5 +2856,51 @@ mod tests {
             .await
             .expect("download with count_views=true should omit cnt entirely");
         assert_eq!(result.status, DownloadStatus::Complete);
+    }
+
+    // -- Content-Range parsing and the _files.xml exemption (#12) --
+
+    #[test]
+    fn content_range_total_parses_normal_form() {
+        assert_eq!(parse_content_range_total("bytes 13-21/22"), Some(22));
+        assert_eq!(parse_content_range_total("bytes 0-0/1"), Some(1));
+    }
+
+    #[test]
+    fn content_range_total_accepts_unsatisfied_range_form() {
+        assert_eq!(parse_content_range_total("bytes */22"), Some(22));
+    }
+
+    #[test]
+    fn content_range_total_is_none_when_server_does_not_know_it() {
+        assert_eq!(parse_content_range_total("bytes 13-21/*"), None);
+    }
+
+    #[test]
+    fn content_range_total_unit_is_case_insensitive() {
+        assert_eq!(parse_content_range_total("BYTES 13-21/22"), Some(22));
+        assert_eq!(parse_content_range_total("  bytes 13-21/22  "), Some(22));
+    }
+
+    #[test]
+    fn content_range_total_rejects_other_units_and_garbage() {
+        assert_eq!(parse_content_range_total("items 1-2/3"), None);
+        assert_eq!(parse_content_range_total("bytes 13-21"), None);
+        assert_eq!(parse_content_range_total(""), None);
+        assert_eq!(parse_content_range_total("bytes 1-2/abc"), None);
+        assert_eq!(parse_content_range_total("bytes 1-2/"), None);
+    }
+
+    #[test]
+    fn files_xml_size_is_unknowable() {
+        assert!(is_size_unknowable("abc", "abc_files.xml"));
+    }
+
+    #[test]
+    fn other_files_have_knowable_sizes() {
+        assert!(!is_size_unknowable("abc", "abc_meta.xml"));
+        assert!(!is_size_unknowable("abc", "other_files.xml"));
+        assert!(!is_size_unknowable("abc", "sub/abc_files.xml"));
+        assert!(!is_size_unknowable("abc", "abc_files.xml.bak"));
     }
 }
