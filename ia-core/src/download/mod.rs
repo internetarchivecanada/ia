@@ -1286,7 +1286,8 @@ mod tests {
         filetime::set_file_mtime(
             &file_path,
             filetime::FileTime::from_unix_time(mtime as i64, 0),
-        );
+        )
+        .unwrap();
 
         let file = FileMetadata {
             name: "existing.txt".to_string(),
