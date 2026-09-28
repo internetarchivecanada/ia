@@ -317,6 +317,21 @@ pub async fn upload_file(
                         });
                     }
 
+                    // A 503 carrying a non-retryable S3 code (AccessDenied,
+                    // InvalidAccessKeyId, ...) is a refusal, not a throttle.
+                    // Same classifier as every other IA-S3 request; polling
+                    // check_limit and re-sending the file would not help.
+                    if let Some(s3_err) = parse_s3_error(&body_text) {
+                        if !s3_err.is_retryable() {
+                            return Err(IaError::UploadFailed {
+                                identifier: identifier.to_string(),
+                                key: key.to_string(),
+                                message: format!("{}: {}", s3_err.code, s3_err.message),
+                                status: Some(503),
+                            });
+                        }
+                    }
+
                     // Rate limited: retry with check_limit polling
                     if retries >= opts.retries {
                         return Err(IaError::UploadFailed {
