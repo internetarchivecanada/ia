@@ -55,6 +55,10 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
+#### Partial files and the size check
+
+Each file streams to `<name>.part` and is renamed into place only when the number of bytes received equals the `size` in the item's metadata. If the stream ends short (or long), the `.part` file is kept and the attempt fails with `download_size_mismatch`; the next attempt, whether the built-in retry or a rerun of the command, sends a `Range` request and resumes from the bytes already on disk. If the server answers a `Range` request with a `Content-Range` total that differs from the metadata size, nothing is written and the file fails with `server_size_mismatch`; retrying cannot fix that, so the command moves on. Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final.
+
 #### Examples
 
 ```sh
