@@ -2,7 +2,7 @@ use crate::error::{format_error_chain, IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
 use crate::upload::checksum::compute_file_md5_async;
 use crate::upload::headers::encode_metadata_headers;
-use crate::upload::s3_error::{parse_s3_error, strip_xml};
+use crate::upload::s3_error::{describe_parsed, parse_s3_error, strip_xml};
 use crate::upload::types::*;
 use crate::IaClient;
 use std::path::Path;
@@ -326,7 +326,7 @@ pub async fn upload_file(
                             return Err(IaError::UploadFailed {
                                 identifier: identifier.to_string(),
                                 key: key.to_string(),
-                                message: format!("{}: {}", s3_err.code, s3_err.message),
+                                message: describe_parsed(status, Some(&s3_err), &body_text),
                                 status: Some(503),
                             });
                         }
@@ -358,11 +358,7 @@ pub async fn upload_file(
                     let body_text = resp.text().await.unwrap_or_default();
                     let s3_err = parse_s3_error(&body_text);
 
-                    // Build a clean error message from parsed XML or raw body
-                    let err_msg = match &s3_err {
-                        Some(e) => format!("{}: {}", e.code, e.message),
-                        None => format!("HTTP {status}: {}", strip_xml(&body_text)),
-                    };
+                    let err_msg = describe_parsed(status, s3_err.as_ref(), &body_text);
 
                     // Same policy as every other IA-S3 request.
                     let should_retry = crate::upload::s3_error::should_retry_s3(status, &body_text);

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use reqwest_retry::{default_on_request_failure, Retryable};
 
 use super::check_limit::is_spam_response;
-use super::s3_error::{parse_s3_error, should_retry_s3, strip_xml};
+use super::s3_error::{describe_parsed, parse_s3_error, should_retry_s3};
 use super::types::{UploadProgress, UploadProgressStatus};
 use crate::error::{format_error_chain, IaError};
 
@@ -185,10 +185,7 @@ where
         }
 
         let parsed = parse_s3_error(&body);
-        let detail = parsed
-            .as_ref()
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
+        let detail = describe_parsed(status, parsed.as_ref(), &body);
 
         return Err(S3Failure {
             error: IaError::UploadFailed {

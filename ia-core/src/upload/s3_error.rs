@@ -84,6 +84,30 @@ pub fn should_retry_s3(status: reqwest::StatusCode, body: &str) -> bool {
     }
 }
 
+/// The user-facing description of a failed IA-S3 response.
+///
+/// The S3 `<Code>` and `<Message>` when the body is an S3 error, otherwise
+/// the HTTP status and the body with its markup stripped. Every place that
+/// reports an S3 failure to the user builds its text here, so a 403
+/// AccessDenied reads the same whichever request hit it.
+#[must_use]
+pub fn describe_s3_failure(status: reqwest::StatusCode, body: &str) -> String {
+    describe_parsed(status, parse_s3_error(body).as_ref(), body)
+}
+
+/// [`describe_s3_failure`] for a caller that has already parsed the body.
+#[must_use]
+pub(crate) fn describe_parsed(
+    status: reqwest::StatusCode,
+    parsed: Option<&S3Error>,
+    body: &str,
+) -> String {
+    match parsed {
+        Some(e) => format!("{}: {}", e.code, e.message),
+        None => format!("HTTP {status}: {}", strip_xml(body)),
+    }
+}
+
 /// Strip XML/HTML tags and collapse whitespace so raw S3 response bodies
 /// don't leak through to user-facing error messages.
 ///
@@ -115,6 +139,26 @@ pub fn strip_xml(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_uses_code_and_message_for_s3_errors() {
+        let body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        assert_eq!(
+            describe_s3_failure(reqwest::StatusCode::FORBIDDEN, body),
+            "AccessDenied: Access Denied"
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_status_and_stripped_body() {
+        assert_eq!(
+            describe_s3_failure(
+                reqwest::StatusCode::BAD_GATEWAY,
+                "<html>Bad <b>Gateway</b></html>"
+            ),
+            "HTTP 502 Bad Gateway: Bad Gateway"
+        );
+    }
 
     #[test]
     fn parse_access_denied() {
