@@ -48,12 +48,12 @@ Closes #11: a slow-trickling datanode can hang a download indefinitely.
 
 **Files:** `ia-core/src/error.rs`
 
-- [ ] **Step 1: Failing tests** in the `tests` module of `error.rs`:
+- [x] **Step 1: Failing tests** in the `tests` module of `error.rs`:
   - `download_stalled_is_not_retryable`
   - `download_stalled_displays_details`: the message names the file, the observed rate, the floor, and the number of re-requests.
   - `json_download_stalled`: code `download_stalled`; `file`, `observed_bytes_per_sec`, `min_bytes_per_sec`, `stalls` in the JSON.
-- [ ] **Step 2: Run** `cargo test -p ia-core download_stalled`; compile failure.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run** `cargo test -p ia-core download_stalled`; compile failure.
+- [x] **Step 3: Implement.**
   ```rust
   /// The stream stayed below the `--min-speed` floor for the whole window
   /// `stalls` times in a row, so the stall budget (`--retries`) is spent.
@@ -62,7 +62,7 @@ Closes #11: a slow-trickling datanode can hang a download indefinitely.
   DownloadStalled { file: String, observed_bytes_per_sec: u64, min_bytes_per_sec: u64, window_secs: u64, stalls: usize },
   ```
   `is_retryable` false, with a comment: the budget was the retries.
-- [ ] **Step 4: Run**; green. Commit: `feat(core): add the DownloadStalled error for spent stall budgets`.
+- [x] **Step 4: Run**; green. Commit: `feat(core): add the DownloadStalled error for spent stall budgets`.
 
 ### Task 2: `StallDetector`
 
@@ -91,7 +91,7 @@ impl StallDetector {
 }
 ```
 
-- [ ] **Step 1: Failing unit tests** in `stall.rs` (clock is `start + Duration`, no runtime needed):
+- [x] **Step 1: Failing unit tests** in `stall.rs` (clock is `start + Duration`, no runtime needed):
   - `no_check_during_grace`: 0 bytes, `check` at 29 s → `None`.
   - `silent_stream_stalls_at_end_of_grace`: 0 bytes, `check` at 30 s → `Some(0)`.
   - `steady_stream_above_floor_never_stalls`: 20 KiB every second for 120 s, floor 10 KiB → `None` at every second.
@@ -101,15 +101,15 @@ impl StallDetector {
   - `fast_then_slow_stalls_when_the_window_average_drops`: 100 KiB/s for 60 s, then 1 KiB/s; stalls at the second the window average first falls below 10 KiB/s (compute the expected second in the test).
   - `gap_longer_than_window_clears_every_bucket`: 1 MiB at t=1, `record` 1 byte at t=200, `check` at 200 → `Some(0)`.
   - `observed_rate_is_reported`: 5 KiB/s for 40 s, `check` at 40 s → `Some(5120)`.
-- [ ] **Step 2: Run** `cargo test -p ia-core stall::`; compile failure.
-- [ ] **Step 3: Implement** with `roll_to(second)` zeroing skipped buckets (all of them when the gap is ≥ 60), `sum / span_secs` where `span_secs = min(elapsed_secs, 60).max(1)`.
-- [ ] **Step 4: Run**; green. Commit: `feat(core): add a sliding-window stall detector for download streams`.
+- [x] **Step 2: Run** `cargo test -p ia-core stall::`; compile failure.
+- [x] **Step 3: Implement** with `roll_to(second)` zeroing skipped buckets (all of them when the gap is ≥ 60), `sum / span_secs` where `span_secs = min(elapsed_secs, 60).max(1)`.
+- [x] **Step 4: Run**; green. Commit: `feat(core): add a sliding-window stall detector for download streams`.
 
 ### Task 3: wire the detector into `download_file`
 
 **Files:** `ia-core/src/download/mod.rs`
 
-- [ ] **Step 1: Failing tests.** Raw-TCP servers under `#[tokio::test]` with `PolicyOverride` (window 2 s, grace 1 s, one byte every 250 ms for a drip), modelled on `stream_error_retries_with_range_and_completes`. A scripted server (`spawn_script_server`) serves one handler per connection and fails if an extra connection arrives. `DownloadOpts { min_speed: 10 * 1024, retries: 5, .. }` unless stated.
+- [x] **Step 1: Failing tests.** Raw-TCP servers under `#[tokio::test]` with `PolicyOverride` (window 2 s, grace 1 s, one byte every 250 ms for a drip), modelled on `stream_error_retries_with_range_and_completes`. A scripted server (`spawn_script_server`) serves one handler per connection and fails if an extra connection arrives. `DownloadOpts { min_speed: 10 * 1024, retries: 5, .. }` unless stated.
   - `drip_feed_stalls_then_resumes_with_range`: the first connection sends headers for a 64 KiB file, then 1 byte every 5 s. At 30 s the detector fires (6 bytes / 30 s). The second connection must carry `Range: bytes=6-` and serves the remaining bytes at once. Result `Complete`, final file equals the 64 KiB body, exactly two connections.
   - `silent_stream_stalls_at_the_end_of_grace`: headers then nothing. The `select!` ticker, not a chunk, must trigger the check; the second connection (`Range: bytes=0-`) completes the file. Assert the first connection was abandoned at about 30 s of virtual time (the server records `Instant::now()` when its socket closes), well before the 60 s `READ_TIMEOUT`.
   - `stall_budget_is_separate_from_stream_error_budget`: `retries: 1`. Connection 1 drips (stall 1 of 1), connection 2 drops mid-body (stream error 1 of 3), connection 3 completes. `Complete`; three connections. Shows a stall does not consume a stream-error retry and vice versa.
@@ -118,8 +118,8 @@ impl StallDetector {
   - `grace_restarts_on_each_stream`: connection 1 drips and stalls at 30 s; connection 2 sends nothing for 25 s then the whole body. `Complete`, two connections: the second stream was not judged by the first stream's clock.
   - `stall_keeps_rolling_md5_correct`: `checksum: true` with the real md5; drip then resume; `Complete` and the final file verifies (the hasher is not reset by the re-request).
   - Through the outer loop: `download_item_with_metadata` with `retries: 1` and a server that always drips → `files_failed == 1` and exactly two connections. The permanent error is not retried from the top.
-- [ ] **Step 2: Run**; fail (today every drip test hangs; give them a `tokio::time::timeout` of 10 virtual minutes so a hang is a failure, not a stuck suite).
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run**; fail (today every drip test hangs; give them a `tokio::time::timeout` of 10 virtual minutes so a hang is a failure, not a stuck suite).
+- [x] **Step 3: Implement.**
   - `pub min_speed: u64` on `DownloadOpts` with a doc comment stating the rule, the units, the fixed window and grace, and `0` disables. Default `10 * 1024`.
   - In `download_file`, before `'stream_retry`: `let mut stall_attempt = 0usize;`. At the top of each `'stream_retry` iteration: `let mut detector = (opts.min_speed > 0).then(|| StallDetector::new(opts.min_speed, Instant::now()));` and `let mut ticker = tokio::time::interval(Duration::from_secs(1));` with `MissedTickBehavior::Delay`.
   - The inner loop becomes a `select!`:
@@ -140,18 +140,18 @@ impl StallDetector {
     ```
     `stream.next()` is cancel-safe, so a tick that loses the race drops nothing.
   - After the loop: `Done` → `break 'stream_retry`. `Error` → the existing budget check and backoff (`MAX_STREAM_RETRIES`, `Network` on exhaustion). `Stalled` → `if stall_attempt >= opts.retries { drop(output); return Err(DownloadStalled {..}) }`, else `stall_attempt += 1`, `warn!` with the observed rate, floor, attempt and budget. Both then fall into one shared re-request tail: flush, `fetch_response` with `Range`, the 416 handling, `check_content_range`, the 200-on-resume `ResumeFailed`, `response = new_resp; continue 'stream_retry`.
-- [ ] **Step 4: Run** `cargo test -p ia-core -p ia-cli`; green. Commit: `fix(download): abandon and resume a stream that stays below --min-speed`.
+- [x] **Step 4: Run** `cargo test -p ia-core -p ia-cli`; green. Commit: `fix(download): abandon and resume a stream that stays below --min-speed`.
 
 ### Task 4: the `--min-speed` flag and help text
 
 **Files:** `ia-cli/src/commands/download.rs`, `ia-cli/tests/cli.rs`
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - Unit tests for `parse_rate` in `download.rs`: `"10K"` → 10240, `"1M"` → 1048576, `"1G"` → 1073741824, `"500"` → 500, `"0"` → 0, `"10k"` → 10240 (case-insensitive), `"10KB"`, `"1.5M"`, `"abc"`, `""`, `"-1"` → `Err` whose message names the accepted forms.
   - `download_help_describes_min_speed` in `tests/cli.rs`: `ia download --help` contains `--min-speed`, `10K`, `60`, `30`, and `0 disables`.
   - `download_rejects_bad_min_speed`: `ia download x --min-speed 10KB` exits 2 with the usage error.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.**
+- [x] **Step 2: Run**; fail.
+- [x] **Step 3: Implement.**
   ```rust
   /// Abandon and resume a stream slower than this (10K, 1M, bytes; 0 disables)
   ///
@@ -161,15 +161,18 @@ impl StallDetector {
   min_speed: u64,
   ```
   A paragraph in `long_about` on stall detection and resume; an example `ia download nasa --min-speed 0` and `ia download nasa --min-speed 1M` in `after_long_help`. Pass `min_speed: args.min_speed` in `make_opts`.
-- [ ] **Step 4: Run**; green. Commit: `feat(cli): add --min-speed and describe stall detection in download --help`.
+- [x] **Step 4: Run**; green. Commit: `feat(cli): add --min-speed and describe stall detection in download --help`.
 
 ### Task 5: docs
 
 **Files:** `docs/usage.md`
 
-- [ ] Flag table row: `` `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s (default: `10K`; `0` disables) ``.
-- [ ] New subsection "Slow and stalled downloads" after "Partial files and the size check": the rule (floor, window, grace, timer), what a stall does (flush, `Range` re-request, no bytes lost, the md5 keeps rolling), the budget (`--retries`, separate from the three body-stream retries), the failure (`download of <name> stalled N times: ...`, `.part` kept, code `download_stalled` in `--json`), the units, `0` to disable, and the relation to the 60 s read timeout.
-- [ ] Commit: `docs: describe --min-speed and stall detection`.
+- [x] Flag table row: `` `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s (default: `10K`; `0` disables) ``.
+- [x] New subsection "Slow and stalled downloads" after "Partial files and the size check": the rule (floor, window, grace, timer), what a stall does (flush, `Range` re-request, no bytes lost, the md5 keeps rolling), the budget (`--retries`, separate from the three body-stream retries), the failure (`download of <name> stalled N times: ...`, `.part` kept, code `download_stalled` in `--json`), the units, `0` to disable, and the relation to the 60 s read timeout.
+- [x] Commit: `docs: describe --min-speed and stall detection`.
+
+
+**Found while doing Task 4:** the one-line doc comment on `Commands::Download` in `ia-cli/src/lib.rs` became `about` and cleared the struct's `long_about` (clap derive does this for a summary-only doc), so no `long_about` had ever rendered for `ia download --help`. The about now lives on `DownloadArgs` beside `long_about` and the variant has no doc comment; `download_long_help_shows_long_about` pins it. Every other subcommand with a `long_about` in `ia-cli/src/commands/*.rs` has the same problem. Left for the docs audit (#17).
 
 ### Task 6: verification and review
 

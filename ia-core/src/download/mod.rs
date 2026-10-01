@@ -140,14 +140,13 @@ pub struct DownloadOpts {
     /// Minimum throughput in bytes per second before a stream is judged
     /// stalled; `0` disables the check.
     ///
-    /// Once a stream is [`stall::GRACE`] (30 s) old, its average over the
-    /// last [`stall::WINDOW`] (60 s), or over its whole life while younger
-    /// than that, is compared with this floor once a second. Below it, the
+    /// Once a stream is 30 s old, its average over the last 60 s, or over
+    /// its whole life while younger than that, is compared with this floor
+    /// once a second. Below it, the
     /// stream is abandoned and the file re-requested with `Range` from the
     /// bytes already on disk, exactly as a body-stream error is handled.
     /// Stalls have their own budget, capped at [`retries`](Self::retries);
-    /// when it is spent the file fails with
-    /// [`IaError::DownloadStalled`](crate::error::IaError::DownloadStalled).
+    /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
 }
