@@ -175,7 +175,8 @@ pub async fn upload_file(
         // check_limit until the rate limit clears; otherwise just back off.
         if retries > 0 {
             if last_was_503 {
-                if let Some(wait) = retry_after {
+                if retry_after.is_some() {
+                    let wait = super::retry::wait_before_retry(retry_after, &backoff, retries - 1);
                     tracing::debug!(
                         identifier,
                         key,
@@ -207,8 +208,7 @@ pub async fn upload_file(
                         status: UploadProgressStatus::Retrying,
                     });
                 }
-                let wait = retry_after
-                    .unwrap_or_else(|| super::retry::backoff_wait(&backoff, retries - 1));
+                let wait = super::retry::wait_before_retry(retry_after, &backoff, retries - 1);
                 tokio::time::sleep(wait).await;
             }
         }
@@ -335,7 +335,7 @@ pub async fn upload_file(
                         retries,
                     });
                 } else if status.as_u16() == 503 {
-                    retry_after = super::retry::retry_after_wait(resp.headers(), &backoff);
+                    retry_after = super::retry::retry_after_wait(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
 
                     // Spam detection: permanent, no retry
@@ -383,7 +383,7 @@ pub async fn upload_file(
                     continue;
                 } else {
                     // Non-503 error — parse S3 XML to classify
-                    retry_after = super::retry::retry_after_wait(resp.headers(), &backoff);
+                    retry_after = super::retry::retry_after_wait(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
                     let s3_err = parse_s3_error(&body_text);
 

@@ -77,23 +77,37 @@ pub(crate) fn backoff_wait(
 }
 
 /// The server's own instruction on how long to wait, if the failed response
-/// carried a `Retry-After` header (seconds, or an HTTP date). It is honored
-/// as given: `Retry-After: 0` means re-send at once, and a value above the
-/// schedule's cap is still waited out in full, with a warning so it shows
-/// up in `--log`.
+/// carried a `Retry-After` header (seconds, or an HTTP date). A pure read:
+/// whether the wait is taken is the caller's decision, made after the
+/// response is classified.
 pub(crate) fn retry_after_wait(
     headers: &reqwest::header::HeaderMap,
-    policy: &ExponentialBackoff,
 ) -> Option<std::time::Duration> {
-    let wait = std::time::Duration::from_secs(crate::retry::extract_retry_after(headers)?);
-    if wait > policy.max_retry_interval {
-        tracing::warn!(
-            retry_after_s = wait.as_secs(),
-            cap_s = policy.max_retry_interval.as_secs(),
-            "server asked for a Retry-After above the backoff cap; honoring it as given"
-        );
+    crate::retry::extract_retry_after(headers).map(std::time::Duration::from_secs)
+}
+
+/// The wait before a retry: the server's `Retry-After` when it gave one,
+/// honored as given (`0` means re-send at once; a value above the
+/// schedule's cap is still waited out in full, with a warning so it shows
+/// up in `--log`), otherwise the schedule's draw for this retry.
+pub(crate) fn wait_before_retry(
+    retry_after: Option<std::time::Duration>,
+    policy: &ExponentialBackoff,
+    n_past_retries: u32,
+) -> std::time::Duration {
+    match retry_after {
+        Some(wait) => {
+            if wait > policy.max_retry_interval {
+                tracing::warn!(
+                    retry_after_s = wait.as_secs(),
+                    cap_s = policy.max_retry_interval.as_secs(),
+                    "server asked for a Retry-After above the backoff cap; honoring it as given"
+                );
+            }
+            wait
+        }
+        None => backoff_wait(policy, n_past_retries),
     }
-    Some(wait)
 }
 
 /// What a retrying S3 call needs to know to report itself.
@@ -229,7 +243,7 @@ where
 
         // The server's own instruction on how long to wait, if it gave one.
         // Read before the body is consumed; it overrides the schedule.
-        let retry_after = retry_after_wait(response.headers(), &ctx.backoff);
+        let retry_after = retry_after_wait(response.headers());
         // Consume the body once: it is needed both to classify and to report.
         let body = response.text().await.unwrap_or_default();
 
@@ -247,7 +261,7 @@ where
         }
 
         if should_retry_s3(status, &body) && attempt <= ctx.retries {
-            let wait = retry_after.unwrap_or_else(|| backoff_wait(&ctx.backoff, attempt - 1));
+            let wait = wait_before_retry(retry_after, &ctx.backoff, attempt - 1);
             tracing::debug!(
                 identifier = ctx.identifier,
                 key = ctx.key,

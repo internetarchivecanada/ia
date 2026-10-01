@@ -1540,18 +1540,16 @@ async fn upload_503_retry_honors_retry_after() {
 
 // -- Review findings on the backoff PR: Retry-After corners --
 
-/// Collect every progress event with the moment it arrived, so a test can
-/// say not only that an event was emitted but when.
-fn timed_progress() -> (
+/// Collect every progress event, so a test can say which status was
+/// reported for which key.
+fn collect_progress() -> (
     Arc<dyn Fn(upload::UploadProgress) + Send + Sync>,
-    Arc<Mutex<Vec<(upload::UploadProgressStatus, Duration)>>>,
+    Arc<Mutex<Vec<upload::UploadProgress>>>,
 ) {
-    let events: Arc<Mutex<Vec<(upload::UploadProgressStatus, Duration)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let started = Instant::now();
+    let events: Arc<Mutex<Vec<upload::UploadProgress>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
     let cb: Arc<dyn Fn(upload::UploadProgress) + Send + Sync> = Arc::new(move |p| {
-        sink.lock().unwrap().push((p.status, started.elapsed()));
+        sink.lock().unwrap().push(p);
     });
     (cb, events)
 }
@@ -1599,14 +1597,15 @@ fn fast_opts(retries: u32) -> UploadOpts {
 /// While the upload sleeps out a Retry-After before polling check_limit,
 /// the UI must already show "waiting for rate limit", not stay on
 /// "uploading". The poll emits that status itself, but only after the
-/// sleep; the event here must arrive before the one-second wait is over.
+/// sleep and with an empty key (it is item-level); the event for the file
+/// itself, with the file's key, is the one emitted before the sleep.
 #[tokio::test]
 async fn upload_503_retry_after_reports_waiting_before_the_sleep() {
     let server = MockServer::start().await;
     mount_503_then_200(&server, "1").await;
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let (cb, events) = timed_progress();
+    let (cb, events) = collect_progress();
 
     let result = upload::upload_file(
         &client,
@@ -1624,22 +1623,40 @@ async fn upload_503_retry_after_reports_waiting_before_the_sleep() {
     assert!(matches!(result.status, UploadStatus::Uploaded));
 
     let events = events.lock().unwrap();
-    let first_wait = events
+    let waiting_keys: Vec<&str> = events
         .iter()
-        .find(|(s, _)| matches!(s, upload::UploadProgressStatus::WaitingRateLimit))
-        .map(|(_, at)| *at)
-        .expect("a WaitingRateLimit event");
+        .filter(|p| matches!(p.status, upload::UploadProgressStatus::WaitingRateLimit))
+        .map(|p| p.key.as_str())
+        .collect();
     assert!(
-        first_wait < Duration::from_millis(700),
-        "WaitingRateLimit first reported at {first_wait:?}, after the Retry-After sleep"
+        waiting_keys.contains(&"file.txt"),
+        "no WaitingRateLimit for the file before the Retry-After sleep; got {waiting_keys:?}"
     );
 }
 
-/// `Retry-After: 0` means re-send now: no backoff wait is substituted.
+/// `Retry-After: 0` means re-send now: no backoff wait is substituted. On
+/// a 500 (the non-503 path) a dropped header would fall back to the 10 s
+/// draw, so this also proves the header was read.
 #[tokio::test]
-async fn upload_503_retry_after_zero_retries_at_once() {
+async fn upload_500_retry_after_zero_retries_at_once() {
     let server = MockServer::start().await;
-    mount_503_then_200(&server, "0").await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("Retry-After", "0")
+                .set_body_string("internal error"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
     let f = temp_file(b"data");
     let client = test_client(&server);
     let opts = UploadOpts {
