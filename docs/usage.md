@@ -549,11 +549,19 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB) |
-| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10) |
-| `--retry-sleep <SECS>` | Sleep between retries in seconds (default: 30) |
+| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
+
+#### Retries
+
+Every IA-S3 request in an upload (the single PUT, or each multipart request: initiate, part, complete, abort, listings) gets `--retries` attempts after the first (default 10). Transient failures retry: connect errors, timeouts, resets, 5xx responses, `429`, and IA's `503 SlowDown`; refusals such as `AccessDenied` do not. The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so retries from many clients do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` re-sends at once. After a `503` on the single PUT, the upload also polls IA's `check_limit` endpoint on the same schedule until the rate limit clears, up to `--retries` polls.
+
+```bash
+# Ride out a flaky link: 20 attempts per part
+ia upload my-item big.iso --multipart --retries 20
+```
 
 #### Batch mode and subcommands
 
@@ -561,7 +569,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
-Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
 **`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
 

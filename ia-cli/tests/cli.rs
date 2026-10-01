@@ -2033,3 +2033,27 @@ fn download_help_describes_md5_mismatch_handling() {
             "deleted once a later attempt verifies",
         ));
 }
+
+// -- upload retries back off; --retry-sleep is gone --
+
+#[test]
+fn upload_help_has_no_retry_sleep_and_describes_backoff() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--retry-sleep").not())
+        .stdout(predicate::str::contains("--retries"))
+        .stdout(predicate::str::contains("up to a cap that doubles"))
+        .stdout(predicate::str::contains("Retry-After: 0"))
+        .stdout(predicate::str::contains("Retry-After"))
+        .stdout(predicate::str::contains("--multipart --retries 20"));
+}
+
+#[test]
+fn upload_rejects_retry_sleep() {
+    ia().args(["upload", "test-item", "Cargo.toml", "--retry-sleep", "5"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("--retry-sleep"));
+}

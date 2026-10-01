@@ -476,13 +476,17 @@ pub(crate) async fn abort_upload_with_ctx(
 /// retries they had while the middleware was doing it for them. The wrappers
 /// are consumed outside this workspace, where a signature that still
 /// compiles would otherwise hide the loss. Inside `upload_file_multipart`
-/// every call uses the caller's `--retries`/`--retry-sleep` instead.
+/// every call uses the caller's `--retries` and backoff bounds instead.
 fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
     S3RetryCtx {
         identifier,
         key,
         retries: DEFAULT_RETRIES,
-        retry_sleep: DEFAULT_RETRY_SLEEP,
+        backoff: super::retry::backoff_policy(
+            DEFAULT_RETRY_MIN_DELAY,
+            DEFAULT_RETRY_MAX_DELAY,
+            DEFAULT_RETRIES,
+        ),
         bytes_sent: 0,
         total_bytes: 0,
         progress: None,
@@ -491,7 +495,8 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
 
 /// Matches the attempt count the retry middleware used to give these calls.
 const DEFAULT_RETRIES: u32 = 3;
-const DEFAULT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_RETRY_MIN_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const DEFAULT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -629,7 +634,7 @@ pub async fn upload_file_multipart(
         identifier,
         key,
         retries: opts.retries,
-        retry_sleep: opts.retry_sleep,
+        backoff: opts.backoff(),
         bytes_sent: 0,
         total_bytes: file_size,
         progress: progress.clone(),
@@ -762,7 +767,7 @@ pub async fn upload_file_multipart(
             identifier,
             key,
             retries: opts.retries,
-            retry_sleep: opts.retry_sleep,
+            backoff: opts.backoff(),
             bytes_sent: offset,
             total_bytes: file_size,
             progress: progress.clone(),

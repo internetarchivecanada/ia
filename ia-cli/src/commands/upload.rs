@@ -1,7 +1,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -95,7 +94,10 @@ fn build_skip_set(
          \n\n  <dim># Force re-upload everything (ignore remote MD5)</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
          \n\n  <dim># Force re-upload ignoring joblog</dim>\
-         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\n"
+         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
+         \n\n  <dim># Ride out a flaky link: 20 attempts per part; waits are random, up to a</dim>\
+         \n  <dim># cap that doubles from 1 s to 60 s, or exactly what Retry-After says</dim>\
+         \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -181,12 +183,12 @@ pub struct UploadArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
+    ///
+    /// Waits between attempts are random, up to a cap that doubles from 1 s
+    /// to 60 s. A Retry-After header from the server sets the wait instead,
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
-
-    /// Sleep between retries (seconds)
-    #[arg(long, default_value = "30")]
-    pub retry_sleep: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -308,12 +310,12 @@ pub struct ImportArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
+    ///
+    /// Waits between attempts are random, up to a cap that doubles from 1 s
+    /// to 60 s. A Retry-After header from the server sets the wait instead,
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
-
-    /// Sleep between retries (seconds)
-    #[arg(long, default_value = "30")]
-    pub retry_sleep: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -446,7 +448,6 @@ pub async fn run(
             open_after_upload: false,
             dry_run: sub.dry_run,
             retries: sub.retries,
-            retry_sleep: sub.retry_sleep,
             json: sub.json,
             multipart: sub.multipart,
             dashboard: args.dashboard,
@@ -528,9 +529,9 @@ async fn run_bare_upload(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
-        retry_sleep: Duration::from_secs(args.retry_sleep),
         headers,
         dry_run: args.dry_run,
+        ..UploadOpts::default()
     };
 
     // Build auto-resume skip set from joblog (if available)
@@ -723,7 +724,6 @@ async fn run_import(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
-        retry_sleep: Duration::from_secs(args.retry_sleep),
         dry_run: args.dry_run,
         ..UploadOpts::default()
     };

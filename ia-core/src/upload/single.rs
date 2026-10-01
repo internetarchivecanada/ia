@@ -163,14 +163,40 @@ pub async fn upload_file(
         Vec::new()
     };
 
-    // Retry loop
+    // Retry loop. Waits follow the standard schedule (see
+    // `retry::backoff_policy`); a Retry-After header on the failed response
+    // sets the wait instead.
+    let backoff = opts.backoff();
     let mut retries = 0u32;
     let mut last_was_503 = false;
+    let mut retry_after: Option<std::time::Duration> = None;
     loop {
-        // On retry: poll check_limit only after 503, otherwise just backoff sleep
+        // On retry: after a 503, wait out any Retry-After and then poll
+        // check_limit until the rate limit clears; otherwise just back off.
         if retries > 0 {
             if last_was_503 {
-                poll_check_limit(client, identifier, opts, progress.clone()).await?;
+                if retry_after.is_some() {
+                    let wait = super::retry::wait_before_retry(retry_after, &backoff, retries - 1);
+                    tracing::debug!(
+                        identifier,
+                        key,
+                        wait_ms = wait.as_millis() as u64,
+                        "honoring Retry-After before polling check_limit"
+                    );
+                    // The poll reports this status too, but only once it
+                    // starts; the UI must not sit on "uploading" meanwhile.
+                    if let Some(ref cb) = progress {
+                        cb(UploadProgress {
+                            identifier: identifier.to_string(),
+                            key: key.to_string(),
+                            bytes_sent: 0,
+                            total_bytes: file_size,
+                            status: UploadProgressStatus::WaitingRateLimit,
+                        });
+                    }
+                    tokio::time::sleep(wait).await;
+                }
+                poll_check_limit(client, identifier, opts, &backoff, progress.clone()).await?;
             } else {
                 // Report retrying status for non-503 errors
                 if let Some(ref cb) = progress {
@@ -182,7 +208,8 @@ pub async fn upload_file(
                         status: UploadProgressStatus::Retrying,
                     });
                 }
-                tokio::time::sleep(opts.retry_sleep).await;
+                let wait = super::retry::wait_before_retry(retry_after, &backoff, retries - 1);
+                tokio::time::sleep(wait).await;
             }
         }
 
@@ -308,6 +335,7 @@ pub async fn upload_file(
                         retries,
                     });
                 } else if status.as_u16() == 503 {
+                    retry_after = super::retry::retry_after_wait(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
 
                     // Spam detection: permanent, no retry
@@ -355,6 +383,7 @@ pub async fn upload_file(
                     continue;
                 } else {
                     // Non-503 error — parse S3 XML to classify
+                    retry_after = super::retry::retry_after_wait(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
                     let s3_err = parse_s3_error(&body_text);
 
@@ -385,6 +414,7 @@ pub async fn upload_file(
                 }
             }
             Err(e) => {
+                retry_after = None;
                 let full_message = format_error_chain(&e);
                 if retries < opts.retries {
                     tracing::debug!(
@@ -417,13 +447,16 @@ use super::build_s3_url;
 
 /// Poll the check_limit endpoint until the rate limit clears.
 ///
-/// Retries up to `opts.retries` times with `opts.retry_sleep` between polls.
+/// Polls up to `opts.retries` times, waiting between polls on the same
+/// backoff schedule as the retries. There is no wait after the last poll:
+/// nothing follows it but the error.
 /// Returns `Ok(())` when the rate limit has cleared.
 /// Returns `Err(CheckLimitFailed)` if all retries are exhausted.
 async fn poll_check_limit(
     client: &IaClient,
     identifier: &str,
     opts: &UploadOpts,
+    backoff: &reqwest_retry::policies::ExponentialBackoff,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<()> {
     let (access, _) = client.require_auth()?;
@@ -438,7 +471,7 @@ async fn poll_check_limit(
         format!("{protocol}://{host}?check_limit=1&accesskey={access}&bucket={identifier}")
     };
 
-    for _attempt in 0..opts.retries {
+    for attempt in 0..opts.retries {
         if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.to_string(),
@@ -465,7 +498,9 @@ async fn poll_check_limit(
             }
         }
 
-        tokio::time::sleep(opts.retry_sleep).await;
+        if attempt + 1 < opts.retries {
+            tokio::time::sleep(super::retry::backoff_wait(backoff, attempt)).await;
+        }
     }
 
     Err(IaError::CheckLimitFailed {
