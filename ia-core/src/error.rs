@@ -109,6 +109,22 @@ pub enum IaError {
         server_size: u64,
     },
 
+    /// The stream's throughput stayed below the `--min-speed` floor for the
+    /// whole window `stalls` times in a row, so the stall budget
+    /// (`--retries`) is spent. Each stall re-requested the file with
+    /// `Range`; the `.part` is kept with every byte received so far.
+    #[error(
+        "download of {file} stalled {stalls} times: {observed_bytes_per_sec} B/s over the last \
+         {window_secs} s is below the --min-speed floor of {min_bytes_per_sec} B/s"
+    )]
+    DownloadStalled {
+        file: String,
+        observed_bytes_per_sec: u64,
+        min_bytes_per_sec: u64,
+        window_secs: u64,
+        stalls: usize,
+    },
+
     #[error("upload failed for {identifier}/{key}: {message}")]
     UploadFailed {
         identifier: String,
@@ -284,6 +300,9 @@ impl IaError {
             // disagreement about the file's size will not change on retry.
             IaError::DownloadSizeMismatch { .. } => true,
             IaError::ServerSizeMismatch { .. } => false,
+            // The stall budget was `--retries`; starting the file over would
+            // only spend it again against the same slow server.
+            IaError::DownloadStalled { .. } => false,
             // Upload errors
             IaError::UploadFailed { .. } => false, // terminal — retry logic is in single.rs
             IaError::SpamDetected { .. } => false, // permanent
@@ -429,6 +448,23 @@ impl IaError {
                 extra.insert("metadata_size".into(), (*metadata_size).into());
                 extra.insert("server_size".into(), (*server_size).into());
                 "server_size_mismatch"
+            }
+            IaError::DownloadStalled {
+                file,
+                observed_bytes_per_sec,
+                min_bytes_per_sec,
+                window_secs,
+                stalls,
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert(
+                    "observed_bytes_per_sec".into(),
+                    (*observed_bytes_per_sec).into(),
+                );
+                extra.insert("min_bytes_per_sec".into(), (*min_bytes_per_sec).into());
+                extra.insert("window_secs".into(), (*window_secs).into());
+                extra.insert("stalls".into(), (*stalls as u64).into());
+                "download_stalled"
             }
             IaError::UploadFailed {
                 identifier,
@@ -1538,5 +1574,46 @@ mod tests {
         assert_eq!(v["error"]["file"], "disk.img");
         assert_eq!(v["error"]["metadata_size"], 40);
         assert_eq!(v["error"]["server_size"], 30);
+    }
+
+    // -- stall detection (#11) --
+
+    fn stalled() -> IaError {
+        IaError::DownloadStalled {
+            file: "disk.img".into(),
+            observed_bytes_per_sec: 512,
+            min_bytes_per_sec: 10240,
+            window_secs: 60,
+            stalls: 5,
+        }
+    }
+
+    #[test]
+    fn download_stalled_is_not_retryable() {
+        // The stall budget was the retries; the outer loop must not start
+        // the file over.
+        assert!(!stalled().is_retryable());
+    }
+
+    #[test]
+    fn download_stalled_displays_details() {
+        let msg = stalled().to_string();
+        assert!(msg.contains("disk.img"), "{msg}");
+        assert!(msg.contains("stalled 5 times"), "{msg}");
+        assert!(msg.contains("512 B/s"), "{msg}");
+        assert!(msg.contains("60 s"), "{msg}");
+        assert!(msg.contains("--min-speed"), "{msg}");
+        assert!(msg.contains("10240 B/s"), "{msg}");
+    }
+
+    #[test]
+    fn json_download_stalled() {
+        let v = parse_json_error(&stalled());
+        assert_eq!(v["error"]["code"], "download_stalled");
+        assert_eq!(v["error"]["file"], "disk.img");
+        assert_eq!(v["error"]["observed_bytes_per_sec"], 512);
+        assert_eq!(v["error"]["min_bytes_per_sec"], 10240);
+        assert_eq!(v["error"]["window_secs"], 60);
+        assert_eq!(v["error"]["stalls"], 5);
     }
 }
