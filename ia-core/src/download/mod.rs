@@ -251,7 +251,7 @@ fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
 /// about its length, retrying will not reconcile them, so this is the
 /// permanent [`IaError::ServerSizeMismatch`]. Only 206 responses are
 /// checked here; a 416's `Content-Range` is handled by
-/// [`range_not_satisfiable_error`]. A total of `*`, a missing metadata
+/// [`range_not_satisfiable`]. A total of `*`, a missing metadata
 /// size, and `{identifier}_files.xml` (see [`is_size_unknowable`]) are all
 /// skipped.
 fn check_content_range(
@@ -292,7 +292,7 @@ fn check_content_range(
 /// - HTML error page stripping
 /// - Optional resume via Range header. A 416 answering that header is
 ///   returned as a response, not an error, so the caller can read its
-///   `Content-Range` (see [`range_not_satisfiable_error`]); without a Range
+///   `Content-Range` (see [`range_not_satisfiable`]); without a Range
 ///   header a 416 is an [`IaError::Http`] like any other failure status
 /// - View-counter suppression via `cnt=0` (see `count_views`)
 ///
@@ -435,33 +435,37 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
     }
 }
 
-/// Map a 416 on a resume `Range` request to a size error.
+/// Decide what a 416 on a resume `Range` request means for the `.part`.
 ///
 /// The caller has already established that `response` is a 416 and that it
 /// answered a request for `bytes={offset}-`, where `offset` is the length of
 /// the `.part` file at `part_path`. The server is saying that offset is at
 /// or past the end of its copy of the file, and its
-/// `Content-Range: bytes */total` names that copy's length. Resuming from
-/// this `.part` can never succeed, so:
+/// `Content-Range: bytes */total` names that copy's length. Nothing more can
+/// be streamed from this `.part`, so:
 ///
 /// - `total` differs from the metadata size: [`IaError::ServerSizeMismatch`].
 ///   The two disagree and retrying cannot reconcile them. The `.part` is
 ///   left alone, as [`check_content_range`] leaves it on a 206.
-/// - `total` equals the metadata size, or the size is unknown or exempt
-///   (see [`is_size_unknowable`]): the `.part` already holds at least the
-///   whole file. It is removed and the retryable
+/// - `total`, the metadata size, and `offset` all agree: the `.part` is the
+///   whole file. `Ok(())` is returned and the caller finishes it in place
+///   (md5 compare when `--checksum` is on, then the rename) instead of
+///   downloading it again.
+/// - `total` equals the metadata size but the `.part` is longer, or the size
+///   is unknown or exempt (see [`is_size_unknowable`]) so there is no third
+///   party to agree: the `.part` is removed and the retryable
 ///   [`IaError::DownloadSizeMismatch`] is returned so the next attempt starts
 ///   from byte 0.
 /// - no parseable total: the plain [`IaError::Http`] a 416 always was.
 ///
 /// The caller must close any writer on `part_path` before calling this.
-async fn range_not_satisfiable_error(
+async fn range_not_satisfiable(
     response: reqwest::Response,
     identifier: &str,
     file: &FileMetadata,
     offset: u64,
     part_path: &Path,
-) -> IaError {
+) -> Result<()> {
     debug_assert_eq!(
         response.status(),
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE
@@ -472,7 +476,7 @@ async fn range_not_satisfiable_error(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range_total);
     let Some(server_size) = server_size else {
-        return http_error_from(response).await;
+        return Err(http_error_from(response).await);
     };
     let metadata_size = file
         .size
@@ -486,11 +490,19 @@ async fn range_not_satisfiable_error(
                 offset,
                 "416 on resume: server length differs from item metadata; keeping .part"
             );
-            IaError::ServerSizeMismatch {
+            Err(IaError::ServerSizeMismatch {
                 file: file.name.clone(),
                 metadata_size,
                 server_size,
-            }
+            })
+        }
+        Some(metadata_size) if metadata_size == offset => {
+            info!(
+                file = %file.name,
+                size = offset,
+                "416 on resume: .part already holds the whole file; finishing it in place"
+            );
+            Ok(())
         }
         _ => {
             warn!(
@@ -500,13 +512,159 @@ async fn range_not_satisfiable_error(
                 "416 on resume: .part is already at or past the file's length; deleting it"
             );
             let _ = fs::remove_file(part_path).await;
-            IaError::DownloadSizeMismatch {
+            Err(IaError::DownloadSizeMismatch {
                 file: file.name.clone(),
                 expected: server_size,
                 received: offset,
+            })
+        }
+    }
+}
+
+/// The `Last-Modified` header of `response` as a timestamp, if it has one
+/// that parses.
+fn last_modified_of(response: &reqwest::Response) -> Option<std::time::SystemTime> {
+    response
+        .headers()
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+}
+
+/// Feed the first `resumed_bytes` of the `.part` at `part_path` into a fresh
+/// md5 state, so a hash that continues over the rest of the stream (or over
+/// nothing, when the `.part` is already the whole file) covers exactly the
+/// bytes the caller counts. Anything past `resumed_bytes` is not read, so
+/// the hash matches the length the caller reports even if the file grew
+/// after it was measured.
+///
+/// Reading the `.part` can take tens of seconds on a 10 GB partial, so a
+/// `Verifying` progress event goes out first and again every 16 MiB.
+async fn seed_hasher_from_part(
+    identifier: &str,
+    file: &FileMetadata,
+    part_path: &Path,
+    resumed_bytes: u64,
+    progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
+) -> Result<md5::Md5> {
+    use md5::{Digest, Md5};
+    use tokio::io::AsyncReadExt;
+
+    let mut h = Md5::new();
+    if let Some(p) = progress {
+        p(DownloadProgress {
+            identifier: identifier.to_string(),
+            file_name: file.name.clone(),
+            bytes_downloaded: 0,
+            total_bytes: Some(resumed_bytes),
+            status: DownloadStatus::Verifying,
+        });
+    }
+    let mut seed = fs::File::open(part_path).await?.take(resumed_bytes);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut seeded: u64 = 0;
+    let mut last_emit: u64 = 0;
+    loop {
+        let n = seed.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        seeded += n as u64;
+        if let Some(p) = progress {
+            if seeded - last_emit >= 16 * 1024 * 1024 {
+                p(DownloadProgress {
+                    identifier: identifier.to_string(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded: seeded,
+                    total_bytes: Some(resumed_bytes),
+                    status: DownloadStatus::Verifying,
+                });
+                last_emit = seeded;
             }
         }
     }
+    Ok(h)
+}
+
+/// Turn a `.part` whose byte count already matches the item metadata into
+/// the finished file: compare the md5 when `hasher` is present (deleting the
+/// `.part` on a mismatch), rename it into place, set its mtime, and report
+/// completion.
+///
+/// Shared by the normal end of a stream and by the 416 shortcut in
+/// [`range_not_satisfiable`], so both finish a file the same way.
+#[allow(clippy::too_many_arguments)]
+async fn finish_part(
+    identifier: &str,
+    file: &FileMetadata,
+    file_path: &Path,
+    part_path: &Path,
+    bytes_downloaded: u64,
+    hasher: Option<md5::Md5>,
+    last_modified: Option<std::time::SystemTime>,
+    opts: &DownloadOpts,
+    progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
+    start: std::time::Instant,
+) -> Result<FileDownloadResult> {
+    // Post-download checksum comparison using the inline-computed hash.
+    if let Some(hasher) = hasher {
+        if let Some(expected_md5) = &file.md5 {
+            if let Some(p) = progress {
+                p(DownloadProgress {
+                    identifier: identifier.to_string(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded,
+                    total_bytes: file.size,
+                    status: DownloadStatus::Verifying,
+                });
+            }
+
+            use md5::Digest;
+            let actual_md5 = format!("{:x}", hasher.finalize());
+            if &actual_md5 != expected_md5 {
+                // Delete the bad file
+                let _ = fs::remove_file(part_path).await;
+                return Err(IaError::ChecksumMismatch {
+                    file: file.name.clone(),
+                    expected: expected_md5.clone(),
+                    actual: actual_md5,
+                });
+            }
+        }
+    }
+
+    // Finalize: rename .part to final name
+    fs::rename(part_path, file_path).await?;
+
+    // Set mtime from Last-Modified header
+    if !opts.no_timestamps {
+        if let Some(mtime) =
+            last_modified.or_else(|| file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t)))
+        {
+            let _ =
+                filetime::set_file_mtime(file_path, filetime::FileTime::from_system_time(mtime));
+        }
+    }
+
+    info!(file = %file.name, bytes = bytes_downloaded, "download complete");
+
+    if let Some(p) = progress {
+        p(DownloadProgress {
+            identifier: identifier.to_string(),
+            file_name: file.name.clone(),
+            bytes_downloaded,
+            total_bytes: file.size,
+            status: DownloadStatus::Complete,
+        });
+    }
+
+    Ok(FileDownloadResult {
+        file_name: file.name.clone(),
+        bytes: bytes_downloaded,
+        status: DownloadStatus::Complete,
+        elapsed: start.elapsed(),
+    })
 }
 
 /// Download a single file from an item.
@@ -649,9 +807,44 @@ pub async fn download_file(
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
         (resume_from, response.status())
     {
-        return Err(
-            range_not_satisfiable_error(response, identifier, file, offset, &part_path).await,
-        );
+        let last_modified = last_modified_of(&response);
+        range_not_satisfiable(response, identifier, file, offset, &part_path).await?;
+        // The .part is the whole file, but never finish it through a
+        // symlink: renaming the link into place would leave a Complete
+        // download pointing outside dest_dir and the mtime write would go
+        // through it. The resume check above followed the link, so this is
+        // the first look at the link itself. Remove it and restart from
+        // byte 0, as the symlink check on the streaming path does.
+        if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+            if meta.file_type().is_symlink() {
+                warn!(file = %file.name, "removing symlink .part file");
+                fs::remove_file(&part_path).await?;
+                return Err(IaError::ResumeFailed {
+                    file: file.name.clone(),
+                    reason: ".part path is a symlink".to_string(),
+                });
+            }
+        }
+        // Hash the .part from disk when asked to, then finish it without
+        // streaming anything.
+        let hasher = if opts.checksum && file.md5.is_some() {
+            Some(seed_hasher_from_part(identifier, file, &part_path, offset, progress).await?)
+        } else {
+            None
+        };
+        return finish_part(
+            identifier,
+            file,
+            &file_path,
+            &part_path,
+            offset,
+            hasher,
+            last_modified,
+            opts,
+            progress,
+            start,
+        )
+        .await;
     }
     check_content_range(&response, identifier, file)?;
     let status = response.status();
@@ -668,11 +861,7 @@ pub async fn download_file(
     };
 
     // Parse Last-Modified for mtime
-    let last_modified = response
-        .headers()
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| httpdate::parse_http_date(s).ok());
+    let last_modified = last_modified_of(&response);
 
     // If .part exists and is a symlink, remove it before writing.
     // Prevents writing through a symlink planted by an attacker.
@@ -701,49 +890,16 @@ pub async fn download_file(
     // seed it with the bytes already present in .part so the final hash
     // covers the full file.
     let mut hasher = if opts.checksum && file.md5.is_some() {
-        use md5::{Digest, Md5};
-        let mut h = Md5::new();
-        if let Some(resumed_bytes) = resume_from {
-            // Seeding reads the full .part before the HTTP stream opens — on
-            // a 10 GB partial that's tens of seconds of silent CPU+IO. Emit
-            // Verifying so the console/TUI shows activity, and re-emit every
-            // 16 MiB with progress.
-            use tokio::io::AsyncReadExt;
-            if let Some(p) = progress {
-                p(DownloadProgress {
-                    identifier: identifier.to_string(),
-                    file_name: file.name.clone(),
-                    bytes_downloaded: 0,
-                    total_bytes: Some(resumed_bytes),
-                    status: DownloadStatus::Verifying,
-                });
+        Some(match resume_from {
+            // Seeding reads the full .part before the HTTP stream opens.
+            Some(resumed_bytes) => {
+                seed_hasher_from_part(identifier, file, &part_path, resumed_bytes, progress).await?
             }
-            let mut seed = fs::File::open(&part_path).await?;
-            let mut buf = vec![0u8; 1024 * 1024];
-            let mut seeded: u64 = 0;
-            let mut last_emit: u64 = 0;
-            loop {
-                let n = seed.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-                seeded += n as u64;
-                if let Some(p) = progress {
-                    if seeded - last_emit >= 16 * 1024 * 1024 {
-                        p(DownloadProgress {
-                            identifier: identifier.to_string(),
-                            file_name: file.name.clone(),
-                            bytes_downloaded: seeded,
-                            total_bytes: Some(resumed_bytes),
-                            status: DownloadStatus::Verifying,
-                        });
-                        last_emit = seeded;
-                    }
-                }
+            None => {
+                use md5::Digest;
+                md5::Md5::new()
             }
-        }
-        Some(h)
+        })
     } else {
         None
     };
@@ -798,14 +954,31 @@ pub async fn download_file(
                             // Close the writer first: the mapping may
                             // remove .part.
                             drop(output);
-                            return Err(range_not_satisfiable_error(
+                            let last_modified = last_modified_of(&new_resp).or(last_modified);
+                            range_not_satisfiable(
                                 new_resp,
                                 identifier,
                                 file,
                                 bytes_downloaded,
                                 &part_path,
                             )
-                            .await);
+                            .await?;
+                            // The .part is the whole file: the stream error
+                            // came after its last byte. The hasher already
+                            // covers every byte written, so finish in place.
+                            return finish_part(
+                                identifier,
+                                file,
+                                &file_path,
+                                &part_path,
+                                bytes_downloaded,
+                                hasher,
+                                last_modified,
+                                opts,
+                                progress,
+                                start,
+                            )
+                            .await;
                         }
                         check_content_range(&new_resp, identifier, file)?;
                         // If the server ignores Range and returns 200, the
@@ -913,64 +1086,19 @@ pub async fn download_file(
         }
     }
 
-    // Post-download checksum comparison using the inline-computed hash.
-    if let Some(hasher) = hasher {
-        if let Some(expected_md5) = &file.md5 {
-            if let Some(p) = progress {
-                p(DownloadProgress {
-                    identifier: identifier.to_string(),
-                    file_name: file.name.clone(),
-                    bytes_downloaded,
-                    total_bytes: file.size,
-                    status: DownloadStatus::Verifying,
-                });
-            }
-
-            use md5::Digest;
-            let actual_md5 = format!("{:x}", hasher.finalize());
-            if &actual_md5 != expected_md5 {
-                // Delete the bad file
-                let _ = fs::remove_file(&part_path).await;
-                return Err(IaError::ChecksumMismatch {
-                    file: file.name.clone(),
-                    expected: expected_md5.clone(),
-                    actual: actual_md5,
-                });
-            }
-        }
-    }
-
-    // Finalize: rename .part to final name
-    fs::rename(&part_path, &file_path).await?;
-
-    // Set mtime from Last-Modified header
-    if !opts.no_timestamps {
-        if let Some(mtime) =
-            last_modified.or_else(|| file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t)))
-        {
-            let _ =
-                filetime::set_file_mtime(&file_path, filetime::FileTime::from_system_time(mtime));
-        }
-    }
-
-    info!(file = %file.name, bytes = bytes_downloaded, "download complete");
-
-    if let Some(p) = progress {
-        p(DownloadProgress {
-            identifier: identifier.to_string(),
-            file_name: file.name.clone(),
-            bytes_downloaded,
-            total_bytes: file.size,
-            status: DownloadStatus::Complete,
-        });
-    }
-
-    Ok(FileDownloadResult {
-        file_name: file.name.clone(),
-        bytes: bytes_downloaded,
-        status: DownloadStatus::Complete,
-        elapsed: start.elapsed(),
-    })
+    finish_part(
+        identifier,
+        file,
+        &file_path,
+        &part_path,
+        bytes_downloaded,
+        hasher,
+        last_modified,
+        opts,
+        progress,
+        start,
+    )
+    .await
 }
 
 /// Check if a file should be skipped based on size + mtime.
@@ -3303,6 +3431,124 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    /// The shortcut must also cover the Range re-request that the
+    /// body-stream retry sends. The server here promises 33 bytes for a
+    /// 32-byte file, sends all 32, and closes, so hyper raises a body-stream
+    /// error after the last real byte arrived. The `Range: bytes=32-`
+    /// re-request is answered 416 `bytes */32`: the .part on disk is the
+    /// whole file, the rolling md5 already covers it, and the file is
+    /// finished without a third connection.
+    #[tokio::test]
+    async fn stream_retry_response_416_at_full_length_completes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let full_body: Vec<u8> = (0..32u8).collect();
+        let full_len = full_body.len() as u64;
+        let promised_len = full_len + 1;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_body = full_body.clone();
+
+        let server_handle = tokio::spawn(async move {
+            async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+                let mut buf = vec![0u8; 4096];
+                let mut acc = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).to_string()
+            }
+
+            // Accept 1: promise 33 bytes, send the real 32, close.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-length: {promised_len}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     accept-ranges: bytes\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&server_body).await.unwrap();
+                stream.flush().await.unwrap();
+                drop(stream);
+            }
+
+            // Accept 2: the Range re-request from byte 32. The file is 32
+            // bytes long, so that offset is past the end.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut stream).await;
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains(&format!("range: bytes={full_len}-")),
+                    "expected Range header on retry, got:\n{req}"
+                );
+                let headers = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                     content-length: 0\r\n\
+                     content-range: bytes */{full_len}\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+
+            // A third connection would mean the file was re-downloaded.
+            let third =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                    .await;
+            assert!(third.is_err(), "unexpected third connection");
+        });
+
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("data.bin", full_len);
+        // md5 of bytes 0..32, as in stream_error_retries_with_range_and_completes.
+        file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
+
+        let result = download_file(
+            &client,
+            "flaky-item",
+            &file,
+            dir.path(),
+            &DownloadOpts {
+                checksum: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, full_len);
+        assert_eq!(
+            std::fs::read(dir.path().join("data.bin")).unwrap(),
+            full_body
+        );
+        assert!(!dir.path().join("data.bin.part").exists());
+
+        server_handle.await.unwrap();
+    }
+
     /// All download requests must send `cnt=0` to suppress the archive.org
     /// view-counter. Verified by gating the wiremock response on the
     /// `query_param("cnt", "0")` matcher — if the param is missing the
@@ -3854,6 +4100,230 @@ mod tests {
             matches!(result, Err(IaError::Http { status: 416, .. })),
             "got {result:?}"
         );
+    }
+
+    // -- 416 at the file's full length finishes the file (#12 follow-up) --
+
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_completes_without_redownload() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // .part length, 416 total, and metadata size all agree: the .part is
+        // the whole file and is renamed into place without another request.
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 32);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img")).unwrap(),
+            vec![b'A'; 32]
+        );
+        assert!(!dir.path().join("disk.img.part").exists());
+
+        // The mtime comes from the item metadata, as a 416 carries no
+        // Last-Modified here.
+        let mtime = std::fs::metadata(dir.path().join("disk.img"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(mtime, 1700000000);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_some());
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_with_checksum_verifies() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta_with_md5("disk.img", 32, &md5_hex(&[b'A'; 32]));
+
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 32);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img")).unwrap(),
+            vec![b'A'; 32]
+        );
+        assert!(!dir.path().join("disk.img.part").exists());
+
+        // The .part was hashed on disk, so the UI saw a Verifying event
+        // before Complete.
+        let seen = events.lock().unwrap();
+        let verifying_idx = seen.iter().position(|s| *s == DownloadStatus::Verifying);
+        let complete_idx = seen.iter().position(|s| *s == DownloadStatus::Complete);
+        assert!(verifying_idx.is_some(), "no Verifying event: {seen:?}");
+        assert!(complete_idx.is_some(), "no Complete event: {seen:?}");
+        assert!(verifying_idx < complete_idx, "{seen:?}");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_deletes_part() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta_with_md5("disk.img", 32, "00000000000000000000000000000000");
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
+
+        // The .part has the right length but the wrong bytes. The md5
+        // compare catches it exactly as it would after a stream.
+        assert!(
+            matches!(result, Err(IaError::ChecksumMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(!dir.path().join("disk.img.part").exists());
+        assert!(!dir.path().join("disk.img").exists());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+    }
+
+    /// A `.part` that is a symlink must never be finished in place, even
+    /// when its target has the agreed length and the server's 416 confirms
+    /// it: renaming the link into place would leave a `Complete` download
+    /// pointing outside the destination, and the mtime write would go
+    /// through the link. The link is removed and the download restarts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_through_symlink_part_restarts() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .mount(&mock_server)
+            .await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_file = target_dir.path().join("target.bin");
+        std::fs::write(&target_file, vec![b'A'; 32]).unwrap();
+        let target_mtime = std::fs::metadata(&target_file).unwrap().modified().unwrap();
+        let part_path = dir.path().join("disk.img.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        let err = first.expect_err("a symlink .part must not be finished in place");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(!dir.path().join("disk.img").exists());
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "the symlink .part should have been removed"
+        );
+        // The target is untouched: same bytes, same mtime.
+        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
+        assert_eq!(
+            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
+            target_mtime
+        );
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status, DownloadStatus::Complete);
+        let final_meta = std::fs::symlink_metadata(dir.path().join("disk.img")).unwrap();
+        assert!(!final_meta.file_type().is_symlink());
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
+    }
+
+    /// With no metadata size there is no third party to agree, so the
+    /// shortcut does not apply: the .part is deleted and the download
+    /// restarts from byte 0, as PR #26 left it.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_without_metadata_size_restarts() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let mut file = test_file_meta("disk.img", 32);
+        file.size = None;
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(expected, 32);
+                assert_eq!(received, 32);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(!dir.path().join("disk.img.part").exists());
+        assert!(!dir.path().join("disk.img").exists());
     }
 
     #[tokio::test]

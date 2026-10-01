@@ -168,3 +168,43 @@ Part of #12. PR #23 left two cases where a `.part` file can never be resumed yet
 - [ ] `just ci`.
 - [ ] Code-reviewer pass; fix findings; re-run.
 - [ ] PR against `main` with `Part of #12`; squash-merge after checks pass; `scripts/ia-cleanup size-dead-ends` only after the merge is confirmed.
+
+---
+
+## Follow-up: a 416 at the file's full length finishes the file (2026-10-01)
+
+Part of #12. PR #26 left one wasteful case: when the `.part` file already holds exactly the whole file and the server's 416 confirms that length, the `.part` is deleted and the file is downloaded again from byte 0. Jake, 2026-10-01: "if it's already downloaded, it shouldn't be again."
+
+**Decision (Jake, 2026-10-01):** when the `.part` length, the 416's `Content-Range: bytes */total`, and the metadata size all agree, finish the file instead of deleting and re-downloading: skip the stream, run the md5 compare when `--checksum` is on, rename `.part` into place. This applies on the initial request and on the mid-stream re-request alike. A `.part` longer than the agreed total still deletes and restarts; a total that differs from the metadata size still fails permanently with the `.part` kept.
+
+**Reading of "all agree":** literal. A file whose metadata has no `size`, or `{identifier}_files.xml`, has no third party to agree, so a 416 at the `.part` length still deletes and restarts as PR #26 left it. Extending the shortcut to those files is a separate question for Jake.
+
+**How the `.part` can be the whole file:** a crash between the final flush and the rename; a body-stream error raised after the last byte arrived (the server promised more than it sent, or dropped a chunked terminator); an older build that stopped before the rename. In each case the bytes on disk are the file, and `--checksum` can still prove it.
+
+**Where it lands:**
+
+- `range_not_satisfiable_error` becomes `range_not_satisfiable(...) -> Result<()>`. `Ok(())` means the `.part` is the whole file and the caller should finish it; every `Err` is the mapping PR #26 defined.
+- The tail of `download_file` after the size check (Verifying event, md5 compare, rename, mtime, Complete event, result) moves into `finish_part`, so the 416 shortcut and the normal path share one finalization.
+- The hasher seeding loop (reads the `.part` into the md5 state with Verifying events) moves into `seed_hasher_from_part`, so the initial-request shortcut can hash the `.part` the same way a resume does. On the mid-stream shortcut the hasher already covers every byte written and is used as is.
+- `Last-Modified` is read from the 416 response when present, as it is from a 200 or 206, so the mtime handling does not change.
+
+### Task D: 416 at the file's full length
+
+- [x] **Step 1: Failing tests** in `ia-core/src/download/mod.rs`:
+  - `range_not_satisfiable_at_part_length_completes_without_redownload`: 32-byte `.part`, metadata 32, 416 `bytes */32` → `Ok`, `status == Complete`, `bytes == 32`, final file holds the `.part` bytes, `.part` gone, exactly one request and it carried `Range`, mtime set from metadata.
+  - `range_not_satisfiable_at_part_length_with_checksum_verifies`: `checksum: true`, md5 matches the `.part` bytes → `Complete`, one request, a `Verifying` progress event was emitted.
+  - `range_not_satisfiable_at_part_length_with_checksum_mismatch_deletes_part`: `checksum: true`, wrong md5 → `ChecksumMismatch`, `.part` gone, no final file, one request.
+  - `range_not_satisfiable_at_part_length_without_metadata_size_restarts`: `size: None`, 32-byte `.part`, 416 `bytes */32` → `DownloadSizeMismatch`, `.part` gone (the literal reading above).
+  - Raw-TCP `stream_retry_response_416_at_full_length_completes`: the server promises 33 bytes for a 32-byte file, sends 32, closes; the `Range: bytes=32-` re-request is answered 416 `bytes */32`; with `checksum: true` → `Complete`, final file is the 32 bytes, no `.part`, exactly two connections.
+  - `range_not_satisfiable_at_part_length_through_symlink_part_restarts` (added after review): a symlink `.part` whose target has the agreed length, 416 `bytes */32` → retryable `ResumeFailed`, the link removed, its target's bytes and mtime untouched, no final file; a second call completes with a regular file. The initial-request shortcut checks `symlink_metadata` before finishing, because the resume check follows the link.
+  - The existing `range_not_satisfiable_at_metadata_total_deletes_part_and_restarts` (40-byte `.part`, total 32) and `range_not_satisfiable_with_different_total_fails_permanently` stay unchanged and keep passing.
+- [x] **Step 2: Run**; the new tests fail (today they get `DownloadSizeMismatch` and a second request).
+- [x] **Step 3: Implement** `range_not_satisfiable`, `finish_part`, `seed_hasher_from_part`, and the two call sites.
+- [x] **Step 4: `docs/usage.md`**: the 416 paragraph gains the full-length case.
+- [x] **Step 5: Run**; green. Commit: `fix(download): finish the file when a 416 confirms the .part is complete`.
+
+### Task E: Verification and review
+
+- [ ] `just ci`.
+- [ ] Code-reviewer pass; fix findings; re-run.
+- [ ] PR against `main` with `Part of #12`; squash-merge after checks pass; `scripts/ia-cleanup size-416-complete` only after the merge is confirmed.
