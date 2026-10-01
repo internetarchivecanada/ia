@@ -54,3 +54,19 @@ Follow-up to PR #10 (one retry policy for every IA-S3 multipart request).
 ### Task 4: verification and review
 
 - [ ] `just ci`; code-reviewer pass; fix findings; PR against `main` ("Follow-up to #10"); squash-merge after checks pass; `scripts/ia-cleanup retry-sleep-backoff` only after a confirmed merge.
+
+### Review findings (2026-10-01), to fix before the PR
+
+Important:
+1. `backoff_policy` panics when `retry_min_delay > retry_max_delay` (the library asserts it), reachable from public `UploadOpts` fields. Validate once: add `UploadOpts::backoff(&self) -> ExponentialBackoff` (crate-visible) that clamps `max = max.max(min)` with a `warn!`, and use it at the four construction sites (`single.rs`, two in `multipart.rs`, `default_ctx`). Test: min > max does not panic and uses min as the cap.
+2. Stale docs: `docs/design-philosophy.md:68` still describes `--retry-sleep` and "three retries one second apart"; the `extract_retry_after` doc comment says HTTP dates are ignored.
+3. `single.rs`: no `WaitingRateLimit` progress event before the Retry-After sleep that precedes the check-limit poll; emit it before sleeping (as `send_with_retry` does with `report_backoff`).
+
+Suggestions, take them:
+4. `backoff_wait`: clamp the computed wait to `policy.max_retry_interval` so a wall-clock step backwards between the two `SystemTime::now()` calls cannot inflate it.
+5. `warn!` when a Retry-After exceeds `retry_max_delay` (honored as given, but visible in `--log`); document that `Retry-After: 0` means an immediate re-send.
+6. `poll_check_limit` sleeps after its final poll before failing; skip the sleep on the last iteration.
+7. Wording in `--retries` help and usage.md: "waits are random, up to a cap that doubles from 1 s to 60 s" (full jitter can shrink a wait; "doubling" describes the cap).
+8. Add tests: a 500 with Retry-After through `single.rs`; a 429 with Retry-After through `send_with_retry`; the HTTP-date form through an upload; min > max clamp.
+
+Noted, no change: metadata read/write now pause 0 s on a past HTTP-date Retry-After instead of the 30 s fallback (that is what the header says); `..UploadOpts::default()` in `run_bare_upload` matches `run_import`.
