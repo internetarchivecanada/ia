@@ -1428,3 +1428,50 @@ async fn upload_with_retry_middleware_no_progress() {
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
 }
+
+/// A 503 that carries a non-retryable S3 code is a refusal, not a throttle.
+/// The multipart path fails on the first attempt; the single-file path must
+/// too, instead of polling check_limit and re-sending the whole file.
+#[tokio::test]
+async fn upload_503_with_non_retryable_code_is_not_retried() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_sleep: Duration::from_millis(1),
+        ..Default::default()
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("AccessDenied must fail on the first attempt");
+    assert!(
+        err.to_string().contains("AccessDenied"),
+        "expected AccessDenied in error: {err}"
+    );
+    server.verify().await;
+}

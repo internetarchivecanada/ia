@@ -8,10 +8,11 @@
 //! - Abort: DELETE /{id}/{key}?uploadId={ID}
 //! - Cleanup: GET /{id}?uploads (list all), then abort
 
+use super::retry::{send_with_retry, S3RetryCtx};
 use crate::error::{IaError, Result};
-use crate::upload::s3_error::{parse_s3_error, strip_xml};
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
+use bytes::Bytes;
 
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
@@ -160,53 +161,58 @@ use super::{build_s3_item_url, build_s3_url};
 /// `x-archive-auto-make-bucket`, `x-archive-queue-derive`, and other
 /// item-creation headers to the initiate request. IA S3 only accepts
 /// metadata at item creation time, so these headers must be sent here.
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn initiate_upload(
     client: &IaClient,
     identifier: &str,
     key: &str,
     extra_headers: &[(String, String)],
 ) -> Result<String> {
+    initiate_upload_with_retry(client, &default_ctx(identifier, key), extra_headers)
+        .await
+        .map(|(id, _attempts)| id)
+}
+
+/// Begin a multipart upload, retrying per the shared IA-S3 policy.
+///
+/// Retrying is correct here: IA answers throttling with 503 `SlowDown`, which
+/// means the request was refused and no upload was created. The cost of not
+/// retrying is that `--multipart` fails outright on IA's most common
+/// response, while a plain upload survives it.
+pub(crate) async fn initiate_upload_with_retry(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    extra_headers: &[(String, String)],
+) -> Result<(String, u32)> {
     let (access, secret) = client.require_auth()?;
+    let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!("{}?uploads", build_s3_url(client, identifier, key));
 
-    let mut req = client
-        .upload_http()
-        .post(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .header("Content-Length", "0");
+    let sent = send_with_retry(ctx, "initiate multipart", || {
+        let mut req = client
+            .upload_http()
+            .post(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .header("Content-Length", "0");
+        for (k, v) in extra_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.send()
+    })
+    .await?;
 
-    for (k, v) in extra_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
+    let attempts = sent.attempts;
+    let body = sent.response.text().await.unwrap_or_default();
 
-    let resp = req.send().await.map_err(|e| IaError::UploadFailed {
-        identifier: identifier.into(),
-        key: key.into(),
-        message: format!("initiate multipart: {e}"),
-        status: None,
-    })?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("initiate multipart failed: {msg}"),
-            status: Some(status.as_u16()),
-        });
-    }
-
-    parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
+    let id = parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
         identifier: identifier.into(),
         key: key.into(),
         message: "initiate response missing UploadId".into(),
         status: None,
-    })
+    })?;
+    Ok((id, attempts))
 }
 
 /// Upload a single part. Returns the ETag for the completion manifest.
@@ -216,6 +222,9 @@ pub async fn initiate_upload(
 /// IA's S3 does not return an `ETag` header on part PUTs; its completion
 /// check compares the manifest entry against the part's MD5. When the header
 /// is absent, the quoted hex MD5 of the body is used instead.
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn upload_part(
     client: &IaClient,
     identifier: &str,
@@ -224,10 +233,34 @@ pub async fn upload_part(
     part_number: u32,
     body: Vec<u8>,
 ) -> Result<String> {
+    let body = Bytes::from(body);
+    let ctx = S3RetryCtx {
+        total_bytes: body.len() as u64,
+        ..default_ctx(identifier, key)
+    };
+    upload_part_with_retry(client, &ctx, upload_id, part_number, body)
+        .await
+        .map(|(etag, _attempts)| etag)
+}
+
+/// Upload one part, retrying per the shared IA-S3 policy.
+///
+/// The body is a `Bytes` so that rebuilding the request on each attempt is a
+/// refcount bump, not a copy of the part. Holding the part across the backoff
+/// is deliberate: re-reading it from disk would cost an I/O round trip on
+/// every attempt, including the common single-attempt case, and the caller
+/// already has the buffer in hand.
+pub(crate) async fn upload_part_with_retry(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+    part_number: u32,
+    body: Bytes,
+) -> Result<(String, u32)> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?partNumber={}&uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, ctx.identifier, ctx.key),
         part_number,
         upload_id,
     );
@@ -237,47 +270,34 @@ pub async fn upload_part(
         format!("\"{:x}\"", Md5::digest(&body))
     };
 
-    let resp = client
-        .upload_http()
-        .put(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .header("Content-Length", content_length.to_string())
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("upload part {part_number}: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        let msg = parse_s3_error(&body_text)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body_text)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("upload part {part_number} failed: {msg}"),
-            status: Some(status.as_u16()),
-        });
-    }
+    let sent = send_with_retry(ctx, &format!("upload part {part_number}"), || {
+        client
+            .upload_http()
+            .put(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .header("Content-Length", content_length.to_string())
+            .body(body.clone())
+            .send()
+    })
+    .await?;
 
     // Prefer the server's ETag; IA omits it, so fall back to the local MD5.
-    Ok(resp
+    let etag = sent
+        .response
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
-        .unwrap_or(local_md5))
+        .unwrap_or(local_md5);
+    Ok((etag, sent.attempts))
 }
 
 /// Complete a multipart upload by sending the manifest.
 ///
 /// `POST /{identifier}/{key}?uploadId={ID}` with XML body
+///
+/// Retries per the shared IA-S3 policy with the default budget. Callers that
+/// need a configurable budget go through `upload_file_multipart`.
 pub async fn complete_upload(
     client: &IaClient,
     identifier: &str,
@@ -286,7 +306,40 @@ pub async fn complete_upload(
     parts: &[(u32, String)],
     keep_old_version: bool,
 ) -> Result<()> {
+    complete_upload_with_retry(
+        client,
+        &default_ctx(identifier, key),
+        upload_id,
+        parts,
+        keep_old_version,
+        None,
+    )
+    .await
+    .map(|_attempts| ())
+}
+
+/// Finish a multipart upload, retrying per the shared IA-S3 policy.
+///
+/// Handles the one case where a retry changes the meaning of the answer. If
+/// the completion applied and only the response was lost, the next attempt
+/// gets `NoSuchUpload`, because a completed upload is no longer in progress.
+/// Treating that as failure is wrong twice over: the upload succeeded, and
+/// the caller's recovery is to re-upload the whole file, since
+/// `list_uploads` cannot see a completed upload either.
+///
+/// `NoSuchUpload` is only evidence of that on a later attempt. On the first
+/// attempt it means what it says — unknown or already-aborted upload id — and
+/// is surfaced.
+pub(crate) async fn complete_upload_with_retry(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+    parts: &[(u32, String)],
+    keep_old_version: bool,
+    expected_size: Option<u64>,
+) -> Result<u32> {
     let (access, secret) = client.require_auth()?;
+    let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!(
         "{}?uploadId={}",
         build_s3_url(client, identifier, key),
@@ -294,42 +347,74 @@ pub async fn complete_upload(
     );
 
     let manifest = build_complete_manifest(parts);
-    let mut req = client
-        .upload_http()
-        .post(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .header("Content-Type", "application/xml")
-        .header("Content-Length", manifest.len().to_string());
+    let result = send_with_retry(ctx, "complete multipart", || {
+        let mut req = client
+            .upload_http()
+            .post(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .header("Content-Type", "application/xml")
+            .header("Content-Length", manifest.len().to_string());
+        if keep_old_version {
+            req = req.header("x-archive-keep-old-version", "1");
+        }
+        req.body(manifest.clone()).send()
+    })
+    .await;
 
-    if keep_old_version {
-        req = req.header("x-archive-keep-old-version", "1");
+    match result {
+        Ok(sent) => Ok(sent.attempts),
+        // NoSuchUpload after a retry may mean an earlier attempt applied and
+        // only its response was lost: a completed upload is no longer in
+        // progress. The retry alone does not prove that, because every
+        // retry trigger (a dropped connection, a 503 SlowDown) means the
+        // earlier attempt was not applied. So ask the item whether the
+        // object is actually there before calling this a success.
+        Err(f) if f.code.as_deref() == Some("NoSuchUpload") && f.attempts > 1 => {
+            if object_landed(client, identifier, key, expected_size).await {
+                tracing::debug!(
+                    identifier,
+                    key,
+                    %upload_id,
+                    attempts = f.attempts,
+                    "completion applied on an earlier attempt; object is present"
+                );
+                Ok(f.attempts)
+            } else {
+                tracing::warn!(
+                    identifier,
+                    key,
+                    %upload_id,
+                    attempts = f.attempts,
+                    "upload id is gone and the object is not in the item; the upload did not complete"
+                );
+                Err(f.error)
+            }
+        }
+        Err(f) => Err(f.error),
     }
+}
 
-    let resp = req
-        .body(manifest)
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("complete multipart: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("complete multipart failed: {msg}"),
-            status: Some(status.as_u16()),
-        });
+/// Whether the item's metadata lists `key`, at `expected_size` when known.
+///
+/// Used only to disambiguate a `NoSuchUpload` after a retried completion.
+/// A metadata fetch failure counts as "not there": the caller then reports
+/// the completion as failed, which is the conservative outcome.
+async fn object_landed(
+    client: &IaClient,
+    identifier: &str,
+    key: &str,
+    expected_size: Option<u64>,
+) -> bool {
+    match client.get_item(identifier).await {
+        Ok(item) => item
+            .files
+            .iter()
+            .any(|f| f.name == key && expected_size.is_none_or(|want| f.size == Some(want))),
+        Err(e) => {
+            tracing::debug!(identifier, key, error = %e, "could not fetch item metadata to confirm completion");
+            false
+        }
     }
-    Ok(())
 }
 
 /// Abort a multipart upload.
@@ -341,41 +426,72 @@ pub async fn abort_upload(
     key: &str,
     upload_id: &str,
 ) -> Result<()> {
+    abort_upload_with_ctx(client, &default_ctx(identifier, key), upload_id).await
+}
+
+/// Abort a multipart upload with the caller's retry budget.
+pub(crate) async fn abort_upload_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+) -> Result<()> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let resp = client
-        .upload_http()
-        .delete(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("abort multipart: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("abort multipart failed: {msg}"),
-            status: Some(status.as_u16()),
-        });
+    let result = send_with_retry(ctx, "abort multipart", || {
+        client
+            .upload_http()
+            .delete(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        // Already gone (completed, expired, or aborted by another run). The
+        // caller wanted it gone; `ia upload cleanup --abort-all` must not
+        // stop at the first upload that no longer exists.
+        Err(f) if f.code.as_deref() == Some("NoSuchUpload") => {
+            tracing::debug!(
+                identifier = ctx.identifier,
+                key = ctx.key,
+                %upload_id,
+                "multipart upload already gone; nothing to abort"
+            );
+            Ok(())
+        }
+        Err(f) => Err(f.error),
     }
-    Ok(())
 }
+
+/// Retry context for the public S3 wrappers, which take no caller-supplied
+/// budget: `initiate_upload`, `upload_part`, `complete_upload`,
+/// `abort_upload`, `list_uploads` and `list_parts`.
+///
+/// These carry no progress of their own, but they must not silently lose the
+/// retries they had while the middleware was doing it for them. The wrappers
+/// are consumed outside this workspace, where a signature that still
+/// compiles would otherwise hide the loss. Inside `upload_file_multipart`
+/// every call uses the caller's `--retries`/`--retry-sleep` instead.
+fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
+    S3RetryCtx {
+        identifier,
+        key,
+        retries: DEFAULT_RETRIES,
+        retry_sleep: DEFAULT_RETRY_SLEEP,
+        bytes_sent: 0,
+        total_bytes: 0,
+        progress: None,
+    }
+}
+
+/// Matches the attempt count the retry middleware used to give these calls.
+const DEFAULT_RETRIES: u32 = 3;
+const DEFAULT_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -384,48 +500,44 @@ pub async fn abort_upload(
 /// Returns an empty list when the item does not exist yet (`NoSuchBucket`),
 /// so callers can fall through to a fresh initiate on a new item.
 pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<MultipartUploadInfo>> {
+    list_uploads_with_ctx(client, &default_ctx(identifier, "")).await
+}
+
+/// List in-progress uploads with the caller's retry budget.
+pub(crate) async fn list_uploads_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+) -> Result<Vec<MultipartUploadInfo>> {
+    let identifier = ctx.identifier;
     let (access, secret) = client.require_auth()?;
     let url = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let resp = client
-        .upload_http()
-        .get(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: String::new(),
-            message: format!("list multipart uploads: {e}"),
-            status: None,
-        })?;
+    let result = send_with_retry(ctx, "list multipart uploads", || {
+        client
+            .upload_http()
+            .get(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let s3_err = parse_s3_error(&body);
+    match result {
+        Ok(sent) => {
+            let body = sent.response.text().await.unwrap_or_default();
+            Ok(parse_list_uploads_response(&body))
+        }
         // A brand-new item has no bucket yet, so there is nothing in progress
         // to list. Treat that as an empty result; the initiate POST that
         // follows carries x-archive-auto-make-bucket and creates the item.
-        if s3_err.as_ref().is_some_and(|e| e.code == "NoSuchBucket") {
+        Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
             tracing::debug!(
                 identifier,
                 "item does not exist yet; no multipart uploads to resume"
             );
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
-        let msg = s3_err
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: String::new(),
-            message: format!("list multipart uploads: {msg}"),
-            status: Some(status.as_u16()),
-        });
+        Err(f) => Err(f.error),
     }
-
-    Ok(parse_list_uploads_response(&body))
 }
 
 /// List completed parts for a multipart upload.
@@ -437,39 +549,31 @@ pub async fn list_parts(
     key: &str,
     upload_id: &str,
 ) -> Result<Vec<PartInfo>> {
+    list_parts_with_ctx(client, &default_ctx(identifier, key), upload_id).await
+}
+
+/// List completed parts with the caller's retry budget.
+pub(crate) async fn list_parts_with_ctx(
+    client: &IaClient,
+    ctx: &S3RetryCtx<'_>,
+    upload_id: &str,
+) -> Result<Vec<PartInfo>> {
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let resp = client
-        .upload_http()
-        .get(&url)
-        .header("Authorization", format!("LOW {access}:{secret}"))
-        .send()
-        .await
-        .map_err(|e| IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("list parts: {e}"),
-            status: None,
-        })?;
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = parse_s3_error(&body)
-            .map(|e| format!("{}: {}", e.code, e.message))
-            .unwrap_or_else(|| format!("HTTP {status}: {}", strip_xml(&body)));
-        return Err(IaError::UploadFailed {
-            identifier: identifier.into(),
-            key: key.into(),
-            message: format!("list parts: {msg}"),
-            status: Some(status.as_u16()),
-        });
-    }
+    let sent = send_with_retry(ctx, "list parts", || {
+        client
+            .upload_http()
+            .get(&url)
+            .header("Authorization", format!("LOW {access}:{secret}"))
+            .send()
+    })
+    .await?;
+    let body = sent.response.text().await.unwrap_or_default();
 
     Ok(parse_list_parts_response(&body))
 }
@@ -521,6 +625,15 @@ pub async fn upload_file_multipart(
 
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
+    let control_ctx = S3RetryCtx {
+        identifier,
+        key,
+        retries: opts.retries,
+        retry_sleep: opts.retry_sleep,
+        bytes_sent: 0,
+        total_bytes: file_size,
+        progress: progress.clone(),
+    };
 
     // Dry run: report what would happen without contacting the server
     if opts.dry_run {
@@ -547,7 +660,7 @@ pub async fn upload_file_multipart(
     }
 
     // Try to resume an existing upload
-    let (upload_id, existing_parts) = try_resume(client, identifier, key).await?;
+    let (upload_id, existing_parts) = try_resume(client, &control_ctx).await?;
 
     // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
     let extra_headers = {
@@ -582,6 +695,9 @@ pub async fn upload_file_multipart(
         hdrs
     };
 
+    // Retries across every request of this upload, for UploadResult.
+    let mut total_retries = 0u32;
+
     let (upload_id, mut completed_parts) = match upload_id {
         Some(id) => {
             tracing::info!(
@@ -598,7 +714,9 @@ pub async fn upload_file_multipart(
             (id, parts)
         }
         None => {
-            let id = initiate_upload(client, identifier, key, &extra_headers).await?;
+            let (id, attempts) =
+                initiate_upload_with_retry(client, &control_ctx, &extra_headers).await?;
+            total_retries += attempts.saturating_sub(1);
             tracing::debug!(identifier, key, upload_id = %id, "initiated multipart upload");
             (id, Vec::new())
         }
@@ -606,7 +724,6 @@ pub async fn upload_file_multipart(
 
     // Compute part boundaries
     let part_count = file_size.div_ceil(part_size).max(1) as u32;
-    let mut total_retries = 0u32;
 
     // Upload each part
     for part_num in 1..=part_count {
@@ -629,58 +746,46 @@ pub async fn upload_file_multipart(
             });
         }
 
-        // Per-part retry loop — re-read from file on each attempt to avoid
-        // holding a 100 MiB clone in memory across retries.
-        let mut part_retries = 0u32;
-        let etag = loop {
-            let data = read_file_range(file, offset, this_part_size).await?;
-            tracing::debug!(
-                identifier,
-                key,
-                part = part_num,
-                of = part_count,
-                bytes = this_part_size,
-                "uploading part"
-            );
-            match upload_part(client, identifier, key, &upload_id, part_num, data).await {
-                Ok(etag) => {
+        // Retry lives in upload_part_with_retry, which uses the same policy
+        // as every other IA-S3 request. This loop owns orchestration only:
+        // progress, accounting, and aborting the upload when a part is lost.
+        let data = read_file_range(file, offset, this_part_size).await?;
+        tracing::debug!(
+            identifier,
+            key,
+            part = part_num,
+            of = part_count,
+            bytes = this_part_size,
+            "uploading part"
+        );
+        let ctx = S3RetryCtx {
+            identifier,
+            key,
+            retries: opts.retries,
+            retry_sleep: opts.retry_sleep,
+            bytes_sent: offset,
+            total_bytes: file_size,
+            progress: progress.clone(),
+        };
+        let etag =
+            match upload_part_with_retry(client, &ctx, &upload_id, part_num, Bytes::from(data))
+                .await
+            {
+                Ok((etag, attempts)) => {
+                    // attempts counts the first try, so retries is one fewer.
+                    total_retries += attempts.saturating_sub(1);
                     tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
-                    break etag;
+                    etag
                 }
                 Err(e) => {
-                    // Check if retryable: 5xx status codes are transient
-                    let is_retryable = matches!(
-                        &e,
-                        IaError::UploadFailed { status: Some(code), .. }
-                            if *code >= 500
-                    );
-
-                    if is_retryable && part_retries < opts.retries {
-                        part_retries += 1;
-                        total_retries += 1;
-
-                        if let Some(ref cb) = progress {
-                            cb(UploadProgress {
-                                identifier: identifier.into(),
-                                key: key.into(),
-                                bytes_sent: offset,
-                                total_bytes: file_size,
-                                status: UploadProgressStatus::WaitingRateLimit,
-                            });
-                        }
-
-                        tokio::time::sleep(opts.retry_sleep).await;
-                        continue;
-                    }
-
-                    // Non-retryable or retries exhausted: abort the upload
                     tracing::warn!(
                         identifier,
                         key,
                         part_num,
                         "multipart part failed, aborting upload"
                     );
-                    if let Err(abort_err) = abort_upload(client, identifier, key, &upload_id).await
+                    if let Err(abort_err) =
+                        abort_upload_with_ctx(client, &control_ctx, &upload_id).await
                     {
                         tracing::warn!(
                             identifier,
@@ -693,8 +798,7 @@ pub async fn upload_file_multipart(
                     }
                     return Err(e);
                 }
-            }
-        };
+            };
 
         completed_parts.push((part_num, etag));
     }
@@ -706,15 +810,21 @@ pub async fn upload_file_multipart(
 
     // Complete the multipart upload
     let keep_old_version = !opts.no_backup;
-    complete_upload(
+    // Every byte has been sent by now; a backoff here must say so.
+    let completion_ctx = S3RetryCtx {
+        bytes_sent: file_size,
+        ..control_ctx
+    };
+    let completion_attempts = complete_upload_with_retry(
         client,
-        identifier,
-        key,
+        &completion_ctx,
         &upload_id,
         &completed_parts,
         keep_old_version,
+        Some(file_size),
     )
     .await?;
+    total_retries += completion_attempts.saturating_sub(1);
 
     // Report completion
     if let Some(ref cb) = progress {
@@ -760,18 +870,17 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
 /// If multiple uploads exist for the same key, returns the most recent one.
 async fn try_resume(
     client: &IaClient,
-    identifier: &str,
-    key: &str,
+    ctx: &S3RetryCtx<'_>,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
-    let uploads = list_uploads(client, identifier).await?;
+    let uploads = list_uploads_with_ctx(client, ctx).await?;
 
     // Find uploads matching this key, take the most recent
     // Take the last matching upload (most recent, S3 returns chronological order)
-    let matching = uploads.iter().rfind(|u| u.key == key);
+    let matching = uploads.iter().rfind(|u| u.key == ctx.key);
 
     match matching {
         Some(info) => {
-            let parts = list_parts(client, identifier, key, &info.upload_id).await?;
+            let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
             Ok((Some(info.upload_id.clone()), parts))
         }
         None => Ok((None, Vec::new())),

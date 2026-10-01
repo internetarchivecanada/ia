@@ -77,11 +77,11 @@ impl std::error::Error for RedirectBlockedError {}
 #[derive(Clone)]
 pub struct IaClient {
     http: ClientWithMiddleware,
-    /// Retry-middleware client over the upload transport (no read
-    /// timeout). For upload-path requests with cloneable bodies:
-    /// multipart part PUTs and S3 control calls (initiate/complete/
-    /// abort/list), whose body sends or server-side processing can
-    /// legitimately exceed the API read timeout.
+    /// Timing-only client over the upload transport (no read timeout, no
+    /// retry layer). For multipart part PUTs and the S3 control calls
+    /// (initiate/complete/abort/list), whose body sends or server-side
+    /// processing can legitimately exceed the API read timeout. Retry for
+    /// these lives in `upload::retry::send_with_retry`.
     upload_http: ClientWithMiddleware,
     /// Raw reqwest client without retry middleware (upload transport,
     /// no read timeout).
@@ -255,15 +255,19 @@ impl IaClient {
             ))
             .build();
 
-        // Same middleware stack over the upload transport, for upload
-        // requests with cloneable bodies (multipart parts, S3 control
-        // calls) that want retry but must not have a read timeout.
+        // Upload transport: timing only, no retry layer.
+        //
+        // Multipart requests (part PUTs and the S3 control calls) retry
+        // through upload::retry::send_with_retry, which classifies on the
+        // S3 error <Code> rather than the HTTP status. Leaving the
+        // middleware here too would stack the two: a part PUT would get 4
+        // middleware attempts inside each of `retries` application
+        // attempts, so `--retries 10` would mean 44 PUTs of a 100 MiB part,
+        // and UploadResult.retries would under-report by 4x. The single-file
+        // PUT streams its body and keeps its own loop over raw_http; it
+        // shares the classifier (s3_error::should_retry_s3).
         let upload_http = ClientBuilder::new(transports.upload)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
-                retry_policy,
-                LoggingRetryStrategy::new(stats.clone()),
-            ))
             .build();
 
         Ok(Self {
@@ -326,13 +330,14 @@ impl IaClient {
         &self.http
     }
 
-    /// Retry-middleware HTTP client over the upload transport.
+    /// Timing-only HTTP client over the upload transport.
     ///
-    /// Like [`Self::http`] but without a read timeout. Use for upload-path
-    /// requests with cloneable bodies — multipart part PUTs and S3 control
-    /// calls — where the body send or server-side processing (e.g.
-    /// assembling a completed multipart upload) can stay silent longer
-    /// than the API read timeout.
+    /// Like [`Self::http`] but without a read timeout and without the retry
+    /// middleware. Use for multipart part PUTs and S3 control calls, where
+    /// the body send or server-side processing (e.g. assembling a completed
+    /// multipart upload) can stay silent longer than the API read timeout.
+    /// Callers retry through `upload::retry::send_with_retry`; nothing on
+    /// this client retries by itself.
     pub(crate) fn upload_http(&self) -> &ClientWithMiddleware {
         &self.upload_http
     }
@@ -340,8 +345,8 @@ impl IaClient {
     /// Raw HTTP client without retry middleware (upload transport).
     ///
     /// Note this covers only streaming uploads. The multipart control calls
-    /// (initiate, complete, abort) still go through [`Self::upload_http`] and
-    /// are retried on 5xx.
+    /// (initiate, complete, abort, listings) go through [`Self::upload_http`]
+    /// and retry via `upload::retry::send_with_retry`.
     ///
     /// Use this for requests with streaming (non-cloneable) bodies, such as
     /// file uploads. The retry middleware requires `Request::try_clone()` to

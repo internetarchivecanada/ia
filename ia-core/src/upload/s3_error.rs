@@ -57,6 +57,58 @@ impl S3Error {
     }
 }
 
+/// Whether an IA-S3 response should be retried.
+///
+/// The single classifier for every upload request: the single-file PUT loop
+/// in `upload::single` and the multipart loop in `upload::retry` both decide
+/// with this. They are the same protocol against the same endpoint, so they
+/// get the same policy.
+///
+/// Decided on the S3 error `<Code>` when the body is a parseable S3 error,
+/// because the code says what actually happened and the status does not. IA
+/// returns 503 both for `SlowDown` (throttled, request never applied, retry
+/// is correct) and for genuine faults, and returns non-retryable conditions
+/// under a range of statuses.
+///
+/// Falls back to the status when the body is not an S3 error — an HTML error
+/// page from a proxy, or an empty body. There, 5xx and 429 are the only
+/// retryable signals; 4xx means the request was understood and refused.
+///
+/// `429` is retryable here even though the middleware declines it for other
+/// endpoints: on S3 there is no separate application-level rate-limit loop
+/// for part uploads, so leaving it to a caller means leaving it unhandled.
+#[must_use]
+pub fn should_retry_s3(status: reqwest::StatusCode, body: &str) -> bool {
+    match parse_s3_error(body) {
+        Some(err) => err.is_retryable(),
+        None => status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+    }
+}
+
+/// The user-facing description of a failed IA-S3 response.
+///
+/// The S3 `<Code>` and `<Message>` when the body is an S3 error, otherwise
+/// the HTTP status and the body with its markup stripped. Every place that
+/// reports an S3 failure to the user builds its text here, so a 403
+/// AccessDenied reads the same whichever request hit it.
+#[must_use]
+pub fn describe_s3_failure(status: reqwest::StatusCode, body: &str) -> String {
+    describe_parsed(status, parse_s3_error(body).as_ref(), body)
+}
+
+/// [`describe_s3_failure`] for a caller that has already parsed the body.
+#[must_use]
+pub(crate) fn describe_parsed(
+    status: reqwest::StatusCode,
+    parsed: Option<&S3Error>,
+    body: &str,
+) -> String {
+    match parsed {
+        Some(e) => format!("{}: {}", e.code, e.message),
+        None => format!("HTTP {status}: {}", strip_xml(body)),
+    }
+}
+
 /// Strip XML/HTML tags and collapse whitespace so raw S3 response bodies
 /// don't leak through to user-facing error messages.
 ///
@@ -88,6 +140,26 @@ pub fn strip_xml(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_uses_code_and_message_for_s3_errors() {
+        let body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        assert_eq!(
+            describe_s3_failure(reqwest::StatusCode::FORBIDDEN, body),
+            "AccessDenied: Access Denied"
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_status_and_stripped_body() {
+        assert_eq!(
+            describe_s3_failure(
+                reqwest::StatusCode::BAD_GATEWAY,
+                "<html>Bad <b>Gateway</b></html>"
+            ),
+            "HTTP 502 Bad Gateway: Bad Gateway"
+        );
+    }
 
     #[test]
     fn parse_access_denied() {
@@ -154,6 +226,65 @@ mod tests {
     fn parse_missing_code_returns_none() {
         let xml = "<Error><Message>Something</Message></Error>";
         assert!(parse_s3_error(xml).is_none());
+    }
+
+    // ── should_retry_s3: the shared upload policy ────────────────────────
+
+    #[test]
+    fn s3_code_decides_over_status() {
+        use reqwest::StatusCode;
+
+        // 503 SlowDown is throttling: rejected, never applied, so retry.
+        let slowdown = "<Error><Code>SlowDown</Code><Message>Reduce rate</Message></Error>";
+        assert!(should_retry_s3(StatusCode::SERVICE_UNAVAILABLE, slowdown));
+
+        // A non-retryable code wins even when the status says 5xx. Retrying
+        // this twelve times is what the old status-only check did.
+        let denied = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        assert!(!should_retry_s3(StatusCode::SERVICE_UNAVAILABLE, denied));
+
+        // And a retryable code wins even when the status is not 5xx.
+        let throttled = "<Error><Code>ThrottlingException</Code><Message>slow</Message></Error>";
+        assert!(should_retry_s3(StatusCode::BAD_REQUEST, throttled));
+    }
+
+    #[test]
+    fn falls_back_to_status_when_body_is_not_an_s3_error() {
+        use reqwest::StatusCode;
+
+        // Proxy HTML, empty bodies: no code to read, so trust the status.
+        for body in ["<html>502 Bad Gateway</html>", "", "not xml"] {
+            assert!(
+                should_retry_s3(StatusCode::BAD_GATEWAY, body),
+                "body: {body:?}"
+            );
+            assert!(
+                should_retry_s3(StatusCode::TOO_MANY_REQUESTS, body),
+                "body: {body:?}"
+            );
+            assert!(
+                !should_retry_s3(StatusCode::FORBIDDEN, body),
+                "body: {body:?}"
+            );
+            assert!(
+                !should_retry_s3(StatusCode::NOT_FOUND, body),
+                "body: {body:?}"
+            );
+            assert!(
+                !should_retry_s3(StatusCode::BAD_REQUEST, body),
+                "body: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_such_upload_is_not_retryable() {
+        use reqwest::StatusCode;
+
+        // Retrying a completed upload's completion is pointless; the caller
+        // interprets this code instead.
+        let body = "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>";
+        assert!(!should_retry_s3(StatusCode::NOT_FOUND, body));
     }
 
     #[test]

@@ -17,6 +17,11 @@ fn temp_file(content: &[u8]) -> NamedTempFile {
 }
 
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
+///
+/// Built with `from_config`, the way production builds one, so every test
+/// here observes the real middleware stack. A client without middleware
+/// cannot tell whether a retry layer was stacked back onto the upload
+/// transport; a test asserting an attempt count would pass regardless.
 fn test_client(server: &MockServer) -> IaClient {
     let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
     let mut config = IaConfig::default();
@@ -24,7 +29,7 @@ fn test_client(server: &MockServer) -> IaClient {
     config.s3_secret = Some("test-secret".into());
     config.general.host = host_port;
     config.general.secure = false;
-    IaClient::from_config_no_retry(config).unwrap()
+    IaClient::from_config(config).unwrap()
 }
 
 // ── Initiate ────────────────────────────────────────────────────────────
@@ -71,6 +76,46 @@ async fn initiate_upload_403_fails() {
     let client = test_client(&server);
     let result = multipart::initiate_upload(&client, "test-item", "file.zip", &[]).await;
     assert!(result.is_err());
+}
+
+/// The public wrapper retries with the default budget. It used to get this
+/// from the middleware; with that layer gone, a wrapper built with
+/// `retries: 0` would compile unchanged for external callers and silently
+/// fail on IA's most common response.
+#[tokio::test]
+async fn public_initiate_upload_retries_a_throttle() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string(
+                "<Error><Code>SlowDown</Code><Message>Reduce rate</Message></Error>",
+            ),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>upload-id-2</UploadId>\
+             </InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let result = multipart::initiate_upload(&client, "test-item", "file.zip", &[]).await;
+
+    // Count first: if the unwrap below panics, wiremock only logs a missed
+    // `expect` instead of failing the test.
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(result.unwrap(), "upload-id-2");
 }
 
 // ── Upload Part ─────────────────────────────────────────────────────────
@@ -939,4 +984,797 @@ async fn zero_part_size_returns_error_not_panic() {
         server.received_requests().await.unwrap().is_empty(),
         "validation must reject part_size=0 before any request is sent"
     );
+}
+
+// ── One IA-S3 retry policy, shared by every upload request ──────────────────
+//
+// Retry lives in upload::retry::send_with_retry and classifies on the S3
+// error <Code>, not the HTTP status. These pin the three things that follow
+// from that: a non-retryable code fails fast even when the status is 5xx, a
+// throttle retries, and the attempt count is exactly what was asked for
+// rather than multiplied by a second layer.
+
+/// Boilerplate shared by the tests below: resume check empty, initiate ok.
+async fn mock_resume_empty_and_initiate(server: &MockServer, upload_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<InitiateMultipartUploadResult><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        )))
+        .mount(server)
+        .await;
+}
+
+fn fast_opts(retries: u32) -> UploadOpts {
+    UploadOpts {
+        verify: false,
+        retries,
+        retry_sleep: std::time::Duration::from_millis(1),
+        ..Default::default()
+    }
+}
+
+/// A non-retryable S3 code must fail on the first attempt even though the
+/// status is 5xx. Classifying on status alone retried this until the budget
+/// ran out, which for a 100 MiB part is minutes of pointless transfer.
+#[tokio::test]
+async fn part_with_non_retryable_code_fails_without_retrying() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-1").await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The part fails, so the upload is aborted.
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(5),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(result.is_err(), "AccessDenied must not be retried");
+}
+
+/// The attempt count is exactly first-try plus `retries`, with no second
+/// layer multiplying it.
+#[tokio::test]
+async fn part_retries_exactly_the_configured_budget() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-2").await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .expect(4) // 1 initial + 3 retries
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let _ = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    server.verify().await;
+}
+
+/// A throttled initiate must retry. IA answers throttling with 503 SlowDown,
+/// so refusing to retry here makes --multipart fail on IA's most common
+/// response while a plain upload survives it.
+#[tokio::test]
+async fn initiate_retries_on_slowdown_then_succeeds() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-3</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-3"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("a throttled initiate should retry and succeed");
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+/// Mount a metadata response for test-item listing the given files.
+async fn mock_item_files(server: &MockServer, files: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": files
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The completion applied and the response was lost. The retry gets
+/// NoSuchUpload, because a completed upload is no longer in progress. A
+/// retry alone does not prove that: every retry trigger (a dropped
+/// connection, a 503 SlowDown) means the earlier attempt was NOT applied.
+/// So NoSuchUpload after a retry is success only when the item's metadata
+/// shows the object at the expected size.
+#[tokio::test]
+async fn complete_no_such_upload_after_a_retry_is_success_when_the_object_exists() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-4").await;
+    mock_item_files(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "11", "md5": "5eb63bbbe01eeed093cb22bb8f5acdc3"}]),
+    )
+    .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    // First complete: 503 SlowDown, so it is retried.
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Retry: the completion had in fact applied, so the upload is gone.
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("NoSuchUpload after a retry, with the object present, is a completed upload");
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+/// Same sequence, but the object is not there: the upload id vanished for
+/// another reason (expired, or aborted by a concurrent `ia upload cleanup`).
+/// Reporting Uploaded here would be a lie, and with --delete-after-upload
+/// it would delete the only copy of a file that was never stored.
+#[tokio::test]
+async fn complete_no_such_upload_after_a_retry_fails_when_the_object_is_missing() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-4b").await;
+    mock_item_files(
+        &server,
+        serde_json::json!([{"name": "other.bin", "size": "3"}]),
+    )
+    .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4b"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-4b"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let mut opts = fast_opts(3);
+    opts.delete_after_upload = true;
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("the object never landed, so this is a failure");
+    assert!(
+        err.to_string().contains("NoSuchUpload"),
+        "error should name the S3 code: {err}"
+    );
+    assert!(
+        f.path().exists(),
+        "--delete-after-upload must not delete a file that was never stored"
+    );
+}
+
+/// On the *first* attempt NoSuchUpload means what it says — an unknown or
+/// already-aborted upload id — and must surface. Treating it as success
+/// unconditionally would mask a genuine failure as a completed upload.
+#[tokio::test]
+async fn complete_surfaces_no_such_upload_on_the_first_attempt() {
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-5").await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-5"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a first-attempt NoSuchUpload is a real failure"
+    );
+}
+
+// ── Transport-level failures ─────────────────────────────────────────────
+//
+// wiremock cannot close a socket mid-exchange, so these use a raw listener.
+
+/// A server that reads one full HTTP request from a connection.
+async fn read_full_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; 8192];
+    let mut acc = Vec::new();
+    let mut body_len: Option<usize> = None;
+    let mut header_end: Option<usize> = None;
+    loop {
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        acc.extend_from_slice(&buf[..n]);
+        if header_end.is_none() {
+            if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                let head = String::from_utf8_lossy(&acc[..pos]).to_ascii_lowercase();
+                body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok());
+            }
+        }
+        if let (Some(he), Some(bl)) = (header_end, body_len) {
+            if acc.len() >= he + bl {
+                break;
+            }
+        }
+    }
+    acc
+}
+
+fn tcp_client(port: u16) -> IaClient {
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = format!("127.0.0.1:{port}");
+    config.general.secure = false;
+    IaClient::from_config(config).unwrap()
+}
+
+/// A connection that closes after the request was written, before any
+/// response, is what a reset or a dropped keep-alive looks like to hyper
+/// (IncompleteMessage). The middleware this branch removed retried it; the
+/// shared policy must too, or one blip on one part aborts a whole upload.
+#[tokio::test]
+async fn part_put_retries_when_the_connection_closes_before_a_response() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        // Connection 1: read the whole PUT, then hang up without answering.
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_full_request(&mut stream).await;
+            assert!(
+                req.starts_with(b"PUT "),
+                "first request should be the part PUT"
+            );
+            drop(stream);
+        }
+        // Connection 2: the retry. Answer it properly.
+        {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let req = read_full_request(&mut stream).await;
+            assert!(req.starts_with(b"PUT "), "retry should be the same PUT");
+            let resp = "HTTP/1.1 200 OK\r\netag: \"etag-retry\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    let client = tcp_client(port);
+    let etag = multipart::upload_part(
+        &client,
+        "test-item",
+        "data.bin",
+        "up-1",
+        1,
+        b"hello world".to_vec(),
+    )
+    .await
+    .expect("a closed connection is transient and must be retried");
+
+    assert_eq!(etag, "\"etag-retry\"");
+    server.await.unwrap();
+}
+
+// ── Shared-policy behaviours pinned after review ─────────────────────────
+
+/// IA's spam rejection is a plain-text 503 with no S3 <Code>. The status
+/// fallback would retry it as a transient 5xx for the whole budget; the
+/// single-file path returns SpamDetected at once, and so must this one.
+#[tokio::test]
+async fn initiate_spam_rejection_is_not_retried() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "<html><body>Your upload appears to be spam. Please contact info@archive.org.</body></html>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(5),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(ia_core::IaError::SpamDetected { .. })),
+        "got {result:?}"
+    );
+    server.verify().await;
+}
+
+/// The resume check is the first request of every multipart upload. It must
+/// use the budget the user asked for, not a fixed one.
+#[tokio::test]
+async fn resume_check_uses_the_configured_retry_budget() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .expect(6) // 1 initial + 5 retries
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(5),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(result.is_err());
+    server.verify().await;
+}
+
+/// Mount a mock that answers once with a 503 SlowDown, then a second mock
+/// that answers every later request with `ok`.
+async fn mock_slowdown_then(
+    server: &MockServer,
+    m: &str,
+    p: &str,
+    param: (&str, &str),
+    ok: ResponseTemplate,
+) {
+    Mock::given(method(m))
+        .and(path(p))
+        .and(query_param(param.0, param.1))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method(m))
+        .and(path(p))
+        .and(query_param(param.0, param.1))
+        .respond_with(ok)
+        .mount(server)
+        .await;
+}
+
+/// UploadResult.retries is what the joblog and --json report. With retry
+/// now application-level for every request, it must count the control
+/// calls too, not only the parts.
+#[tokio::test]
+async fn retries_counts_control_call_attempts() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploads", ""),
+        ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-6</UploadId></InitiateMultipartUploadResult>",
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploadId", "mp-6"),
+        ResponseTemplate::new(200),
+    )
+    .await;
+
+    let f = temp_file(b"hello world");
+    let result = multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(
+        result.retries, 2,
+        "one initiate retry plus one complete retry"
+    );
+}
+
+/// A backoff after a throttle is a rate-limit wait; a backoff after any
+/// other failure is a plain retry. The progress bar prints different text
+/// for the two, so the events must say which one happened, and the event
+/// for the completion call must carry the bytes actually sent.
+#[tokio::test]
+async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
+    use ia_core::upload::{UploadProgress, UploadProgressStatus};
+    use std::sync::{Arc, Mutex};
+
+    let server = MockServer::start().await;
+    mock_resume_empty_and_initiate(&server, "mp-7").await;
+
+    // Part: 500 InternalError once (retryable, not a throttle), then 200.
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string(
+                "<Error><Code>InternalError</Code><Message>oops</Message></Error>",
+            ),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+    // Complete: 503 SlowDown once (a throttle), then 200.
+    mock_slowdown_then(
+        &server,
+        "POST",
+        "/test-item/data.bin",
+        ("uploadId", "mp-7"),
+        ResponseTemplate::new(200),
+    )
+    .await;
+
+    let events: Arc<Mutex<Vec<UploadProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let progress: Arc<dyn Fn(UploadProgress) + Send + Sync> =
+        Arc::new(move |p| sink.lock().unwrap().push(p));
+
+    let f = temp_file(b"hello world");
+    multipart::upload_file_multipart(
+        &test_client(&server),
+        "test-item",
+        f.path(),
+        "data.bin",
+        &fast_opts(3),
+        1024,
+        true,
+        true,
+        None,
+        Some(progress),
+    )
+    .await
+    .unwrap();
+
+    let events = events.lock().unwrap();
+    let retrying: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.status, UploadProgressStatus::Retrying))
+        .collect();
+    let waiting: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.status, UploadProgressStatus::WaitingRateLimit))
+        .collect();
+    assert_eq!(
+        retrying.len(),
+        1,
+        "one Retrying for the InternalError: {events:#?}"
+    );
+    assert_eq!(retrying[0].bytes_sent, 0, "part 1 starts at offset 0");
+    assert_eq!(
+        waiting.len(),
+        1,
+        "one WaitingRateLimit for the SlowDown: {events:#?}"
+    );
+    assert_eq!(
+        waiting[0].bytes_sent, 11,
+        "completion backoff reports the whole file as sent"
+    );
+}
+
+// ── Abort ────────────────────────────────────────────────────────────────
+
+/// `ia upload cleanup --abort-all` aborts every listed upload in turn. One
+/// that vanished between the listing and the DELETE is not a failure, and
+/// must not stop the loop.
+#[tokio::test]
+async fn abort_of_a_vanished_upload_is_not_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            "<Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    multipart::abort_upload(&test_client(&server), "test-item", "data.bin", "gone")
+        .await
+        .expect("an already-gone upload is already aborted");
+    server.verify().await;
+}
+
+/// The public abort wrapper keeps the default budget, so a throttle on the
+/// DELETE is retried.
+#[tokio::test]
+async fn abort_retries_a_throttle() {
+    let server = MockServer::start().await;
+    mock_slowdown_then(
+        &server,
+        "DELETE",
+        "/test-item/data.bin",
+        ("uploadId", "mp-8"),
+        ResponseTemplate::new(204),
+    )
+    .await;
+
+    multipart::abort_upload(&test_client(&server), "test-item", "data.bin", "mp-8")
+        .await
+        .expect("a throttled abort retries and succeeds");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
 }
