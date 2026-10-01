@@ -30,11 +30,37 @@ pub enum IaError {
     #[error("rate limited (retry after {retry_after}s)")]
     RateLimited { retry_after: u64 },
 
-    #[error("checksum mismatch for {file}: expected {expected}, got {actual}")]
+    /// The downloaded bytes do not hash to the md5 in the item's metadata.
+    /// The bytes are kept at `kept` (`<name>.md5-mismatch`) so a corrupt
+    /// transfer can be told from a bad source file or wrong metadata;
+    /// nothing is left as `.part`, so a retry starts from byte 0. `kept` is
+    /// `None` when the copy could not be kept (something the rename cannot
+    /// replace sits at that path); the download was removed instead.
+    #[error(
+        "checksum mismatch for {file}: expected {expected}, got {actual}; {}",
+        kept_note(.kept)
+    )]
     ChecksumMismatch {
         file: String,
         expected: String,
         actual: String,
+        kept: Option<String>,
+    },
+
+    /// Two downloads in a row hashed to the same wrong md5. The transfer is
+    /// not corrupting the data; the source file or its metadata is wrong,
+    /// and downloading again cannot change that. The last copy is kept at
+    /// `kept` (see [`IaError::ChecksumMismatch`] for `None`).
+    #[error(
+        "checksum mismatch for {file} twice in a row (expected {expected}, got {actual}): the \
+         source file or its metadata is likely wrong; {}",
+        kept_note(.kept)
+    )]
+    SourceChecksumMismatch {
+        file: String,
+        expected: String,
+        actual: String,
+        kept: Option<String>,
     },
 
     #[error("disk full: {}", path.display())]
@@ -203,6 +229,15 @@ pub enum IaError {
     Json(#[from] serde_json::Error),
 }
 
+/// The tail of a checksum-mismatch message: where the download was kept,
+/// or that it could not be.
+fn kept_note(kept: &Option<String>) -> String {
+    match kept {
+        Some(path) => format!("kept the download at {path}"),
+        None => "the download could not be kept and was removed".to_string(),
+    }
+}
+
 pub type Result<T> = std::result::Result<T, IaError>;
 
 /// Format a full error chain, walking `.source()` to capture all causes.
@@ -286,6 +321,8 @@ impl IaError {
                     | std::io::ErrorKind::NetworkUnreachable
             ),
             IaError::ChecksumMismatch { .. } => true,
+            // The same wrong md5 twice: the source is wrong, not the wire.
+            IaError::SourceChecksumMismatch { .. } => false,
             IaError::ResumeFailed { .. } => true,
             // LLM API errors: retry on 429/5xx, not on 4xx
             IaError::LlmApi { status, .. } => *status == 429 || *status >= 500,
@@ -357,11 +394,29 @@ impl IaError {
                 file,
                 expected,
                 actual,
+                kept,
             } => {
                 extra.insert("file".into(), file.clone().into());
                 extra.insert("expected".into(), expected.clone().into());
                 extra.insert("actual".into(), actual.clone().into());
+                if let Some(kept) = kept {
+                    extra.insert("kept".into(), kept.clone().into());
+                }
                 "checksum_mismatch"
+            }
+            IaError::SourceChecksumMismatch {
+                file,
+                expected,
+                actual,
+                kept,
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert("expected".into(), expected.clone().into());
+                extra.insert("actual".into(), actual.clone().into());
+                if let Some(kept) = kept {
+                    extra.insert("kept".into(), kept.clone().into());
+                }
+                "source_checksum_mismatch"
             }
             IaError::DiskFull { path } => {
                 extra.insert("path".into(), path.display().to_string().into());
@@ -677,9 +732,77 @@ mod tests {
             file: "photo.jpg".to_string(),
             expected: "abc123".to_string(),
             actual: "def456".to_string(),
+            kept: Some("/dl/item/photo.jpg.md5-mismatch".to_string()),
         };
-        assert!(err.to_string().contains("photo.jpg"));
-        assert!(err.to_string().contains("abc123"));
+        let msg = err.to_string();
+        assert!(msg.contains("photo.jpg"), "{msg}");
+        assert!(msg.contains("abc123"), "{msg}");
+        assert!(msg.contains("def456"), "{msg}");
+        assert!(
+            msg.contains("kept the download at /dl/item/photo.jpg.md5-mismatch"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_says_when_the_copy_could_not_be_kept() {
+        let err = IaError::ChecksumMismatch {
+            file: "photo.jpg".to_string(),
+            expected: "abc123".to_string(),
+            actual: "def456".to_string(),
+            kept: None,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the download could not be kept and was removed"),
+            "{msg}"
+        );
+        assert!(!msg.contains("kept the download at"), "{msg}");
+        let v = parse_json_error(&err);
+        assert!(v["error"].get("kept").is_none(), "{v}");
+    }
+
+    // -- md5 mismatch handling (#14) --
+
+    fn source_mismatch() -> IaError {
+        IaError::SourceChecksumMismatch {
+            file: "disk.img".into(),
+            expected: "1a2b".into(),
+            actual: "9f8e".into(),
+            kept: Some("/dl/big-item/disk.img.md5-mismatch".into()),
+        }
+    }
+
+    #[test]
+    fn source_checksum_mismatch_is_not_retryable() {
+        assert!(!source_mismatch().is_retryable());
+    }
+
+    #[test]
+    fn source_checksum_mismatch_displays_details() {
+        let msg = source_mismatch().to_string();
+        assert!(msg.contains("disk.img"), "{msg}");
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("1a2b"), "{msg}");
+        assert!(msg.contains("9f8e"), "{msg}");
+        assert!(
+            msg.contains("source file or its metadata is likely wrong"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("kept the download at /dl/big-item/disk.img.md5-mismatch"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn json_source_checksum_mismatch() {
+        let v = parse_json_error(&source_mismatch());
+        assert_eq!(v["error"]["code"], "source_checksum_mismatch");
+        assert_eq!(v["error"]["file"], "disk.img");
+        assert_eq!(v["error"]["expected"], "1a2b");
+        assert_eq!(v["error"]["actual"], "9f8e");
+        assert_eq!(v["error"]["kept"], "/dl/big-item/disk.img.md5-mismatch");
     }
 
     #[test]
@@ -760,12 +883,14 @@ mod tests {
             file: "photo.jpg".into(),
             expected: "abc123".into(),
             actual: "def456".into(),
+            kept: Some("photo.jpg.md5-mismatch".into()),
         };
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "checksum_mismatch");
         assert_eq!(v["error"]["file"], "photo.jpg");
         assert_eq!(v["error"]["expected"], "abc123");
         assert_eq!(v["error"]["actual"], "def456");
+        assert_eq!(v["error"]["kept"], "photo.jpg.md5-mismatch");
     }
 
     #[test]
@@ -1034,6 +1159,7 @@ mod tests {
             file: "photo.jpg".into(),
             expected: "abc".into(),
             actual: "def".into(),
+            kept: Some("photo.jpg.md5-mismatch".into()),
         };
         assert!(err.is_retryable());
     }

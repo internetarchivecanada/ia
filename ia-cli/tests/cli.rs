@@ -2019,3 +2019,17 @@ fn download_long_help_shows_long_about() {
         .stdout(predicate::str::contains("Each file streams to").not())
         .stdout(predicate::str::contains("Download files from an item"));
 }
+
+// -- md5 mismatch handling (#14) --
+
+#[test]
+fn download_help_describes_md5_mismatch_handling() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".md5-mismatch"))
+        .stdout(predicate::str::contains("twice in a row"))
+        .stdout(predicate::str::contains(
+            "deleted once a later attempt verifies",
+        ));
+}

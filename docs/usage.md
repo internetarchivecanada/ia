@@ -44,7 +44,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--exclude-source <TYPE>` | Exclude by source type |
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
-| `-C, --checksum` | Verify checksums (slower, reads every local file) |
+| `-C, --checksum` | Verify md5 checksums (slower, reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` |
 | `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5) |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
@@ -73,6 +73,14 @@ A connection that drops is resumed: the bytes already in the `.part` file stay, 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
 Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
+
+#### Checksum mismatches
+
+With `--checksum`, a local file whose md5 matches the item metadata is skipped, and a downloaded file's md5 is computed from the stream and compared when the stream ends. On a mismatch the bytes are kept beside the file as `<name>.md5-mismatch` and the error names that path: `checksum mismatch for <name>: expected X, got Y; kept the download at <path>`. Nothing is left as `.part`, so the file is downloaded again from byte 0. Keeping the copy is what makes the next step possible: comparing it against a second download, or against the source, tells a corrupt transfer from a bad source file or wrong metadata.
+
+If the second download has the same wrong md5, the transfer is not corrupting anything and the source file or its metadata is wrong. The file then fails for good with `checksum mismatch for <name> twice in a row (expected X, got Y): the source file or its metadata is likely wrong; kept the download at <path>` (in `--json` output the error code is `download_failed` and this text is the message). A different wrong md5 means the transfer is corrupting data, and retrying continues up to `--retries`. Only one `.md5-mismatch` copy is kept per file: a new mismatch replaces it, and it is deleted once a later attempt verifies. A download that ends with a mismatch therefore needs room for two copies of the file while the retry runs.
+
+`.md5-mismatch` files are never resumed from and never count as a downloaded file; delete them when you are done with them. If the copy cannot be kept because something the rename cannot replace sits at that path (a directory, say), the download is removed instead and the message says `the download could not be kept and was removed`.
 
 #### Examples
 

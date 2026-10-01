@@ -66,7 +66,10 @@ pub(crate) struct S3Response {
 /// retry is worth checking against the item, on the first attempt it is not.
 #[derive(Debug)]
 pub(crate) struct S3Failure {
-    pub error: IaError,
+    /// Boxed so the `Err` side of `send_with_retry` stays small: `IaError`
+    /// is over 100 bytes and clippy's `result_large_err` draws the line at
+    /// 128 for the whole failure.
+    pub error: Box<IaError>,
     /// S3 error `<Code>`, when the body was a parseable S3 error.
     pub code: Option<String>,
     /// Attempts made, counting the first.
@@ -75,7 +78,7 @@ pub(crate) struct S3Failure {
 
 impl From<S3Failure> for IaError {
     fn from(f: S3Failure) -> Self {
-        f.error
+        *f.error
     }
 }
 
@@ -129,12 +132,12 @@ where
                     continue;
                 }
                 return Err(S3Failure {
-                    error: IaError::UploadFailed {
+                    error: Box::new(IaError::UploadFailed {
                         identifier: ctx.identifier.into(),
                         key: ctx.key.into(),
                         message: describe_attempts(&format!("{context}: {cause}"), attempt),
                         status: None,
-                    },
+                    }),
                     code: None,
                     attempts: attempt,
                 });
@@ -157,9 +160,9 @@ where
         // permanent, and the single-file path already treats it as such.
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE && is_spam_response(&body) {
             return Err(S3Failure {
-                error: IaError::SpamDetected {
+                error: Box::new(IaError::SpamDetected {
                     identifier: ctx.identifier.into(),
-                },
+                }),
                 code: None,
                 attempts: attempt,
             });
@@ -192,12 +195,12 @@ where
         let detail = describe_parsed(status, parsed.as_ref(), &body);
 
         return Err(S3Failure {
-            error: IaError::UploadFailed {
+            error: Box::new(IaError::UploadFailed {
                 identifier: ctx.identifier.into(),
                 key: ctx.key.into(),
                 message: describe_attempts(&format!("{context} failed: {detail}"), attempt),
                 status: Some(status.as_u16()),
-            },
+            }),
             code: parsed.map(|e| e.code),
             attempts: attempt,
         });

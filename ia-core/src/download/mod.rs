@@ -601,10 +601,19 @@ async fn seed_hasher_from_part(
     Ok(h)
 }
 
+/// Where a download that failed its md5 check is kept: beside the file, as
+/// `<name>.md5-mismatch`. Nothing resumes from or skips on this name. An
+/// item file literally named `<name>.md5-mismatch` would share the path,
+/// as one named `<name>.part` shares the partial file's.
+fn mismatch_path(file_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.md5-mismatch", file_path.display()))
+}
+
 /// Turn a `.part` whose byte count already matches the item metadata into
-/// the finished file: compare the md5 when `hasher` is present (deleting the
-/// `.part` on a mismatch), rename it into place, set its mtime, and report
-/// completion.
+/// the finished file: compare the md5 when `hasher` is present (keeping the
+/// bytes as `<name>.md5-mismatch` on a mismatch, see [`mismatch_path`]),
+/// rename it into place, remove an earlier `.md5-mismatch` once the file is
+/// verified, set its mtime, and report completion.
 ///
 /// Shared by the normal end of a stream and by the 416 shortcut in
 /// [`range_not_satisfiable`], so both finish a file the same way.
@@ -622,6 +631,7 @@ async fn finish_part(
     start: std::time::Instant,
 ) -> Result<FileDownloadResult> {
     // Post-download checksum comparison using the inline-computed hash.
+    let hasher_matched = hasher.is_some() && file.md5.is_some();
     if let Some(hasher) = hasher {
         if let Some(expected_md5) = &file.md5 {
             if let Some(p) = progress {
@@ -637,12 +647,43 @@ async fn finish_part(
             use md5::Digest;
             let actual_md5 = format!("{:x}", hasher.finalize());
             if &actual_md5 != expected_md5 {
-                // Delete the bad file
-                let _ = fs::remove_file(part_path).await;
+                // Keep the bytes under a name nothing resumes from, so the
+                // copy can be compared against the source or a second
+                // download. The rename replaces an earlier bad copy, or a
+                // planted symlink at that path, without following it. If
+                // it cannot (a directory in the way, say), the .part must
+                // still go: left in place, every later run would re-hash
+                // the same bytes and fail the same way.
+                let kept_path = mismatch_path(file_path);
+                let kept = match fs::rename(part_path, &kept_path).await {
+                    Ok(()) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected_md5,
+                            actual = %actual_md5,
+                            kept = %kept_path.display(),
+                            "md5 mismatch; keeping the download for inspection"
+                        );
+                        Some(kept_path.display().to_string())
+                    }
+                    Err(e) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected_md5,
+                            actual = %actual_md5,
+                            kept = %kept_path.display(),
+                            error = %e,
+                            "md5 mismatch; could not keep the download, removing it"
+                        );
+                        let _ = fs::remove_file(part_path).await;
+                        None
+                    }
+                };
                 return Err(IaError::ChecksumMismatch {
                     file: file.name.clone(),
                     expected: expected_md5.clone(),
                     actual: actual_md5,
+                    kept,
                 });
             }
         }
@@ -650,6 +691,28 @@ async fn finish_part(
 
     // Finalize: rename .part to final name
     fs::rename(part_path, file_path).await?;
+
+    // Verified and in place. An earlier bad copy has told its story, so it
+    // goes; if it cannot be removed, that is a stale file to mention, not a
+    // failure of a download that already succeeded.
+    if hasher_matched {
+        let kept_path = mismatch_path(file_path);
+        if fs::symlink_metadata(&kept_path).await.is_ok() {
+            match fs::remove_file(&kept_path).await {
+                Ok(()) => info!(
+                    file = %file.name,
+                    kept = %kept_path.display(),
+                    "removed the earlier md5-mismatch copy"
+                ),
+                Err(e) => warn!(
+                    file = %file.name,
+                    kept = %kept_path.display(),
+                    error = %e,
+                    "could not remove the earlier md5-mismatch copy"
+                ),
+            }
+        }
+    }
 
     // Set mtime from Last-Modified header
     if !opts.no_timestamps {
@@ -789,9 +852,23 @@ pub async fn download_file(
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
 
     // Check for partial file (.part) for resume.
-    // Open first, then stat the fd — avoids TOCTOU race where the .part file
-    // could be replaced with a symlink between exists() and metadata().
+    //
+    // A symlink .part goes first (#25). File::open follows links, so a
+    // planted link would otherwise lend its target's length to the Range
+    // request; the 206 tail would then land at offset 0 of a fresh .part,
+    // and a later run could resume that tail into a wrong file of the
+    // right length. Remove the link now, so no Range is ever shaped by it.
     let part_path = PathBuf::from(format!("{}.part", file_path.display()));
+    if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+        if meta.file_type().is_symlink() {
+            warn!(file = %file.name, "removing symlink .part file before resume");
+            fs::remove_file(&part_path).await?;
+        }
+    }
+    // Open first, then stat the fd, so the length is of the file actually
+    // opened and a directory or other non-regular file is never resumed.
+    // (The fd metadata cannot tell a link planted after the check above;
+    // the two later symlink checks keep every write off such a link.)
     let resume_from = match fs::File::open(&part_path).await {
         Ok(f) => {
             let meta = f.metadata().await?;
@@ -826,9 +903,10 @@ pub async fn download_file(
         // The .part is the whole file, but never finish it through a
         // symlink: renaming the link into place would leave a Complete
         // download pointing outside dest_dir and the mtime write would go
-        // through it. The resume check above followed the link, so this is
-        // the first look at the link itself. Remove it and restart from
-        // byte 0, as the symlink check on the streaming path does.
+        // through it. The check before the resume offset was read removes
+        // a link that was already there; this guards against one planted
+        // since. Remove it and restart from byte 0, as the symlink check
+        // on the streaming path does.
         if let Ok(meta) = fs::symlink_metadata(&part_path).await {
             if meta.file_type().is_symlink() {
                 warn!(file = %file.name, "removing symlink .part file");
@@ -877,8 +955,10 @@ pub async fn download_file(
     // Parse Last-Modified for mtime
     let last_modified = last_modified_of(&response);
 
-    // If .part exists and is a symlink, remove it before writing.
-    // Prevents writing through a symlink planted by an attacker.
+    // If .part is a symlink, remove it before writing. The check before
+    // the resume offset was read handles a link that was already there;
+    // this one guards against a link planted since, so no write ever goes
+    // through a symlink.
     if let Ok(meta) = fs::symlink_metadata(&part_path).await {
         if meta.file_type().is_symlink() {
             warn!(file = %file.name, "removing symlink .part file");
@@ -1150,7 +1230,7 @@ pub async fn download_file(
 
     // The stream ended. Refuse to rename a file whose byte count differs
     // from the item metadata. This runs before the md5 comparison because
-    // that path deletes .part.
+    // that path moves .part away (to .md5-mismatch) on a mismatch.
     //
     // Short: the .part file is deliberately kept. The error is retryable
     // and the next attempt resumes it with Range.
@@ -1400,6 +1480,11 @@ pub async fn download_item_with_metadata(
 
             let prog_ref = progress.as_deref();
             let mut last_err = None;
+            // The wrong md5 the previous attempt produced, if it ended in a
+            // checksum mismatch (#14). The same wrong md5 twice in a row
+            // means the wire is fine and the source is wrong; downloading
+            // again cannot change that. Any other outcome forgets it.
+            let mut last_wrong_md5: Option<String> = None;
 
             for attempt in 0..=opts.retries {
                 if attempt > 0 {
@@ -1410,7 +1495,31 @@ pub async fn download_item_with_metadata(
 
                 match download_file(&client, &identifier, &file, &dest_dir, &opts, prog_ref).await {
                     Ok(result) => return result,
+                    Err(IaError::ChecksumMismatch {
+                        file: name,
+                        expected,
+                        actual,
+                        kept,
+                    }) if last_wrong_md5.as_deref() == Some(actual.as_str()) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected,
+                            actual = %actual,
+                            "same wrong md5 twice in a row; the source is wrong, not the transfer"
+                        );
+                        last_err = Some(IaError::SourceChecksumMismatch {
+                            file: name,
+                            expected,
+                            actual,
+                            kept,
+                        });
+                        break;
+                    }
                     Err(e) => {
+                        last_wrong_md5 = match &e {
+                            IaError::ChecksumMismatch { actual, .. } => Some(actual.clone()),
+                            _ => None,
+                        };
                         if e.is_disk_full() {
                             warn!(file = %file.name, "disk full, aborting item");
                             disk_full.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2464,32 +2573,32 @@ mod tests {
         );
     }
 
+    /// A symlink `.part` is removed before the resume offset is read (#25),
+    /// so no Range request is ever shaped by a planted link: the first
+    /// attempt sends a plain GET and completes with the right bytes. Before
+    /// the fix the link's target length went out as the Range offset, the
+    /// 206 tail landed at offset 0 of a fresh `.part`, and a second run
+    /// could resume that tail into a wrong file of the right length.
     #[cfg(unix)]
     #[tokio::test]
-    async fn part_file_symlink_works_with_206_response() {
-        // Regression test: when a .part symlink is detected and removed,
-        // resume_from must be reset to None. Otherwise, if the server
-        // returns 206 (keeping resume_from as Some), the append-mode open
-        // on the deleted path would fail with NotFound.
+    async fn part_file_symlink_is_removed_before_the_range_request() {
         use wiremock::matchers::header_exists;
 
         let mock_server = MockServer::start().await;
         let full_body = b"complete file data here";
 
-        // Return 206 Partial Content when Range header is present
+        // If a Range request still went out, this 206 would answer it and
+        // the download could not come out right.
         Mock::given(method("GET"))
             .and(path("/download/test-item/ranged.txt"))
             .and(header_exists("Range"))
             .respond_with(
                 ResponseTemplate::new(206)
                     .set_body_bytes(b"data here".to_vec())
-                    // 9 bytes at the tail of the 23-byte full body.
                     .insert_header("Content-Range", "bytes 14-22/23"),
             )
             .mount(&mock_server)
             .await;
-
-        // Fallback: return full content when no Range header
         Mock::given(method("GET"))
             .and(path("/download/test-item/ranged.txt"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()))
@@ -2499,13 +2608,10 @@ mod tests {
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-
-        // Create a symlink .part file pointing to another location
         let target_file = target_dir.path().join("target.txt");
-        std::fs::write(&target_file, "original content").unwrap();
+        std::fs::write(&target_file, "original content").unwrap(); // 16 bytes
         let part_path = dir.path().join("ranged.txt.part");
         std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
-
         let file = test_file_meta("ranged.txt", full_body.len() as u64);
 
         let result = download_file(
@@ -2516,23 +2622,28 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        // The Range request was already sent before the symlink was noticed,
-        // so the 206 body (9 bytes) lands at offset 0 of a fresh .part. That
-        // is not the 23-byte file, and it must not be renamed into place.
-        assert!(
-            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
-            "got {result:?}"
-        );
-        assert!(!dir.path().join("ranged.txt").exists());
-
-        // The symlink target should NOT have been modified
-        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(
-            target_content, "original content",
-            "symlink target should not be modified even with 206 response"
+            std::fs::read(dir.path().join("ranged.txt")).unwrap(),
+            full_body
         );
+        let final_meta = std::fs::symlink_metadata(dir.path().join("ranged.txt")).unwrap();
+        assert!(!final_meta.file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "link removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_file).unwrap(),
+            "original content",
+            "symlink target must not be modified"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none(), "no Range sent");
     }
 
     #[tokio::test]
@@ -3093,34 +3204,247 @@ mod tests {
         assert!(!dir.path().join("a.txt.part").exists());
     }
 
-    #[tokio::test]
-    async fn checksum_inline_hash_detects_mismatch_and_removes_part() {
-        let body = b"correct content".to_vec();
-        let wrong_md5 = "00000000000000000000000000000000"; // not the real md5
-
-        let mock_server = MockServer::start().await;
+    /// Serve `body` for `b.txt` and return a client plus a temp dir.
+    async fn mount_body(mock_server: &MockServer, body: &[u8]) -> (IaClient, tempfile::TempDir) {
         Mock::given(method("GET"))
             .and(path("/download/test-item/b.txt"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&mock_server)
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(mock_server)
             .await;
-
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let file = test_file_meta_with_md5("b.txt", body.len() as u64, wrong_md5);
+        (client, tempfile::tempdir().unwrap())
+    }
 
-        let opts = DownloadOpts {
+    const WRONG_MD5: &str = "00000000000000000000000000000000";
+
+    fn checksum_opts() -> DownloadOpts {
+        DownloadOpts {
             checksum: true,
             ..Default::default()
-        };
-        let err = download_file(&client, "test-item", &file, dir.path(), &opts, None)
-            .await
-            .unwrap_err();
+        }
+    }
 
-        assert!(matches!(err, IaError::ChecksumMismatch { .. }));
-        // Bad .part must be deleted, final file must not exist.
+    /// A failed md5 check keeps the bytes as `<name>.md5-mismatch` and the
+    /// error names that path (#14). Nothing is left as `.part`, so the
+    /// next attempt starts from byte 0.
+    #[tokio::test]
+    async fn checksum_mismatch_keeps_the_download_as_md5_mismatch() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        match &err {
+            IaError::ChecksumMismatch {
+                expected,
+                actual,
+                kept,
+                ..
+            } => {
+                assert_eq!(expected, WRONG_MD5);
+                assert_eq!(actual, &md5_hex(&body));
+                assert_eq!(
+                    kept.as_deref(),
+                    Some(kept_path.display().to_string().as_str())
+                );
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        assert!(err.is_retryable());
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
         assert!(!dir.path().join("b.txt").exists());
         assert!(!dir.path().join("b.txt.part").exists());
+    }
+
+    /// Only one bad copy is kept per file: a new mismatch replaces it.
+    #[tokio::test]
+    async fn checksum_mismatch_overwrites_an_earlier_kept_copy() {
+        let body = b"second bad copy".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"first bad copy, longer than the second").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
+    }
+
+    /// Once a later attempt verifies, the bad copy has served its purpose
+    /// and is removed.
+    #[tokio::test]
+    async fn verified_download_removes_an_earlier_kept_copy() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"an earlier bad copy").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, &md5_hex(&body));
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert!(!kept_path.exists(), "the earlier bad copy should be gone");
+    }
+
+    /// A completion without --checksum does not touch an existing bad
+    /// copy: nothing was verified, so there is no reason to drop evidence.
+    #[tokio::test]
+    async fn unverified_download_leaves_an_earlier_kept_copy() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"an earlier bad copy").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(&kept_path).unwrap(), b"an earlier bad copy");
+    }
+
+    /// Something the rename cannot replace sits at the kept path (here a
+    /// directory). The copy cannot be kept, so the `.part` is removed
+    /// instead, the next attempt starts from byte 0, and the error says the
+    /// copy could not be kept. The old `.part` must not survive, or every
+    /// later run would re-hash the same bytes and fail the same way.
+    #[tokio::test]
+    async fn checksum_mismatch_with_a_directory_at_the_kept_path_removes_the_part() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::create_dir(&kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            IaError::ChecksumMismatch { kept, .. } => assert_eq!(*kept, None),
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        assert!(err.to_string().contains("could not be kept"), "{err}");
+        assert!(err.is_retryable());
+        assert!(kept_path.is_dir(), "the directory is left alone");
+        assert!(!dir.path().join("b.txt.part").exists());
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    /// A verified download with something unremovable at the kept path:
+    /// the file is in place and Complete; the stale copy is a warning, not
+    /// a failure.
+    #[tokio::test]
+    async fn verified_download_with_a_directory_at_the_kept_path_still_completes() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::create_dir(&kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, &md5_hex(&body));
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert!(!dir.path().join("b.txt.part").exists());
+        assert!(kept_path.is_dir());
+    }
+
+    /// A planted symlink at the kept path is replaced by the rename, never
+    /// written through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checksum_mismatch_through_a_symlinked_kept_path_replaces_the_link() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("target.bin");
+        std::fs::write(&target, b"untouchable").unwrap();
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::os::unix::fs::symlink(&target, &kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+        let meta = std::fs::symlink_metadata(&kept_path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "kept path is now a regular file"
+        );
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouchable");
     }
 
     #[tokio::test]
@@ -5015,17 +5339,25 @@ mod tests {
         assert!(!dir.path().join("disk.img").exists());
     }
 
-    /// A symlink `.part` whose target is longer than the file: the delete
-    /// arm removes the link, not the target.
+    /// A symlink `.part` whose target is longer than the file. Since #25 the
+    /// link is removed before the resume offset is read, so no Range goes
+    /// out at all: a plain GET completes the file and the target is never
+    /// touched.
     #[cfg(unix)]
     #[tokio::test]
-    async fn range_not_satisfiable_past_part_length_through_symlink_removes_only_the_link() {
+    async fn symlink_part_longer_than_the_file_is_removed_and_the_file_downloaded() {
         use wiremock::matchers::header_exists;
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/download/test-item/disk.img"))
             .and(header_exists("Range"))
             .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .mount(&mock_server)
+            .await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
             .mount(&mock_server)
             .await;
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
@@ -5045,22 +5377,19 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 40);
-            }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
-        }
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
         assert!(
             std::fs::symlink_metadata(&part_path).is_err(),
             "link removed"
         );
         assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 40]);
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none());
     }
 
     /// A `.part` that is a directory: not a regular file, so no Range is
@@ -5352,6 +5681,180 @@ mod tests {
         );
         assert!(!dir.path().join("data.bin").exists());
         server.await.unwrap();
+    }
+
+    // -- repeated wrong md5 stops the retries (#14) --
+
+    fn item_with(identifier: &str, file: FileMetadata) -> crate::types::ItemMetadata {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+        ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single(identifier.to_string())),
+                ..Default::default()
+            },
+            files: vec![file],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Serve `body` for the next `times` requests only. wiremock tries
+    /// mocks in mount order and skips one whose budget is spent, so a
+    /// sequence of these plays bodies in order.
+    async fn mount_times(mock_server: &MockServer, status: u16, body: &[u8], times: u64) {
+        Mock::given(method("GET"))
+            .and(path("/download/bad-item/disk.img"))
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(body.to_vec()))
+            .up_to_n_times(times)
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn download_bad_item(
+        mock_server: &MockServer,
+        dir: &Path,
+        md5: &str,
+        retries: usize,
+    ) -> ItemDownloadResult {
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let item = item_with("bad-item", test_file_meta_with_md5("disk.img", 16, md5));
+        let opts = DownloadOpts {
+            destdir: dir.to_path_buf(),
+            checksum: true,
+            retries,
+            ..Default::default()
+        };
+        download_item_with_metadata(
+            &client,
+            "bad-item",
+            &item,
+            &opts,
+            Arc::new(Semaphore::new(1)),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn failure_message(result: &ItemDownloadResult) -> String {
+        match &result.results[0].status {
+            DownloadStatus::Failed(msg) => msg.clone(),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The same bytes twice means the wire is fine and the source or its
+    /// metadata is wrong: stop after the second download, keep the copy.
+    #[tokio::test]
+    async fn same_wrong_md5_twice_stops_retrying() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 5).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert!(
+            msg.contains("source file or its metadata is likely wrong"),
+            "{msg}"
+        );
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert!(msg.contains(&kept.display().to_string()), "{msg}");
+        assert_eq!(std::fs::read(&kept).unwrap(), body_a);
+        assert!(!dir.path().join("bad-item").join("disk.img.part").exists());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// Different wrong bytes each time means the transfer is corrupting
+    /// data: keep retrying up to --retries, and keep the latest copy.
+    #[tokio::test]
+    async fn different_wrong_md5_keeps_retrying() {
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &[b'A'; 16], 1).await;
+        mount_times(&mock_server, 200, &[b'B'; 16], 1).await;
+        mount_times(&mock_server, 200, &[b'C'; 16], 1).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 2).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(!msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("checksum mismatch"), "{msg}");
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![b'C'; 16]);
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// A corrupt first transfer followed by a good one: the file completes
+    /// and the bad copy is removed.
+    #[tokio::test]
+    async fn different_wrong_md5_then_success_completes_and_removes_kept_copy() {
+        let good = vec![b'G'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &[b'A'; 16], 1).await;
+        mount_times(&mock_server, 200, &good, 1).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), &md5_hex(&good), 5).await;
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        let item_dir = dir.path().join("bad-item");
+        assert_eq!(std::fs::read(item_dir.join("disk.img")).unwrap(), good);
+        assert!(!item_dir.join("disk.img.md5-mismatch").exists());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// --retries 0: the first mismatch is final; the copy is kept.
+    #[tokio::test]
+    async fn retries_zero_keeps_the_mismatch_and_stops() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 0).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(!msg.contains("twice in a row"), "{msg}");
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert_eq!(std::fs::read(&kept).unwrap(), body_a);
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// "Twice in a row" means consecutive. A different error in between
+    /// (here a 500) forgets the first mismatch, so the next mismatch is a
+    /// first one again; the one after that is the repeat and stops the
+    /// loop. Attempts: A (mismatch), 500 (reset), A (first again), A
+    /// (repeat): four requests, with a budget that would have allowed five.
+    /// The download transport has no retry middleware, so the 500 reaches
+    /// the per-file loop once and the count is exact.
+    #[tokio::test]
+    async fn a_different_error_between_mismatches_resets_the_repeat_check() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 1).await;
+        mount_times(&mock_server, 500, b"boom", 1).await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 4).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 4);
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org
@@ -6005,7 +6508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_deletes_part() {
+    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_keeps_md5_mismatch() {
         let mock_server = MockServer::start().await;
         let (client, dir) =
             mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
@@ -6018,26 +6521,31 @@ mod tests {
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
 
         // The .part has the right length but the wrong bytes. The md5
-        // compare catches it exactly as it would after a stream.
+        // compare catches it exactly as it would after a stream, and keeps
+        // the bytes as .md5-mismatch (#14).
         assert!(
             matches!(result, Err(IaError::ChecksumMismatch { .. })),
             "got {result:?}"
         );
         assert!(!dir.path().join("disk.img.part").exists());
         assert!(!dir.path().join("disk.img").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img.md5-mismatch")).unwrap(),
+            vec![b'A'; 32]
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "{requests:#?}");
     }
 
-    /// A `.part` that is a symlink must never be finished in place, even
-    /// when its target has the agreed length and the server's 416 confirms
-    /// it: renaming the link into place would leave a `Complete` download
-    /// pointing outside the destination, and the mtime write would go
-    /// through the link. The link is removed and the download restarts.
+    /// A symlink `.part` whose target has the agreed length never reaches
+    /// the 416 shortcut: the link is removed before the resume offset is
+    /// read (#25), so a plain GET goes out and completes on the first
+    /// attempt. The 416 mock here would only answer a Range request.
     #[cfg(unix)]
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_through_symlink_part_restarts() {
+    async fn range_not_satisfiable_at_part_length_through_symlink_part_never_reaches_the_shortcut()
+    {
         use wiremock::matchers::header_exists;
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -6063,35 +6571,7 @@ mod tests {
         std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
         let file = test_file_meta("disk.img", 32);
 
-        let first = download_file(
-            &client,
-            "test-item",
-            &file,
-            dir.path(),
-            &DownloadOpts::default(),
-            None,
-        )
-        .await;
-
-        let err = first.expect_err("a symlink .part must not be finished in place");
-        match &err {
-            IaError::ResumeFailed { reason, .. } => assert!(reason.contains("symlink"), "{reason}"),
-            other => panic!("expected ResumeFailed, got {other:?}"),
-        }
-        assert!(err.is_retryable(), "{err:?}");
-        assert!(!dir.path().join("disk.img").exists());
-        assert!(
-            std::fs::symlink_metadata(&part_path).is_err(),
-            "the symlink .part should have been removed"
-        );
-        // The target is untouched: same bytes, same mtime.
-        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
-        assert_eq!(
-            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
-            target_mtime
-        );
-
-        let second = download_file(
+        let result = download_file(
             &client,
             "test-item",
             &file,
@@ -6101,10 +6581,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(second.status, DownloadStatus::Complete);
+
+        assert_eq!(result.status, DownloadStatus::Complete);
         let final_meta = std::fs::symlink_metadata(dir.path().join("disk.img")).unwrap();
         assert!(!final_meta.file_type().is_symlink());
         assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "link removed"
+        );
+        // The target is untouched: same bytes, same mtime.
+        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
+        assert_eq!(
+            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
+            target_mtime
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none());
     }
 
     /// With no metadata size there is no third party to agree, so the
