@@ -208,3 +208,56 @@ Part of #12. PR #26 left one wasteful case: when the `.part` file already holds 
 - [ ] `just ci`.
 - [ ] Code-reviewer pass; fix findings; re-run.
 - [ ] PR against `main` with `Part of #12`; squash-merge after checks pass; `scripts/ia-cleanup size-416-complete` only after the merge is confirmed.
+
+### Task F: corner-case audit of the 416 shortcut (2026-10-01, after PR #27 merged)
+
+Jake asked for every corner case of PR #27 to be tested. The matrix, with `L` the `.part` length, `T` the 416's total, `M` the metadata size, and the test that pins each cell:
+
+| Case | Outcome | Test |
+|------|---------|------|
+| `L == T == M`, no `--checksum` | finished in place, one request, mtime from metadata | `range_not_satisfiable_at_part_length_completes_without_redownload` |
+| `L == T == M`, `--checksum`, md5 matches | Verifying then Complete | `..._with_checksum_verifies` |
+| `L == T == M`, `--checksum`, md5 wrong | `ChecksumMismatch`, `.part` deleted | `..._with_checksum_mismatch_deletes_part` |
+| `L == T == M`, `--checksum`, no md5 in metadata | no hashing; events exactly Starting, Complete | `..._with_checksum_but_no_md5_skips_hashing` (new) |
+| `L == T == M == 0` | empty file finished | `range_not_satisfiable_at_zero_length_completes_empty_file` (new) |
+| `L == T == M`, 416 carries `Last-Modified` | header wins over metadata mtime | `..._uses_last_modified_from_the_416` (new) |
+| `L == T == M`, `.part` is a symlink | link removed, retryable `ResumeFailed`, target untouched | `..._through_symlink_part_restarts` |
+| `L == T == M` through `download_item_with_metadata` | `files_downloaded == 1`, one request | `..._counts_as_downloaded_in_item_result` (new) |
+| `L > T == M` | `.part` deleted, retryable restart | `range_not_satisfiable_at_metadata_total_deletes_part_and_restarts`, `..._recovers_through_outer_retry_loop` |
+| `L == T != M` | `ServerSizeMismatch`, `.part` kept | `..._with_different_total_keeps_part` (new) |
+| `L != T != M` | `ServerSizeMismatch`, `.part` kept | `range_not_satisfiable_with_different_total_fails_permanently` |
+| `L < T == M` (protocol violation) | `.part` deleted, retryable restart | `range_not_satisfiable_before_part_length_deletes_part_and_restarts` (new) |
+| `M` unknown, `L == T` | `.part` deleted, restart (literal reading) | `..._without_metadata_size_restarts` |
+| `_files.xml`, `L == T` | `.part` deleted, restart (literal reading) | `range_not_satisfiable_on_files_xml_at_part_length_restarts` (new) |
+| `_files.xml`, `L > T` | `.part` deleted, restart | `range_not_satisfiable_on_files_xml_deletes_part` |
+| 416 without `Content-Range`, or with `bytes */*` | plain `Http 416`, `.part` kept | `range_not_satisfiable_without_content_range_is_an_http_error`, `content_range_total_rejects_other_units_and_garbage` |
+| `bytes */0` parses | `Some(0)` | `content_range_total_accepts_zero` (new) |
+| no `Range` sent (zip, scandata) | plain `Http 416` | `fetch_response_416_without_range_is_an_http_error` |
+| mid-stream, all bytes then error, `--checksum`, from byte 0 | finished through the shared tail | `stream_retry_response_416_at_full_length_completes` |
+| mid-stream, all bytes then error, no `--checksum` | finished | `stream_retry_response_416_at_full_length_completes_without_checksum` (new) |
+| mid-stream, resumed `.part`, seeded hasher, all bytes then error | finished, md5 right | `..._completes_resumed_download` (new) |
+| mid-stream, bytes past `M` within tolerance, then 416 at `M` | `.part` deleted, retryable restart | `stream_retry_response_416_past_metadata_size_deletes_part_and_restarts` (new) |
+| mid-stream, 416 with `T != M` | `ServerSizeMismatch`, `.part` kept | `stream_retry_response_416_fails_permanently` |
+| stall then 416 at full length (#11) | finished | `stall_after_the_last_byte_finishes_through_416` |
+| `L == T == M`, `--no-timestamps`, 416 with `Last-Modified` | the `.part`'s own mtime survives the rename | `..._honors_no_timestamps` (round 2) |
+| `L == T == M`, `--checksum`, full progress payloads | Starting 32/32, Verifying 0/32, Verifying 32/32, Complete 32/32 | `..._progress_payloads` (round 2) |
+| `--dry-run` with a full `.part` | Skipped, no request, `.part` untouched | `dry_run_with_full_length_part_sends_nothing` (round 2) |
+| `L == T == M`, rename fails (read-only dir) | `Io(PermissionDenied)`, `.part` kept | `..._rename_failure_keeps_part` (round 2) |
+| symlink `.part`, `L > T == M` | link removed, target untouched, retryable restart | `..._past_part_length_through_symlink_removes_only_the_link` (round 2) |
+| `.part` is a directory | no Range sent, `Io` error on open | `directory_part_sends_no_range_and_fails_on_open` (round 2) |
+| mid-stream, 200 answered the Range (reset), all bytes then error, `--checksum` | finished, md5 of the new bytes | `stream_retry_response_416_at_full_length_completes_after_resume_reset` (round 2) |
+| mid-stream, first response had `Last-Modified`, 416 none | first response's wins over metadata | `stream_retry_response_416_keeps_first_response_last_modified` (round 2) |
+| mid-stream, 416 has `Last-Modified` | the 416's wins | `stream_retry_response_416_last_modified_wins` (round 2) |
+| mid-stream, two re-requests then 416 at full length, `--checksum` | finished, md5 right | `stream_retry_response_416_after_two_re_requests_keeps_md5` (round 2) |
+| mid-stream, `M` unknown, all bytes then error, 416 at that length | `.part` deleted, retryable restart (literal reading) | `stream_retry_response_416_without_metadata_size_restarts` (round 2) |
+| mid-stream, `_files.xml`, same | same | `stream_retry_response_416_on_files_xml_restarts` (round 2) |
+| mid-stream, 416 without `Content-Range` | plain `Http 416`, flushed bytes kept | `stream_retry_response_416_without_content_range_is_an_http_error` (round 2) |
+
+Every new test, in both rounds, passed against the merged code; no defect was found. The review's raw-TCP determinism check: hyper's h1 body decoder hands out every buffered byte before it reports the EOF of an under-delivered `content-length`, and data and error travel through the same channel, so the "all bytes then a stream error" servers are deterministic (25 consecutive runs, no flake).
+
+Two observations from the audit, recorded for Jake, not changed here:
+
+- Under the literal reading, a file with no metadata size (or `_files.xml`) whose every byte arrived is finished when the stream ends cleanly but deleted and re-downloaded when the stream ends with an error and the 416 confirms the length. The two outcomes for the same bytes depend on how the connection ended.
+- The delete arm's `DownloadSizeMismatch { expected: 30, received: 30 }` renders as "expected 30 bytes, received 30 bytes", which reads as a contradiction. A dedicated reason would be clearer. Not testable deterministically: the `.part` growing between the length check and the hash (`seed_hasher_from_part` reads exactly the measured length, so the hash covers what is reported). By design, not a defect: without `--checksum` a full-length `.part` with wrong bytes is renamed into place, as any unverified download is; #13 (md5 by default) is the answer.
+
+- [x] `just ci`; code-reviewer pass asked for cells still missing and got the round-2 rows above; PR with `Part of #12`; merge after checks; `scripts/ia-cleanup size-416-corner-cases` after a confirmed merge.

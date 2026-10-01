@@ -4356,6 +4356,1004 @@ mod tests {
         );
     }
 
+    // -- 416 shortcut corner cases (#12 follow-up, PR #27 audit) --
+
+    /// `.part` length equals the server total but the metadata disagrees:
+    /// the disagreement wins, as on a 206, and nothing is touched.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_with_different_total_keeps_part() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 30, Some("bytes */30")).await;
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 32);
+                assert_eq!(server_size, 30);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img.part"))
+                .unwrap()
+                .len(),
+            30
+        );
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    /// A 416 for an offset inside the file violates the protocol (the range
+    /// was satisfiable). The `.part` is not trusted: it is removed and the
+    /// download restarts from zero.
+    #[tokio::test]
+    async fn range_not_satisfiable_before_part_length_deletes_part_and_restarts() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 20, Some("bytes */32")).await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&mock_server)
+            .await;
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match &first {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 20);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(first.unwrap_err().is_retryable());
+        assert!(!dir.path().join("disk.img.part").exists());
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
+    }
+
+    /// `_files.xml` has no trustworthy metadata size, so even a `.part` at
+    /// the server's length is not finished in place (the literal reading of
+    /// "all three agree"). It is removed and the download restarts.
+    #[tokio::test]
+    async fn range_not_satisfiable_on_files_xml_at_part_length_restarts() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "test-item_files.xml", 30, Some("bytes */30")).await;
+        let file = test_file_meta("test-item_files.xml", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match &result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 30);
+                assert_eq!(*received, 30);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(result.unwrap_err().is_retryable());
+        assert!(!dir.path().join("test-item_files.xml.part").exists());
+        assert!(!dir.path().join("test-item_files.xml").exists());
+    }
+
+    /// An empty file whose empty `.part` draws `416 bytes */0`: zero, zero
+    /// and zero agree, and the empty file is finished, md5 and all.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_zero_length_completes_empty_file() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_resume_416(&mock_server, "empty.txt", 0, Some("bytes */0")).await;
+        // test_file_meta's md5 is the md5 of the empty string.
+        let file = test_file_meta("empty.txt", 0);
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 0);
+        assert_eq!(std::fs::read(dir.path().join("empty.txt")).unwrap(), b"");
+        assert!(!dir.path().join("empty.txt.part").exists());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A 416 may carry Last-Modified. It is preferred over the metadata
+    /// mtime, exactly as on a 200 or 206.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_uses_last_modified_from_the_416() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disk.img.part"), vec![b'A'; 32]).unwrap();
+        let server_mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(416)
+                    .insert_header("Content-Range", "bytes */32")
+                    .insert_header(
+                        "Last-Modified",
+                        httpdate::fmt_http_date(server_mtime).as_str(),
+                    ),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        // Metadata says 1700000000; the header must win.
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        let mtime = std::fs::metadata(dir.path().join("disk.img"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime, server_mtime);
+    }
+
+    /// `--checksum` on a file with no md5 in metadata: nothing to compare,
+    /// so the `.part` is not read back. The only events are Starting and
+    /// Complete; in particular no Downloading, since nothing streamed.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_with_checksum_but_no_md5_skips_hashing() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let mut file = test_file_meta("disk.img", 32);
+        file.md5 = None;
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img")).unwrap(),
+            vec![b'A'; 32]
+        );
+        let seen = events.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![DownloadStatus::Starting, DownloadStatus::Complete],
+            "{seen:?}"
+        );
+    }
+
+    /// The shortcut's Complete is an ordinary completion to the item loop:
+    /// it counts as downloaded with its byte count, after one request.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_counts_as_downloaded_in_item_result() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+        use wiremock::matchers::header_exists;
+
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let item_dir = dir.path().join("done-item");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        std::fs::write(item_dir.join("disk.img.part"), vec![b'A'; 32]).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/download/done-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("done-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("disk.img", 32)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let result = download_item_with_metadata(
+            &client,
+            "done-item",
+            &item,
+            &opts,
+            Arc::new(Semaphore::new(1)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        assert_eq!(result.files_skipped, 0);
+        assert_eq!(result.bytes_total, 32);
+        assert_eq!(
+            std::fs::read(item_dir.join("disk.img")).unwrap(),
+            vec![b'A'; 32]
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Mid-stream 416 at full length on a resumed download: the hasher was
+    /// seeded from the existing `.part`, rolled over the streamed bytes, and
+    /// the 416 confirms the file is whole. An unseeded hasher would give the
+    /// md5 of bytes 12..32 and fail the compare.
+    #[tokio::test]
+    async fn stream_retry_response_416_at_full_length_completes_resumed_download() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let on_disk = 12usize;
+        let body_for_handler = body.clone();
+        // 206 from byte 12 that promises 21 bytes but sends 20 and closes:
+        // the client has all 32 bytes and a body-stream error.
+        let over_promising: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                assert_eq!(range_offset_of(&request), Some(on_disk as u64), "{request}");
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     content-length: {}\r\n\
+                     content-range: bytes {on_disk}-31/32\r\n\
+                     content-type: application/octet-stream\r\n\
+                     connection: close\r\n\
+                     \r\n",
+                    32 - on_disk + 1
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                send_all(&mut stream, &body_for_handler[on_disk..]).await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![over_promising, range_not_satisfiable_at(32)],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin.part"), &body[..on_disk]).unwrap();
+        let mut file = test_file_meta("data.bin", 32);
+        file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 32);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert!(!dir.path().join("data.bin.part").exists());
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(records[1].range_offset(), Some(32));
+    }
+
+    /// Mid-stream 416 at full length without --checksum: nothing to hash,
+    /// the `.part` is simply renamed.
+    #[tokio::test]
+    async fn stream_retry_response_416_at_full_length_completes_without_checksum() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let body_for_handler = body.clone();
+        let over_promising: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                send_head(&mut stream, &request, 33).await;
+                send_all(&mut stream, &body_for_handler).await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![over_promising, range_not_satisfiable_at(32)],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", 32);
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// The server sent more bytes than the metadata size (within the 10%
+    /// mid-stream tolerance) and then dropped. The Range re-request from
+    /// byte 35 draws `416 bytes */32`: total and metadata agree, the `.part`
+    /// is longer than both, so it is removed and the download restarts.
+    #[tokio::test]
+    async fn stream_retry_response_416_past_metadata_size_deletes_part_and_restarts() {
+        let sent: Vec<u8> = (0..35u8).collect();
+        let sent_for_handler = sent.clone();
+        let over_long: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                send_head(&mut stream, &request, 40).await;
+                send_all(&mut stream, &sent_for_handler).await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![over_long, range_not_satisfiable_at(32)],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", 32);
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
+
+        match &result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 35);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(result.unwrap_err().is_retryable());
+        assert!(!dir.path().join("data.bin.part").exists());
+        assert!(!dir.path().join("data.bin").exists());
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(records[1].range_offset(), Some(35));
+    }
+
+    // -- 416 shortcut corner cases, second round (reviewer findings) --
+
+    /// A 200 or 206 head carrying extra raw header lines.
+    async fn send_head_with(
+        stream: &mut tokio::net::TcpStream,
+        request: &str,
+        promised_total: u64,
+        extra_headers: &str,
+    ) -> u64 {
+        use tokio::io::AsyncWriteExt;
+        let offset = range_offset_of(request);
+        let head = match offset {
+            Some(offset) => format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 content-length: {}\r\n\
+                 content-range: bytes {offset}-{}/{promised_total}\r\n\
+                 {extra_headers}\
+                 connection: close\r\n\
+                 \r\n",
+                promised_total - offset,
+                promised_total - 1,
+            ),
+            None => format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-length: {promised_total}\r\n\
+                 accept-ranges: bytes\r\n\
+                 {extra_headers}\
+                 connection: close\r\n\
+                 \r\n"
+            ),
+        };
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        offset.unwrap_or(0)
+    }
+
+    /// A 416 with the given total and extra raw header lines.
+    fn range_not_satisfiable_with(total: u64, extra_headers: &'static str) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                assert!(range_offset_of(&request).is_some(), "{request}");
+                let head = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                     content-length: 0\r\n\
+                     content-range: bytes */{total}\r\n\
+                     {extra_headers}\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.flush().await;
+            })
+        })
+    }
+
+    /// Promise one byte more than `body`, send `body` from the requested
+    /// offset, close: the client has every byte and a stream error.
+    fn over_promising(body: Vec<u8>, extra_headers: &'static str) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset =
+                    send_head_with(&mut stream, &request, body.len() as u64 + 1, extra_headers)
+                        .await as usize;
+                send_all(&mut stream, &body[offset..]).await;
+            })
+        })
+    }
+
+    fn http_date(secs: u64) -> String {
+        httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    fn mtime_secs(path: &Path) -> u64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// `--no-timestamps` leaves the renamed file with the `.part`'s own
+    /// mtime, ignoring both the 416's Last-Modified and the metadata mtime.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_honors_no_timestamps() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("disk.img.part");
+        std::fs::write(&part_path, vec![b'A'; 32]).unwrap();
+        filetime::set_file_mtime(
+            &part_path,
+            filetime::FileTime::from_unix_time(1_500_000_000, 0),
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(416)
+                    .insert_header("Content-Range", "bytes */32")
+                    .insert_header("Last-Modified", http_date(1_600_000_000).as_str()),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let file = test_file_meta("disk.img", 32); // metadata mtime 1700000000
+        let opts = DownloadOpts {
+            no_timestamps: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(mtime_secs(&dir.path().join("disk.img")), 1_500_000_000);
+    }
+
+    /// Every progress payload on the shortcut with `--checksum` and an md5:
+    /// Starting at the resume offset, Verifying while the `.part` is hashed
+    /// (from zero), Verifying again before the rename, Complete. No
+    /// Downloading, since nothing streamed.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_progress_payloads() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta_with_md5("disk.img", 32, &md5_hex(&[b'A'; 32]));
+        let events: Arc<std::sync::Mutex<Vec<(DownloadStatus, u64, Option<u64>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                assert_eq!(p.identifier, "test-item");
+                assert_eq!(p.file_name, "disk.img");
+                v.push((p.status, p.bytes_downloaded, p.total_bytes));
+            }
+        });
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
+            .await
+            .unwrap();
+
+        let seen = events.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                (DownloadStatus::Starting, 32, Some(32)),
+                (DownloadStatus::Verifying, 0, Some(32)),
+                (DownloadStatus::Verifying, 32, Some(32)),
+                (DownloadStatus::Complete, 32, Some(32)),
+            ],
+            "{seen:?}"
+        );
+    }
+
+    /// `--dry-run` returns before the `.part` is even looked at: no request,
+    /// the `.part` untouched.
+    #[tokio::test]
+    async fn dry_run_with_full_length_part_sends_nothing() {
+        let mock_server = MockServer::start().await; // no mocks: any request 404s
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disk.img.part"), vec![b'A'; 32]).unwrap();
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let file = test_file_meta("disk.img", 32);
+        let opts = DownloadOpts {
+            dry_run: true,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            DownloadStatus::Skipped("dry run".to_string())
+        );
+        assert_eq!(result.bytes, 32);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img.part"))
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(!dir.path().join("disk.img").exists());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// When the rename itself fails, the error surfaces and the `.part` is
+    /// left where it was: the bytes are not lost to a permissions problem.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_rename_failure_keeps_part() {
+        use std::os::unix::fs::PermissionsExt;
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta("disk.img", 32);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        // Restore before asserting so the tempdir can be cleaned up even if
+        // an assertion fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        match &result {
+            Err(IaError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("expected Io(PermissionDenied), got {other:?}"),
+        }
+        assert!(!result.unwrap_err().is_retryable());
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img.part"))
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    /// A symlink `.part` whose target is longer than the file: the delete
+    /// arm removes the link, not the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn range_not_satisfiable_past_part_length_through_symlink_removes_only_the_link() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_file = target_dir.path().join("target.bin");
+        std::fs::write(&target_file, vec![b'A'; 40]).unwrap();
+        let part_path = dir.path().join("disk.img.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match &result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 40);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "link removed"
+        );
+        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 40]);
+    }
+
+    /// A `.part` that is a directory: not a regular file, so no Range is
+    /// sent, and opening it for writing fails with an I/O error rather than
+    /// anything being renamed.
+    #[tokio::test]
+    async fn directory_part_sends_no_range_and_fails_on_open() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'F'; 32]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("disk.img.part")).unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(IaError::Io(_))), "got {result:?}");
+        assert!(dir.path().join("disk.img.part").is_dir());
+        assert!(!dir.path().join("disk.img").exists());
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("range").is_none());
+    }
+
+    /// The first response answered a Range request with 200, so the stale
+    /// `.part` was truncated and the hasher started fresh. The full body
+    /// then arrived with a stream error; the 416 at full length finishes
+    /// the file and the md5 is of the new bytes, not the stale ones.
+    #[tokio::test]
+    async fn stream_retry_response_416_at_full_length_completes_after_resume_reset() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let body_for_handler = body.clone();
+        let ignores_range: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                assert_eq!(range_offset_of(&request), Some(12), "{request}");
+                let head = "HTTP/1.1 200 OK\r\n\
+                            content-length: 33\r\n\
+                            connection: close\r\n\
+                            \r\n";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                send_all(&mut stream, &body_for_handler).await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![ignores_range, range_not_satisfiable_at(32)],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.bin.part"), vec![b'Z'; 12]).unwrap();
+        let mut file = test_file_meta("data.bin", 32);
+        file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        let records = server.await.unwrap();
+        assert_eq!(records[1].range_offset(), Some(32));
+    }
+
+    /// Mid-stream: the first response's Last-Modified is kept when the 416
+    /// has none.
+    #[tokio::test]
+    async fn stream_retry_response_416_keeps_first_response_last_modified() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let (client, server) = spawn_script_server(
+            vec![
+                over_promising(
+                    body.clone(),
+                    "last-modified: Sun, 13 Sep 2020 12:26:40 GMT\r\n",
+                ),
+                range_not_satisfiable_at(32),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", 32); // metadata mtime 1700000000
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(mtime_secs(&dir.path().join("data.bin")), 1_600_000_000);
+        server.await.unwrap();
+    }
+
+    /// Mid-stream: a Last-Modified on the 416 wins over the first
+    /// response's and over the metadata.
+    #[tokio::test]
+    async fn stream_retry_response_416_last_modified_wins() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let (client, server) = spawn_script_server(
+            vec![
+                over_promising(
+                    body.clone(),
+                    "last-modified: Sun, 13 Sep 2020 12:26:40 GMT\r\n",
+                ),
+                // 1500000000 = Fri, 14 Jul 2017 02:40:00 GMT
+                range_not_satisfiable_with(32, "last-modified: Fri, 14 Jul 2017 02:40:00 GMT\r\n"),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", 32);
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(mtime_secs(&dir.path().join("data.bin")), 1_500_000_000);
+        server.await.unwrap();
+    }
+
+    /// Two body-stream errors, then a 416 at full length. The hasher is
+    /// carried across every re-request, so the md5 of the whole file comes
+    /// out right.
+    #[tokio::test]
+    async fn stream_retry_response_416_after_two_re_requests_keeps_md5() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let b1 = body.clone();
+        let first: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                send_head(&mut stream, &request, 33).await;
+                send_all(&mut stream, &b1[..12]).await;
+            })
+        });
+        let b2 = body.clone();
+        let second: ConnHandler = Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                assert_eq!(range_offset_of(&request), Some(12), "{request}");
+                let head = "HTTP/1.1 206 Partial Content\r\n\
+                            content-length: 21\r\n\
+                            content-range: bytes 12-31/32\r\n\
+                            connection: close\r\n\
+                            \r\n";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                send_all(&mut stream, &b2[12..]).await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![first, second, range_not_satisfiable_at(32)],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("data.bin", 32);
+        file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
+        let opts = DownloadOpts {
+            checksum: true,
+            ..Default::default()
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        let records = server.await.unwrap();
+        assert_eq!(records[1].range_offset(), Some(12));
+        assert_eq!(records[2].range_offset(), Some(32));
+    }
+
+    /// Mid-stream 416 at full length for a file with no metadata size: the
+    /// literal reading has no third party to agree, so the `.part` is
+    /// deleted and the retryable restart follows, even though every byte
+    /// had arrived. (A clean stream end would have finished it.)
+    #[tokio::test]
+    async fn stream_retry_response_416_without_metadata_size_restarts() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let (client, server) = spawn_script_server(
+            vec![
+                over_promising(body.clone(), ""),
+                range_not_satisfiable_at(32),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("data.bin", 32);
+        file.size = None;
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
+
+        match &result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 32);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(result.unwrap_err().is_retryable());
+        assert!(!dir.path().join("data.bin.part").exists());
+        assert!(!dir.path().join("data.bin").exists());
+        server.await.unwrap();
+    }
+
+    /// The `_files.xml` twin of the test above.
+    #[tokio::test]
+    async fn stream_retry_response_416_on_files_xml_restarts() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let (client, server) = spawn_script_server(
+            vec![
+                over_promising(body.clone(), ""),
+                range_not_satisfiable_at(32),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        // run_download uses the identifier "slow-item".
+        let file = test_file_meta("slow-item_files.xml", 100);
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
+
+        match &result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 32);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(!dir.path().join("slow-item_files.xml.part").exists());
+        server.await.unwrap();
+    }
+
+    /// Mid-stream 416 without a parseable total: the plain HTTP error, the
+    /// flushed bytes kept in `.part`.
+    #[tokio::test]
+    async fn stream_retry_response_416_without_content_range_is_an_http_error() {
+        let body: Vec<u8> = (0..32u8).collect();
+        let bare_416: ConnHandler = Box::new(|mut stream, _request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let head = "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                            content-length: 0\r\n\
+                            connection: close\r\n\
+                            \r\n";
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.flush().await;
+            })
+        });
+        let (client, server) = spawn_script_server(
+            vec![over_promising(body.clone(), ""), bare_416],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", 32);
+
+        let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
+
+        assert!(
+            matches!(result, Err(IaError::Http { status: 416, .. })),
+            "got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("data.bin.part")).unwrap(),
+            body
+        );
+        assert!(!dir.path().join("data.bin").exists());
+        server.await.unwrap();
+    }
+
     /// All download requests must send `cnt=0` to suppress the archive.org
     /// view-counter. Verified by gating the wiremock response on the
     /// `query_param("cnt", "0")` matcher — if the param is missing the
@@ -4496,6 +5494,12 @@ mod tests {
         assert_eq!(parse_content_range_total(""), None);
         assert_eq!(parse_content_range_total("bytes 1-2/abc"), None);
         assert_eq!(parse_content_range_total("bytes 1-2/"), None);
+        assert_eq!(parse_content_range_total("bytes */*"), None);
+    }
+
+    #[test]
+    fn content_range_total_accepts_zero() {
+        assert_eq!(parse_content_range_total("bytes */0"), Some(0));
     }
 
     #[test]
@@ -5070,6 +6074,10 @@ mod tests {
         .await;
 
         let err = first.expect_err("a symlink .part must not be finished in place");
+        match &err {
+            IaError::ResumeFailed { reason, .. } => assert!(reason.contains("symlink"), "{reason}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
+        }
         assert!(err.is_retryable(), "{err:?}");
         assert!(!dir.path().join("disk.img").exists());
         assert!(
@@ -5120,15 +6128,16 @@ mod tests {
         )
         .await;
 
-        match result {
+        match &result {
             Err(IaError::DownloadSizeMismatch {
                 expected, received, ..
             }) => {
-                assert_eq!(expected, 32);
-                assert_eq!(received, 32);
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 32);
             }
             other => panic!("expected DownloadSizeMismatch, got {other:?}"),
         }
+        assert!(result.unwrap_err().is_retryable());
         assert!(!dir.path().join("disk.img.part").exists());
         assert!(!dir.path().join("disk.img").exists());
     }
