@@ -387,10 +387,10 @@ pub(crate) async fn complete_upload_with_retry(
                     attempts = f.attempts,
                     "upload id is gone and the object is not in the item; the upload did not complete"
                 );
-                Err(f.error)
+                Err(*f.error)
             }
         }
-        Err(f) => Err(f.error),
+        Err(f) => Err(*f.error),
     }
 }
 
@@ -464,7 +464,7 @@ pub(crate) async fn abort_upload_with_ctx(
             );
             Ok(())
         }
-        Err(f) => Err(f.error),
+        Err(f) => Err(*f.error),
     }
 }
 
@@ -536,7 +536,7 @@ pub(crate) async fn list_uploads_with_ctx(
             );
             Ok(Vec::new())
         }
-        Err(f) => Err(f.error),
+        Err(f) => Err(*f.error),
     }
 }
 
