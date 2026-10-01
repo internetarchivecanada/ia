@@ -55,6 +55,14 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
+#### Partial files and the size check
+
+Each file streams to `<name>.part` and is renamed into place only when the number of bytes received equals the `size` in the item's metadata. Otherwise the file is reported as failed with a message of the form `download size mismatch for <name>: expected N bytes, received M bytes` (in `--json` output the error code is `download_failed` and this text is the message). When the body came up short, the `.part` file is kept and the next attempt, whether the built-in retry or a rerun of the command, sends a `Range` request and resumes from the bytes already on disk. When the body ran long the same failure is reported; a body more than 10% (at least 1 KB) over the metadata size is abandoned mid-stream instead, with `download too large` and its `.part` deleted.
+
+If the server answers a `Range` request with a `Content-Range` total that differs from the metadata size, nothing from that response is written and the file fails with `server reports N bytes for <name> but item metadata says M bytes`. Retrying cannot fix that, so the command moves on to the next file.
+
+Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final.
+
 #### Examples
 
 ```sh

@@ -212,6 +212,75 @@ pub(crate) fn ensure_cnt_zero(url: &str) -> String {
     format!("{url}{sep}cnt=0")
 }
 
+/// Extract the complete length from a `Content-Range` header value.
+///
+/// Accepts the two forms RFC 9110 allows for the `bytes` unit,
+/// `bytes <first>-<last>/<complete-length>` and `bytes */<complete-length>`,
+/// and returns `None` when the complete length is `*` (the server does not
+/// know it), when the unit is not `bytes`, or when the value does not parse.
+///
+/// ```text
+/// "bytes 13-21/22"  -> Some(22)
+/// "bytes */22"      -> Some(22)
+/// "bytes 13-21/*"   -> None
+/// ```
+#[must_use]
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (unit, range_and_total) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (_range, total) = range_and_total.trim().rsplit_once('/')?;
+    total.trim().parse().ok()
+}
+
+/// Whether a file's metadata `size` cannot be trusted by construction.
+///
+/// `{identifier}_files.xml` lists every file in the item, including
+/// itself, so its own size is recorded before the final bytes exist and
+/// never matches what the server sends. Nothing else is exempt.
+#[must_use]
+fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
+    file_name.strip_prefix(identifier) == Some("_files.xml")
+}
+
+/// Fail before writing anything when a 206's `Content-Range` total disagrees
+/// with the size in the item's metadata.
+///
+/// The server and the metadata describe the same file; if they disagree
+/// about its length, retrying will not reconcile them, so this is the
+/// permanent [`IaError::ServerSizeMismatch`]. Only 206 responses carry
+/// `Content-Range`; a total of `*`, a missing metadata size, and
+/// `{identifier}_files.xml` (see [`is_size_unknowable`]) are all skipped.
+fn check_content_range(
+    response: &reqwest::Response,
+    identifier: &str,
+    file: &FileMetadata,
+) -> Result<()> {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(());
+    }
+    let Some(metadata_size) = file.size else {
+        return Ok(());
+    };
+    if is_size_unknowable(identifier, &file.name) {
+        return Ok(());
+    }
+    let server_size = response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total);
+    match server_size {
+        Some(server_size) if server_size != metadata_size => Err(IaError::ServerSizeMismatch {
+            file: file.name.clone(),
+            metadata_size,
+            server_size,
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Fetch a response from archive.org with auth, manual redirect following, and SSRF guard.
 ///
 /// Handles:
@@ -478,6 +547,7 @@ pub async fn download_file(
     }
 
     let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
+    check_content_range(&response, identifier, file)?;
     let status = response.status();
 
     // If we asked for a Range but got 200 (not 206), the server ignored our
@@ -618,6 +688,7 @@ pub async fn download_file(
                         let new_resp =
                             fetch_response(client, &url, Some(bytes_downloaded), opts.count_views)
                                 .await?;
+                        check_content_range(&new_resp, identifier, file)?;
                         // If the server ignores Range and returns 200, the
                         // safe thing is to surface the original error rather
                         // than try to splice a full-file stream onto an
@@ -643,7 +714,10 @@ pub async fn download_file(
             }
             bytes_downloaded += chunk.len() as u64;
 
-            // Abort if response exceeds expected size (10% tolerance, min 1KB buffer)
+            // Early exit for a grossly oversized body (10% over, min 1 KB)
+            // so a runaway response cannot fill the disk. Any smaller
+            // discrepancy is caught by the exact count check after the
+            // stream ends, which keeps .part instead of deleting it.
             if let Some(expected) = file.size {
                 let max_allowed = expected + (expected / 10).max(1024);
                 if bytes_downloaded > max_allowed {
@@ -676,6 +750,26 @@ pub async fn download_file(
 
     output.flush().await?;
     drop(output);
+
+    // The stream ended. Refuse to rename a file whose byte count differs
+    // from the item metadata. The .part file is deliberately kept: the error
+    // is retryable and the next attempt resumes it with Range. This runs
+    // before the md5 comparison because that path deletes .part.
+    if let Some(expected) = file.size {
+        if bytes_downloaded != expected && !is_size_unknowable(identifier, &file.name) {
+            warn!(
+                file = %file.name,
+                expected,
+                received = bytes_downloaded,
+                "byte count differs from item metadata; keeping .part for resume"
+            );
+            return Err(IaError::DownloadSizeMismatch {
+                file: file.name.clone(),
+                expected,
+                received: bytes_downloaded,
+            });
+        }
+    }
 
     // Post-download checksum comparison using the inline-computed hash.
     if let Some(hasher) = hasher {
@@ -1190,7 +1284,8 @@ mod tests {
         filetime::set_file_mtime(
             &file_path,
             filetime::FileTime::from_unix_time(mtime as i64, 0),
-        );
+        )
+        .unwrap();
 
         let file = FileMetadata {
             name: "existing.txt".to_string(),
@@ -1732,10 +1827,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_allows_slightly_oversized_response() {
+    async fn slightly_oversized_response_is_a_size_mismatch() {
         let mock_server = MockServer::start().await;
-        // File metadata says 100 bytes. Max = 100 + max(10, 1024) = 1124.
-        // Sending 105 bytes (5% over) should succeed.
+        // File metadata says 100 bytes. The mid-stream too-large abort only
+        // fires past 100 + max(10, 1024) = 1124, so 105 bytes stream to the
+        // end; the exact count check then refuses to rename it into place.
         let body = vec![b'Y'; 105];
 
         Mock::given(method("GET"))
@@ -1756,11 +1852,21 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(result.status, DownloadStatus::Complete);
-        assert_eq!(result.bytes, 105);
+        match result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(expected, 100);
+                assert_eq!(received, 105);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        // Unlike the gross-oversize abort, the bytes are kept for inspection
+        // and resume; nothing is renamed into place.
+        assert!(dir.path().join("normal.txt.part").exists());
+        assert!(!dir.path().join("normal.txt").exists());
     }
 
     #[test]
@@ -1904,7 +2010,8 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(206)
                     .set_body_bytes(b"data here".to_vec())
-                    .insert_header("Content-Range", "bytes 13-21/22"),
+                    // 9 bytes at the tail of the 23-byte full body.
+                    .insert_header("Content-Range", "bytes 14-22/23"),
             )
             .mount(&mock_server)
             .await;
@@ -1936,10 +2043,16 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert_eq!(result.status, DownloadStatus::Complete);
+        // The Range request was already sent before the symlink was noticed,
+        // so the 206 body (9 bytes) lands at offset 0 of a fresh .part. That
+        // is not the 23-byte file, and it must not be renamed into place.
+        assert!(
+            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(!dir.path().join("ranged.txt").exists());
 
         // The symlink target should NOT have been modified
         let target_content = std::fs::read_to_string(&target_file).unwrap();
@@ -2715,6 +2828,126 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    /// The Content-Range check must also cover the Range re-request that the
+    /// body-stream retry sends. wiremock always sets a correct Content-Length,
+    /// so the first response's mid-body drop needs the raw listener.
+    #[tokio::test]
+    async fn stream_retry_response_with_wrong_total_fails_permanently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let full_body: Vec<u8> = (0..32u8).collect();
+        let full_len = full_body.len() as u64;
+        let chopped_at: u64 = 12;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_body = full_body.clone();
+
+        let server_handle = tokio::spawn(async move {
+            async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+                let mut buf = vec![0u8; 4096];
+                let mut acc = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).to_string()
+            }
+
+            // Accept 1: promise 32 bytes, send 12, close.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-length: {full_len}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     accept-ranges: bytes\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream
+                    .write_all(&server_body[..chopped_at as usize])
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                drop(stream);
+            }
+
+            // Accept 2: the Range re-request. Answer 206 but claim the file
+            // is 40 bytes long, not 32. The client may hang up without
+            // reading the body, so write errors are ignored here.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut stream).await;
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains(&format!("range: bytes={chopped_at}-")),
+                    "expected Range header on retry, got:\n{req}"
+                );
+                let remainder = &server_body[chopped_at as usize..];
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     content-length: {}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     content-range: bytes {chopped_at}-{end}/40\r\n\
+                     connection: close\r\n\
+                     \r\n",
+                    remainder.len(),
+                    end = full_len - 1,
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(remainder).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", full_len);
+
+        let result = download_file(
+            &client,
+            "flaky-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 32);
+                assert_eq!(server_size, 40);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        // The first response's 12 bytes were flushed before the re-request;
+        // nothing from the second response was written.
+        let part = std::fs::read(dir.path().join("data.bin.part")).unwrap();
+        assert_eq!(part, &full_body[..chopped_at as usize]);
+        assert!(!dir.path().join("data.bin").exists());
+
+        server_handle.await.unwrap();
+    }
+
     /// All download requests must send `cnt=0` to suppress the archive.org
     /// view-counter. Verified by gating the wiremock response on the
     /// `query_param("cnt", "0")` matcher — if the param is missing the
@@ -2822,5 +3055,399 @@ mod tests {
             .await
             .expect("download with count_views=true should omit cnt entirely");
         assert_eq!(result.status, DownloadStatus::Complete);
+    }
+
+    // -- Content-Range parsing and the _files.xml exemption (#12) --
+
+    #[test]
+    fn content_range_total_parses_normal_form() {
+        assert_eq!(parse_content_range_total("bytes 13-21/22"), Some(22));
+        assert_eq!(parse_content_range_total("bytes 0-0/1"), Some(1));
+    }
+
+    #[test]
+    fn content_range_total_accepts_unsatisfied_range_form() {
+        assert_eq!(parse_content_range_total("bytes */22"), Some(22));
+    }
+
+    #[test]
+    fn content_range_total_is_none_when_server_does_not_know_it() {
+        assert_eq!(parse_content_range_total("bytes 13-21/*"), None);
+    }
+
+    #[test]
+    fn content_range_total_unit_is_case_insensitive() {
+        assert_eq!(parse_content_range_total("BYTES 13-21/22"), Some(22));
+        assert_eq!(parse_content_range_total("  bytes 13-21/22  "), Some(22));
+    }
+
+    #[test]
+    fn content_range_total_rejects_other_units_and_garbage() {
+        assert_eq!(parse_content_range_total("items 1-2/3"), None);
+        assert_eq!(parse_content_range_total("bytes 13-21"), None);
+        assert_eq!(parse_content_range_total(""), None);
+        assert_eq!(parse_content_range_total("bytes 1-2/abc"), None);
+        assert_eq!(parse_content_range_total("bytes 1-2/"), None);
+    }
+
+    #[test]
+    fn files_xml_size_is_unknowable() {
+        assert!(is_size_unknowable("abc", "abc_files.xml"));
+    }
+
+    #[test]
+    fn other_files_have_knowable_sizes() {
+        assert!(!is_size_unknowable("abc", "abc_meta.xml"));
+        assert!(!is_size_unknowable("abc", "other_files.xml"));
+        assert!(!is_size_unknowable("abc", "sub/abc_files.xml"));
+        assert!(!is_size_unknowable("abc", "abc_files.xml.bak"));
+    }
+
+    // -- Content-Range check on 206 responses (#12) --
+
+    /// Put a 5-byte `.part` on disk and mount a 206 mock for the Range
+    /// request that follows. Returns the client and the destination dir.
+    async fn mount_resume_206(
+        mock_server: &MockServer,
+        name: &str,
+        content_range: &str,
+    ) -> (IaClient, tempfile::TempDir) {
+        use wiremock::matchers::header_exists;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(format!("{name}.part")), b"AAAAA").unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/download/test-item/{name}")))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(vec![b'B'; 25])
+                    .insert_header("Content-Range", content_range),
+            )
+            .mount(mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        (client, dir)
+    }
+
+    #[tokio::test]
+    async fn content_range_total_mismatch_fails_permanently() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_resume_206(&mock_server, "disk.img", "bytes 5-29/30").await;
+        // Metadata claims 40 bytes; the server says the file is 30.
+        let file = test_file_meta("disk.img", 40);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 40);
+                assert_eq!(server_size, 30);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        // Nothing was written: .part is untouched and no final file exists.
+        let part = std::fs::read(dir.path().join("disk.img.part")).unwrap();
+        assert_eq!(part, b"AAAAA");
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    #[tokio::test]
+    async fn content_range_star_total_is_ignored() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_resume_206(&mock_server, "disk.img", "bytes 5-29/*").await;
+        let file = test_file_meta("disk.img", 30);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        let got = std::fs::read(dir.path().join("disk.img")).unwrap();
+        assert_eq!(got.len(), 30);
+        assert_eq!(&got[..5], b"AAAAA");
+    }
+
+    #[tokio::test]
+    async fn content_range_mismatch_on_files_xml_is_ignored() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_206(&mock_server, "test-item_files.xml", "bytes 5-29/30").await;
+        // Metadata size is wrong by construction for _files.xml.
+        let file = test_file_meta("test-item_files.xml", 40);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 30);
+    }
+
+    // -- post-stream byte-count check (#12) --
+
+    /// Mount the two responses a short-then-resumed download sees: a 200
+    /// carrying only the first 20 of 32 bytes, and a 206 for the Range
+    /// request that follows with the remaining 12. wiremock tries mocks in
+    /// mount order, so the Range-only mock goes first.
+    async fn mount_short_then_range(mock_server: &MockServer, item: &str, name: &str) -> Vec<u8> {
+        use wiremock::matchers::header_exists;
+        let full: Vec<u8> = (0..32u8).collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/{name}")))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(full[20..].to_vec())
+                    .insert_header("Content-Range", "bytes 20-31/32"),
+            )
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full[..20].to_vec()))
+            .mount(mock_server)
+            .await;
+        full
+    }
+
+    #[tokio::test]
+    async fn short_body_keeps_part_and_returns_retryable_error() {
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(r) => panic!("expected an error, got {r:?}"),
+        };
+        assert!(
+            matches!(
+                err,
+                IaError::DownloadSizeMismatch {
+                    expected: 32,
+                    received: 20,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(err.is_retryable());
+        let part = std::fs::read(dir.path().join("disk.img.part")).unwrap();
+        assert_eq!(part, &full[..20]);
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    #[tokio::test]
+    async fn short_body_then_rerun_resumes_and_completes() {
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+        assert!(matches!(first, Err(IaError::DownloadSizeMismatch { .. })));
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.status, DownloadStatus::Complete);
+        assert_eq!(second.bytes, 32);
+        let got = std::fs::read(dir.path().join("disk.img")).unwrap();
+        assert_eq!(got, full);
+        assert!(!dir.path().join("disk.img.part").exists());
+
+        // Exactly two requests: the short 200 and one Range request.
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+        let range = requests[1]
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(range, "bytes=20-");
+    }
+
+    #[tokio::test]
+    async fn short_body_recovers_through_outer_retry_loop() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+
+        let mock_server = MockServer::start().await;
+        let full = mount_short_then_range(&mock_server, "short-item", "disk.img").await;
+
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("short-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("disk.img", 32)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries: 1,
+            ..Default::default()
+        };
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let result =
+            download_item_with_metadata(&client, "short-item", &item, &opts, semaphore, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        let got = std::fs::read(dir.path().join("short-item/disk.img")).unwrap();
+        assert_eq!(got, full);
+    }
+
+    #[tokio::test]
+    async fn short_body_with_checksum_keeps_part() {
+        let mock_server = MockServer::start().await;
+        mount_short_then_range(&mock_server, "test-item", "disk.img").await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // test_file_meta carries an md5 that cannot match 20 bytes of data.
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts {
+                checksum: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+
+        // The size check runs before the md5 check, which would have deleted
+        // the .part file.
+        assert!(
+            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
+            "got {result:?}"
+        );
+        assert!(dir.path().join("disk.img.part").exists());
+    }
+
+    #[tokio::test]
+    async fn file_without_size_is_unaffected() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/nosize.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'Z'; 20]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = test_file_meta("nosize.bin", 0);
+        file.size = None;
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn files_xml_size_mismatch_is_ignored() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test-item_files.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'<'; 20]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test-item_files.xml", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 20);
     }
 }

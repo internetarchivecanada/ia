@@ -86,6 +86,27 @@ pub enum IaError {
         received: u64,
     },
 
+    /// The body ended with a byte count that differs from the size in the
+    /// item's metadata. The `.part` file is kept so a retry can resume it.
+    #[error(
+        "download size mismatch for {file}: expected {expected} bytes, received {received} bytes"
+    )]
+    DownloadSizeMismatch {
+        file: String,
+        expected: u64,
+        received: u64,
+    },
+
+    /// A 206 response's `Content-Range` total disagrees with the size in the
+    /// item's metadata. Retrying cannot reconcile the two, so this is
+    /// permanent. Nothing is written when it fires.
+    #[error("server reports {server_size} bytes for {file} but item metadata says {metadata_size} bytes")]
+    ServerSizeMismatch {
+        file: String,
+        metadata_size: u64,
+        server_size: u64,
+    },
+
     #[error("upload failed for {identifier}/{key}: {message}")]
     UploadFailed {
         identifier: String,
@@ -257,6 +278,10 @@ impl IaError {
             // Security — never retry
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
+            // A short transfer resumes from .part; a server/metadata
+            // disagreement about the file's size will not change on retry.
+            IaError::DownloadSizeMismatch { .. } => true,
+            IaError::ServerSizeMismatch { .. } => false,
             // Upload errors
             IaError::UploadFailed { .. } => false, // terminal — retry logic is in single.rs
             IaError::SpamDetected { .. } => false, // permanent
@@ -382,6 +407,26 @@ impl IaError {
                 extra.insert("expected".into(), (*expected).into());
                 extra.insert("received".into(), (*received).into());
                 "download_too_large"
+            }
+            IaError::DownloadSizeMismatch {
+                file,
+                expected,
+                received,
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert("expected".into(), (*expected).into());
+                extra.insert("received".into(), (*received).into());
+                "download_size_mismatch"
+            }
+            IaError::ServerSizeMismatch {
+                file,
+                metadata_size,
+                server_size,
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert("metadata_size".into(), (*metadata_size).into());
+                extra.insert("server_size".into(), (*server_size).into());
+                "server_size_mismatch"
             }
             IaError::UploadFailed {
                 identifier,
@@ -1415,5 +1460,81 @@ mod tests {
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "task_not_found");
         assert_eq!(v["error"]["task_id"], 123);
+    }
+
+    // -- size mismatch variants (#12) --
+
+    #[test]
+    fn download_size_mismatch_is_retryable() {
+        let err = IaError::DownloadSizeMismatch {
+            file: "disk.img".into(),
+            expected: 32,
+            received: 20,
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn server_size_mismatch_is_not_retryable() {
+        let err = IaError::ServerSizeMismatch {
+            file: "disk.img".into(),
+            metadata_size: 40,
+            server_size: 30,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn download_size_mismatch_displays_both_sizes() {
+        let err = IaError::DownloadSizeMismatch {
+            file: "disk.img".into(),
+            expected: 32,
+            received: 20,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("disk.img"), "{msg}");
+        assert!(msg.contains("32"), "{msg}");
+        assert!(msg.contains("20"), "{msg}");
+    }
+
+    #[test]
+    fn server_size_mismatch_displays_both_sizes() {
+        let err = IaError::ServerSizeMismatch {
+            file: "disk.img".into(),
+            metadata_size: 40,
+            server_size: 30,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("disk.img"), "{msg}");
+        assert!(msg.contains("40"), "{msg}");
+        assert!(msg.contains("30"), "{msg}");
+    }
+
+    #[test]
+    fn json_download_size_mismatch() {
+        let err = IaError::DownloadSizeMismatch {
+            file: "disk.img".into(),
+            expected: 32,
+            received: 20,
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "download_size_mismatch");
+        assert_eq!(v["error"]["file"], "disk.img");
+        assert_eq!(v["error"]["expected"], 32);
+        assert_eq!(v["error"]["received"], 20);
+    }
+
+    #[test]
+    fn json_server_size_mismatch() {
+        let err = IaError::ServerSizeMismatch {
+            file: "disk.img".into(),
+            metadata_size: 40,
+            server_size: 30,
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "server_size_mismatch");
+        assert_eq!(v["error"]["file"], "disk.img");
+        assert_eq!(v["error"]["metadata_size"], 40);
+        assert_eq!(v["error"]["server_size"], 30);
     }
 }
