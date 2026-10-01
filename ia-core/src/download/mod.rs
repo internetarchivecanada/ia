@@ -533,10 +533,13 @@ fn last_modified_of(response: &reqwest::Response) -> Option<std::time::SystemTim
 
 /// Feed the first `resumed_bytes` of the `.part` at `part_path` into a fresh
 /// md5 state, so a hash that continues over the rest of the stream (or over
-/// nothing, when the `.part` is already the whole file) covers the full file.
+/// nothing, when the `.part` is already the whole file) covers exactly the
+/// bytes the caller counts. Anything past `resumed_bytes` is not read, so
+/// the hash matches the length the caller reports even if the file grew
+/// after it was measured.
 ///
-/// Reading the whole `.part` can take tens of seconds on a 10 GB partial, so
-/// a `Verifying` progress event goes out first and again every 16 MiB.
+/// Reading the `.part` can take tens of seconds on a 10 GB partial, so a
+/// `Verifying` progress event goes out first and again every 16 MiB.
 async fn seed_hasher_from_part(
     identifier: &str,
     file: &FileMetadata,
@@ -557,7 +560,7 @@ async fn seed_hasher_from_part(
             status: DownloadStatus::Verifying,
         });
     }
-    let mut seed = fs::File::open(part_path).await?;
+    let mut seed = fs::File::open(part_path).await?.take(resumed_bytes);
     let mut buf = vec![0u8; 1024 * 1024];
     let mut seeded: u64 = 0;
     let mut last_emit: u64 = 0;
@@ -806,8 +809,24 @@ pub async fn download_file(
     {
         let last_modified = last_modified_of(&response);
         range_not_satisfiable(response, identifier, file, offset, &part_path).await?;
-        // The .part is the whole file. Hash it from disk when asked to, then
-        // finish it without streaming anything.
+        // The .part is the whole file, but never finish it through a
+        // symlink: renaming the link into place would leave a Complete
+        // download pointing outside dest_dir and the mtime write would go
+        // through it. The resume check above followed the link, so this is
+        // the first look at the link itself. Remove it and restart from
+        // byte 0, as the symlink check on the streaming path does.
+        if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+            if meta.file_type().is_symlink() {
+                warn!(file = %file.name, "removing symlink .part file");
+                fs::remove_file(&part_path).await?;
+                return Err(IaError::ResumeFailed {
+                    file: file.name.clone(),
+                    reason: ".part path is a symlink".to_string(),
+                });
+            }
+        }
+        // Hash the .part from disk when asked to, then finish it without
+        // streaming anything.
         let hasher = if opts.checksum && file.md5.is_some() {
             Some(seed_hasher_from_part(identifier, file, &part_path, offset, progress).await?)
         } else {
@@ -4198,6 +4217,79 @@ mod tests {
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "{requests:#?}");
+    }
+
+    /// A `.part` that is a symlink must never be finished in place, even
+    /// when its target has the agreed length and the server's 416 confirms
+    /// it: renaming the link into place would leave a `Complete` download
+    /// pointing outside the destination, and the mtime write would go
+    /// through the link. The link is removed and the download restarts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_through_symlink_part_restarts() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .mount(&mock_server)
+            .await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_file = target_dir.path().join("target.bin");
+        std::fs::write(&target_file, vec![b'A'; 32]).unwrap();
+        let target_mtime = std::fs::metadata(&target_file).unwrap().modified().unwrap();
+        let part_path = dir.path().join("disk.img.part");
+        std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        let err = first.expect_err("a symlink .part must not be finished in place");
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(!dir.path().join("disk.img").exists());
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "the symlink .part should have been removed"
+        );
+        // The target is untouched: same bytes, same mtime.
+        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
+        assert_eq!(
+            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
+            target_mtime
+        );
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status, DownloadStatus::Complete);
+        let final_meta = std::fs::symlink_metadata(dir.path().join("disk.img")).unwrap();
+        assert!(!final_meta.file_type().is_symlink());
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
     }
 
     /// With no metadata size there is no third party to agree, so the

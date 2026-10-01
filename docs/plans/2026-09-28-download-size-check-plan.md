@@ -190,17 +190,18 @@ Part of #12. PR #26 left one wasteful case: when the `.part` file already holds 
 
 ### Task D: 416 at the file's full length
 
-- [ ] **Step 1: Failing tests** in `ia-core/src/download/mod.rs`:
+- [x] **Step 1: Failing tests** in `ia-core/src/download/mod.rs`:
   - `range_not_satisfiable_at_part_length_completes_without_redownload`: 32-byte `.part`, metadata 32, 416 `bytes */32` → `Ok`, `status == Complete`, `bytes == 32`, final file holds the `.part` bytes, `.part` gone, exactly one request and it carried `Range`, mtime set from metadata.
   - `range_not_satisfiable_at_part_length_with_checksum_verifies`: `checksum: true`, md5 matches the `.part` bytes → `Complete`, one request, a `Verifying` progress event was emitted.
   - `range_not_satisfiable_at_part_length_with_checksum_mismatch_deletes_part`: `checksum: true`, wrong md5 → `ChecksumMismatch`, `.part` gone, no final file, one request.
   - `range_not_satisfiable_at_part_length_without_metadata_size_restarts`: `size: None`, 32-byte `.part`, 416 `bytes */32` → `DownloadSizeMismatch`, `.part` gone (the literal reading above).
   - Raw-TCP `stream_retry_response_416_at_full_length_completes`: the server promises 33 bytes for a 32-byte file, sends 32, closes; the `Range: bytes=32-` re-request is answered 416 `bytes */32`; with `checksum: true` → `Complete`, final file is the 32 bytes, no `.part`, exactly two connections.
+  - `range_not_satisfiable_at_part_length_through_symlink_part_restarts` (added after review): a symlink `.part` whose target has the agreed length, 416 `bytes */32` → retryable `ResumeFailed`, the link removed, its target's bytes and mtime untouched, no final file; a second call completes with a regular file. The initial-request shortcut checks `symlink_metadata` before finishing, because the resume check follows the link.
   - The existing `range_not_satisfiable_at_metadata_total_deletes_part_and_restarts` (40-byte `.part`, total 32) and `range_not_satisfiable_with_different_total_fails_permanently` stay unchanged and keep passing.
-- [ ] **Step 2: Run**; the new tests fail (today they get `DownloadSizeMismatch` and a second request).
-- [ ] **Step 3: Implement** `range_not_satisfiable`, `finish_part`, `seed_hasher_from_part`, and the two call sites.
-- [ ] **Step 4: `docs/usage.md`**: the 416 paragraph gains the full-length case.
-- [ ] **Step 5: Run**; green. Commit: `fix(download): finish the file when a 416 confirms the .part is complete`.
+- [x] **Step 2: Run**; the new tests fail (today they get `DownloadSizeMismatch` and a second request).
+- [x] **Step 3: Implement** `range_not_satisfiable`, `finish_part`, `seed_hasher_from_part`, and the two call sites.
+- [x] **Step 4: `docs/usage.md`**: the 416 paragraph gains the full-length case.
+- [x] **Step 5: Run**; green. Commit: `fix(download): finish the file when a 416 confirms the .part is complete`.
 
 ### Task E: Verification and review
 
