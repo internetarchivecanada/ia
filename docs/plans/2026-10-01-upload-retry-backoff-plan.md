@@ -1,64 +1,55 @@
 # Upload Retry Backoff Implementation Plan
 
-Follow-up to PR #10 (one retry policy for every IA-S3 multipart request). Jake, 2026-10-01: exponential backoff is objectively better than a constant sleep; do the standard thing.
+Follow-up to PR #10 (one retry policy for every IA-S3 multipart request).
 
-**Goal:** IA-S3 upload retries use truncated exponential backoff with jitter and honor `Retry-After`, with `--retry-sleep` as the base delay. This is what every HTTP client library does.
+**Decision (Jake, 2026-10-01):** remove `--retry-sleep`. Retries follow the industry standard: the number of attempts is the only knob; the schedule is truncated exponential backoff with jitter from the library already in the tree (`reqwest-retry` re-exports `retry_policies::ExponentialBackoff`); a `Retry-After` header from the server overrides the computed wait. "We must always adhere to Retry-After. Everywhere anything is retried."
 
-**History, stated plainly:** the application-level `--retry-sleep` was always a constant sleep, before and after PR #10. What #10 removed was the transport middleware's exponential backoff (1 s to 60 s over three attempts) that sat underneath the application loop on IA-S3 calls and multiplied its attempts. This plan gives the application loop the backoff itself.
+**Definitions.** Retry: the same request again after a failure. Backoff: the wait before a retry. Exponential: each wait doubles. Truncated: no single wait exceeds a cap. Jitter: each wait is randomized so clients do not retry in lockstep. Retry-After: the HTTP header in which the server says how long to wait (seconds, or an HTTP date).
 
-**Architecture:** one pure function, `retry_delay(base, attempt, retry_after, unit)` in `ia-core/src/upload/retry.rs`, used by both sleep sites in `send_with_retry` (multipart) and by the retry loop in `single.rs`. The check-limit poll in `single.rs` keeps its plain interval: it is a poll, not a retry.
+**Schedule.** Library `ExponentialBackoff` with bounds 1 s to 60 s, base 2, full jitter (a uniform random wait between 0 and the computed one). The upper bounds for retries 1, 2, 3, ... are 1, 2, 4, 8, 16, 32, 60, 60, ... s. Whole-run worst case over the default 10 retries is about 4 minutes. These are the bounds the transport middleware used before PR #10.
 
-**Rule:**
+**History, plainly:** the application-level `--retry-sleep` was always a constant sleep. PR #10 removed the middleware's exponential backoff from under it. This plan puts the standard schedule into the application loop and drops the flag.
 
-- delay for retry `n` (1-based) = `min(base × 2^(n-1), 60 s)`, then full jitter: a uniform random fraction of that in `[0, 1)`.
-- A `Retry-After` header on the failed response (seconds, or an HTTP date) overrides the computed delay, as given, without jitter: the server said how long.
-- `--retry-sleep` is the base; default stays 30 s. Default sequence of upper bounds: 30, 60, 60, ... s; `--retry-sleep 1` gives 1, 2, 4, 8, 16, 32, 60, 60, ... s.
-- The 60 s ceiling is a constant (`MAX_RETRY_DELAY`), documented, not a flag.
+**Architecture:**
 
-**Engineering calls, not Jake decisions:**
+- `UploadOpts` loses `retry_sleep` and gains `retry_min_delay` (1 s) and `retry_max_delay` (60 s): the schedule's bounds, with builder methods. They are library configuration, not CLI flags; tests shrink them to milliseconds. `retries` stays.
+- `S3RetryCtx` carries the built `ExponentialBackoff` instead of a sleep. `send_with_retry` reads `Retry-After` from a failed response before consuming its body and sleeps that, or else the policy's wait for the retry number.
+- `single.rs`: the non-503 retry sleep uses the same policy; the check-limit poll waits with the same policy between polls (a poll with backoff, standard) and honors `Retry-After` from the 503 that sent it there.
+- `crate::retry::extract_retry_after` learns the HTTP-date form (`httpdate` is already a dependency); a date in the past is 0.
+- CLI: `--retry-sleep` removed from both `UploadArgs`; the `--retries` help says how the waits grow and that `Retry-After` is honored.
 
-- Jitter source: a small splitmix64 step seeded from the clock, in `retry.rs`. No new crate (AGENTS.md: ask before adding one); jitter does not need a cryptographic source.
-- `Retry-After` is honored as given. Libraries that honor it (urllib3, Google's clients) do not cap it; the server's number is an instruction.
-- `--retry-sleep 0` keeps meaning no sleep: the base is zero, every computed delay is zero, `Retry-After` still applies.
-- `UploadOpts::retry_sleep` keeps its name and type; its doc says "base" now. No public API change.
+**Public API (ia-core):** `UploadOpts::retry_sleep` field and builder method removed; `retry_min_delay`/`retry_max_delay` added. `S3RetryCtx` is crate-private. CLI: `--retry-sleep` removed (was in the Python CLI as `--sleep`; the parity is deliberately dropped).
 
-**Out of scope:** the download side's per-file retry delay (`2^attempt` capped at 60 s, already exponential, no jitter) and the stall/stream re-request delays (#11); the metadata-write `Retry-After` handling in `concurrency.rs`.
+**Other retry sites (audit, 2026-10-01):** honored today: tasks API (rate-limit pause), metadata writes (`concurrency.rs`). Not honored, for the next PR: download per-file loop (headers are dropped in `fetch_response` before the loop sees the error), AI client LLM retries, the transport retry middleware (reqwest-retry 0.9 has no Retry-After support). Not applicable: stream re-request after a body error, metadata-read decode retries (no response to read).
 
 ---
 
-### Task 1: the delay function
+### Task 1: the schedule and the header
 
-**Files:** `ia-core/src/upload/retry.rs`
+**Files:** `ia-core/src/upload/types.rs`, `ia-core/src/upload/retry.rs`, `ia-core/src/retry.rs`
 
-- [ ] **Step 1: Failing unit tests** for `retry_delay(base, attempt, retry_after, unit)` with `unit` the jitter fraction:
-  - `unit = 1.0`, base 30 s: attempts 1, 2, 3 → 30, 60, 60 s.
-  - `unit = 1.0`, base 1 s: attempts 1..=8 → 1, 2, 4, 8, 16, 32, 60, 60 s.
-  - `unit = 0.5`, base 30 s, attempt 1 → 15 s; `unit = 0.0` → 0.
-  - base 0 → 0 for every attempt and unit.
-  - `retry_after = Some(90 s)` overrides regardless of base, attempt and unit (also when 90 > 60: the cap is for the computed delay only).
-  - attempt 40 does not overflow (saturates at the cap).
-  - `parse_retry_after("120")` → 120 s; an HTTP date 30 s ahead → about 30 s; a date in the past → 0; `"soon"` → `None`.
-  - `jitter_unit()` returns values in `[0, 1)` across many calls and is not constant.
+- [ ] **Step 1: Failing tests.**
+  - `types.rs`: the defaults test asserts `retry_min_delay == 1 s`, `retry_max_delay == 60 s`, and no `retry_sleep`.
+  - `retry.rs` (new `tests` module): `backoff_policy(min, max, retries)` + `backoff_wait(&policy, n_past_retries)`: with 1 s/60 s, retry 1 waits at most 1 s, retry 7 and 20 at most 60 s, never more than the upper bound, and 1000 draws are not all equal (jitter). With retries = 3, `n_past_retries = 3` → zero wait (the policy says do not retry; the loop's own budget check is what ends the loop).
+  - `crate::retry`: `extract_retry_after("120")` → 120; an HTTP date 30 s ahead → 29..=31; a date in the past → 0; `"soon"` → None.
 - [ ] **Step 2: Run**; compile failure.
-- [ ] **Step 3: Implement** `MAX_RETRY_DELAY`, `retry_delay`, `parse_retry_after`, `jitter_unit`.
-- [ ] **Step 4: Run**; green. Commit: `feat(upload): truncated exponential backoff with jitter for IA-S3 retries (pure function)`.
+- [ ] **Step 3: Implement.** Commit: `feat(upload): standard exponential backoff schedule; Retry-After parses HTTP dates`.
 
-### Task 2: use it
+### Task 2: use them, drop the flag
 
-**Files:** `ia-core/src/upload/retry.rs`, `ia-core/src/upload/single.rs`
+**Files:** `ia-core/src/upload/retry.rs`, `single.rs`, `multipart.rs`, `ia-cli/src/commands/upload.rs`, tests
 
-- [ ] **Step 1: Failing tests** (wiremock, in `ia-core/tests/upload_multipart.rs` and `upload_single.rs`):
-  - `retry_after_header_is_honored`: a part PUT answers 503 with `Retry-After: 1` once, then 200; `retry_sleep` 1 ms; the upload completes and takes at least 1 s.
-  - `retry_delay_grows_with_the_attempt`: `retry_sleep` 200 ms, two 503s then 200; total elapsed at least 300 ms is not provable with full jitter, so instead assert through a probe: `send_with_retry` is private, so test the delay sequence indirectly by setting `retry_sleep` to 0 and checking that three attempts complete quickly (the zero base path), and rely on the unit tests for the growth. (If a cleaner seam appears while implementing, use it.)
-  - `single_file_retry_honors_retry_after`: same as the first, through `upload_file`.
+- [ ] **Step 1: Failing tests.**
+  - `ia-core/tests/upload_multipart.rs`: `part_retry_honors_retry_after`: part PUT answers 503 with `Retry-After: 1` once, then 200; bounds 1 ms/2 ms; the upload completes and takes at least 1 s.
+  - `ia-core/tests/upload_single.rs`: `retry_honors_retry_after`: same through `upload_file` on a 503 whose check-limit clears at once.
+  - `ia-cli/tests/cli.rs`: `upload --help` has no `--retry-sleep`; `ia upload x f --retry-sleep 5` exits 2 with "unexpected argument"; `--retries` help mentions `Retry-After`.
+  - Existing tests: every `retry_sleep: Duration::from_millis(..)` becomes `retry_min_delay: Duration::from_millis(1), retry_max_delay: Duration::from_millis(2)`.
 - [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** In `send_with_retry`, read `Retry-After` before the body is consumed; both sleep sites call `retry_delay(ctx.retry_sleep, attempt, retry_after, jitter_unit())`; log the chosen delay. In `single.rs`, the non-503 retry sleep does the same with its `retries` counter.
-- [ ] **Step 4: Run**; green. Commit: `fix(upload): back off exponentially between IA-S3 retries and honor Retry-After`.
+- [ ] **Step 3: Implement.** Commit: `fix(upload): remove --retry-sleep; back off exponentially and honor Retry-After on IA-S3 retries`.
 
-### Task 3: help and docs
+### Task 3: docs
 
-- [ ] `--retry-sleep` help: "Base delay between retries in seconds; doubles each retry up to 60 s, with jitter; a Retry-After header overrides it". Both `UploadArgs` copies. `docs/usage.md` row and a sentence in the upload section's retry paragraph. `UploadOpts::retry_sleep` doc.
-- [ ] Commit: `docs: describe the upload retry backoff`.
+- [ ] `docs/usage.md`: drop the `--retry-sleep` row and its mention in the batch-options list; the `--retries` row says "waits grow from 1 s to 60 s with jitter; a Retry-After header is honored". Commit: `docs: retries back off; --retry-sleep is gone`.
 
 ### Task 4: verification and review
 
