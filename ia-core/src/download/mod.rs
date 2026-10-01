@@ -249,9 +249,11 @@ fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
 ///
 /// The server and the metadata describe the same file; if they disagree
 /// about its length, retrying will not reconcile them, so this is the
-/// permanent [`IaError::ServerSizeMismatch`]. Only 206 responses carry
-/// `Content-Range`; a total of `*`, a missing metadata size, and
-/// `{identifier}_files.xml` (see [`is_size_unknowable`]) are all skipped.
+/// permanent [`IaError::ServerSizeMismatch`]. Only 206 responses are
+/// checked here; a 416's `Content-Range` is handled by
+/// [`range_not_satisfiable_error`]. A total of `*`, a missing metadata
+/// size, and `{identifier}_files.xml` (see [`is_size_unknowable`]) are all
+/// skipped.
 fn check_content_range(
     response: &reqwest::Response,
     identifier: &str,
@@ -642,15 +644,14 @@ pub async fn download_file(
     }
 
     let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
-    if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        return Err(range_not_satisfiable_error(
-            response,
-            identifier,
-            file,
-            resume_from.unwrap_or(0),
-            &part_path,
-        )
-        .await);
+    // A 416 only comes back when a Range header was sent, so the resume
+    // offset is always present alongside it.
+    if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
+        (resume_from, response.status())
+    {
+        return Err(
+            range_not_satisfiable_error(response, identifier, file, offset, &part_path).await,
+        );
     }
     check_content_range(&response, identifier, file)?;
     let status = response.status();
@@ -3714,6 +3715,69 @@ mod tests {
         assert_eq!(requests.len(), 2, "{requests:#?}");
         assert!(requests[0].headers.get("range").is_some());
         assert!(requests[1].headers.get("range").is_none());
+    }
+
+    /// End to end through the outer retry loop: the 416 at the metadata
+    /// total deletes `.part`, the retryable error earns a second attempt,
+    /// and the plain GET that follows completes the file.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_metadata_total_recovers_through_outer_retry_loop() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+        use wiremock::matchers::header_exists;
+
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let item_dir = dir.path().join("stale-item");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        std::fs::write(item_dir.join("disk.img.part"), vec![b'A'; 40]).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/download/stale-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/stale-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("stale-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("disk.img", 32)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries: 1,
+            ..Default::default()
+        };
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let result =
+            download_item_with_metadata(&client, "stale-item", &item, &opts, semaphore, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        assert_eq!(std::fs::read(item_dir.join("disk.img")).unwrap(), full);
+        assert!(!item_dir.join("disk.img.part").exists());
     }
 
     #[tokio::test]

@@ -63,7 +63,7 @@ If the server answers a `Range` request with a `Content-Range` total that differ
 
 If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree, the `.part` file is deleted and the file is reported as `download size mismatch`, which is retried from the beginning.
 
-Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final.
+Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final. The one exception is a 416 on a resume: with no metadata size to compare against, the server's length is taken as the file's, so the `.part` file is removed and the download restarts.
 
 #### Examples
 
