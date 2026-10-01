@@ -80,7 +80,7 @@ With `--checksum`, a local file whose md5 matches the item metadata is skipped, 
 
 If the second download has the same wrong md5, the transfer is not corrupting anything and the source file or its metadata is wrong. The file then fails for good with `checksum mismatch for <name> twice in a row (expected X, got Y): the source file or its metadata is likely wrong; kept the download at <path>` (in `--json` output the error code is `download_failed` and this text is the message). A different wrong md5 means the transfer is corrupting data, and retrying continues up to `--retries`. Only one `.md5-mismatch` copy is kept per file: a new mismatch replaces it, and it is deleted once a later attempt verifies. A download that ends with a mismatch therefore needs room for two copies of the file while the retry runs.
 
-`.md5-mismatch` files are never resumed from and never count as a downloaded file; delete them when you are done with them.
+`.md5-mismatch` files are never resumed from and never count as a downloaded file; delete them when you are done with them. If the copy cannot be kept because something the rename cannot replace sits at that path (a directory, say), the download is removed instead and the message says `the download could not be kept and was removed`.
 
 #### Examples
 

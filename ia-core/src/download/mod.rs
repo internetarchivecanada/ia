@@ -602,7 +602,9 @@ async fn seed_hasher_from_part(
 }
 
 /// Where a download that failed its md5 check is kept: beside the file, as
-/// `<name>.md5-mismatch`. Nothing resumes from or skips on this name.
+/// `<name>.md5-mismatch`. Nothing resumes from or skips on this name. An
+/// item file literally named `<name>.md5-mismatch` would share the path,
+/// as one named `<name>.part` shares the partial file's.
 fn mismatch_path(file_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.md5-mismatch", file_path.display()))
 }
@@ -629,6 +631,7 @@ async fn finish_part(
     start: std::time::Instant,
 ) -> Result<FileDownloadResult> {
     // Post-download checksum comparison using the inline-computed hash.
+    let hasher_matched = hasher.is_some() && file.md5.is_some();
     if let Some(hasher) = hasher {
         if let Some(expected_md5) = &file.md5 {
             if let Some(p) = progress {
@@ -643,38 +646,73 @@ async fn finish_part(
 
             use md5::Digest;
             let actual_md5 = format!("{:x}", hasher.finalize());
-            let kept = mismatch_path(file_path);
             if &actual_md5 != expected_md5 {
                 // Keep the bytes under a name nothing resumes from, so the
                 // copy can be compared against the source or a second
                 // download. The rename replaces an earlier bad copy, or a
-                // planted symlink at that path, without following it.
-                warn!(
-                    file = %file.name,
-                    expected = %expected_md5,
-                    actual = %actual_md5,
-                    kept = %kept.display(),
-                    "md5 mismatch; keeping the download for inspection"
-                );
-                fs::rename(part_path, &kept).await?;
+                // planted symlink at that path, without following it. If
+                // it cannot (a directory in the way, say), the .part must
+                // still go: left in place, every later run would re-hash
+                // the same bytes and fail the same way.
+                let kept_path = mismatch_path(file_path);
+                let kept = match fs::rename(part_path, &kept_path).await {
+                    Ok(()) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected_md5,
+                            actual = %actual_md5,
+                            kept = %kept_path.display(),
+                            "md5 mismatch; keeping the download for inspection"
+                        );
+                        Some(kept_path.display().to_string())
+                    }
+                    Err(e) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected_md5,
+                            actual = %actual_md5,
+                            kept = %kept_path.display(),
+                            error = %e,
+                            "md5 mismatch; could not keep the download, removing it"
+                        );
+                        let _ = fs::remove_file(part_path).await;
+                        None
+                    }
+                };
                 return Err(IaError::ChecksumMismatch {
                     file: file.name.clone(),
                     expected: expected_md5.clone(),
                     actual: actual_md5,
-                    kept: kept.display().to_string(),
+                    kept,
                 });
-            }
-            // Verified. An earlier bad copy has told its story; a good file
-            // now exists, so the copy goes.
-            if fs::symlink_metadata(&kept).await.is_ok() {
-                fs::remove_file(&kept).await?;
-                info!(file = %file.name, kept = %kept.display(), "removed the earlier md5-mismatch copy");
             }
         }
     }
 
     // Finalize: rename .part to final name
     fs::rename(part_path, file_path).await?;
+
+    // Verified and in place. An earlier bad copy has told its story, so it
+    // goes; if it cannot be removed, that is a stale file to mention, not a
+    // failure of a download that already succeeded.
+    if hasher_matched {
+        let kept_path = mismatch_path(file_path);
+        if fs::symlink_metadata(&kept_path).await.is_ok() {
+            match fs::remove_file(&kept_path).await {
+                Ok(()) => info!(
+                    file = %file.name,
+                    kept = %kept_path.display(),
+                    "removed the earlier md5-mismatch copy"
+                ),
+                Err(e) => warn!(
+                    file = %file.name,
+                    kept = %kept_path.display(),
+                    error = %e,
+                    "could not remove the earlier md5-mismatch copy"
+                ),
+            }
+        }
+    }
 
     // Set mtime from Last-Modified header
     if !opts.no_timestamps {
@@ -827,8 +865,10 @@ pub async fn download_file(
             fs::remove_file(&part_path).await?;
         }
     }
-    // Open first, then stat the fd — avoids TOCTOU race where the .part file
-    // could be replaced with a symlink between exists() and metadata().
+    // Open first, then stat the fd, so the length is of the file actually
+    // opened and a directory or other non-regular file is never resumed.
+    // (The fd metadata cannot tell a link planted after the check above;
+    // the two later symlink checks keep every write off such a link.)
     let resume_from = match fs::File::open(&part_path).await {
         Ok(f) => {
             let meta = f.metadata().await?;
@@ -1190,7 +1230,7 @@ pub async fn download_file(
 
     // The stream ended. Refuse to rename a file whose byte count differs
     // from the item metadata. This runs before the md5 comparison because
-    // that path deletes .part.
+    // that path moves .part away (to .md5-mismatch) on a mismatch.
     //
     // Short: the .part file is deliberately kept. The error is retryable
     // and the next attempt resumes it with Range.
@@ -3215,7 +3255,10 @@ mod tests {
             } => {
                 assert_eq!(expected, WRONG_MD5);
                 assert_eq!(actual, &md5_hex(&body));
-                assert_eq!(kept, &kept_path.display().to_string());
+                assert_eq!(
+                    kept.as_deref(),
+                    Some(kept_path.display().to_string().as_str())
+                );
             }
             other => panic!("expected ChecksumMismatch, got {other:?}"),
         }
@@ -3301,6 +3344,71 @@ mod tests {
 
         assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(std::fs::read(&kept_path).unwrap(), b"an earlier bad copy");
+    }
+
+    /// Something the rename cannot replace sits at the kept path (here a
+    /// directory). The copy cannot be kept, so the `.part` is removed
+    /// instead, the next attempt starts from byte 0, and the error says the
+    /// copy could not be kept. The old `.part` must not survive, or every
+    /// later run would re-hash the same bytes and fail the same way.
+    #[tokio::test]
+    async fn checksum_mismatch_with_a_directory_at_the_kept_path_removes_the_part() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::create_dir(&kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        match &err {
+            IaError::ChecksumMismatch { kept, .. } => assert_eq!(*kept, None),
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        assert!(err.to_string().contains("could not be kept"), "{err}");
+        assert!(err.is_retryable());
+        assert!(kept_path.is_dir(), "the directory is left alone");
+        assert!(!dir.path().join("b.txt.part").exists());
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    /// A verified download with something unremovable at the kept path:
+    /// the file is in place and Complete; the stale copy is a warning, not
+    /// a failure.
+    #[tokio::test]
+    async fn verified_download_with_a_directory_at_the_kept_path_still_completes() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::create_dir(&kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, &md5_hex(&body));
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert!(!dir.path().join("b.txt.part").exists());
+        assert!(kept_path.is_dir());
     }
 
     /// A planted symlink at the kept path is replaced by the rename, never
@@ -5727,7 +5835,11 @@ mod tests {
 
     /// "Twice in a row" means consecutive. A different error in between
     /// (here a 500) forgets the first mismatch, so the next mismatch is a
-    /// first one again and the loop runs to --retries with the plain error.
+    /// first one again; the one after that is the repeat and stops the
+    /// loop. Attempts: A (mismatch), 500 (reset), A (first again), A
+    /// (repeat): four requests, with a budget that would have allowed five.
+    /// The download transport has no retry middleware, so the 500 reaches
+    /// the per-file loop once and the count is exact.
     #[tokio::test]
     async fn a_different_error_between_mismatches_resets_the_repeat_check() {
         let body_a = vec![b'A'; 16];
@@ -5737,18 +5849,12 @@ mod tests {
         mount_times(&mock_server, 200, &body_a, 100).await;
         let dir = tempfile::tempdir().unwrap();
 
-        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 2).await;
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 4).await;
 
         assert_eq!(result.files_failed, 1, "{result:?}");
         let msg = failure_message(&result);
-        assert!(!msg.contains("twice in a row"), "{msg}");
-        assert!(msg.contains("checksum mismatch"), "{msg}");
-        // Attempts: A (mismatch), 500 (reset), A (a first mismatch again),
-        // then the budget of 2 retries is spent.
-        assert!(
-            mock_server.received_requests().await.unwrap().len() >= 3,
-            "the 500 is retried by the transport middleware too, so the count is a floor"
-        );
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 4);
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org

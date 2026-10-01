@@ -111,6 +111,14 @@ Closes #14 (keep the file on md5 mismatch, stop re-downloading a bad source) and
 - [x] `docs/usage.md`: "Checksum mismatches" subsection after "Slow and stalled downloads"; `-C` row mentions the kept file.
 - [x] Commit: `docs: describe md5 mismatch handling`.
 
+**Review findings (2026-10-01), fixed before the PR:**
+
+- The earlier `.md5-mismatch` was removed before the rename into place and with `?`, so a directory at that path made a verified file permanently undownloadable with an I/O error that never mentioned md5. The removal now runs after the rename into place and is best-effort (a `warn!` on failure). Pinned by `verified_download_with_a_directory_at_the_kept_path_still_completes`.
+- A failed rename to `.md5-mismatch` left the `.part` in place, so every later run re-hashed the same bytes and failed the same way. On failure the `.part` is now removed and `kept` is `None`; the message says the download could not be kept and was removed. `kept` is therefore `Option<String>` on both variants and absent from the JSON when `None`. Pinned by `checksum_mismatch_with_a_directory_at_the_kept_path_removes_the_part`.
+- The reset test asserted a request-count floor on a false premise (the download transport has no retry middleware, so the count is exact). It is now the plan's four-request version with `retries: 4`: A, 500, A, A, with the repeat firing after the reset.
+- Stale comments fixed: the resume open no longer claims to guard against symlinks; the size check's comment says the md5 path moves `.part` away rather than deleting it. `mismatch_path` notes the name collision with an item file literally named `<name>.md5-mismatch`.
+- Not changed: the TOCTOU window between the early symlink check and `File::open` (a link planted in that window lends its length to the Range, the later guards keep writes off it, and the same attacker could plant a bogus regular `.part`); `dev`/`ino` comparison would close it with std only, left for a later pass. Test wall time: the per-file loop sleeps 2^attempt seconds for real, so the repeat-rule tests add about 30 s of sleep across the file, in parallel.
+
 ### Task 6: verification and review
 
 - [ ] `just ci`.
