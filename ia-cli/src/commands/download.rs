@@ -28,9 +28,16 @@ use crate::output::DownloadDisplay;
 
 #[derive(Args)]
 #[command(
+    about = "Download files from an item",
     long_about = "Download files from the Internet Archive. Downloads all files from an item, \
         or specific files when file names are given. Supports batch downloads via search queries, \
-        item lists, or piped identifiers from stdin.",
+        item lists, or piped identifiers from stdin.\n\n\
+        Each file streams to <name>.part and is renamed into place once its byte count matches \
+        the item metadata. A dropped connection is resumed with a Range request from the bytes \
+        on disk. So is a stream that stays below --min-speed (default 10K: 10 KiB/s averaged \
+        over the last 60 s, after a 30 s grace at the start of each stream); each such stall \
+        spends one of the file's --retries, and when they are gone the file fails and keeps \
+        its .part for a later run.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -39,6 +46,8 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Batch download from a search query</dim>\n  <bold>$ ia download --search \"collection:nasa AND mediatype:movies\"</bold>\
          \n\n  <dim># Batch download specific files per item via {identifier} template</dim>\n  <bold>$ ia download --search \"collection:us-supreme-court\" '{identifier}.pdf' '{identifier}_meta.xml'</bold>\
          \n\n  <dim># Batch download from piped identifiers</dim>\n  <bold>$ ia search -q collection:nasa --json | ia download</bold>\
+         \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
+         \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
@@ -89,9 +98,32 @@ pub struct DownloadArgs {
     #[arg(short = 'C', long)]
     checksum: bool,
 
-    /// Max retries per file
+    /// Max retries per file (also the number of stalls allowed, see --min-speed)
     #[arg(short = 'R', long, default_value = "5")]
     retries: usize,
+
+    /// Abandon and resume a stream slower than this (10K, 1M, bytes; 0 disables)
+    ///
+    /// Once a stream is 30 s old, its average rate over the last 60 s (or over
+    /// its whole life while younger than that) is compared with this floor
+    /// once a second. Below it, the stream is abandoned: the bytes received so
+    /// far stay in the .part file and the file is re-requested with a Range
+    /// header from that offset, exactly as a dropped connection is handled.
+    /// The new stream gets its own 30 s grace. No byte is lost or fetched
+    /// twice, and the md5 check (--checksum) still covers the whole file.
+    ///
+    /// Each stall spends one of the file's --retries. When they are gone the
+    /// file fails with "download of <name> stalled N times ..." (--json code
+    /// download_stalled), its .part is kept for a later run, and it is not
+    /// attempted again in this one. Dropped connections have their own budget
+    /// of three re-requests and do not count here.
+    ///
+    /// RATE is bytes per second: a plain number, or a number followed by K, M,
+    /// or G for powers of 1024 (10K is 10240 bytes per second). 0 disables the
+    /// check, so only the transport's 60 s read timeout can end a silent
+    /// stream, and a stream that trickles never ends.
+    #[arg(long, value_name = "RATE", default_value = "10K", value_parser = parse_rate)]
+    min_speed: u64,
 
     /// Don't set file modification times
     #[arg(long)]
@@ -137,6 +169,31 @@ pub struct DownloadArgs {
     /// Convert format when downloading a zip member (e.g., "jpg" to convert JP2 → JPEG)
     #[arg(long, value_name = "EXT", requires = "zip_member")]
     pub zip_convert: Option<String>,
+}
+
+/// Parse a `--min-speed` value: bytes per second as a plain number, or a
+/// number followed by `K`, `M`, or `G` for powers of 1024. `0` is accepted
+/// and turns the check off.
+fn parse_rate(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    let err = || {
+        format!(
+            "`{s}` is not a rate: expected bytes per second as a number, or a number \
+             followed by K, M, or G for powers of 1024 (for example 10K or 1M); 0 disables"
+        )
+    };
+    let (digits, multiplier) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 1u64),
+        Some('k' | 'K') => (&s[..s.len() - 1], 1u64 << 10),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1u64 << 20),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1u64 << 30),
+        _ => return Err(err()),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(err());
+    }
+    let n: u64 = digits.parse().map_err(|_| err())?;
+    n.checked_mul(multiplier).ok_or_else(err)
 }
 
 fn parse_source(s: &str) -> std::result::Result<FileSource, String> {
@@ -413,8 +470,7 @@ pub async fn run(
         dry_run: args.dry_run,
         filter: filter.clone(),
         count_views: args.count_views,
-        // Replaced by --min-speed in the next commit.
-        min_speed: DownloadOpts::default().min_speed,
+        min_speed: args.min_speed,
     };
 
     let opts = make_opts(base_destdir.clone());
@@ -1218,6 +1274,36 @@ fn print_json_item_result(result: &std::result::Result<ItemDownloadResult, (Stri
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // -- --min-speed parsing (#11) --
+
+    #[test]
+    fn parse_rate_accepts_plain_bytes_and_binary_suffixes() {
+        assert_eq!(parse_rate("500"), Ok(500));
+        assert_eq!(parse_rate("0"), Ok(0));
+        assert_eq!(parse_rate("10K"), Ok(10 * 1024));
+        assert_eq!(parse_rate("10k"), Ok(10 * 1024));
+        assert_eq!(parse_rate("1M"), Ok(1024 * 1024));
+        assert_eq!(parse_rate("1G"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_rate(" 2M "), Ok(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_rate_rejects_other_forms_and_names_the_accepted_ones() {
+        for bad in ["10KB", "1.5M", "abc", "", "-1", "K", "10 K", "1T"] {
+            let err = parse_rate(bad).unwrap_err();
+            assert!(err.contains("10K"), "{bad:?}: {err}");
+            assert!(err.contains("1M"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_rate_rejects_overflow() {
+        assert!(parse_rate("99999999999999999999").is_err());
+        assert!(parse_rate("18446744073709551615G").is_err());
+    }
+
     use super::*;
     use std::time::Duration;
 
