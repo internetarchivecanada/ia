@@ -3,6 +3,8 @@
 use ia_core::upload::{self, UploadOpts, UploadStatus};
 use ia_core::{IaClient, IaConfig};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1534,4 +1536,276 @@ async fn upload_503_retry_honors_retry_after() {
         "Retry-After: 1 was not waited for ({:?})",
         started.elapsed()
     );
+}
+
+// -- Review findings on the backoff PR: Retry-After corners --
+
+/// Collect every progress event with the moment it arrived, so a test can
+/// say not only that an event was emitted but when.
+fn timed_progress() -> (
+    Arc<dyn Fn(upload::UploadProgress) + Send + Sync>,
+    Arc<Mutex<Vec<(upload::UploadProgressStatus, Duration)>>>,
+) {
+    let events: Arc<Mutex<Vec<(upload::UploadProgressStatus, Duration)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let started = Instant::now();
+    let sink = events.clone();
+    let cb: Arc<dyn Fn(upload::UploadProgress) + Send + Sync> = Arc::new(move |p| {
+        sink.lock().unwrap().push((p.status, started.elapsed()));
+    });
+    (cb, events)
+}
+
+/// Mount a 503 with the given Retry-After value once, then a 200, and a
+/// check_limit that clears at once.
+async fn mount_503_then_200(server: &MockServer, retry_after: &str) {
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", retry_after)
+                .set_body_string("Please reduce your request rate."),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+        )
+        .mount(server)
+        .await;
+}
+
+fn fast_opts(retries: u32) -> UploadOpts {
+    UploadOpts {
+        verify: false,
+        checksum: false,
+        retries,
+        retry_min_delay: Duration::from_millis(1),
+        retry_max_delay: Duration::from_millis(2),
+        ..Default::default()
+    }
+}
+
+/// While the upload sleeps out a Retry-After before polling check_limit,
+/// the UI must already show "waiting for rate limit", not stay on
+/// "uploading". The poll emits that status itself, but only after the
+/// sleep; the event here must arrive before the one-second wait is over.
+#[tokio::test]
+async fn upload_503_retry_after_reports_waiting_before_the_sleep() {
+    let server = MockServer::start().await;
+    mount_503_then_200(&server, "1").await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+    let (cb, events) = timed_progress();
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &fast_opts(3),
+        true,
+        true,
+        None,
+        Some(cb),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+
+    let events = events.lock().unwrap();
+    let first_wait = events
+        .iter()
+        .find(|(s, _)| matches!(s, upload::UploadProgressStatus::WaitingRateLimit))
+        .map(|(_, at)| *at)
+        .expect("a WaitingRateLimit event");
+    assert!(
+        first_wait < Duration::from_millis(700),
+        "WaitingRateLimit first reported at {first_wait:?}, after the Retry-After sleep"
+    );
+}
+
+/// `Retry-After: 0` means re-send now: no backoff wait is substituted.
+#[tokio::test]
+async fn upload_503_retry_after_zero_retries_at_once() {
+    let server = MockServer::start().await;
+    mount_503_then_200(&server, "0").await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        retry_min_delay: Duration::from_secs(10),
+        retry_max_delay: Duration::from_secs(10),
+        ..fast_opts(3)
+    };
+
+    let started = Instant::now();
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Retry-After: 0 was not honored as an immediate retry ({:?})",
+        started.elapsed()
+    );
+}
+
+/// The header's HTTP-date form is honored like the seconds form.
+#[tokio::test]
+async fn upload_503_retry_after_http_date_is_honored() {
+    let server = MockServer::start().await;
+    let when = std::time::SystemTime::now() + Duration::from_secs(2);
+    mount_503_then_200(&server, &httpdate::fmt_http_date(when)).await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+
+    let started = Instant::now();
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &fast_opts(3),
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    // The date has one-second granularity, so a date 2 s ahead yields a
+    // wait of 1 s or 2 s.
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "HTTP-date Retry-After was not waited for ({:?})",
+        started.elapsed()
+    );
+}
+
+/// A 500 with Retry-After goes down the non-503 retry path; the header is
+/// honored there too.
+#[tokio::test]
+async fn upload_500_retry_honors_retry_after() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("Retry-After", "1")
+                .set_body_string("internal error"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+
+    let started = Instant::now();
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &fast_opts(3),
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "Retry-After: 1 on a 500 was not waited for ({:?})",
+        started.elapsed()
+    );
+}
+
+/// When the last check_limit poll still says over the limit, the upload
+/// fails right away; there is no retry left for the sleep to precede.
+/// (Before the fix the sleep was a jittered draw up to 10 s, so this test
+/// fails most runs rather than every run.)
+#[tokio::test]
+async fn check_limit_exhaustion_does_not_sleep_after_the_last_poll() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("Please reduce your request rate."),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":1}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        retry_min_delay: Duration::from_secs(10),
+        retry_max_delay: Duration::from_secs(10),
+        ..fast_opts(1)
+    };
+
+    let started = Instant::now();
+    let err = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("the rate limit never clears");
+    assert!(
+        matches!(err, ia_core::IaError::CheckLimitFailed { .. }),
+        "expected CheckLimitFailed, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "slept after the final check_limit poll ({:?})",
+        started.elapsed()
+    );
+    server.verify().await;
 }

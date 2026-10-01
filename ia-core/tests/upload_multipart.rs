@@ -586,6 +586,90 @@ async fn upload_file_multipart_part_retry_honors_retry_after() {
     );
 }
 
+/// A 429 is a throttle too; its Retry-After is honored like a 503's.
+#[tokio::test]
+async fn upload_file_multipart_part_429_retry_honors_retry_after() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello multipart world");
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-429</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_string("Too Many Requests"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-429"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After: 1 on a 429 was not waited for ({:?})",
+        started.elapsed()
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn upload_file_multipart_aborts_on_permanent_error() {
     let server = MockServer::start().await;

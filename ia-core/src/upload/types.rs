@@ -78,6 +78,17 @@ impl Default for UploadOpts {
     }
 }
 
+impl UploadOpts {
+    /// The retry schedule these options describe: truncated exponential
+    /// backoff with full jitter between `retry_min_delay` and
+    /// `retry_max_delay`, for `retries` attempts. The one place the schedule
+    /// is built from the opts, so every retry loop gets the same bounds and
+    /// the same guard against `min > max`.
+    pub(crate) fn backoff(&self) -> reqwest_retry::policies::ExponentialBackoff {
+        super::retry::backoff_policy(self.retry_min_delay, self.retry_max_delay, self.retries)
+    }
+}
+
 /// Builder for [`UploadOpts`].
 ///
 /// All fields default to the same values as `UploadOpts::default()`.
@@ -351,6 +362,34 @@ mod tests {
         assert_eq!(opts.retry_min_delay, Duration::from_secs(1));
         assert_eq!(opts.retry_max_delay, Duration::from_secs(60));
         assert!(opts.metadata.is_empty());
+    }
+
+    /// `backoff()` is the one place the schedule is built from the opts, so
+    /// every retry loop gets the same bounds and the same clamp.
+    #[test]
+    fn backoff_is_built_from_the_opts() {
+        let opts = UploadOpts {
+            retries: 4,
+            retry_min_delay: Duration::from_millis(5),
+            retry_max_delay: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let policy = opts.backoff();
+        assert_eq!(policy.max_n_retries, Some(4));
+        assert_eq!(policy.min_retry_interval, Duration::from_millis(5));
+        assert_eq!(policy.max_retry_interval, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn backoff_clamps_max_up_to_min() {
+        let opts = UploadOpts {
+            retry_min_delay: Duration::from_millis(50),
+            retry_max_delay: Duration::from_millis(5),
+            ..Default::default()
+        };
+        let policy = opts.backoff();
+        assert_eq!(policy.min_retry_interval, Duration::from_millis(50));
+        assert_eq!(policy.max_retry_interval, Duration::from_millis(50));
     }
 
     #[test]

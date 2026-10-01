@@ -53,9 +53,9 @@ Follow-up to PR #10 (one retry policy for every IA-S3 multipart request).
 
 ### Task 4: verification and review
 
-- [ ] `just ci`; code-reviewer pass; fix findings; PR against `main` ("Follow-up to #10"); squash-merge after checks pass; `scripts/ia-cleanup retry-sleep-backoff` only after a confirmed merge.
+- [x] `just ci`; code-reviewer pass; fix findings. [ ] PR against `main` ("Follow-up to #10"); squash-merge after checks pass; `scripts/ia-cleanup retry-sleep-backoff` only after a confirmed merge.
 
-### Review findings (2026-10-01), to fix before the PR
+### Review findings (2026-10-01), fixed before the PR
 
 Important:
 1. `backoff_policy` panics when `retry_min_delay > retry_max_delay` (the library asserts it), reachable from public `UploadOpts` fields. Validate once: add `UploadOpts::backoff(&self) -> ExponentialBackoff` (crate-visible) that clamps `max = max.max(min)` with a `warn!`, and use it at the four construction sites (`single.rs`, two in `multipart.rs`, `default_ctx`). Test: min > max does not panic and uses min as the cap.
@@ -68,5 +68,15 @@ Suggestions, take them:
 6. `poll_check_limit` sleeps after its final poll before failing; skip the sleep on the last iteration.
 7. Wording in `--retries` help and usage.md: "waits are random, up to a cap that doubles from 1 s to 60 s" (full jitter can shrink a wait; "doubling" describes the cap).
 8. Add tests: a 500 with Retry-After through `single.rs`; a 429 with Retry-After through `send_with_retry`; the HTTP-date form through an upload; min > max clamp.
+
+How they were closed (same day, test-first):
+- 1: `backoff_policy` clamps `max` up to `min` with a `warn!`; `UploadOpts::backoff()` (crate-visible) is the one builder used by `single.rs` and both opts-derived sites in `multipart.rs`; `default_ctx` keeps the constants. Tests: `min_above_max_does_not_panic_and_caps_at_min` (retry.rs), `backoff_is_built_from_the_opts`, `backoff_clamps_max_up_to_min` (types.rs); red was a compile failure on the missing method.
+- 2: `design-philosophy.md` and the `extract_retry_after` doc comment rewritten.
+- 3: `WaitingRateLimit` emitted before the Retry-After sleep in `single.rs`. Test `upload_503_retry_after_reports_waiting_before_the_sleep` (red: first event at 1.005 s; green: before 700 ms).
+- 4: `backoff_wait` clips to `policy.max_retry_interval`. No deterministic test: the clock step cannot be injected; `waits_never_exceed_the_schedule` covers the normal path.
+- 5: `retry::retry_after_wait` wraps `extract_retry_after`, warns above the cap, and is the single Retry-After reader for `send_with_retry` and `single.rs`. `Retry-After: 0` documented in `--retries` help and usage.md; pinned by `upload_503_retry_after_zero_retries_at_once`.
+- 6: `poll_check_limit` skips the sleep after its last poll. Test `check_limit_exhaustion_does_not_sleep_after_the_last_poll` (red: 8.9 s; green: under 2 s; the red is probabilistic because the sleep was a jittered draw).
+- 7: help and usage.md say "random, up to a cap that doubles from 1 s to 60 s"; `upload_help_has_no_retry_sleep_and_describes_backoff` asserts the phrase.
+- 8: `upload_500_retry_honors_retry_after`, `upload_503_retry_after_http_date_is_honored` (single), `upload_file_multipart_part_429_retry_honors_retry_after` (multipart). These pin behavior already on the branch and passed on their first run.
 
 Noted, no change: metadata read/write now pause 0 s on a past HTTP-date Retry-After instead of the 30 s fallback (that is what the header says); `..UploadOpts::default()` in `run_bare_upload` matches `run_import`.

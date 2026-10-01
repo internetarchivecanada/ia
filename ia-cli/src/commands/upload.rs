@@ -181,9 +181,9 @@ pub struct UploadArgs {
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
     ///
-    /// Waits between attempts grow from 1 s to 60 s, doubling each time
-    /// with random jitter; a Retry-After header from the server sets the
-    /// wait instead.
+    /// Waits between attempts are random, up to a cap that doubles from 1 s
+    /// to 60 s. A Retry-After header from the server sets the wait instead,
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -308,9 +308,9 @@ pub struct ImportArgs {
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
     ///
-    /// Waits between attempts grow from 1 s to 60 s, doubling each time
-    /// with random jitter; a Retry-After header from the server sets the
-    /// wait instead.
+    /// Waits between attempts are random, up to a cap that doubles from 1 s
+    /// to 60 s. A Retry-After header from the server sets the wait instead,
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 

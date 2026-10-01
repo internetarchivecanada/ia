@@ -166,8 +166,7 @@ pub async fn upload_file(
     // Retry loop. Waits follow the standard schedule (see
     // `retry::backoff_policy`); a Retry-After header on the failed response
     // sets the wait instead.
-    let backoff =
-        super::retry::backoff_policy(opts.retry_min_delay, opts.retry_max_delay, opts.retries);
+    let backoff = opts.backoff();
     let mut retries = 0u32;
     let mut last_was_503 = false;
     let mut retry_after: Option<std::time::Duration> = None;
@@ -183,6 +182,17 @@ pub async fn upload_file(
                         wait_ms = wait.as_millis() as u64,
                         "honoring Retry-After before polling check_limit"
                     );
+                    // The poll reports this status too, but only once it
+                    // starts; the UI must not sit on "uploading" meanwhile.
+                    if let Some(ref cb) = progress {
+                        cb(UploadProgress {
+                            identifier: identifier.to_string(),
+                            key: key.to_string(),
+                            bytes_sent: 0,
+                            total_bytes: file_size,
+                            status: UploadProgressStatus::WaitingRateLimit,
+                        });
+                    }
                     tokio::time::sleep(wait).await;
                 }
                 poll_check_limit(client, identifier, opts, &backoff, progress.clone()).await?;
@@ -325,8 +335,7 @@ pub async fn upload_file(
                         retries,
                     });
                 } else if status.as_u16() == 503 {
-                    retry_after = crate::retry::extract_retry_after(resp.headers())
-                        .map(std::time::Duration::from_secs);
+                    retry_after = super::retry::retry_after_wait(resp.headers(), &backoff);
                     let body_text = resp.text().await.unwrap_or_default();
 
                     // Spam detection: permanent, no retry
@@ -374,8 +383,7 @@ pub async fn upload_file(
                     continue;
                 } else {
                     // Non-503 error — parse S3 XML to classify
-                    retry_after = crate::retry::extract_retry_after(resp.headers())
-                        .map(std::time::Duration::from_secs);
+                    retry_after = super::retry::retry_after_wait(resp.headers(), &backoff);
                     let body_text = resp.text().await.unwrap_or_default();
                     let s3_err = parse_s3_error(&body_text);
 
@@ -440,7 +448,8 @@ use super::build_s3_url;
 /// Poll the check_limit endpoint until the rate limit clears.
 ///
 /// Polls up to `opts.retries` times, waiting between polls on the same
-/// backoff schedule as the retries.
+/// backoff schedule as the retries. There is no wait after the last poll:
+/// nothing follows it but the error.
 /// Returns `Ok(())` when the rate limit has cleared.
 /// Returns `Err(CheckLimitFailed)` if all retries are exhausted.
 async fn poll_check_limit(
@@ -489,7 +498,9 @@ async fn poll_check_limit(
             }
         }
 
-        tokio::time::sleep(super::retry::backoff_wait(backoff, attempt)).await;
+        if attempt + 1 < opts.retries {
+            tokio::time::sleep(super::retry::backoff_wait(backoff, attempt)).await;
+        }
     }
 
     Err(IaError::CheckLimitFailed {

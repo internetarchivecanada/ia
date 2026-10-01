@@ -30,11 +30,27 @@ use crate::error::{format_error_chain, IaError};
 /// `min × 2^(n-1)`, never more than `max`. Past `retries` the policy says do
 /// not retry; the loops here enforce their own budget, so that case yields
 /// no wait at all.
+///
+/// The library asserts `min <= max`. The bounds are public fields on
+/// `UploadOpts`, so a caller can set them the wrong way round; rather than
+/// panic, the larger value wins and `min` becomes the cap, with a warning.
+/// Build the policy through [`super::UploadOpts::backoff`] when the bounds
+/// come from the opts.
 pub(crate) fn backoff_policy(
     min: std::time::Duration,
     max: std::time::Duration,
     retries: u32,
 ) -> ExponentialBackoff {
+    let max = if max < min {
+        tracing::warn!(
+            min_ms = min.as_millis() as u64,
+            max_ms = max.as_millis() as u64,
+            "retry_max_delay is below retry_min_delay; using retry_min_delay as the cap"
+        );
+        min
+    } else {
+        max
+    };
     ExponentialBackoff::builder()
         .retry_bounds(min, max)
         .jitter(Jitter::Full)
@@ -43,6 +59,10 @@ pub(crate) fn backoff_policy(
 
 /// How long to wait before the next attempt, given how many retries have
 /// already been made. Zero when the policy's own budget is spent.
+///
+/// The policy returns an absolute instant; the wait is that instant minus
+/// now. Two `SystemTime::now()` calls are involved, and the wall clock can
+/// step between them, so the result is clipped to the policy's cap.
 pub(crate) fn backoff_wait(
     policy: &ExponentialBackoff,
     n_past_retries: u32,
@@ -50,9 +70,30 @@ pub(crate) fn backoff_wait(
     match policy.should_retry(std::time::SystemTime::now(), n_past_retries) {
         RetryDecision::Retry { execute_after } => execute_after
             .duration_since(std::time::SystemTime::now())
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .min(policy.max_retry_interval),
         RetryDecision::DoNotRetry => std::time::Duration::ZERO,
     }
+}
+
+/// The server's own instruction on how long to wait, if the failed response
+/// carried a `Retry-After` header (seconds, or an HTTP date). It is honored
+/// as given: `Retry-After: 0` means re-send at once, and a value above the
+/// schedule's cap is still waited out in full, with a warning so it shows
+/// up in `--log`.
+pub(crate) fn retry_after_wait(
+    headers: &reqwest::header::HeaderMap,
+    policy: &ExponentialBackoff,
+) -> Option<std::time::Duration> {
+    let wait = std::time::Duration::from_secs(crate::retry::extract_retry_after(headers)?);
+    if wait > policy.max_retry_interval {
+        tracing::warn!(
+            retry_after_s = wait.as_secs(),
+            cap_s = policy.max_retry_interval.as_secs(),
+            "server asked for a Retry-After above the backoff cap; honoring it as given"
+        );
+    }
+    Some(wait)
 }
 
 /// What a retrying S3 call needs to know to report itself.
@@ -188,8 +229,7 @@ where
 
         // The server's own instruction on how long to wait, if it gave one.
         // Read before the body is consumed; it overrides the schedule.
-        let retry_after = crate::retry::extract_retry_after(response.headers())
-            .map(std::time::Duration::from_secs);
+        let retry_after = retry_after_wait(response.headers(), &ctx.backoff);
         // Consume the body once: it is needed both to classify and to report.
         let body = response.text().await.unwrap_or_default();
 
@@ -321,6 +361,19 @@ mod tests {
         let policy = backoff_policy(MIN, MAX, 3);
         assert_eq!(backoff_wait(&policy, 3), Duration::ZERO);
         assert_eq!(backoff_wait(&policy, 50), Duration::ZERO);
+    }
+
+    /// The library asserts min <= max. Those bounds are public fields on
+    /// `UploadOpts`, so a caller can set them the wrong way round; that
+    /// must not panic. The larger value wins: min becomes the cap.
+    #[test]
+    fn min_above_max_does_not_panic_and_caps_at_min() {
+        let policy = backoff_policy(Duration::from_secs(60), Duration::from_secs(1), 10);
+        assert_eq!(policy.min_retry_interval, Duration::from_secs(60));
+        assert_eq!(policy.max_retry_interval, Duration::from_secs(60));
+        for n in 0..10 {
+            assert!(backoff_wait(&policy, n) <= Duration::from_secs(60));
+        }
     }
 
     #[test]

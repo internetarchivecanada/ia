@@ -204,8 +204,10 @@ pub fn is_retryable_body_error(err: &reqwest::Error) -> bool {
 
 /// Parse the `Retry-After` header as a number of seconds.
 ///
-/// Returns `None` if the header is missing or its value is not a valid
-/// non-negative integer (i.e. HTTP-date values are silently ignored).
+/// Accepts both forms the header allows: a non-negative integer number of
+/// seconds, or an HTTP date, which becomes the whole seconds from now until
+/// that date (zero when the date has passed). Returns `None` if the header
+/// is missing or is neither form.
 pub fn extract_retry_after(headers: &HeaderMap) -> Option<u64> {
     let value = headers.get("retry-after")?.to_str().ok()?.trim();
     if let Ok(secs) = value.parse::<u64>() {

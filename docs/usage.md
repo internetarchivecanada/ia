@@ -549,7 +549,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB) |
-| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits grow from 1 s to 60 s, doubling with jitter; a `Retry-After` header sets the wait instead |
+| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
