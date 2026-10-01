@@ -549,8 +549,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB) |
-| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10) |
-| `--retry-sleep <SECS>` | Sleep between retries in seconds (default: 30) |
+| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits grow from 1 s to 60 s, doubling with jitter; a `Retry-After` header sets the wait instead |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
@@ -561,7 +560,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
-Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--retry-sleep`, `--dry-run`, `--json`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
 **`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
 

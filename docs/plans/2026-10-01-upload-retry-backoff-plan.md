@@ -20,7 +20,7 @@ Follow-up to PR #10 (one retry policy for every IA-S3 multipart request).
 
 **Public API (ia-core):** `UploadOpts::retry_sleep` field and builder method removed; `retry_min_delay`/`retry_max_delay` added. `S3RetryCtx` is crate-private. CLI: `--retry-sleep` removed (was in the Python CLI as `--sleep`; the parity is deliberately dropped).
 
-**Other retry sites (audit, 2026-10-01):** honored today: tasks API (rate-limit pause), metadata writes (`concurrency.rs`). Not honored, for the next PR: download per-file loop (headers are dropped in `fetch_response` before the loop sees the error), AI client LLM retries, the transport retry middleware (reqwest-retry 0.9 has no Retry-After support). Not applicable: stream re-request after a body error, metadata-read decode retries (no response to read).
+**Other retry sites (audit, 2026-10-01):** honored today: tasks API (rate-limit pause), metadata writes (`concurrency.rs`), metadata reads on a 429 (`read.rs` turns it into `RateLimited` with the header's seconds; the concurrent path pauses every worker for that long). Not honored, for the next PR, fixed once at the transport layer so every API call gets it: 5xx on any API call (the reqwest-retry 0.9 middleware ignores the header), search (a 429 or 503 is a plain `Http` error: no retry, no pause, header never read), the download per-file loop (headers are dropped in `fetch_response` before the loop sees the error), AI client LLM retries. Not applicable: stream re-request after a body error, metadata-read decode retries (no response to read).
 
 ---
 
@@ -28,28 +28,28 @@ Follow-up to PR #10 (one retry policy for every IA-S3 multipart request).
 
 **Files:** `ia-core/src/upload/types.rs`, `ia-core/src/upload/retry.rs`, `ia-core/src/retry.rs`
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - `types.rs`: the defaults test asserts `retry_min_delay == 1 s`, `retry_max_delay == 60 s`, and no `retry_sleep`.
   - `retry.rs` (new `tests` module): `backoff_policy(min, max, retries)` + `backoff_wait(&policy, n_past_retries)`: with 1 s/60 s, retry 1 waits at most 1 s, retry 7 and 20 at most 60 s, never more than the upper bound, and 1000 draws are not all equal (jitter). With retries = 3, `n_past_retries = 3` → zero wait (the policy says do not retry; the loop's own budget check is what ends the loop).
-  - `crate::retry`: `extract_retry_after("120")` → 120; an HTTP date 30 s ahead → 29..=31; a date in the past → 0; `"soon"` → None.
-- [ ] **Step 2: Run**; compile failure.
-- [ ] **Step 3: Implement.** Commit: `feat(upload): standard exponential backoff schedule; Retry-After parses HTTP dates`.
+  - `crate::retry`: `extract_retry_after("120")` → 120; an HTTP date 30 s ahead → 29..=31; a date in the past → 0; `"soon"` → None. (Tasks 1 and 2 were committed together: the schedule helpers are unused until the loops call them, and every commit must pass clippy.)
+- [x] **Step 2: Run**; compile failure.
+- [x] **Step 3: Implement.** Commit: `feat(upload): standard exponential backoff schedule; Retry-After parses HTTP dates`.
 
 ### Task 2: use them, drop the flag
 
 **Files:** `ia-core/src/upload/retry.rs`, `single.rs`, `multipart.rs`, `ia-cli/src/commands/upload.rs`, tests
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - `ia-core/tests/upload_multipart.rs`: `part_retry_honors_retry_after`: part PUT answers 503 with `Retry-After: 1` once, then 200; bounds 1 ms/2 ms; the upload completes and takes at least 1 s.
   - `ia-core/tests/upload_single.rs`: `retry_honors_retry_after`: same through `upload_file` on a 503 whose check-limit clears at once.
   - `ia-cli/tests/cli.rs`: `upload --help` has no `--retry-sleep`; `ia upload x f --retry-sleep 5` exits 2 with "unexpected argument"; `--retries` help mentions `Retry-After`.
   - Existing tests: every `retry_sleep: Duration::from_millis(..)` becomes `retry_min_delay: Duration::from_millis(1), retry_max_delay: Duration::from_millis(2)`.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(upload): remove --retry-sleep; back off exponentially and honor Retry-After on IA-S3 retries`.
+- [x] **Step 2: Run**; fail.
+- [x] **Step 3: Implement.** Commit: `fix(upload): remove --retry-sleep; back off exponentially and honor Retry-After on IA-S3 retries`.
 
 ### Task 3: docs
 
-- [ ] `docs/usage.md`: drop the `--retry-sleep` row and its mention in the batch-options list; the `--retries` row says "waits grow from 1 s to 60 s with jitter; a Retry-After header is honored". Commit: `docs: retries back off; --retry-sleep is gone`.
+- [x] `docs/usage.md`: drop the `--retry-sleep` row and its mention in the batch-options list; the `--retries` row says "waits grow from 1 s to 60 s with jitter; a Retry-After header is honored". Commit: `docs: retries back off; --retry-sleep is gone`.
 
 ### Task 4: verification and review
 
