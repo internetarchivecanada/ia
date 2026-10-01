@@ -480,7 +480,8 @@ async fn upload_file_multipart_part_retry_on_503() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: std::time::Duration::from_millis(1), // fast for tests
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2), // fast for tests
         ..Default::default()
     };
 
@@ -501,6 +502,88 @@ async fn upload_file_multipart_part_retry_on_503() {
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
     assert!(result.retries >= 1);
+}
+
+/// A 503 that carries `Retry-After` is waited out for as long as the
+/// server says, not for the backoff's millisecond test bounds.
+#[tokio::test]
+async fn upload_file_multipart_part_retry_honors_retry_after() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello multipart world");
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-ra</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "1")
+                .set_body_string("SlowDown"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-ra"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After: 1 was not waited for ({:?})",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -1020,7 +1103,8 @@ fn fast_opts(retries: u32) -> UploadOpts {
     UploadOpts {
         verify: false,
         retries,
-        retry_sleep: std::time::Duration::from_millis(1),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     }
 }

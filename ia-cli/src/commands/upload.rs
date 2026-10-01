@@ -1,7 +1,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -181,12 +180,12 @@ pub struct UploadArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
+    ///
+    /// Waits between attempts grow from 1 s to 60 s, doubling each time
+    /// with random jitter; a Retry-After header from the server sets the
+    /// wait instead.
     #[arg(long, default_value = "10")]
     pub retries: u32,
-
-    /// Sleep between retries (seconds)
-    #[arg(long, default_value = "30")]
-    pub retry_sleep: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -308,12 +307,12 @@ pub struct ImportArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart)
+    ///
+    /// Waits between attempts grow from 1 s to 60 s, doubling each time
+    /// with random jitter; a Retry-After header from the server sets the
+    /// wait instead.
     #[arg(long, default_value = "10")]
     pub retries: u32,
-
-    /// Sleep between retries (seconds)
-    #[arg(long, default_value = "30")]
-    pub retry_sleep: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -446,7 +445,6 @@ pub async fn run(
             open_after_upload: false,
             dry_run: sub.dry_run,
             retries: sub.retries,
-            retry_sleep: sub.retry_sleep,
             json: sub.json,
             multipart: sub.multipart,
             dashboard: args.dashboard,
@@ -528,9 +526,9 @@ async fn run_bare_upload(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
-        retry_sleep: Duration::from_secs(args.retry_sleep),
         headers,
         dry_run: args.dry_run,
+        ..UploadOpts::default()
     };
 
     // Build auto-resume skip set from joblog (if available)
@@ -723,7 +721,6 @@ async fn run_import(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
-        retry_sleep: Duration::from_secs(args.retry_sleep),
         dry_run: args.dry_run,
         ..UploadOpts::default()
     };

@@ -38,8 +38,13 @@ pub struct UploadOpts {
     pub multipart: bool,
     /// Maximum retry attempts on transient failure.
     pub retries: u32,
-    /// Sleep duration between retries.
-    pub retry_sleep: Duration,
+    /// Shortest wait before a retry: the first retry waits up to this long,
+    /// and each later one up to twice the previous, with jitter.
+    /// Default 1 s. Library configuration, not a CLI flag; tests shrink it.
+    pub retry_min_delay: Duration,
+    /// Longest wait before any one retry. Default 60 s. A `Retry-After`
+    /// header from the server overrides the computed wait regardless.
+    pub retry_max_delay: Duration,
     /// Additional HTTP headers to include.
     pub headers: Vec<(String, String)>,
     /// Validate everything but don't actually upload.
@@ -65,7 +70,8 @@ impl Default for UploadOpts {
             test_item: false,
             multipart: false,
             retries: 10,
-            retry_sleep: Duration::from_secs(30),
+            retry_min_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(60),
             headers: Vec::new(),
             dry_run: false,
         }
@@ -196,9 +202,12 @@ impl UploadOptsBuilder {
         self
     }
 
-    /// Set sleep duration between retries.
-    pub fn retry_sleep(mut self, duration: Duration) -> Self {
-        self.opts.retry_sleep = duration;
+    /// Set the bounds of the retry backoff: the first retry waits up to
+    /// `min`, each later one up to twice the previous, never more than
+    /// `max`.
+    pub fn retry_delay_bounds(mut self, min: Duration, max: Duration) -> Self {
+        self.opts.retry_min_delay = min;
+        self.opts.retry_max_delay = max;
         self
     }
 
@@ -339,7 +348,8 @@ mod tests {
         assert!(!opts.no_derive);
         assert!(!opts.no_backup);
         assert_eq!(opts.retries, 10);
-        assert_eq!(opts.retry_sleep, Duration::from_secs(30));
+        assert_eq!(opts.retry_min_delay, Duration::from_secs(1));
+        assert_eq!(opts.retry_max_delay, Duration::from_secs(60));
         assert!(opts.metadata.is_empty());
     }
 

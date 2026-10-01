@@ -207,10 +207,18 @@ pub fn is_retryable_body_error(err: &reqwest::Error) -> bool {
 /// Returns `None` if the header is missing or its value is not a valid
 /// non-negative integer (i.e. HTTP-date values are silently ignored).
 pub fn extract_retry_after(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse().ok())
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    // The other form the header allows: an HTTP date. A date already past
+    // means "now", that is, zero seconds.
+    let when = httpdate::parse_http_date(value).ok()?;
+    Some(
+        when.duration_since(std::time::SystemTime::now())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
 }
 
 /// Retry strategy that records diagnostics before delegating retry decisions.
@@ -517,14 +525,16 @@ mod tests {
         assert_eq!(extract_retry_after(&headers), None);
     }
 
+    /// The header's other form is an HTTP date. One already in the past
+    /// means "now": zero seconds, not an unparseable value.
     #[test]
-    fn extract_retry_after_non_numeric() {
+    fn extract_retry_after_past_http_date_is_zero() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "retry-after",
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
         );
-        assert_eq!(extract_retry_after(&headers), None);
+        assert_eq!(extract_retry_after(&headers), Some(0));
     }
 
     #[test]
@@ -607,5 +617,48 @@ mod tests {
             "429 without retry-after should still not retry"
         );
         assert_eq!(stats.summary().total_retry_wait, Duration::ZERO);
+    }
+    // -- Retry-After forms --
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn retry_after_seconds() {
+        assert_eq!(
+            extract_retry_after(&headers_with_retry_after("120")),
+            Some(120)
+        );
+        assert_eq!(
+            extract_retry_after(&headers_with_retry_after(" 7 ")),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_future() {
+        let when = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+        let value = httpdate::fmt_http_date(when);
+        let secs = extract_retry_after(&headers_with_retry_after(&value)).unwrap();
+        assert!((29..=31).contains(&secs), "{secs}");
+    }
+
+    #[test]
+    fn retry_after_http_date_in_the_past_is_zero() {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        let value = httpdate::fmt_http_date(when);
+        assert_eq!(
+            extract_retry_after(&headers_with_retry_after(&value)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn retry_after_garbage_is_none() {
+        assert_eq!(extract_retry_after(&headers_with_retry_after("soon")), None);
+        assert_eq!(extract_retry_after(&HeaderMap::new()), None);
     }
 }

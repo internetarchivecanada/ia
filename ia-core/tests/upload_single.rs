@@ -612,8 +612,6 @@ async fn upload_progress_callback_fires() {
 
 #[tokio::test]
 async fn upload_503_rate_limit_retry() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     // First PUT returns 503 (non-spam), second succeeds
@@ -648,7 +646,8 @@ async fn upload_503_rate_limit_retry() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: Duration::from_millis(10), // fast for tests
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2), // fast for tests
         ..Default::default()
     };
 
@@ -710,8 +709,6 @@ async fn upload_content_length_header() {
 
 #[tokio::test]
 async fn upload_403_is_not_retried() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     // 403 should be returned immediately — NOT retried
@@ -728,7 +725,8 @@ async fn upload_403_is_not_retried() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: Duration::from_millis(1),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
 
@@ -754,8 +752,6 @@ async fn upload_403_is_not_retried() {
 
 #[tokio::test]
 async fn upload_400_bad_digest_is_not_retried() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -771,7 +767,8 @@ async fn upload_400_bad_digest_is_not_retried() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: Duration::from_millis(1),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
 
@@ -1060,8 +1057,6 @@ async fn upload_precomputed_checksum_used_for_content_md5() {
 
 #[tokio::test]
 async fn upload_retries_on_server_error() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     // First attempt: 500 with retryable S3 error
@@ -1097,7 +1092,8 @@ async fn upload_retries_on_server_error() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: Duration::from_millis(10),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
 
@@ -1123,8 +1119,6 @@ async fn upload_retries_on_server_error() {
 
 #[tokio::test]
 async fn upload_503_retries_exhausted() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     // check_limit returns not-over-limit so poll_check_limit clears quickly
@@ -1151,7 +1145,8 @@ async fn upload_503_retries_exhausted() {
     let opts = UploadOpts {
         verify: false,
         retries: 2,
-        retry_sleep: Duration::from_millis(10),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
 
@@ -1434,8 +1429,6 @@ async fn upload_with_retry_middleware_no_progress() {
 /// too, instead of polling check_limit and re-sending the whole file.
 #[tokio::test]
 async fn upload_503_with_non_retryable_code_is_not_retried() {
-    use std::time::Duration;
-
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -1451,7 +1444,8 @@ async fn upload_503_with_non_retryable_code_is_not_retried() {
     let opts = UploadOpts {
         verify: false,
         retries: 3,
-        retry_sleep: Duration::from_millis(1),
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
 
@@ -1474,4 +1468,70 @@ async fn upload_503_with_non_retryable_code_is_not_retried() {
         "expected AccessDenied in error: {err}"
     );
     server.verify().await;
+}
+
+/// A 503 that carries `Retry-After` is waited out for as long as the
+/// server says before the check-limit poll and the retry, not for the
+/// backoff's millisecond test bounds.
+#[tokio::test]
+async fn upload_503_retry_honors_retry_after() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "1")
+                .set_body_string("Please reduce your request rate."),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After: 1 was not waited for ({:?})",
+        started.elapsed()
+    );
 }
