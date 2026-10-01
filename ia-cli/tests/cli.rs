@@ -2045,7 +2045,8 @@ fn upload_help_has_no_retry_sleep_and_describes_backoff() {
         .stdout(predicate::str::contains("--retries"))
         .stdout(predicate::str::contains("up to a cap that doubles"))
         .stdout(predicate::str::contains("Retry-After: 0"))
-        .stdout(predicate::str::contains("Retry-After"));
+        .stdout(predicate::str::contains("Retry-After"))
+        .stdout(predicate::str::contains("--multipart --retries 20"));
 }
 
 #[test]

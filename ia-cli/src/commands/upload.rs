@@ -94,7 +94,10 @@ fn build_skip_set(
          \n\n  <dim># Force re-upload everything (ignore remote MD5)</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
          \n\n  <dim># Force re-upload ignoring joblog</dim>\
-         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\n"
+         \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
+         \n\n  <dim># Ride out a flaky link: 20 attempts per part; waits are random, up to a</dim>\
+         \n  <dim># cap that doubles from 1 s to 60 s, or exactly what Retry-After says</dim>\
+         \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\n"
     ),
     subcommand_required = false,
 )]
