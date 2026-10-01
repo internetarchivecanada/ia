@@ -72,7 +72,7 @@ A connection that drops is resumed: the bytes already in the `.part` file stay, 
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
-Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_stalled`). Dropped connections have their own budget of three re-requests per attempt and do not count against the stalls. `--retries 0` means the first stall fails the file.
+Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
 
 #### Examples
 

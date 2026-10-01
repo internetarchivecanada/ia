@@ -27,7 +27,11 @@ Closes #11: a slow-trickling datanode can hang a download indefinitely.
 - **No new progress status.** A stall logs a `warn!` and the download continues; adding a `DownloadStatus::Stalled` would break exhaustive matches in the external GUI and is not needed for the fix.
 - **Check interval.** One second. The `select!` branch is disabled when `min_speed` is 0, so a disabled detector costs nothing.
 
-**Out of scope:** switching datanode on a stall (#15); per-part streams (#16); relative floors (a fraction of the best observed rate). The `READ_TIMEOUT` of 60 s on the transport stays; it catches a fully silent connection after 60 s on its own, which arrives as a body-stream error and takes that path and that budget.
+**Out of scope:** switching datanode on a stall (#15); per-part streams (#16); relative floors (a fraction of the best observed rate). The `READ_TIMEOUT` of 60 s on the transport stays, but with the check on it no longer gets a turn: the detector judges a fully silent connection at 30 s, so such a connection now spends one of the `--retries` stalls (no backoff) instead of one of the three body-stream retries (with backoff). Only with `--min-speed 0` does the read timeout end a silent stream, as a body-stream error.
+
+**Measurement detail (from the review):** the check runs right after a one-second bucket rolls over, so the bucket for the second in progress is nearly empty. It is left out of both the sum and the span; otherwise a stream at exactly the floor would read as 59/60 of it and stall. The window is therefore at least two seconds.
+
+**Error count (from the review):** `stalls` in `DownloadStalled` counts every stall, so it is `--retries + 1` when the budget is spent and `1` with `--retries 0`; the message uses "time" or "times" accordingly. The CLI's per-file `--json` error code stays `download_failed` (the message is this text), as for every per-file failure; `download_stalled` is the code library consumers get from `IaError::to_json_error`.
 
 ---
 

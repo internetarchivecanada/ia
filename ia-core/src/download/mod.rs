@@ -1040,14 +1040,14 @@ pub async fn download_file(
                 // body-phase failure — connection drop, incomplete
                 // message, decode error, or stream timeout. They all
                 // share a remedy: sleep briefly, re-request with Range.
+                // Flush buffered bytes to disk so the .part file size
+                // matches `bytes_downloaded`: the Range offset for the
+                // retry request, or what the next attempt resumes from.
+                output.flush().await?;
                 if stream_attempt >= MAX_STREAM_RETRIES {
                     return Err(IaError::Network(m_err));
                 }
                 stream_attempt += 1;
-                // Flush buffered bytes to disk so the .part file size
-                // matches `bytes_downloaded` — the Range offset for
-                // the retry request.
-                output.flush().await?;
                 let backoff = std::time::Duration::from_millis(
                     500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
                 );
@@ -1071,9 +1071,11 @@ pub async fn download_file(
                 output.flush().await?;
                 if stall_attempt >= opts.retries {
                     drop(output);
+                    // This stall plus the ones already re-requested.
+                    let stalls = stall_attempt + 1;
                     warn!(
                         file = %file.name,
-                        stalls = stall_attempt,
+                        stalls,
                         bytes_downloaded,
                         observed_bytes_per_sec = observed,
                         min_bytes_per_sec = opts.min_speed,
@@ -1085,7 +1087,7 @@ pub async fn download_file(
                         observed_bytes_per_sec: observed,
                         min_bytes_per_sec: opts.min_speed,
                         window_secs,
-                        stalls: stall_attempt,
+                        stalls,
                     });
                 }
                 stall_attempt += 1;
@@ -4060,7 +4062,8 @@ mod tests {
                 assert_eq!(name, "data.bin");
                 assert_eq!(*min_bytes_per_sec, FLOOR);
                 assert_eq!(*window_secs, TEST_WINDOW.as_secs());
-                assert_eq!(*stalls, 2);
+                // Three streams stalled; the first two were re-requested.
+                assert_eq!(*stalls, 3);
                 assert!(*observed_bytes_per_sec < FLOOR);
             }
             other => panic!("expected DownloadStalled, got {other:?}"),
@@ -4212,10 +4215,145 @@ mod tests {
         assert_eq!(result.files_downloaded, 0);
         let failed = &result.results[0];
         match &failed.status {
-            DownloadStatus::Failed(msg) => assert!(msg.contains("stalled 1 times"), "{msg}"),
+            DownloadStatus::Failed(msg) => assert!(msg.contains("stalled 2 times"), "{msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
         assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// A connection that answers a Range request with 416 and the given
+    /// total, as the server does when the offset is at the end of the file.
+    fn range_not_satisfiable_at(total: u64) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                assert!(
+                    range_offset_of(&request).is_some(),
+                    "expected a Range request, got:\n{request}"
+                );
+                let head = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                     content-length: 0\r\n\
+                     content-range: bytes */{total}\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.flush().await;
+            })
+        })
+    }
+
+    /// A connection that promises one byte more than it has, serves the
+    /// whole body at once, and then goes quiet: the client has every byte
+    /// but the stream never ends.
+    fn serving_then_hanging(body: Vec<u8>, max: Duration) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset = send_head(&mut stream, &request, body.len() as u64 + 1).await as usize;
+                send_all(&mut stream, &body[offset..]).await;
+                wait_for_close(&mut stream, max).await;
+            })
+        })
+    }
+
+    #[test]
+    fn default_min_speed_is_ten_kib_per_second() {
+        assert_eq!(DownloadOpts::default().min_speed, 10 * 1024);
+    }
+
+    #[tokio::test]
+    async fn retries_zero_fails_on_the_first_stall() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) =
+            spawn_script_server(vec![dripping(body.clone(), DRIP)], Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        let err = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 0))
+            .await
+            .expect_err("the only stream dripped");
+
+        match &err {
+            IaError::DownloadStalled { stalls, .. } => assert_eq!(*stalls, 1),
+            other => panic!("expected DownloadStalled, got {other:?}"),
+        }
+        assert!(err.to_string().contains("stalled 1 time:"), "{err}");
+        assert!(dir.path().join("data.bin.part").exists());
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// The stream delivered every byte and then stalled before ending. The
+    /// Range re-request from the end of the file draws a 416 at the
+    /// metadata size, and the shared tail finishes the .part in place.
+    #[tokio::test]
+    async fn stall_after_the_last_byte_finishes_through_416() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![
+                serving_then_hanging(body.clone(), Duration::from_secs(30)),
+                range_not_satisfiable_at(body.len() as u64),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
+        let opts = DownloadOpts {
+            checksum: true,
+            ..stall_opts(FLOOR, 5)
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, body.len() as u64);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert!(!dir.path().join("data.bin.part").exists());
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(records[1].range_offset(), Some(body.len() as u64));
+    }
+
+    /// A stall part way through a resumed download: the hasher was seeded
+    /// from the existing .part, rolled over the dripped bytes, and rolls on
+    /// over the second resume. The final md5 must still match.
+    #[tokio::test]
+    async fn stall_during_resumed_download_keeps_seeded_md5() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![dripping(body.clone(), DRIP), serving(body.clone())],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = 10 * 1024;
+        std::fs::write(dir.path().join("data.bin.part"), &body[..on_disk]).unwrap();
+        let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
+        let opts = DownloadOpts {
+            checksum: true,
+            ..stall_opts(FLOOR, 5)
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(records[0].range_offset(), Some(on_disk as u64));
+        let resumed = records[1].range_offset().unwrap();
+        assert!(
+            resumed > on_disk as u64 && resumed <= on_disk as u64 + 12,
+            "{resumed}"
+        );
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org

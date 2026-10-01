@@ -113,10 +113,12 @@ pub struct DownloadArgs {
     /// twice, and the md5 check (--checksum) still covers the whole file.
     ///
     /// Each stall spends one of the file's --retries. When they are gone the
-    /// file fails with "download of <name> stalled N times ..." (--json code
-    /// download_stalled), its .part is kept for a later run, and it is not
-    /// attempted again in this one. Dropped connections have their own budget
-    /// of three re-requests and do not count here.
+    /// file fails with "download of <name> stalled N times: ..." (N counts
+    /// every stall, so it is one more than --retries; in --json output the
+    /// file's error code is download_failed and this is its message), its
+    /// .part is kept for a later run, and it is not attempted again in this
+    /// one. Dropped connections have their own budget of three re-requests
+    /// and do not count here.
     ///
     /// RATE is bytes per second: a plain number, or a number followed by K, M,
     /// or G for powers of 1024 (10K is 10240 bytes per second). 0 disables the
@@ -1274,8 +1276,6 @@ fn print_json_item_result(result: &std::result::Result<ItemDownloadResult, (Stri
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // -- --min-speed parsing (#11) --
 
     #[test]

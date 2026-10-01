@@ -109,13 +109,15 @@ pub enum IaError {
         server_size: u64,
     },
 
-    /// The stream's throughput stayed below the `--min-speed` floor for the
-    /// whole window `stalls` times in a row, so the stall budget
-    /// (`--retries`) is spent. Each stall re-requested the file with
-    /// `Range`; the `.part` is kept with every byte received so far.
+    /// The stream fell below the `--min-speed` floor `stalls` times in a
+    /// row and the stall budget (`--retries`) is spent: every stall but the
+    /// last re-requested the file with `Range`, so `stalls` is one more than
+    /// the retries. `observed_bytes_per_sec` is the last average measured.
+    /// The `.part` is kept with every byte received so far.
     #[error(
-        "download of {file} stalled {stalls} times: {observed_bytes_per_sec} B/s over the last \
-         {window_secs} s is below the --min-speed floor of {min_bytes_per_sec} B/s"
+        "download of {file} stalled {stalls} {}: {observed_bytes_per_sec} B/s over the last \
+         {window_secs} s is below the --min-speed floor of {min_bytes_per_sec} B/s",
+        if *.stalls == 1 { "time" } else { "times" }
     )]
     DownloadStalled {
         file: String,
@@ -1604,6 +1606,20 @@ mod tests {
         assert!(msg.contains("60 s"), "{msg}");
         assert!(msg.contains("--min-speed"), "{msg}");
         assert!(msg.contains("10240 B/s"), "{msg}");
+    }
+
+    #[test]
+    fn download_stalled_uses_the_singular_for_one_stall() {
+        let err = IaError::DownloadStalled {
+            file: "disk.img".into(),
+            observed_bytes_per_sec: 0,
+            min_bytes_per_sec: 10240,
+            window_secs: 60,
+            stalls: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("stalled 1 time:"), "{msg}");
+        assert!(!msg.contains("1 times"), "{msg}");
     }
 
     #[test]
