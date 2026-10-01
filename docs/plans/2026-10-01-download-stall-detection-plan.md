@@ -6,7 +6,7 @@ Closes #11: a slow-trickling datanode can hang a download indefinitely.
 
 **Architecture:** a small pure `StallDetector` (new file `ia-core/src/download/stall.rs`) keeps a sliding window of bytes received per second and answers "is this stream stalled right now?". `download_file` feeds it from the chunk loop and asks it once a second from a `tokio::time::interval` branch in a `tokio::select!` alongside `stream.next()`. A stall takes the same exit as a body-stream error: flush the `.part`, drop the stream, re-request with `Range: bytes={bytes_downloaded}-`. Stalls have their own counter, capped at `opts.retries`; body-stream errors keep `MAX_STREAM_RETRIES` (3). When the stall budget is spent the file fails with a new, permanent `IaError::DownloadStalled`.
 
-**Tech Stack:** existing crates only. `tokio::select!` and `tokio::time::interval` are already available (`macros`, `time` via `rt`). Tests: `wiremock` for HTTP, a raw `tokio::net::TcpListener` for the drip-feed body, `tokio::time::pause` (the `test-util` dev-dependency is already present) so a 60-second window runs in milliseconds.
+**Tech Stack:** existing crates only. `tokio::select!` and `tokio::time::interval` are already available (`macros`, `time` via `rt`). Tests: `wiremock` for HTTP, a raw `tokio::net::TcpListener` for the drip-feed body. The drip tests run in real time with the window and grace shrunk to 2 s and 1 s through a `cfg(test)`-only thread-local override in `stall.rs` (`PolicyOverride`), so each stall costs about a second. tokio's paused clock was tried first and does not work with real sockets: its auto-advance runs reqwest's 30 s connect timeout out before the loopback connect completes.
 
 **Decisions (Jake, 2026-10-01):**
 
@@ -68,7 +68,7 @@ Closes #11: a slow-trickling datanode can hang a download indefinitely.
 
 **Files:** `ia-core/src/download/stall.rs`, `mod stall;` in `download/mod.rs`
 
-The detector is pure: every method takes `now: tokio::time::Instant` so unit tests pick the clock and the drip test can run under `tokio::time::pause`.
+The detector is pure: every method takes `now: tokio::time::Instant` so unit tests pick the clock. It takes the window and grace as constructor arguments; `download_file` passes `stall::policy()`, which returns the fixed constants except under `cfg(test)` while a `PolicyOverride` is alive on the thread.
 
 ```rust
 pub(crate) const WINDOW: Duration = Duration::from_secs(60);
@@ -109,7 +109,7 @@ impl StallDetector {
 
 **Files:** `ia-core/src/download/mod.rs`
 
-- [ ] **Step 1: Failing tests.** Raw-TCP servers under `#[tokio::test(start_paused = true)]`, modelled on `stream_error_retries_with_range_and_completes`. Every server sleeps on tokio timers, so the paused clock drives both sides and each test finishes in well under a second of wall time. `DownloadOpts { min_speed: 10 * 1024, retries: 5, .. }` unless stated.
+- [ ] **Step 1: Failing tests.** Raw-TCP servers under `#[tokio::test]` with `PolicyOverride` (window 2 s, grace 1 s, one byte every 250 ms for a drip), modelled on `stream_error_retries_with_range_and_completes`. A scripted server (`spawn_script_server`) serves one handler per connection and fails if an extra connection arrives. `DownloadOpts { min_speed: 10 * 1024, retries: 5, .. }` unless stated.
   - `drip_feed_stalls_then_resumes_with_range`: the first connection sends headers for a 64 KiB file, then 1 byte every 5 s. At 30 s the detector fires (6 bytes / 30 s). The second connection must carry `Range: bytes=6-` and serves the remaining bytes at once. Result `Complete`, final file equals the 64 KiB body, exactly two connections.
   - `silent_stream_stalls_at_the_end_of_grace`: headers then nothing. The `select!` ticker, not a chunk, must trigger the check; the second connection (`Range: bytes=0-`) completes the file. Assert the first connection was abandoned at about 30 s of virtual time (the server records `Instant::now()` when its socket closes), well before the 60 s `READ_TIMEOUT`.
   - `stall_budget_is_separate_from_stream_error_budget`: `retries: 1`. Connection 1 drips (stall 1 of 1), connection 2 drops mid-body (stream error 1 of 3), connection 3 completes. `Complete`; three connections. Shows a stall does not consume a stream-error retry and vice versa.

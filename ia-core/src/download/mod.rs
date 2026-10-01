@@ -137,6 +137,19 @@ pub struct DownloadOpts {
     /// `cnt` query parameter is absent (any value, including `cnt=1`,
     /// suppresses counting).
     pub count_views: bool,
+    /// Minimum throughput in bytes per second before a stream is judged
+    /// stalled; `0` disables the check.
+    ///
+    /// Once a stream is [`stall::GRACE`] (30 s) old, its average over the
+    /// last [`stall::WINDOW`] (60 s), or over its whole life while younger
+    /// than that, is compared with this floor once a second. Below it, the
+    /// stream is abandoned and the file re-requested with `Range` from the
+    /// bytes already on disk, exactly as a body-stream error is handled.
+    /// Stalls have their own budget, capped at [`retries`](Self::retries);
+    /// when it is spent the file fails with
+    /// [`IaError::DownloadStalled`](crate::error::IaError::DownloadStalled).
+    /// The default is 10 KiB/s.
+    pub min_speed: u64,
 }
 
 impl Default for DownloadOpts {
@@ -150,6 +163,7 @@ impl Default for DownloadOpts {
             dry_run: false,
             filter: FileFilter::default(),
             count_views: false,
+            min_speed: 10 * 1024,
         }
     }
 }
@@ -915,130 +929,219 @@ pub async fn download_file(
     // server would have happily served a few seconds later.
     const MAX_STREAM_RETRIES: usize = 3;
     let mut stream_attempt: usize = 0;
+    // Stall budget, separate from the stream-error budget and capped at
+    // `opts.retries` (#11). A stall is not a failure of the connection but
+    // of its pace: the server is answering, too slowly to be worth waiting
+    // for. Each stall re-requests with Range exactly as a stream error
+    // does; when the budget is spent the file fails for good.
+    let mut stall_attempt: usize = 0;
+    let (stall_window, stall_grace) = stall::policy();
     let mut response = response;
 
-    'stream_retry: loop {
-        let mut stream = response.bytes_stream();
+    /// Why the chunk loop stopped reading a response body.
+    enum StreamEnd {
+        /// The body ended on its own.
+        Done,
+        /// The body stream returned an error.
+        Error(reqwest_middleware::Error),
+        /// The stall detector judged the stream too slow.
+        Stalled { observed: u64, window_secs: u64 },
+    }
 
-        loop {
-            let chunk = match stream.next().await {
-                Some(Ok(c)) => c,
-                Some(Err(stream_err)) => {
-                    let m_err = reqwest_middleware::Error::from(stream_err);
-                    // Any error after successful response headers is a
-                    // body-phase failure — connection drop, incomplete
-                    // message, decode error, or stream timeout. They all
-                    // share a remedy: sleep briefly, re-request with Range.
-                    if stream_attempt < MAX_STREAM_RETRIES {
-                        stream_attempt += 1;
-                        // Flush buffered bytes to disk so the .part file size
-                        // matches `bytes_downloaded` — the Range offset for
-                        // the retry request.
-                        output.flush().await?;
-                        let backoff = std::time::Duration::from_millis(
-                            500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
-                        );
-                        warn!(
-                            file = %file.name,
-                            attempt = stream_attempt,
-                            max = MAX_STREAM_RETRIES,
-                            bytes_downloaded,
-                            backoff_ms = backoff.as_millis() as u64,
-                            error = %crate::error::format_error_chain(&m_err),
-                            "body-stream error, retrying with Range",
-                        );
-                        tokio::time::sleep(backoff).await;
-                        let new_resp =
-                            fetch_response(client, &url, Some(bytes_downloaded), opts.count_views)
-                                .await?;
-                        if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                            // Close the writer first: the mapping may
-                            // remove .part.
-                            drop(output);
-                            let last_modified = last_modified_of(&new_resp).or(last_modified);
-                            range_not_satisfiable(
-                                new_resp,
-                                identifier,
-                                file,
-                                bytes_downloaded,
-                                &part_path,
-                            )
-                            .await?;
-                            // The .part is the whole file: the stream error
-                            // came after its last byte. The hasher already
-                            // covers every byte written, so finish in place.
-                            return finish_part(
-                                identifier,
-                                file,
-                                &file_path,
-                                &part_path,
-                                bytes_downloaded,
-                                hasher,
-                                last_modified,
-                                opts,
-                                progress,
-                                start,
-                            )
-                            .await;
+    loop {
+        let mut stream = response.bytes_stream();
+        // Every stream is judged on its own clock: a re-request is a new
+        // connection, possibly to a different backend, and gets the full
+        // grace before its pace counts.
+        let mut detector = (opts.min_speed > 0).then(|| {
+            stall::StallDetector::new(
+                opts.min_speed,
+                stall_window,
+                stall_grace,
+                tokio::time::Instant::now(),
+            )
+        });
+        // The check must run even when no chunk arrives, or a stream that
+        // sends nothing would never be judged until the transport's read
+        // timeout. `stream.next()` is cancel-safe, so a tick that wins the
+        // race drops no bytes.
+        let mut ticker = tokio::time::interval(stall::CHECK_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let end = loop {
+            tokio::select! {
+                next = stream.next() => match next {
+                    Some(Ok(chunk)) => {
+                        output.write_all(&chunk).await?;
+                        if let Some(h) = hasher.as_mut() {
+                            use md5::Digest;
+                            h.update(&chunk);
                         }
-                        check_content_range(&new_resp, identifier, file)?;
-                        // If the server ignores Range and returns 200, the
-                        // safe thing is to surface the original error rather
-                        // than try to splice a full-file stream onto an
-                        // existing `.part` offset.
-                        if new_resp.status() == reqwest::StatusCode::OK && bytes_downloaded > 0 {
-                            return Err(IaError::ResumeFailed {
-                                file: file.name.clone(),
-                                reason: "server ignored Range header on retry".to_string(),
-                            });
+                        bytes_downloaded += chunk.len() as u64;
+                        if let Some(d) = detector.as_mut() {
+                            d.record(tokio::time::Instant::now(), chunk.len() as u64);
                         }
-                        response = new_resp;
-                        continue 'stream_retry;
+
+                        // Early exit for a grossly oversized body (10% over,
+                        // min 1 KB) so a runaway response cannot fill the
+                        // disk. Any smaller discrepancy is caught by the
+                        // exact count check after the stream ends.
+                        if let Some(expected) = file.size {
+                            let max_allowed = expected + (expected / 10).max(1024);
+                            if bytes_downloaded > max_allowed {
+                                drop(output);
+                                let _ = fs::remove_file(&part_path).await;
+                                return Err(IaError::DownloadTooLarge {
+                                    file: file.name.clone(),
+                                    expected,
+                                    received: bytes_downloaded,
+                                });
+                            }
+                        }
+
+                        // Rate-limit progress updates to every 256KB to
+                        // reduce lock contention
+                        if let Some(p) = progress {
+                            if bytes_downloaded - last_progress_at >= 256 * 1024 {
+                                p(DownloadProgress {
+                                    identifier: identifier.to_string(),
+                                    file_name: file.name.clone(),
+                                    bytes_downloaded,
+                                    total_bytes: file.size,
+                                    status: DownloadStatus::Downloading,
+                                });
+                                last_progress_at = bytes_downloaded;
+                            }
+                        }
                     }
+                    Some(Err(stream_err)) => {
+                        break StreamEnd::Error(reqwest_middleware::Error::from(stream_err));
+                    }
+                    None => break StreamEnd::Done,
+                },
+                _ = ticker.tick(), if detector.is_some() => {
+                    if let Some(d) = detector.as_mut() {
+                        if let Some(observed) = d.check(tokio::time::Instant::now()) {
+                            break StreamEnd::Stalled {
+                                observed,
+                                window_secs: d.window_secs(),
+                            };
+                        }
+                    }
+                }
+            }
+        };
+        // Close the abandoned connection before opening the next one.
+        drop(stream);
+
+        match end {
+            StreamEnd::Done => break,
+            StreamEnd::Error(m_err) => {
+                // Any error after successful response headers is a
+                // body-phase failure — connection drop, incomplete
+                // message, decode error, or stream timeout. They all
+                // share a remedy: sleep briefly, re-request with Range.
+                if stream_attempt >= MAX_STREAM_RETRIES {
                     return Err(IaError::Network(m_err));
                 }
-                None => break,
-            };
-
-            output.write_all(&chunk).await?;
-            if let Some(h) = hasher.as_mut() {
-                use md5::Digest;
-                h.update(&chunk);
+                stream_attempt += 1;
+                // Flush buffered bytes to disk so the .part file size
+                // matches `bytes_downloaded` — the Range offset for
+                // the retry request.
+                output.flush().await?;
+                let backoff = std::time::Duration::from_millis(
+                    500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
+                );
+                warn!(
+                    file = %file.name,
+                    attempt = stream_attempt,
+                    max = MAX_STREAM_RETRIES,
+                    bytes_downloaded,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %crate::error::format_error_chain(&m_err),
+                    "body-stream error, retrying with Range",
+                );
+                tokio::time::sleep(backoff).await;
             }
-            bytes_downloaded += chunk.len() as u64;
-
-            // Early exit for a grossly oversized body (10% over, min 1 KB)
-            // so a runaway response cannot fill the disk. Any smaller
-            // discrepancy is caught by the exact count check after the
-            // stream ends.
-            if let Some(expected) = file.size {
-                let max_allowed = expected + (expected / 10).max(1024);
-                if bytes_downloaded > max_allowed {
+            StreamEnd::Stalled {
+                observed,
+                window_secs,
+            } => {
+                // Flush first either way: the bytes that did arrive belong
+                // on disk, as the Range offset or for a later resume.
+                output.flush().await?;
+                if stall_attempt >= opts.retries {
                     drop(output);
-                    let _ = fs::remove_file(&part_path).await;
-                    return Err(IaError::DownloadTooLarge {
-                        file: file.name.clone(),
-                        expected,
-                        received: bytes_downloaded,
-                    });
-                }
-            }
-
-            // Rate-limit progress updates to every 256KB to reduce lock contention
-            if let Some(p) = progress {
-                if bytes_downloaded - last_progress_at >= 256 * 1024 {
-                    p(DownloadProgress {
-                        identifier: identifier.to_string(),
-                        file_name: file.name.clone(),
+                    warn!(
+                        file = %file.name,
+                        stalls = stall_attempt,
                         bytes_downloaded,
-                        total_bytes: file.size,
-                        status: DownloadStatus::Downloading,
+                        observed_bytes_per_sec = observed,
+                        min_bytes_per_sec = opts.min_speed,
+                        window_secs,
+                        "stream below --min-speed and the stall budget is spent; keeping .part"
+                    );
+                    return Err(IaError::DownloadStalled {
+                        file: file.name.clone(),
+                        observed_bytes_per_sec: observed,
+                        min_bytes_per_sec: opts.min_speed,
+                        window_secs,
+                        stalls: stall_attempt,
                     });
-                    last_progress_at = bytes_downloaded;
                 }
+                stall_attempt += 1;
+                // No backoff: the stream has already cost at least the
+                // grace, and the server is answering, just too slowly.
+                warn!(
+                    file = %file.name,
+                    attempt = stall_attempt,
+                    max = opts.retries,
+                    bytes_downloaded,
+                    observed_bytes_per_sec = observed,
+                    min_bytes_per_sec = opts.min_speed,
+                    window_secs,
+                    "stream below --min-speed, re-requesting with Range",
+                );
             }
         }
-        break;
+
+        // Re-request from the bytes on disk. Shared by the stream-error
+        // and stall paths.
+        let new_resp =
+            fetch_response(client, &url, Some(bytes_downloaded), opts.count_views).await?;
+        if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            // Close the writer first: the mapping may remove .part.
+            drop(output);
+            let last_modified = last_modified_of(&new_resp).or(last_modified);
+            range_not_satisfiable(new_resp, identifier, file, bytes_downloaded, &part_path).await?;
+            // The .part is the whole file: the stream ended after its last
+            // byte. The hasher already covers every byte written, so
+            // finish in place.
+            return finish_part(
+                identifier,
+                file,
+                &file_path,
+                &part_path,
+                bytes_downloaded,
+                hasher,
+                last_modified,
+                opts,
+                progress,
+                start,
+            )
+            .await;
+        }
+        check_content_range(&new_resp, identifier, file)?;
+        // If the server ignores Range and returns 200, the safe thing is
+        // to surface an error rather than try to splice a full-file
+        // stream onto an existing `.part` offset.
+        if new_resp.status() == reqwest::StatusCode::OK && bytes_downloaded > 0 {
+            return Err(IaError::ResumeFailed {
+                file: file.name.clone(),
+                reason: "server ignored Range header on retry".to_string(),
+            });
+        }
+        response = new_resp;
     }
 
     output.flush().await?;
@@ -3548,6 +3651,572 @@ mod tests {
         assert!(!dir.path().join("data.bin.part").exists());
 
         server_handle.await.unwrap();
+    }
+
+    // -- stall detection (#11) --
+    //
+    // Drip-feeding servers on a raw TcpListener, in real time with the
+    // window and grace shrunk through `stall::PolicyOverride` (window 2 s,
+    // grace 1 s) so each stall costs about a second of wall time. tokio's
+    // paused clock cannot be used: its auto-advance runs reqwest's connect
+    // timeout out before a real TCP connect completes. The 60 s read timeout
+    // on the transport stays real, which is what the silent-stream test
+    // relies on to show the detector fired first.
+
+    type ConnHandler = Box<
+        dyn FnOnce(tokio::net::TcpStream, String) -> futures::future::BoxFuture<'static, ()> + Send,
+    >;
+
+    #[derive(Debug)]
+    struct ConnRecord {
+        request: String,
+        accepted_at: tokio::time::Instant,
+        finished_at: tokio::time::Instant,
+    }
+
+    impl ConnRecord {
+        fn range_offset(&self) -> Option<u64> {
+            range_offset_of(&self.request)
+        }
+    }
+
+    /// The `N` of a `Range: bytes=N-` header in a request head.
+    fn range_offset_of(request: &str) -> Option<u64> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.trim().eq_ignore_ascii_case("range") {
+                return None;
+            }
+            value
+                .trim()
+                .strip_prefix("bytes=")?
+                .strip_suffix('-')?
+                .parse()
+                .ok()
+        })
+    }
+
+    async fn read_request_head(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 4096];
+        let mut acc = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n]);
+            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&acc).to_string()
+    }
+
+    /// Serve `handlers` in order, one per connection, then make sure no
+    /// further connection arrives within `quiet_for`. The task's result is
+    /// one record per connection: the request head and when the handler
+    /// started and finished.
+    async fn spawn_script_server(
+        handlers: Vec<ConnHandler>,
+        quiet_for: Duration,
+    ) -> (IaClient, tokio::task::JoinHandle<Vec<ConnRecord>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = handlers.len();
+        let handle = tokio::spawn(async move {
+            let mut records = Vec::new();
+            for handler in handlers {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let accepted_at = tokio::time::Instant::now();
+                let request = read_request_head(&mut stream).await;
+                handler(stream, request.clone()).await;
+                records.push(ConnRecord {
+                    request,
+                    accepted_at,
+                    finished_at: tokio::time::Instant::now(),
+                });
+            }
+            // Any further connection within `quiet_for` is a bug in the
+            // client: a re-request or a retry that should not have happened.
+            let extra = tokio::time::timeout(quiet_for, listener.accept()).await;
+            assert!(
+                extra.is_err(),
+                "a connection arrived after the {expected} scripted ones"
+            );
+            records
+        });
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        (IaClient::from_config(config).unwrap(), handle)
+    }
+
+    /// Write a 200 (no Range in the request) or a 206 from the requested
+    /// offset, promising `promised_total - offset` body bytes. Returns the
+    /// offset. `promised_total` may exceed the real length to make the
+    /// client see a chopped stream as an error.
+    async fn send_head(
+        stream: &mut tokio::net::TcpStream,
+        request: &str,
+        promised_total: u64,
+    ) -> u64 {
+        use tokio::io::AsyncWriteExt;
+        let offset = range_offset_of(request);
+        let head = match offset {
+            Some(offset) => format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 content-length: {}\r\n\
+                 content-range: bytes {offset}-{}/{promised_total}\r\n\
+                 content-type: application/octet-stream\r\n\
+                 connection: close\r\n\
+                 \r\n",
+                promised_total - offset,
+                promised_total - 1,
+            ),
+            None => format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-length: {promised_total}\r\n\
+                 content-type: application/octet-stream\r\n\
+                 accept-ranges: bytes\r\n\
+                 connection: close\r\n\
+                 \r\n"
+            ),
+        };
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        offset.unwrap_or(0)
+    }
+
+    async fn send_all(stream: &mut tokio::net::TcpStream, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let _ = stream.write_all(bytes).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Write `step` bytes every `every` until the client goes away or the
+    /// bytes run out. Returns how many bytes were written.
+    async fn drip(
+        stream: tokio::net::TcpStream,
+        bytes: &[u8],
+        step: usize,
+        every: Duration,
+    ) -> usize {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut rd, mut wr) = stream.into_split();
+        let mut sink = [0u8; 64];
+        let mut written = 0;
+        while written < bytes.len() {
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {
+                    let end = (written + step).min(bytes.len());
+                    if wr.write_all(&bytes[written..end]).await.is_err()
+                        || wr.flush().await.is_err()
+                    {
+                        break;
+                    }
+                    written = end;
+                }
+                closed = rd.read(&mut sink) => {
+                    if matches!(closed, Ok(0) | Err(_)) {
+                        break;
+                    }
+                }
+            }
+        }
+        written
+    }
+
+    /// Block until the client closes the connection or `max` passes.
+    async fn wait_for_close(stream: &mut tokio::net::TcpStream, max: Duration) {
+        use tokio::io::AsyncReadExt;
+        let mut sink = [0u8; 64];
+        let _ = tokio::time::timeout(max, stream.read(&mut sink)).await;
+    }
+
+    /// A connection that drips `body` one byte every `every` from the
+    /// requested offset: below any sane floor, so the client must abandon
+    /// it.
+    fn dripping(body: Vec<u8>, every: Duration) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset = send_head(&mut stream, &request, body.len() as u64).await as usize;
+                drip(stream, &body[offset..], 1, every).await;
+            })
+        })
+    }
+
+    /// A connection that serves the rest of `body` at once.
+    fn serving(body: Vec<u8>) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset = send_head(&mut stream, &request, body.len() as u64).await as usize;
+                send_all(&mut stream, &body[offset..]).await;
+            })
+        })
+    }
+
+    /// A connection that sends the head and nothing else until the client
+    /// hangs up (or `max` passes).
+    fn silent(total: u64, max: Duration) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                send_head(&mut stream, &request, total).await;
+                wait_for_close(&mut stream, max).await;
+            })
+        })
+    }
+
+    /// A connection that sends the head, waits `pause`, then serves the rest
+    /// of `body` at once.
+    fn pausing_then_serving(body: Vec<u8>, pause: Duration) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset = send_head(&mut stream, &request, body.len() as u64).await as usize;
+                tokio::time::sleep(pause).await;
+                send_all(&mut stream, &body[offset..]).await;
+            })
+        })
+    }
+
+    /// A connection that promises the rest of `body`, sends `chunk` bytes
+    /// of it, and closes: a body-stream error on the client.
+    fn chopping(body: Vec<u8>, chunk: usize) -> ConnHandler {
+        Box::new(move |mut stream, request| {
+            Box::pin(async move {
+                let offset = send_head(&mut stream, &request, body.len() as u64).await as usize;
+                let end = (offset + chunk).min(body.len());
+                send_all(&mut stream, &body[offset..end]).await;
+            })
+        })
+    }
+
+    fn stall_body() -> Vec<u8> {
+        (0..64 * 1024u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    const TEST_WINDOW: Duration = Duration::from_secs(2);
+    const TEST_GRACE: Duration = Duration::from_secs(1);
+    /// One byte this often is far below any floor.
+    const DRIP: Duration = Duration::from_millis(250);
+    const FLOOR: u64 = 10 * 1024;
+
+    fn shrink_policy() -> stall::PolicyOverride {
+        stall::PolicyOverride::new(TEST_WINDOW, TEST_GRACE)
+    }
+
+    fn stall_opts(min_speed: u64, retries: usize) -> DownloadOpts {
+        DownloadOpts {
+            min_speed,
+            retries,
+            ..Default::default()
+        }
+    }
+
+    /// Real time. A hung download fails the test instead of the suite.
+    const STALL_TEST_LIMIT: Duration = Duration::from_secs(60);
+
+    async fn run_download(
+        client: &IaClient,
+        file: &FileMetadata,
+        dir: &Path,
+        opts: &DownloadOpts,
+    ) -> Result<FileDownloadResult> {
+        tokio::time::timeout(
+            STALL_TEST_LIMIT,
+            download_file(client, "slow-item", file, dir, opts, None),
+        )
+        .await
+        .expect("download_file hung past the time limit")
+    }
+
+    #[tokio::test]
+    async fn drip_feed_stalls_then_resumes_with_range() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![dripping(body.clone(), DRIP), serving(body.clone())],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        let result = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert!(!dir.path().join("data.bin.part").exists());
+
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(records[0].range_offset(), None);
+        // The re-request resumed from the dripped bytes: a handful during
+        // the grace, give or take the byte in flight when the stream was
+        // abandoned. The final file proves no byte was lost or doubled.
+        let resumed_from = records[1]
+            .range_offset()
+            .expect("second request carried Range");
+        assert!(
+            (1..=12).contains(&resumed_from),
+            "resumed from {resumed_from}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_stream_stalls_at_the_end_of_grace() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![
+                silent(body.len() as u64, Duration::from_secs(30)),
+                serving(body.clone()),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        let result = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 2, "{records:#?}");
+        // No chunk ever arrived, so only the once-a-second check could have
+        // noticed. It fired at the end of the grace, far inside the
+        // transport's 60 s read timeout.
+        let held_for = records[0].finished_at - records[0].accepted_at;
+        assert!(
+            (TEST_GRACE..Duration::from_secs(10)).contains(&held_for),
+            "first connection held for {held_for:?}"
+        );
+        assert_eq!(records[1].range_offset(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn stall_budget_is_separate_from_stream_error_budget() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![
+                dripping(body.clone(), DRIP),
+                chopping(body.clone(), 1000),
+                serving(body.clone()),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        // One stall allowed. The stall uses it; the chopped stream that
+        // follows is a body-stream error on its own budget of three.
+        let result = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 1))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 3, "{records:#?}");
+        let second = records[1].range_offset().unwrap();
+        let third = records[2].range_offset().unwrap();
+        assert_eq!(third, second + 1000, "{records:#?}");
+    }
+
+    #[tokio::test]
+    async fn spent_stall_budget_fails_permanently() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![
+                dripping(body.clone(), DRIP),
+                dripping(body.clone(), DRIP),
+                dripping(body.clone(), DRIP),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        let result = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 2)).await;
+
+        let err = result.expect_err("every stream dripped");
+        match &err {
+            IaError::DownloadStalled {
+                file: name,
+                min_bytes_per_sec,
+                window_secs,
+                stalls,
+                observed_bytes_per_sec,
+            } => {
+                assert_eq!(name, "data.bin");
+                assert_eq!(*min_bytes_per_sec, FLOOR);
+                assert_eq!(*window_secs, TEST_WINDOW.as_secs());
+                assert_eq!(*stalls, 2);
+                assert!(*observed_bytes_per_sec < FLOOR);
+            }
+            other => panic!("expected DownloadStalled, got {other:?}"),
+        }
+        assert!(!err.is_retryable());
+        // Every dripped byte is on disk for a later resume.
+        let part = std::fs::read(dir.path().join("data.bin.part")).unwrap();
+        assert!(!part.is_empty());
+        assert_eq!(&body[..part.len()], &part[..]);
+        assert!(!dir.path().join("data.bin").exists());
+        let records = server.await.unwrap();
+        assert_eq!(records.len(), 3, "{records:#?}");
+    }
+
+    #[tokio::test]
+    async fn min_speed_zero_disables_detection() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![pausing_then_serving(
+                body.clone(),
+                Duration::from_millis(2500),
+            )],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        // 2.5 s of silence after the head is past the grace and the window,
+        // but with the check off only the 60 s read timeout could end the
+        // stream, and it does not get there.
+        let result = run_download(&client, &file, dir.path(), &stall_opts(0, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn grace_restarts_on_each_stream() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![
+                dripping(body.clone(), DRIP),
+                pausing_then_serving(body.clone(), Duration::from_millis(600)),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", body.len() as u64);
+
+        // The second stream is silent for 600 ms. Judged by the first
+        // stream's clock it would be well past the grace with nothing in the
+        // window; on its own clock it is still inside the grace when the
+        // body arrives.
+        let result = run_download(&client, &file, dir.path(), &stall_opts(FLOOR, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stall_keeps_rolling_md5_correct() {
+        let _policy = shrink_policy();
+        let body = stall_body();
+        let (client, server) = spawn_script_server(
+            vec![dripping(body.clone(), DRIP), serving(body.clone())],
+            Duration::ZERO,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
+        let opts = DownloadOpts {
+            checksum: true,
+            ..stall_opts(FLOOR, 5)
+        };
+
+        let result = run_download(&client, &file, dir.path(), &opts)
+            .await
+            .unwrap();
+
+        // The hasher saw the dripped bytes and then the resumed stream; a
+        // reset at the re-request would fail the compare.
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("data.bin")).unwrap(), body);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_file_is_not_retried_by_the_outer_loop() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+        let _policy = shrink_policy();
+        let body = stall_body();
+        // The outer loop's first retry delay is 2 s; a wrongful retry would
+        // connect again within the 3 s quiet period.
+        let (client, server) = spawn_script_server(
+            vec![dripping(body.clone(), DRIP), dripping(body.clone(), DRIP)],
+            Duration::from_secs(3),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("slow-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("data.bin", body.len() as u64)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            ..stall_opts(FLOOR, 1)
+        };
+
+        // retries = 1 is one stall re-request. The permanent error that
+        // follows must not earn the file a fresh attempt from the top,
+        // which would be two more dripping connections.
+        let result = tokio::time::timeout(
+            STALL_TEST_LIMIT,
+            download_item_with_metadata(
+                &client,
+                "slow-item",
+                &item,
+                &opts,
+                Arc::new(Semaphore::new(1)),
+                None,
+            ),
+        )
+        .await
+        .expect("download hung past the time limit")
+        .unwrap();
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        assert_eq!(result.files_downloaded, 0);
+        let failed = &result.results[0];
+        match &failed.status {
+            DownloadStatus::Failed(msg) => assert!(msg.contains("stalled 1 times"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(server.await.unwrap().len(), 2);
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org

@@ -413,6 +413,8 @@ pub async fn run(
         dry_run: args.dry_run,
         filter: filter.clone(),
         count_views: args.count_views,
+        // Replaced by --min-speed in the next commit.
+        min_speed: DownloadOpts::default().min_speed,
     };
 
     let opts = make_opts(base_destdir.clone());
