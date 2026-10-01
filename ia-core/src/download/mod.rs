@@ -814,9 +814,21 @@ pub async fn download_file(
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
 
     // Check for partial file (.part) for resume.
+    //
+    // A symlink .part goes first (#25). File::open follows links, so a
+    // planted link would otherwise lend its target's length to the Range
+    // request; the 206 tail would then land at offset 0 of a fresh .part,
+    // and a later run could resume that tail into a wrong file of the
+    // right length. Remove the link now, so no Range is ever shaped by it.
+    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
+    if let Ok(meta) = fs::symlink_metadata(&part_path).await {
+        if meta.file_type().is_symlink() {
+            warn!(file = %file.name, "removing symlink .part file before resume");
+            fs::remove_file(&part_path).await?;
+        }
+    }
     // Open first, then stat the fd — avoids TOCTOU race where the .part file
     // could be replaced with a symlink between exists() and metadata().
-    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
     let resume_from = match fs::File::open(&part_path).await {
         Ok(f) => {
             let meta = f.metadata().await?;
@@ -851,9 +863,10 @@ pub async fn download_file(
         // The .part is the whole file, but never finish it through a
         // symlink: renaming the link into place would leave a Complete
         // download pointing outside dest_dir and the mtime write would go
-        // through it. The resume check above followed the link, so this is
-        // the first look at the link itself. Remove it and restart from
-        // byte 0, as the symlink check on the streaming path does.
+        // through it. The check before the resume offset was read removes
+        // a link that was already there; this guards against one planted
+        // since. Remove it and restart from byte 0, as the symlink check
+        // on the streaming path does.
         if let Ok(meta) = fs::symlink_metadata(&part_path).await {
             if meta.file_type().is_symlink() {
                 warn!(file = %file.name, "removing symlink .part file");
@@ -902,8 +915,10 @@ pub async fn download_file(
     // Parse Last-Modified for mtime
     let last_modified = last_modified_of(&response);
 
-    // If .part exists and is a symlink, remove it before writing.
-    // Prevents writing through a symlink planted by an attacker.
+    // If .part is a symlink, remove it before writing. The check before
+    // the resume offset was read handles a link that was already there;
+    // this one guards against a link planted since, so no write ever goes
+    // through a symlink.
     if let Ok(meta) = fs::symlink_metadata(&part_path).await {
         if meta.file_type().is_symlink() {
             warn!(file = %file.name, "removing symlink .part file");
@@ -2518,32 +2533,32 @@ mod tests {
         );
     }
 
+    /// A symlink `.part` is removed before the resume offset is read (#25),
+    /// so no Range request is ever shaped by a planted link: the first
+    /// attempt sends a plain GET and completes with the right bytes. Before
+    /// the fix the link's target length went out as the Range offset, the
+    /// 206 tail landed at offset 0 of a fresh `.part`, and a second run
+    /// could resume that tail into a wrong file of the right length.
     #[cfg(unix)]
     #[tokio::test]
-    async fn part_file_symlink_works_with_206_response() {
-        // Regression test: when a .part symlink is detected and removed,
-        // resume_from must be reset to None. Otherwise, if the server
-        // returns 206 (keeping resume_from as Some), the append-mode open
-        // on the deleted path would fail with NotFound.
+    async fn part_file_symlink_is_removed_before_the_range_request() {
         use wiremock::matchers::header_exists;
 
         let mock_server = MockServer::start().await;
         let full_body = b"complete file data here";
 
-        // Return 206 Partial Content when Range header is present
+        // If a Range request still went out, this 206 would answer it and
+        // the download could not come out right.
         Mock::given(method("GET"))
             .and(path("/download/test-item/ranged.txt"))
             .and(header_exists("Range"))
             .respond_with(
                 ResponseTemplate::new(206)
                     .set_body_bytes(b"data here".to_vec())
-                    // 9 bytes at the tail of the 23-byte full body.
                     .insert_header("Content-Range", "bytes 14-22/23"),
             )
             .mount(&mock_server)
             .await;
-
-        // Fallback: return full content when no Range header
         Mock::given(method("GET"))
             .and(path("/download/test-item/ranged.txt"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(full_body.to_vec()))
@@ -2553,13 +2568,10 @@ mod tests {
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-
-        // Create a symlink .part file pointing to another location
         let target_file = target_dir.path().join("target.txt");
-        std::fs::write(&target_file, "original content").unwrap();
+        std::fs::write(&target_file, "original content").unwrap(); // 16 bytes
         let part_path = dir.path().join("ranged.txt.part");
         std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
-
         let file = test_file_meta("ranged.txt", full_body.len() as u64);
 
         let result = download_file(
@@ -2570,23 +2582,28 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        // The Range request was already sent before the symlink was noticed,
-        // so the 206 body (9 bytes) lands at offset 0 of a fresh .part. That
-        // is not the 23-byte file, and it must not be renamed into place.
-        assert!(
-            matches!(result, Err(IaError::DownloadSizeMismatch { .. })),
-            "got {result:?}"
-        );
-        assert!(!dir.path().join("ranged.txt").exists());
-
-        // The symlink target should NOT have been modified
-        let target_content = std::fs::read_to_string(&target_file).unwrap();
+        assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(
-            target_content, "original content",
-            "symlink target should not be modified even with 206 response"
+            std::fs::read(dir.path().join("ranged.txt")).unwrap(),
+            full_body
         );
+        let final_meta = std::fs::symlink_metadata(dir.path().join("ranged.txt")).unwrap();
+        assert!(!final_meta.file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "link removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_file).unwrap(),
+            "original content",
+            "symlink target must not be modified"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none(), "no Range sent");
     }
 
     #[tokio::test]
@@ -5214,17 +5231,25 @@ mod tests {
         assert!(!dir.path().join("disk.img").exists());
     }
 
-    /// A symlink `.part` whose target is longer than the file: the delete
-    /// arm removes the link, not the target.
+    /// A symlink `.part` whose target is longer than the file. Since #25 the
+    /// link is removed before the resume offset is read, so no Range goes
+    /// out at all: a plain GET completes the file and the target is never
+    /// touched.
     #[cfg(unix)]
     #[tokio::test]
-    async fn range_not_satisfiable_past_part_length_through_symlink_removes_only_the_link() {
+    async fn symlink_part_longer_than_the_file_is_removed_and_the_file_downloaded() {
         use wiremock::matchers::header_exists;
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/download/test-item/disk.img"))
             .and(header_exists("Range"))
             .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */32"))
+            .mount(&mock_server)
+            .await;
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
             .mount(&mock_server)
             .await;
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
@@ -5244,22 +5269,19 @@ mod tests {
             &DownloadOpts::default(),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
-        match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 40);
-            }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
-        }
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
         assert!(
             std::fs::symlink_metadata(&part_path).is_err(),
             "link removed"
         );
         assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 40]);
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none());
     }
 
     /// A `.part` that is a directory: not a regular file, so no Range is
@@ -6410,14 +6432,14 @@ mod tests {
         assert_eq!(requests.len(), 1, "{requests:#?}");
     }
 
-    /// A `.part` that is a symlink must never be finished in place, even
-    /// when its target has the agreed length and the server's 416 confirms
-    /// it: renaming the link into place would leave a `Complete` download
-    /// pointing outside the destination, and the mtime write would go
-    /// through the link. The link is removed and the download restarts.
+    /// A symlink `.part` whose target has the agreed length never reaches
+    /// the 416 shortcut: the link is removed before the resume offset is
+    /// read (#25), so a plain GET goes out and completes on the first
+    /// attempt. The 416 mock here would only answer a Range request.
     #[cfg(unix)]
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_through_symlink_part_restarts() {
+    async fn range_not_satisfiable_at_part_length_through_symlink_part_never_reaches_the_shortcut()
+    {
         use wiremock::matchers::header_exists;
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -6443,35 +6465,7 @@ mod tests {
         std::os::unix::fs::symlink(&target_file, &part_path).unwrap();
         let file = test_file_meta("disk.img", 32);
 
-        let first = download_file(
-            &client,
-            "test-item",
-            &file,
-            dir.path(),
-            &DownloadOpts::default(),
-            None,
-        )
-        .await;
-
-        let err = first.expect_err("a symlink .part must not be finished in place");
-        match &err {
-            IaError::ResumeFailed { reason, .. } => assert!(reason.contains("symlink"), "{reason}"),
-            other => panic!("expected ResumeFailed, got {other:?}"),
-        }
-        assert!(err.is_retryable(), "{err:?}");
-        assert!(!dir.path().join("disk.img").exists());
-        assert!(
-            std::fs::symlink_metadata(&part_path).is_err(),
-            "the symlink .part should have been removed"
-        );
-        // The target is untouched: same bytes, same mtime.
-        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
-        assert_eq!(
-            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
-            target_mtime
-        );
-
-        let second = download_file(
+        let result = download_file(
             &client,
             "test-item",
             &file,
@@ -6481,10 +6475,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(second.status, DownloadStatus::Complete);
+
+        assert_eq!(result.status, DownloadStatus::Complete);
         let final_meta = std::fs::symlink_metadata(dir.path().join("disk.img")).unwrap();
         assert!(!final_meta.file_type().is_symlink());
         assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
+        assert!(
+            std::fs::symlink_metadata(&part_path).is_err(),
+            "link removed"
+        );
+        // The target is untouched: same bytes, same mtime.
+        assert_eq!(std::fs::read(&target_file).unwrap(), vec![b'A'; 32]);
+        assert_eq!(
+            std::fs::metadata(&target_file).unwrap().modified().unwrap(),
+            target_mtime
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_none());
     }
 
     /// With no metadata size there is no third party to agree, so the
