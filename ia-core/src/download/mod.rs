@@ -717,7 +717,7 @@ pub async fn download_file(
             // Early exit for a grossly oversized body (10% over, min 1 KB)
             // so a runaway response cannot fill the disk. Any smaller
             // discrepancy is caught by the exact count check after the
-            // stream ends, which keeps .part instead of deleting it.
+            // stream ends.
             if let Some(expected) = file.size {
                 let max_allowed = expected + (expected / 10).max(1024);
                 if bytes_downloaded > max_allowed {
@@ -752,22 +752,45 @@ pub async fn download_file(
     drop(output);
 
     // The stream ended. Refuse to rename a file whose byte count differs
-    // from the item metadata. The .part file is deliberately kept: the error
-    // is retryable and the next attempt resumes it with Range. This runs
-    // before the md5 comparison because that path deletes .part.
+    // from the item metadata. This runs before the md5 comparison because
+    // that path deletes .part.
+    //
+    // Short: the .part file is deliberately kept. The error is retryable
+    // and the next attempt resumes it with Range.
+    //
+    // Long: the server sent more bytes than the metadata says the file has,
+    // so the two disagree about its length and retrying cannot reconcile
+    // them. A .part longer than the file is not a prefix of anything, and a
+    // Range request from its end could only draw a 416, so it is removed.
     if let Some(expected) = file.size {
-        if bytes_downloaded != expected && !is_size_unknowable(identifier, &file.name) {
-            warn!(
-                file = %file.name,
-                expected,
-                received = bytes_downloaded,
-                "byte count differs from item metadata; keeping .part for resume"
-            );
-            return Err(IaError::DownloadSizeMismatch {
-                file: file.name.clone(),
-                expected,
-                received: bytes_downloaded,
-            });
+        if !is_size_unknowable(identifier, &file.name) {
+            if bytes_downloaded > expected {
+                warn!(
+                    file = %file.name,
+                    expected,
+                    received = bytes_downloaded,
+                    "body ran past the item metadata size; deleting .part"
+                );
+                let _ = fs::remove_file(&part_path).await;
+                return Err(IaError::ServerSizeMismatch {
+                    file: file.name.clone(),
+                    metadata_size: expected,
+                    server_size: bytes_downloaded,
+                });
+            }
+            if bytes_downloaded < expected {
+                warn!(
+                    file = %file.name,
+                    expected,
+                    received = bytes_downloaded,
+                    "byte count differs from item metadata; keeping .part for resume"
+                );
+                return Err(IaError::DownloadSizeMismatch {
+                    file: file.name.clone(),
+                    expected,
+                    received: bytes_downloaded,
+                });
+            }
         }
     }
 
@@ -1827,11 +1850,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slightly_oversized_response_is_a_size_mismatch() {
+    async fn oversized_body_within_tolerance_is_permanent_and_deletes_part() {
         let mock_server = MockServer::start().await;
         // File metadata says 100 bytes. The mid-stream too-large abort only
         // fires past 100 + max(10, 1024) = 1124, so 105 bytes stream to the
-        // end; the exact count check then refuses to rename it into place.
+        // end. A .part longer than the file is not a prefix of anything, so
+        // the count check fails permanently and removes it.
         let body = vec![b'Y'; 105];
 
         Mock::given(method("GET"))
@@ -1855,18 +1879,115 @@ mod tests {
         .await;
 
         match result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
             }) => {
-                assert_eq!(expected, 100);
-                assert_eq!(received, 105);
+                assert_eq!(metadata_size, 100);
+                assert_eq!(server_size, 105);
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
         }
-        // Unlike the gross-oversize abort, the bytes are kept for inspection
-        // and resume; nothing is renamed into place.
-        assert!(dir.path().join("normal.txt.part").exists());
+        assert!(!dir.path().join("normal.txt.part").exists());
         assert!(!dir.path().join("normal.txt").exists());
+    }
+
+    /// The oversize rule also covers a resumed stream: the 206's
+    /// Content-Range total agrees with the metadata, but the body keeps
+    /// going past the end it declared.
+    #[tokio::test]
+    async fn oversized_resume_body_deletes_part() {
+        use wiremock::matchers::header_exists;
+        let mock_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("disk.img.part"), b"AAAAA").unwrap();
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .and(header_exists("Range"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(vec![b'B'; 27])
+                    .insert_header("Content-Range", "bytes 5-29/30"),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let file = test_file_meta("disk.img", 30);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 30);
+                assert_eq!(server_size, 32);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        assert!(!dir.path().join("disk.img.part").exists());
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    /// Through the outer retry loop an oversize body is tried exactly once:
+    /// the error is permanent, so no retry and no second request.
+    #[tokio::test]
+    async fn oversized_body_is_not_retried() {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/long-item/normal.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'Y'; 105]))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let item = ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single("long-item".to_string())),
+                ..Default::default()
+            },
+            files: vec![test_file_meta("normal.txt", 100)],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        };
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries: 2,
+            ..Default::default()
+        };
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let result =
+            download_item_with_metadata(&client, "long-item", &item, &opts, semaphore, None)
+                .await
+                .unwrap();
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        assert_eq!(result.files_downloaded, 0);
+        assert!(!dir.path().join("long-item/normal.txt.part").exists());
+        assert!(!dir.path().join("long-item/normal.txt").exists());
     }
 
     #[test]
