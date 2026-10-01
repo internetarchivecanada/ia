@@ -45,7 +45,8 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
 | `-C, --checksum` | Verify checksums (slower, reads every local file) |
-| `-R, --retries <N>` | Max retries per file (default: 5) |
+| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5) |
+| `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
 | `--count-views` | Increment archive.org's public view counter (off by default) |
@@ -64,6 +65,14 @@ If the server answers a `Range` request with a `Content-Range` total that differ
 If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree and the `.part` file is exactly that long, it already holds the whole file: nothing more is downloaded, the md5 is compared when `--checksum` is on, and the `.part` file is renamed into place. When the two agree but the `.part` file is longer, it is deleted and the file is reported as `download size mismatch`, which is retried from the beginning.
 
 Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final. The one exception is a 416 on a resume: with no metadata size to compare against, the server's length is taken as the file's, so the `.part` file is removed and the download restarts, even when the `.part` file is already that long.
+
+#### Slow and stalled downloads
+
+A connection that drops is resumed: the bytes already in the `.part` file stay, and the file is re-requested with a `Range` header from that offset. A connection that keeps sending bytes too slowly gets the same treatment. Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace. No byte is lost or fetched twice, and the md5 comparison made with `--checksum` still covers the whole file.
+
+The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
+
+Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
 
 #### Examples
 
@@ -88,6 +97,12 @@ ia download --itemlist items.txt
 
 # Preview what would be downloaded
 ia download nasa --dry-run
+
+# Give up on a stream averaging under 1 MiB/s and resume it with a Range request
+ia download nasa --min-speed 1M
+
+# Never abandon a slow stream (only the 60 s read timeout applies)
+ia download nasa --min-speed 0
 
 # List the contents of a ZIP archive without downloading it
 ia download myitem --zip-list myitem_jp2.zip

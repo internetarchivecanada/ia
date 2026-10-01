@@ -103,7 +103,8 @@ enum Commands {
     /// Create and manage collections
     #[command(visible_alias = "col")]
     Collection(commands::collection::CollectionArgs),
-    /// Download files from an item
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on DownloadArgs. Both live on the struct.
     #[command(visible_alias = "do")]
     Download(commands::download::DownloadArgs),
     /// List files in an item with filtering and formatting

@@ -1964,3 +1964,58 @@ fn jobs_non_numeric_rejected() {
         .failure()
         .stderr(predicate::str::contains("not a number"));
 }
+
+// -- --min-speed (#11) --
+
+#[test]
+fn download_help_describes_min_speed() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--min-speed <RATE>"))
+        // The rule, in numbers the user can act on.
+        .stdout(predicate::str::contains("10K"))
+        .stdout(predicate::str::contains("60 s"))
+        .stdout(predicate::str::contains("30 s"))
+        .stdout(predicate::str::contains("Range"))
+        .stdout(predicate::str::contains("--retries"))
+        .stdout(predicate::str::contains("0 disables"))
+        // Example in the Examples section.
+        .stdout(predicate::str::contains("--min-speed 0"));
+}
+
+#[test]
+fn download_short_help_mentions_min_speed() {
+    ia().args(["download", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--min-speed <RATE>"));
+}
+
+#[test]
+fn download_rejects_bad_min_speed() {
+    ia().args(["download", "test-item", "--min-speed", "10KB"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("--min-speed"))
+        .stderr(predicate::str::contains("10K"));
+}
+
+/// The struct-level `long_about` must reach `--help`. A doc comment on the
+/// `Commands::Download` variant used to replace it with the one-line about.
+#[test]
+fn download_long_help_shows_long_about() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Download files from the Internet Archive.",
+        ))
+        .stdout(predicate::str::contains("Each file streams to <name>.part"));
+    ia().args(["download", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Each file streams to").not())
+        .stdout(predicate::str::contains("Download files from an item"));
+}
