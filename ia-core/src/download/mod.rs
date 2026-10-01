@@ -1425,6 +1425,11 @@ pub async fn download_item_with_metadata(
 
             let prog_ref = progress.as_deref();
             let mut last_err = None;
+            // The wrong md5 the previous attempt produced, if it ended in a
+            // checksum mismatch (#14). The same wrong md5 twice in a row
+            // means the wire is fine and the source is wrong; downloading
+            // again cannot change that. Any other outcome forgets it.
+            let mut last_wrong_md5: Option<String> = None;
 
             for attempt in 0..=opts.retries {
                 if attempt > 0 {
@@ -1435,7 +1440,31 @@ pub async fn download_item_with_metadata(
 
                 match download_file(&client, &identifier, &file, &dest_dir, &opts, prog_ref).await {
                     Ok(result) => return result,
+                    Err(IaError::ChecksumMismatch {
+                        file: name,
+                        expected,
+                        actual,
+                        kept,
+                    }) if last_wrong_md5.as_deref() == Some(actual.as_str()) => {
+                        warn!(
+                            file = %file.name,
+                            expected = %expected,
+                            actual = %actual,
+                            "same wrong md5 twice in a row; the source is wrong, not the transfer"
+                        );
+                        last_err = Some(IaError::SourceChecksumMismatch {
+                            file: name,
+                            expected,
+                            actual,
+                            kept,
+                        });
+                        break;
+                    }
                     Err(e) => {
+                        last_wrong_md5 = match &e {
+                            IaError::ChecksumMismatch { actual, .. } => Some(actual.clone()),
+                            _ => None,
+                        };
                         if e.is_disk_full() {
                             warn!(file = %file.name, "disk full, aborting item");
                             disk_full.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5522,6 +5551,182 @@ mod tests {
         );
         assert!(!dir.path().join("data.bin").exists());
         server.await.unwrap();
+    }
+
+    // -- repeated wrong md5 stops the retries (#14) --
+
+    fn item_with(identifier: &str, file: FileMetadata) -> crate::types::ItemMetadata {
+        use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
+        ItemMetadata {
+            metadata: MetadataFields {
+                identifier: Some(MetadataValue::Single(identifier.to_string())),
+                ..Default::default()
+            },
+            files: vec![file],
+            server: None,
+            d1: None,
+            d2: None,
+            dir: None,
+            files_count: None,
+            item_size: None,
+            is_dark: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Serve `body` for the next `times` requests only. wiremock tries
+    /// mocks in mount order and skips one whose budget is spent, so a
+    /// sequence of these plays bodies in order.
+    async fn mount_times(mock_server: &MockServer, status: u16, body: &[u8], times: u64) {
+        Mock::given(method("GET"))
+            .and(path("/download/bad-item/disk.img"))
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(body.to_vec()))
+            .up_to_n_times(times)
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn download_bad_item(
+        mock_server: &MockServer,
+        dir: &Path,
+        md5: &str,
+        retries: usize,
+    ) -> ItemDownloadResult {
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let item = item_with("bad-item", test_file_meta_with_md5("disk.img", 16, md5));
+        let opts = DownloadOpts {
+            destdir: dir.to_path_buf(),
+            checksum: true,
+            retries,
+            ..Default::default()
+        };
+        download_item_with_metadata(
+            &client,
+            "bad-item",
+            &item,
+            &opts,
+            Arc::new(Semaphore::new(1)),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn failure_message(result: &ItemDownloadResult) -> String {
+        match &result.results[0].status {
+            DownloadStatus::Failed(msg) => msg.clone(),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The same bytes twice means the wire is fine and the source or its
+    /// metadata is wrong: stop after the second download, keep the copy.
+    #[tokio::test]
+    async fn same_wrong_md5_twice_stops_retrying() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 5).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(msg.contains("twice in a row"), "{msg}");
+        assert!(
+            msg.contains("source file or its metadata is likely wrong"),
+            "{msg}"
+        );
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert!(msg.contains(&kept.display().to_string()), "{msg}");
+        assert_eq!(std::fs::read(&kept).unwrap(), body_a);
+        assert!(!dir.path().join("bad-item").join("disk.img.part").exists());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// Different wrong bytes each time means the transfer is corrupting
+    /// data: keep retrying up to --retries, and keep the latest copy.
+    #[tokio::test]
+    async fn different_wrong_md5_keeps_retrying() {
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &[b'A'; 16], 1).await;
+        mount_times(&mock_server, 200, &[b'B'; 16], 1).await;
+        mount_times(&mock_server, 200, &[b'C'; 16], 1).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 2).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(!msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("checksum mismatch"), "{msg}");
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![b'C'; 16]);
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// A corrupt first transfer followed by a good one: the file completes
+    /// and the bad copy is removed.
+    #[tokio::test]
+    async fn different_wrong_md5_then_success_completes_and_removes_kept_copy() {
+        let good = vec![b'G'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &[b'A'; 16], 1).await;
+        mount_times(&mock_server, 200, &good, 1).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), &md5_hex(&good), 5).await;
+
+        assert_eq!(result.files_downloaded, 1, "{result:?}");
+        assert_eq!(result.files_failed, 0);
+        let item_dir = dir.path().join("bad-item");
+        assert_eq!(std::fs::read(item_dir.join("disk.img")).unwrap(), good);
+        assert!(!item_dir.join("disk.img.md5-mismatch").exists());
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// --retries 0: the first mismatch is final; the copy is kept.
+    #[tokio::test]
+    async fn retries_zero_keeps_the_mismatch_and_stops() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 0).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(!msg.contains("twice in a row"), "{msg}");
+        let kept = dir.path().join("bad-item").join("disk.img.md5-mismatch");
+        assert_eq!(std::fs::read(&kept).unwrap(), body_a);
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// "Twice in a row" means consecutive. A different error in between
+    /// (here a 500) forgets the first mismatch, so the next mismatch is a
+    /// first one again and the loop runs to --retries with the plain error.
+    #[tokio::test]
+    async fn a_different_error_between_mismatches_resets_the_repeat_check() {
+        let body_a = vec![b'A'; 16];
+        let mock_server = MockServer::start().await;
+        mount_times(&mock_server, 200, &body_a, 1).await;
+        mount_times(&mock_server, 500, b"boom", 1).await;
+        mount_times(&mock_server, 200, &body_a, 100).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = download_bad_item(&mock_server, dir.path(), WRONG_MD5, 2).await;
+
+        assert_eq!(result.files_failed, 1, "{result:?}");
+        let msg = failure_message(&result);
+        assert!(!msg.contains("twice in a row"), "{msg}");
+        assert!(msg.contains("checksum mismatch"), "{msg}");
+        // Attempts: A (mismatch), 500 (reset), A (a first mismatch again),
+        // then the budget of 2 retries is spent.
+        assert!(
+            mock_server.received_requests().await.unwrap().len() >= 3,
+            "the 500 is retried by the transport middleware too, so the count is a floor"
+        );
     }
 
     /// All download requests must send `cnt=0` to suppress the archive.org
