@@ -61,6 +61,8 @@ Each file streams to `<name>.part` and is renamed into place only when the numbe
 
 If the server answers a `Range` request with a `Content-Range` total that differs from the metadata size, nothing from that response is written and the file fails with `server reports N bytes for <name> but item metadata says M bytes`. Retrying cannot fix that, so the command moves on to the next file.
 
+If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree, the `.part` file is deleted and the file is reported as `download size mismatch`, which is retried from the beginning.
+
 Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final.
 
 #### Examples

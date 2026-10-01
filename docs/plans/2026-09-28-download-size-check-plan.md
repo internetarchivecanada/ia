@@ -136,7 +136,7 @@ Part of #12. PR #23 left two cases where a `.part` file can never be resumed yet
 
 **Engineering call, not a Jake decision:** the `total == metadata size` branch of (2). The literal decision would produce "server reports 32 bytes but item metadata says 32 bytes", which names no disagreement. Restarting from zero is the one outcome that is correct for every way a `.part` can reach the file's full length (a crash between the final flush and the rename, a `.part` written by an older version that accepted oversize bodies, or a file dropped there by something else).
 
-**Where the 416 is handled:** `fetch_response` turns every non-2xx into `IaError::Http` after consuming the body, which discards `Content-Range`. It now returns a 416 response unchanged when the caller sent a `Range` header (`resume_from.is_some()`); callers that pass `None` (`scandata`, `zip`) see no change. `download_file` passes each fetched response through `check_range_not_satisfiable` before `check_content_range`, on the initial request and on the mid-stream re-request alike.
+**Where the 416 is handled:** `fetch_response` turns every non-2xx into `IaError::Http` after consuming the body, which discards `Content-Range`. It now returns a 416 response unchanged when the caller sent a `Range` header (`resume_from.is_some()`); callers that pass `None` (`scandata`, `zip`) see no change. `download_file` checks each fetched response for a 416 before `check_content_range` and returns `range_not_satisfiable_error` for it, on the initial request and on the mid-stream re-request alike. The non-success tail of `fetch_response` moves into `http_error_from` so the 416 fallback can reuse it.
 
 ### Task A: Oversize body within tolerance
 
@@ -159,7 +159,7 @@ Part of #12. PR #23 left two cases where a `.part` file can never be resumed yet
   - `fetch_response_416_without_range_is_an_http_error`: `resume_from: None` → `Err(Http { status: 416, .. })` (the `scandata`/`zip` contract).
   - Raw-TCP `stream_retry_response_416_fails_permanently`: 32-byte promise chopped at 12, the Range re-request answered `416` with `content-range: bytes */12` → `ServerSizeMismatch { 32, 12 }`, `.part` holds the 12 bytes.
 - [ ] **Step 2: Run**; fail (today every case is `Http { status: 416 }`).
-- [ ] **Step 3: Implement** `check_range_not_satisfiable` and the `fetch_response` exception described above.
+- [ ] **Step 3: Implement** `range_not_satisfiable_error`, `http_error_from`, and the `fetch_response` exception described above.
 - [ ] **Step 4: `docs/usage.md`**: add the 416 paragraph after the `Content-Range` one.
 - [ ] **Step 5: Run**; green. Commit: `fix(download): map a 416 on a resume request to a size error instead of a dead end`.
 

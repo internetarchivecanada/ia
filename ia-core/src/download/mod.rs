@@ -288,7 +288,10 @@ fn check_content_range(
 /// - Manual redirect following with auth preservation (reqwest strips Authorization on redirect)
 /// - SSRF guard: only follows redirects to *.archive.org or the configured host
 /// - HTML error page stripping
-/// - Optional resume via Range header
+/// - Optional resume via Range header. A 416 answering that header is
+///   returned as a response, not an error, so the caller can read its
+///   `Content-Range` (see [`range_not_satisfiable_error`]); without a Range
+///   header a 416 is an [`IaError::Http`] like any other failure status
 /// - View-counter suppression via `cnt=0` (see `count_views`)
 ///
 /// When `count_views` is `false` (the default for every internal caller) the
@@ -391,25 +394,117 @@ pub(crate) async fn fetch_response(
     })?;
 
     let status = response.status();
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        let body = response.text().await.unwrap_or_default();
-        // IA often returns full HTML error pages (e.g. "Item not available").
-        // Strip HTML and use the canonical reason phrase instead.
-        let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
-            status
-                .canonical_reason()
-                .unwrap_or("unknown error")
-                .to_string()
-        } else {
-            body
-        };
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message,
-        });
+    // A 416 answers the Range header we sent: the resume offset is at or
+    // past the end of the server's copy. Its Content-Range names the
+    // server's length, which `download_file` needs, so it is returned to
+    // the caller instead of being collapsed into `IaError::Http` here.
+    // Callers that send no Range keep seeing a 416 as the plain HTTP error.
+    let range_not_satisfiable =
+        resume_from.is_some() && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+    if !status.is_success()
+        && status != reqwest::StatusCode::PARTIAL_CONTENT
+        && !range_not_satisfiable
+    {
+        return Err(http_error_from(response).await);
     }
 
     Ok(response)
+}
+
+/// Turn a non-success response into [`IaError::Http`], consuming the body
+/// for the message.
+///
+/// IA often returns full HTML error pages (e.g. "Item not available"); those
+/// are replaced by the status's canonical reason phrase.
+async fn http_error_from(response: reqwest::Response) -> IaError {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
+        status
+            .canonical_reason()
+            .unwrap_or("unknown error")
+            .to_string()
+    } else {
+        body
+    };
+    IaError::Http {
+        status: status.as_u16(),
+        message,
+    }
+}
+
+/// Map a 416 on a resume `Range` request to a size error.
+///
+/// The caller has already established that `response` is a 416 and that it
+/// answered a request for `bytes={offset}-`, where `offset` is the length of
+/// the `.part` file at `part_path`. The server is saying that offset is at
+/// or past the end of its copy of the file, and its
+/// `Content-Range: bytes */total` names that copy's length. Resuming from
+/// this `.part` can never succeed, so:
+///
+/// - `total` differs from the metadata size: [`IaError::ServerSizeMismatch`].
+///   The two disagree and retrying cannot reconcile them. The `.part` is
+///   left alone, as [`check_content_range`] leaves it on a 206.
+/// - `total` equals the metadata size, or the size is unknown or exempt
+///   (see [`is_size_unknowable`]): the `.part` already holds at least the
+///   whole file. It is removed and the retryable
+///   [`IaError::DownloadSizeMismatch`] is returned so the next attempt starts
+///   from byte 0.
+/// - no parseable total: the plain [`IaError::Http`] a 416 always was.
+///
+/// The caller must close any writer on `part_path` before calling this.
+async fn range_not_satisfiable_error(
+    response: reqwest::Response,
+    identifier: &str,
+    file: &FileMetadata,
+    offset: u64,
+    part_path: &Path,
+) -> IaError {
+    debug_assert_eq!(
+        response.status(),
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    let server_size = response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total);
+    let Some(server_size) = server_size else {
+        return http_error_from(response).await;
+    };
+    let metadata_size = file
+        .size
+        .filter(|_| !is_size_unknowable(identifier, &file.name));
+    match metadata_size {
+        Some(metadata_size) if metadata_size != server_size => {
+            warn!(
+                file = %file.name,
+                metadata_size,
+                server_size,
+                offset,
+                "416 on resume: server length differs from item metadata; keeping .part"
+            );
+            IaError::ServerSizeMismatch {
+                file: file.name.clone(),
+                metadata_size,
+                server_size,
+            }
+        }
+        _ => {
+            warn!(
+                file = %file.name,
+                server_size,
+                offset,
+                "416 on resume: .part is already at or past the file's length; deleting it"
+            );
+            let _ = fs::remove_file(part_path).await;
+            IaError::DownloadSizeMismatch {
+                file: file.name.clone(),
+                expected: server_size,
+                received: offset,
+            }
+        }
+    }
 }
 
 /// Download a single file from an item.
@@ -547,6 +642,16 @@ pub async fn download_file(
     }
 
     let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
+    if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        return Err(range_not_satisfiable_error(
+            response,
+            identifier,
+            file,
+            resume_from.unwrap_or(0),
+            &part_path,
+        )
+        .await);
+    }
     check_content_range(&response, identifier, file)?;
     let status = response.status();
 
@@ -688,6 +793,19 @@ pub async fn download_file(
                         let new_resp =
                             fetch_response(client, &url, Some(bytes_downloaded), opts.count_views)
                                 .await?;
+                        if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                            // Close the writer first: the mapping may
+                            // remove .part.
+                            drop(output);
+                            return Err(range_not_satisfiable_error(
+                                new_resp,
+                                identifier,
+                                file,
+                                bytes_downloaded,
+                                &part_path,
+                            )
+                            .await);
+                        }
                         check_content_range(&new_resp, identifier, file)?;
                         // If the server ignores Range and returns 200, the
                         // safe thing is to surface the original error rather
@@ -3069,6 +3187,121 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    /// The 416 mapping must also cover the Range re-request that the
+    /// body-stream retry sends. The server here shrinks the file between
+    /// the two requests: it promised 32 bytes, dropped after 12, and then
+    /// answers the `Range: bytes=12-` re-request with 416 `bytes */12`.
+    #[tokio::test]
+    async fn stream_retry_response_416_fails_permanently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let full_body: Vec<u8> = (0..32u8).collect();
+        let full_len = full_body.len() as u64;
+        let chopped_at: u64 = 12;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_body = full_body.clone();
+
+        let server_handle = tokio::spawn(async move {
+            async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+                let mut buf = vec![0u8; 4096];
+                let mut acc = Vec::new();
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                String::from_utf8_lossy(&acc).to_string()
+            }
+
+            // Accept 1: promise 32 bytes, send 12, close.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_request(&mut stream).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-length: {full_len}\r\n\
+                     content-type: application/octet-stream\r\n\
+                     accept-ranges: bytes\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream
+                    .write_all(&server_body[..chopped_at as usize])
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                drop(stream);
+            }
+
+            // Accept 2: the Range re-request. Answer 416 and say the file is
+            // only 12 bytes long.
+            {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let req = read_request(&mut stream).await;
+                assert!(
+                    req.to_ascii_lowercase()
+                        .contains(&format!("range: bytes={chopped_at}-")),
+                    "expected Range header on retry, got:\n{req}"
+                );
+                let headers = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n\
+                     content-length: 0\r\n\
+                     content-range: bytes */{chopped_at}\r\n\
+                     connection: close\r\n\
+                     \r\n"
+                );
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("data.bin", full_len);
+
+        let result = download_file(
+            &client,
+            "flaky-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 32);
+                assert_eq!(server_size, 12);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        // The 12 bytes from the first response were flushed before the
+        // re-request and stay on disk.
+        let part = std::fs::read(dir.path().join("data.bin.part")).unwrap();
+        assert_eq!(part, &full_body[..chopped_at as usize]);
+        assert!(!dir.path().join("data.bin").exists());
+
+        server_handle.await.unwrap();
+    }
+
     /// All download requests must send `cnt=0` to suppress the archive.org
     /// view-counter. Verified by gating the wiremock response on the
     /// `query_param("cnt", "0")` matcher — if the param is missing the
@@ -3355,6 +3588,208 @@ mod tests {
             .mount(mock_server)
             .await;
         full
+    }
+
+    // -- 416 on a resume Range request (#12 follow-up) --
+
+    /// Put a `.part` of `part_len` bytes on disk and answer the Range
+    /// request that follows with 416, carrying `content_range` if given.
+    async fn mount_resume_416(
+        mock_server: &MockServer,
+        name: &str,
+        part_len: usize,
+        content_range: Option<&str>,
+    ) -> (IaClient, tempfile::TempDir) {
+        use wiremock::matchers::header_exists;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(format!("{name}.part")),
+            vec![b'A'; part_len],
+        )
+        .unwrap();
+        let mut template = ResponseTemplate::new(416);
+        if let Some(content_range) = content_range {
+            template = template.insert_header("Content-Range", content_range);
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/download/test-item/{name}")))
+            .and(header_exists("Range"))
+            .respond_with(template)
+            .mount(mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        (client, dir)
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_with_different_total_fails_permanently() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 40, Some("bytes */30")).await;
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::ServerSizeMismatch {
+                metadata_size,
+                server_size,
+                ..
+            }) => {
+                assert_eq!(metadata_size, 32);
+                assert_eq!(server_size, 30);
+            }
+            other => panic!("expected ServerSizeMismatch, got {other:?}"),
+        }
+        // Server and metadata disagree; nothing is written and the .part is
+        // left alone, as with the Content-Range check on a 206.
+        let part = std::fs::read(dir.path().join("disk.img.part")).unwrap();
+        assert_eq!(part.len(), 40);
+        assert!(!dir.path().join("disk.img").exists());
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_at_metadata_total_deletes_part_and_restarts() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 40, Some("bytes */32")).await;
+        // A plain GET (no Range) gets the whole file.
+        let full = vec![b'F'; 32];
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(full.clone()))
+            .mount(&mock_server)
+            .await;
+        let file = test_file_meta("disk.img", 32);
+
+        let first = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        // The .part already holds at least the whole file. It is removed and
+        // the error is retryable so the next attempt starts from byte 0.
+        match &first {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(*expected, 32);
+                assert_eq!(*received, 40);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(first.unwrap_err().is_retryable());
+        assert!(!dir.path().join("disk.img.part").exists());
+        assert!(!dir.path().join("disk.img").exists());
+
+        let second = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("disk.img")).unwrap(), full);
+
+        // Exactly two requests: the Range request that drew the 416 and the
+        // plain GET that followed.
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{requests:#?}");
+        assert!(requests[0].headers.get("range").is_some());
+        assert!(requests[1].headers.get("range").is_none());
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_on_files_xml_deletes_part() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "test-item_files.xml", 40, Some("bytes */30")).await;
+        // Metadata size is wrong by construction for _files.xml, so the
+        // server's total is the only length that counts.
+        let file = test_file_meta("test-item_files.xml", 100);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        match result {
+            Err(IaError::DownloadSizeMismatch {
+                expected, received, ..
+            }) => {
+                assert_eq!(expected, 30);
+                assert_eq!(received, 40);
+            }
+            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+        }
+        assert!(!dir.path().join("test-item_files.xml.part").exists());
+    }
+
+    #[tokio::test]
+    async fn range_not_satisfiable_without_content_range_is_an_http_error() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_resume_416(&mock_server, "disk.img", 40, None).await;
+        let file = test_file_meta("disk.img", 32);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+
+        // Without a total there is nothing to compare; today's behavior.
+        assert!(
+            matches!(result, Err(IaError::Http { status: 416, .. })),
+            "got {result:?}"
+        );
+        assert!(dir.path().join("disk.img.part").exists());
+    }
+
+    /// Callers that send no Range header (scandata, zip listing) must keep
+    /// seeing a 416 as the plain HTTP error it always was.
+    #[tokio::test]
+    async fn fetch_response_416_without_range_is_an_http_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/disk.img"))
+            .respond_with(ResponseTemplate::new(416).insert_header("Content-Range", "bytes */30"))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let url = client.url("/download/test-item/disk.img");
+
+        let result = fetch_response(&client, &url, None, false).await;
+
+        assert!(
+            matches!(result, Err(IaError::Http { status: 416, .. })),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]

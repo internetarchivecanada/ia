@@ -98,10 +98,10 @@ pub enum IaError {
     },
 
     /// The server and the item's metadata disagree about the file's length:
-    /// a 206 response's `Content-Range` total differs from the metadata
-    /// size, or the body ran past it. Retrying cannot reconcile the two, so
-    /// this is permanent. On the `Content-Range` case nothing is written; on
-    /// the long-body case the oversize `.part` file is removed.
+    /// a 206 or 416 response's `Content-Range` total differs from the
+    /// metadata size, or the body ran past it. Retrying cannot reconcile the
+    /// two, so this is permanent. On the `Content-Range` cases nothing is
+    /// written; on the long-body case the oversize `.part` file is removed.
     #[error("server reports {server_size} bytes for {file} but item metadata says {metadata_size} bytes")]
     ServerSizeMismatch {
         file: String,
