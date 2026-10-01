@@ -601,10 +601,17 @@ async fn seed_hasher_from_part(
     Ok(h)
 }
 
+/// Where a download that failed its md5 check is kept: beside the file, as
+/// `<name>.md5-mismatch`. Nothing resumes from or skips on this name.
+fn mismatch_path(file_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.md5-mismatch", file_path.display()))
+}
+
 /// Turn a `.part` whose byte count already matches the item metadata into
-/// the finished file: compare the md5 when `hasher` is present (deleting the
-/// `.part` on a mismatch), rename it into place, set its mtime, and report
-/// completion.
+/// the finished file: compare the md5 when `hasher` is present (keeping the
+/// bytes as `<name>.md5-mismatch` on a mismatch, see [`mismatch_path`]),
+/// rename it into place, remove an earlier `.md5-mismatch` once the file is
+/// verified, set its mtime, and report completion.
 ///
 /// Shared by the normal end of a stream and by the 416 shortcut in
 /// [`range_not_satisfiable`], so both finish a file the same way.
@@ -636,14 +643,32 @@ async fn finish_part(
 
             use md5::Digest;
             let actual_md5 = format!("{:x}", hasher.finalize());
+            let kept = mismatch_path(file_path);
             if &actual_md5 != expected_md5 {
-                // Delete the bad file
-                let _ = fs::remove_file(part_path).await;
+                // Keep the bytes under a name nothing resumes from, so the
+                // copy can be compared against the source or a second
+                // download. The rename replaces an earlier bad copy, or a
+                // planted symlink at that path, without following it.
+                warn!(
+                    file = %file.name,
+                    expected = %expected_md5,
+                    actual = %actual_md5,
+                    kept = %kept.display(),
+                    "md5 mismatch; keeping the download for inspection"
+                );
+                fs::rename(part_path, &kept).await?;
                 return Err(IaError::ChecksumMismatch {
                     file: file.name.clone(),
                     expected: expected_md5.clone(),
                     actual: actual_md5,
+                    kept: kept.display().to_string(),
                 });
+            }
+            // Verified. An earlier bad copy has told its story; a good file
+            // now exists, so the copy goes.
+            if fs::symlink_metadata(&kept).await.is_ok() {
+                fs::remove_file(&kept).await?;
+                info!(file = %file.name, kept = %kept.display(), "removed the earlier md5-mismatch copy");
             }
         }
     }
@@ -3093,34 +3118,179 @@ mod tests {
         assert!(!dir.path().join("a.txt.part").exists());
     }
 
-    #[tokio::test]
-    async fn checksum_inline_hash_detects_mismatch_and_removes_part() {
-        let body = b"correct content".to_vec();
-        let wrong_md5 = "00000000000000000000000000000000"; // not the real md5
-
-        let mock_server = MockServer::start().await;
+    /// Serve `body` for `b.txt` and return a client plus a temp dir.
+    async fn mount_body(mock_server: &MockServer, body: &[u8]) -> (IaClient, tempfile::TempDir) {
         Mock::given(method("GET"))
             .and(path("/download/test-item/b.txt"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-            .mount(&mock_server)
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(mock_server)
             .await;
-
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let file = test_file_meta_with_md5("b.txt", body.len() as u64, wrong_md5);
+        (client, tempfile::tempdir().unwrap())
+    }
 
-        let opts = DownloadOpts {
+    const WRONG_MD5: &str = "00000000000000000000000000000000";
+
+    fn checksum_opts() -> DownloadOpts {
+        DownloadOpts {
             checksum: true,
             ..Default::default()
-        };
-        let err = download_file(&client, "test-item", &file, dir.path(), &opts, None)
-            .await
-            .unwrap_err();
+        }
+    }
 
-        assert!(matches!(err, IaError::ChecksumMismatch { .. }));
-        // Bad .part must be deleted, final file must not exist.
+    /// A failed md5 check keeps the bytes as `<name>.md5-mismatch` and the
+    /// error names that path (#14). Nothing is left as `.part`, so the
+    /// next attempt starts from byte 0.
+    #[tokio::test]
+    async fn checksum_mismatch_keeps_the_download_as_md5_mismatch() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        match &err {
+            IaError::ChecksumMismatch {
+                expected,
+                actual,
+                kept,
+                ..
+            } => {
+                assert_eq!(expected, WRONG_MD5);
+                assert_eq!(actual, &md5_hex(&body));
+                assert_eq!(kept, &kept_path.display().to_string());
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        assert!(err.is_retryable());
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
         assert!(!dir.path().join("b.txt").exists());
         assert!(!dir.path().join("b.txt.part").exists());
+    }
+
+    /// Only one bad copy is kept per file: a new mismatch replaces it.
+    #[tokio::test]
+    async fn checksum_mismatch_overwrites_an_earlier_kept_copy() {
+        let body = b"second bad copy".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"first bad copy, longer than the second").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
+    }
+
+    /// Once a later attempt verifies, the bad copy has served its purpose
+    /// and is removed.
+    #[tokio::test]
+    async fn verified_download_removes_an_earlier_kept_copy() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"an earlier bad copy").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, &md5_hex(&body));
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert!(!kept_path.exists(), "the earlier bad copy should be gone");
+    }
+
+    /// A completion without --checksum does not touch an existing bad
+    /// copy: nothing was verified, so there is no reason to drop evidence.
+    #[tokio::test]
+    async fn unverified_download_leaves_an_earlier_kept_copy() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::fs::write(&kept_path, b"an earlier bad copy").unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(&kept_path).unwrap(), b"an earlier bad copy");
+    }
+
+    /// A planted symlink at the kept path is replaced by the rename, never
+    /// written through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checksum_mismatch_through_a_symlinked_kept_path_replaces_the_link() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("target.bin");
+        std::fs::write(&target, b"untouchable").unwrap();
+        let kept_path = dir.path().join("b.txt.md5-mismatch");
+        std::os::unix::fs::symlink(&target, &kept_path).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &checksum_opts(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+        let meta = std::fs::symlink_metadata(&kept_path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "kept path is now a regular file"
+        );
+        assert_eq!(std::fs::read(&kept_path).unwrap(), body);
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouchable");
     }
 
     #[tokio::test]
@@ -6005,7 +6175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_deletes_part() {
+    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_keeps_md5_mismatch() {
         let mock_server = MockServer::start().await;
         let (client, dir) =
             mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
@@ -6018,13 +6188,18 @@ mod tests {
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
 
         // The .part has the right length but the wrong bytes. The md5
-        // compare catches it exactly as it would after a stream.
+        // compare catches it exactly as it would after a stream, and keeps
+        // the bytes as .md5-mismatch (#14).
         assert!(
             matches!(result, Err(IaError::ChecksumMismatch { .. })),
             "got {result:?}"
         );
         assert!(!dir.path().join("disk.img.part").exists());
         assert!(!dir.path().join("disk.img").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img.md5-mismatch")).unwrap(),
+            vec![b'A'; 32]
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "{requests:#?}");
