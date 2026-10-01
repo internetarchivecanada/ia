@@ -1689,13 +1689,19 @@ async fn upload_500_retry_after_zero_retries_at_once() {
 }
 
 /// The header's HTTP-date form is honored like the seconds form.
+///
+/// The date has one-second granularity and is measured against the clock
+/// when the 503 is read, so it is computed right before the request with
+/// 3 s of headroom: the wait is then at least 1 s as long as the request
+/// takes under a second to reach the mock, which a loaded CI runner can
+/// otherwise exceed when the date is fixed before the server is mounted.
 #[tokio::test]
 async fn upload_503_retry_after_http_date_is_honored() {
     let server = MockServer::start().await;
-    let when = std::time::SystemTime::now() + Duration::from_secs(2);
-    mount_503_then_200(&server, &httpdate::fmt_http_date(when)).await;
     let f = temp_file(b"data");
     let client = test_client(&server);
+    let when = std::time::SystemTime::now() + Duration::from_secs(3);
+    mount_503_then_200(&server, &httpdate::fmt_http_date(when)).await;
 
     let started = Instant::now();
     let result = upload::upload_file(
@@ -1713,8 +1719,6 @@ async fn upload_503_retry_after_http_date_is_honored() {
     .unwrap();
     assert!(matches!(result.status, UploadStatus::Uploaded));
     assert_eq!(result.retries, 1);
-    // The date has one-second granularity, so a date 2 s ahead yields a
-    // wait of 1 s or 2 s.
     assert!(
         started.elapsed() >= Duration::from_secs(1),
         "HTTP-date Retry-After was not waited for ({:?})",
