@@ -37,7 +37,9 @@ use crate::output::DownloadDisplay;
         on disk. So is a stream that stays below --min-speed (default 10K: 10 KiB/s averaged \
         over the last 60 s, after a 30 s grace at the start of each stream); each such stall \
         spends one of the file's --retries, and when they are gone the file fails and keeps \
-        its .part for a later run.",
+        its .part for a later run. With --checksum, a download whose md5 does not match is \
+        kept as <name>.md5-mismatch and downloaded again; the same wrong md5 twice means the \
+        source is wrong and the file fails.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -94,7 +96,20 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_directories: bool,
 
-    /// Verify checksums (slower, reads every local file)
+    /// Verify md5 checksums (slower, reads every local file)
+    ///
+    /// Before downloading, a local file whose md5 matches the item metadata
+    /// is skipped. While downloading, the md5 is computed from the stream
+    /// and compared when the stream ends. On a mismatch the bytes are kept
+    /// beside the file as <name>.md5-mismatch and the error names that
+    /// path, so a corrupt transfer can be told from a bad source file or
+    /// wrong metadata; nothing is left as .part, and the file is downloaded
+    /// again from byte 0. If the second download has the same wrong md5,
+    /// the source file or its metadata is wrong and the file fails for good
+    /// with "checksum mismatch ... twice in a row". A different wrong md5
+    /// means the transfer is corrupting data and retrying continues up to
+    /// --retries. Only one .md5-mismatch copy is kept per file, and it is
+    /// deleted once a later attempt verifies.
     #[arg(short = 'C', long)]
     checksum: bool,
 
