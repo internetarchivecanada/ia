@@ -105,7 +105,7 @@ fn build_skip_set(
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
-         \n  <bold>$ ia upload cleanup my-item big.iso</bold>\n"
+         \n  <bold>$ ia upload cleanup my-item big.iso --abort</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -210,7 +210,7 @@ pub struct UploadArgs {
     /// that fails for good (IA refuses it, or its --retries run out) does
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is
@@ -349,7 +349,7 @@ pub struct ImportArgs {
     /// that fails for good (IA refuses it, or its --retries run out) does
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is

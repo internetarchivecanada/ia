@@ -28,9 +28,9 @@
 
 **Files:** `ia-core/src/upload/multipart.rs` (+ unit tests), `ia-cli/src/commands/upload.rs` help, `docs/usage.md`, `docs/plans/2026-10-02-upload-part-failure-plan.md` (dated note)
 
-- [ ] **Step 1: Failing tests.** `KeptUpload::describe` tests end with `ia upload cleanup item f.bin --abort`; the not-resuming warning likewise; the CLI help test for the kept-upload example asserts `--abort`.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `docs(upload): the way to discard a kept multipart upload is cleanup --abort`.
+- [x] **Step 1: Failing tests.** `KeptUpload::describe` tests end with `ia upload cleanup item f.bin --abort`; the CLI help test for the kept-upload example asserts `--abort` (the not-resuming warning has no log capture; its text changed alongside).
+- [x] **Step 2: Run**; two `describe` tests and the help test failed on the missing `--abort`.
+- [x] **Step 3: Implement.** The message, the warning, both `--multipart` doc comments, the help example, the three usage.md quotes, the cleanup section's table and examples, and a dated note in the #18 plan. Commit: `docs(upload): the way to discard a kept multipart upload is cleanup --abort`.
 
 ### Task 3: verification and review
 

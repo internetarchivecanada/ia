@@ -52,3 +52,5 @@ Noted, no change: `abort_upload_with_ctx` stays reachable through the public `ab
 ### Task 3: verification and review
 
 - [ ] `just ci`; code-reviewer pass (default model); fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-part-failure` only after a confirmed merge.
+
+> **2026-10-02 (#24):** the discard command named in the message, usage.md and the help examples is now `ia upload cleanup <item> <key> --abort`; a bare `cleanup ITEM FILE` lists. See `docs/plans/2026-10-02-upload-cleanup-safety-plan.md`.

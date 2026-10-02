@@ -2112,7 +2112,10 @@ fn upload_help_describes_kept_multipart_upload_on_part_failure() {
         .assert()
         .success()
         .stdout(predicate::str::contains("names its upload ID"))
-        .stdout(predicate::str::contains("ia upload cleanup"))
+        .stdout(predicate::str::contains(
+            "ia upload cleanup my-item big.iso --abort",
+        ))
+        .stdout(predicate::str::contains("ITEM FILE --abort"))
         .stdout(predicate::str::contains("resumes from the parts"));
 }
 

@@ -576,7 +576,7 @@ ia upload my-item big.iso --multipart --retries 20
 
 #### Resuming a multipart upload
 
-Before sending any part, `--multipart` asks IA for unfinished multipart uploads of the same file name in the item and checks each part IA already holds against the local file: the part number must fall within the file's parts at the current part size (100 MiB), the part's size on IA must equal the local range's size, and its ETag must equal the md5 of the local range. The md5s come from one read of the local file. Every part passes → those parts are skipped and the rest are sent under the same upload ID. Any part fails (the local file changed, the part size changed, a different file has the same name) → a fresh upload starts and the stale one is left on IA, named in a warning: `not resuming multipart upload <id>: part 1 has ETag <etag> on IA but the local range's md5 differs; it is left on IA, discard it with: ia upload cleanup <item> <file>`. With several unfinished uploads for the name, the newest one that passes is resumed. A listing without a part size is checked by md5 alone.
+Before sending any part, `--multipart` asks IA for unfinished multipart uploads of the same file name in the item and checks each part IA already holds against the local file: the part number must fall within the file's parts at the current part size (100 MiB), the part's size on IA must equal the local range's size, and its ETag must equal the md5 of the local range. The md5s come from one read of the local file. Every part passes → those parts are skipped and the rest are sent under the same upload ID. Any part fails (the local file changed, the part size changed, a different file has the same name) → a fresh upload starts and the stale one is left on IA, named in a warning: `not resuming multipart upload <id>: part 1 has ETag <etag> on IA but the local range's md5 differs; it is left on IA, discard it with: ia upload cleanup <item> <file> --abort`. With several unfinished uploads for the name, the newest one that passes is resumed. A listing without a part size is checked by md5 alone.
 
 #### Verifying a multipart upload
 
@@ -584,13 +584,13 @@ The skip check applies to `--multipart` as to a single PUT: the one read that gi
 
 #### Multipart part failures
 
-With `--multipart`, a part that fails for good does not abort the upload, because an abort tells IA to delete every part already uploaded. The upload stays on IA, and the file fails with a message that names it. When IA refused the part (`AccessDenied`, `InvalidAccessKeyId`, `BadDigest`, any non-retryable S3 code): `part 3 of 7 refused by IA (AccessDenied: Access Denied): multipart upload <id> is kept with 2 parts on IA; fix the cause and rerun the same command to resume, or discard it with: ia upload cleanup <item> <file>`. When the part's `--retries` ran out: `part 3 of 7 failed after 11 attempts (SlowDown: ...): multipart upload <id> is kept with 2 parts on IA; rerun the same command to resume, or discard it with: ia upload cleanup <item> <file>`. When part 1 fails on a fresh upload the message says the upload `is kept on IA with no parts yet`. A remote name with spaces or quote characters is single-quoted in the suggested command. IA's spam rejection on a part is not a part failure: it stops the whole item, as it does for a single PUT. In `--json` output and the joblog this text is the failure message. Rerunning the same command finds the upload, skips the parts IA already holds, and sends the rest. Killing the process mid-upload has always behaved this way; the two paths now match.
+With `--multipart`, a part that fails for good does not abort the upload, because an abort tells IA to delete every part already uploaded. The upload stays on IA, and the file fails with a message that names it. When IA refused the part (`AccessDenied`, `InvalidAccessKeyId`, `BadDigest`, any non-retryable S3 code): `part 3 of 7 refused by IA (AccessDenied: Access Denied): multipart upload <id> is kept with 2 parts on IA; fix the cause and rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When the part's `--retries` ran out: `part 3 of 7 failed after 11 attempts (SlowDown: ...): multipart upload <id> is kept with 2 parts on IA; rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When part 1 fails on a fresh upload the message says the upload `is kept on IA with no parts yet`. A remote name with spaces or quote characters is single-quoted in the suggested command. IA's spam rejection on a part is not a part failure: it stops the whole item, as it does for a single PUT. In `--json` output and the joblog this text is the failure message. Rerunning the same command finds the upload, skips the parts IA already holds, and sends the rest. Killing the process mid-upload has always behaved this way; the two paths now match.
 
 ```bash
 # After a part failure: rerun to resume from the parts already on IA ...
 ia upload my-item big.iso --multipart
 # ... or discard the kept upload
-ia upload cleanup my-item big.iso
+ia upload cleanup my-item big.iso --abort
 ```
 
 #### Batch mode and subcommands
@@ -613,14 +613,16 @@ Supports the same options as the bare command: `-m`, `--header`, `--checksums`, 
 | `--identifier-from-dirname` | Generate identifiers from parent directory names |
 | `--json` | Output template as JSONL |
 
-**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item.
+**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item. Lists by default, with or without FILE: each unfinished upload with its upload ID, when it started, and the parts IA holds (count and bytes). Nothing is aborted unless asked, and there is no interactive prompt. An abort tells IA to delete every part already uploaded; a rerun of the upload resumes from those parts instead, so abort only what you mean to discard.
 
 | Flag | Description |
 |------|-------------|
 | `<IDENTIFIER>` | Item identifier |
-| `[FILE]` | Specific file to clean up |
-| `--abort-all` | Abort all incomplete uploads without confirmation |
-| `--json` | Output as JSON |
+| `[FILE]` | Only this file's incomplete uploads (lists them; add `--abort` to abort) |
+| `--abort` | Abort FILE's incomplete upload(s); requires FILE |
+| `--abort-all` | Abort every incomplete upload of the item |
+| `--dry-run` | Show what `--abort` or `--abort-all` would abort; abort nothing |
+| `--json` | Output as JSON: a listing is one array (`key`, `upload_id`, `initiated`, `parts`, `bytes`); each abort is one object per line with `"action": "aborted"` or `"would_abort"` |
 
 #### Examples
 
@@ -648,8 +650,9 @@ ia upload template ./files/ -o template.csv
 # ... edit template.csv to add metadata columns ...
 ia upload --spreadsheet template.csv
 
-# Abort stale multipart uploads
+# List stale multipart uploads, then abort one of them
 ia upload cleanup my-item
+ia upload cleanup my-item file.zip --abort
 
 # Dry run — validate without uploading
 ia upload my-item file.pdf --dry-run
