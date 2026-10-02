@@ -58,3 +58,5 @@ Noted, no change: `DEFAULT_MIN_SPEED` in `default_ctx` duplicates the `UploadOpt
 ### Task 6: verification and review
 
 - [ ] `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-stall-detection` only after a confirmed merge.
+
+> **2026-10-02, after #41:** `--min-speed` removed from upload. A rate floor has no purpose for an upload (a re-send goes to the same endpoint; only a dead send is a signal, and that is a fixed rule: no bytes for 60 s). See `docs/plans/2026-10-02-upload-dead-send-plan.md`.

@@ -504,7 +504,6 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
             DEFAULT_RETRY_MAX_DELAY,
             DEFAULT_RETRIES,
         ),
-        min_speed: DEFAULT_MIN_SPEED,
         bytes_sent: 0,
         total_bytes: 0,
         progress: None,
@@ -515,8 +514,6 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
 const DEFAULT_RETRIES: u32 = 3;
 const DEFAULT_RETRY_MIN_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DEFAULT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
-/// The body-send floor the public wrappers use: download's and upload's default.
-const DEFAULT_MIN_SPEED: u64 = 10 * 1024;
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -717,7 +714,6 @@ pub async fn upload_file_multipart(
         key,
         retries: opts.retries,
         backoff: opts.backoff(),
-        min_speed: opts.min_speed,
         bytes_sent: 0,
         total_bytes: file_size,
         progress: progress.clone(),
@@ -855,7 +851,6 @@ pub async fn upload_file_multipart(
             key,
             retries: opts.retries,
             backoff: opts.backoff(),
-            min_speed: opts.min_speed,
             bytes_sent: offset,
             total_bytes: file_size,
             progress: progress.clone(),
@@ -1089,7 +1084,7 @@ impl KeptUpload<'_> {
     /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
     /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38) as
-    /// "part N of M stalled K times (<the stall measurement>)". Anything
+    /// "part N of M stalled K times (no bytes sent for W s)". Anything
     /// else the part request produced, in practice IA's spam rejection
     /// (`SpamDetected`), is fatal for the whole item and passes through
     /// unchanged so the item loop still stops on it.
@@ -1106,8 +1101,6 @@ impl KeptUpload<'_> {
                 Self::detail(&message, self.part_num, failure.attempts),
             ),
             IaError::UploadStalled {
-                observed_bytes_per_sec,
-                min_bytes_per_sec,
                 window_secs,
                 stalls,
                 ..
@@ -1124,10 +1117,9 @@ impl KeptUpload<'_> {
                     identifier: self.identifier.into(),
                     key: self.key.into(),
                     message: format!(
-                        "part {} of {} stalled {stalls} {} ({observed_bytes_per_sec} B/s over the \
-                         last {window_secs} s is below the --min-speed floor of \
-                         {min_bytes_per_sec} B/s{attempts}): multipart upload {} {kept}; rerun the \
-                         same command to resume, or discard it with: ia upload cleanup {} {} --abort",
+                        "part {} of {} stalled {stalls} {} (no bytes sent for {window_secs} s{attempts}): \
+                         multipart upload {} {kept}; rerun the same command to resume, or discard it \
+                         with: ia upload cleanup {} {} --abort",
                         self.part_num,
                         self.part_count,
                         if stalls == 1 { "time" } else { "times" },
@@ -1617,8 +1609,6 @@ mod tests {
             error: Box::new(IaError::UploadStalled {
                 identifier: "item".into(),
                 key: "f.bin".into(),
-                observed_bytes_per_sec: 512,
-                min_bytes_per_sec: 10240,
                 window_secs: 60,
                 stalls: 2,
             }),
@@ -1628,7 +1618,9 @@ mod tests {
         let err = kept(2, 3, 1, "f.bin").describe(stalled);
         let msg = err.to_string();
         assert!(
-            msg.contains("part 2 of 3 stalled 2 times (512 B/s over the last 60 s is below the --min-speed floor of 10240 B/s, after 3 attempts): "),
+            msg.contains(
+                "part 2 of 3 stalled 2 times (no bytes sent for 60 s, after 3 attempts): "
+            ),
             "{msg}"
         );
         assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin --abort"), "{msg}");
