@@ -11,6 +11,7 @@
 //! Both listings follow S3 pagination (`IsTruncated` and the next marker).
 
 use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
+use super::stall_watch::bytes_chunks;
 use crate::error::{IaError, Result};
 use crate::upload::checksum::FileHashes;
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
@@ -193,7 +194,7 @@ pub(crate) async fn initiate_upload_with_retry(
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!("{}?uploads", build_s3_url(client, identifier, key));
 
-    let sent = send_with_retry(ctx, "initiate multipart", || {
+    let sent = send_with_retry(ctx, "initiate multipart", |_watch| {
         let mut req = client
             .upload_http()
             .post(&url)
@@ -282,13 +283,17 @@ pub(crate) async fn upload_part_with_retry(
         format!("\"{:x}\"", Md5::digest(&body))
     };
 
-    let sent = send_with_retry(ctx, &format!("upload part {part_number}"), || {
+    // The part goes out as a watched stream of 64 KiB slices (no copy), so a
+    // server that stops reading is caught by the stall detector. The
+    // explicit Content-Length keeps the transfer unchunked, as IA requires.
+    let sent = send_with_retry(ctx, &format!("upload part {part_number}"), |watch| {
+        let stream = watch.wrap(bytes_chunks(body.clone()), content_length as u64);
         client
             .upload_http()
             .put(&url)
             .header("Authorization", format!("LOW {access}:{secret}"))
             .header("Content-Length", content_length.to_string())
-            .body(body.clone())
+            .body(reqwest::Body::wrap_stream(stream))
             .send()
     })
     .await?;
@@ -359,7 +364,7 @@ pub(crate) async fn complete_upload_with_retry(
     );
 
     let manifest = build_complete_manifest(parts);
-    let result = send_with_retry(ctx, "complete multipart", || {
+    let result = send_with_retry(ctx, "complete multipart", |_watch| {
         let mut req = client
             .upload_http()
             .post(&url)
@@ -454,7 +459,7 @@ pub(crate) async fn abort_upload_with_ctx(
         upload_id,
     );
 
-    let result = send_with_retry(ctx, "abort multipart", || {
+    let result = send_with_retry(ctx, "abort multipart", |_watch| {
         client
             .upload_http()
             .delete(&url)
@@ -499,6 +504,7 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
             DEFAULT_RETRY_MAX_DELAY,
             DEFAULT_RETRIES,
         ),
+        min_speed: DEFAULT_MIN_SPEED,
         bytes_sent: 0,
         total_bytes: 0,
         progress: None,
@@ -509,6 +515,8 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
 const DEFAULT_RETRIES: u32 = 3;
 const DEFAULT_RETRY_MIN_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DEFAULT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+/// The body-send floor the public wrappers use: download's and upload's default.
+const DEFAULT_MIN_SPEED: u64 = 10 * 1024;
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -556,7 +564,7 @@ pub(crate) async fn list_uploads_with_ctx(
             ),
             None => base.clone(),
         };
-        let result = send_with_retry(ctx, "list multipart uploads", || {
+        let result = send_with_retry(ctx, "list multipart uploads", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -627,7 +635,7 @@ pub(crate) async fn list_parts_with_ctx(
             Some(m) => format!("{base}&part-number-marker={}", urlencoding::encode(m)),
             None => base.clone(),
         };
-        let sent = send_with_retry(ctx, "list parts", || {
+        let sent = send_with_retry(ctx, "list parts", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -709,6 +717,7 @@ pub async fn upload_file_multipart(
         key,
         retries: opts.retries,
         backoff: opts.backoff(),
+        min_speed: opts.min_speed,
         bytes_sent: 0,
         total_bytes: file_size,
         progress: progress.clone(),
@@ -846,6 +855,7 @@ pub async fn upload_file_multipart(
             key,
             retries: opts.retries,
             backoff: opts.backoff(),
+            min_speed: opts.min_speed,
             bytes_sent: offset,
             total_bytes: file_size,
             progress: progress.clone(),
@@ -1078,10 +1088,11 @@ impl KeptUpload<'_> {
     /// cause before rerunning; a spent budget says how many attempts were
     /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
-    /// Only an `UploadFailed` is reworded. Anything else the part request
-    /// produced, in practice IA's spam rejection (`SpamDetected`), is fatal
-    /// for the whole item and passes through unchanged so the item loop
-    /// still stops on it.
+    /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38) as
+    /// "part N of M stalled K times (<the stall measurement>)". Anything
+    /// else the part request produced, in practice IA's spam rejection
+    /// (`SpamDetected`), is fatal for the whole item and passes through
+    /// unchanged so the item loop still stops on it.
     fn describe(&self, failure: S3Failure) -> IaError {
         let refused = failure
             .code
@@ -1094,13 +1105,42 @@ impl KeptUpload<'_> {
                 status,
                 Self::detail(&message, self.part_num, failure.attempts),
             ),
+            IaError::UploadStalled {
+                observed_bytes_per_sec,
+                min_bytes_per_sec,
+                window_secs,
+                stalls,
+                ..
+            } => {
+                let kept = self.kept_sentence();
+                // Attempts can exceed stalls when an earlier attempt failed
+                // some other way; say so, as the UploadFailed arm does.
+                let attempts = if failure.attempts > 1 {
+                    format!(", after {} attempts", failure.attempts)
+                } else {
+                    String::new()
+                };
+                return IaError::UploadFailed {
+                    identifier: self.identifier.into(),
+                    key: self.key.into(),
+                    message: format!(
+                        "part {} of {} stalled {stalls} {} ({observed_bytes_per_sec} B/s over the \
+                         last {window_secs} s is below the --min-speed floor of \
+                         {min_bytes_per_sec} B/s{attempts}): multipart upload {} {kept}; rerun the \
+                         same command to resume, or discard it with: ia upload cleanup {} {} --abort",
+                        self.part_num,
+                        self.part_count,
+                        if stalls == 1 { "time" } else { "times" },
+                        self.upload_id,
+                        self.identifier,
+                        shell_word(self.key)
+                    ),
+                    status: None,
+                };
+            }
             other => return other,
         };
-        let kept = match self.parts_on_ia {
-            0 => "is kept on IA with no parts yet".to_string(),
-            1 => "is kept with 1 part on IA".to_string(),
-            n => format!("is kept with {n} parts on IA"),
-        };
+        let kept = self.kept_sentence();
         let what = if refused {
             format!(
                 "part {} of {} refused by IA ({detail})",
@@ -1129,6 +1169,15 @@ impl KeptUpload<'_> {
                 shell_word(self.key)
             ),
             status,
+        }
+    }
+
+    /// "is kept with N parts on IA", or "is kept on IA with no parts yet".
+    fn kept_sentence(&self) -> String {
+        match self.parts_on_ia {
+            0 => "is kept on IA with no parts yet".to_string(),
+            1 => "is kept with 1 part on IA".to_string(),
+            n => format!("is kept with {n} parts on IA"),
         }
     }
 
@@ -1558,6 +1607,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A stalled part is a failed part: the upload is kept on IA and the
+    /// message carries the stall detail plus both ways forward.
+    #[test]
+    fn describe_stalled_part_is_a_kept_upload() {
+        let stalled = S3Failure {
+            error: Box::new(IaError::UploadStalled {
+                identifier: "item".into(),
+                key: "f.bin".into(),
+                observed_bytes_per_sec: 512,
+                min_bytes_per_sec: 10240,
+                window_secs: 60,
+                stalls: 2,
+            }),
+            code: None,
+            attempts: 3,
+        };
+        let err = kept(2, 3, 1, "f.bin").describe(stalled);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("part 2 of 3 stalled 2 times (512 B/s over the last 60 s is below the --min-speed floor of 10240 B/s, after 3 attempts): "),
+            "{msg}"
+        );
+        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin --abort"), "{msg}");
+        assert!(
+            matches!(err, IaError::UploadFailed { status: None, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub(crate) mod progress_body;
 mod retry;
 pub mod s3_error;
 mod single;
+pub(crate) mod stall_watch;
 pub mod template;
 mod types;
 pub mod validate;

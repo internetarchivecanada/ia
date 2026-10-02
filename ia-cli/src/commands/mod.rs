@@ -7,6 +7,7 @@ pub mod download;
 pub mod list;
 pub mod man;
 pub mod metadata;
+pub mod rate;
 pub mod search;
 pub mod status;
 pub mod tasks;

@@ -5,7 +5,7 @@ Design doc: `docs/plans/2026-02-20-ia-rust-port-design.md`
 
 ## Safety
 
-**Tests must be hermetic — zero outbound network requests.** Every HTTP call in a test, read or write, must go through a `wiremock` mock.
+**Tests must be hermetic — zero outbound network requests.** Every HTTP call in a test, read or write, must go through a `wiremock` mock, or a raw loopback listener bound to 127.0.0.1 when wiremock cannot produce the behavior (a connection that stops reading, a stalled body).
 
 Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive.org from any automated code path.
 
