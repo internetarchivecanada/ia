@@ -474,8 +474,10 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
 /// - `total` equals the metadata size but the `.part` is longer, or the size
 ///   is unknown or exempt (see [`is_size_unknowable`]) so there is no third
 ///   party to agree: the `.part` is removed and the retryable
-///   [`IaError::DownloadSizeMismatch`] is returned so the next attempt starts
-///   from byte 0.
+///   [`IaError::ResumeFailed`] is returned, its reason naming both lengths,
+///   so the next attempt starts from byte 0. (Not `DownloadSizeMismatch`:
+///   nothing was received, and with equal lengths that message would read
+///   as a contradiction.)
 /// - no parseable total: the plain [`IaError::Http`] a 416 always was.
 ///
 /// The caller must close any writer on `part_path` before calling this.
@@ -532,10 +534,21 @@ async fn range_not_satisfiable(
                 "416 on resume: .part is already at or past the file's length; deleting it"
             );
             let _ = fs::remove_file(part_path).await;
-            Err(IaError::DownloadSizeMismatch {
+            let reason = match metadata_size {
+                Some(_) => format!(
+                    "the .part file is {offset} bytes and the server's copy is {server_size} \
+                     bytes; it cannot be resumed, so it was removed and the download restarts \
+                     from byte 0"
+                ),
+                None => format!(
+                    "the .part file is {offset} bytes and the server's copy is {server_size} \
+                     bytes, and the item metadata gives no size to confirm it; it was removed \
+                     and the download restarts from byte 0"
+                ),
+            };
+            Err(IaError::ResumeFailed {
                 file: file.name.clone(),
-                expected: server_size,
-                received: offset,
+                reason,
             })
         }
     }
@@ -4777,13 +4790,15 @@ mod tests {
         .await;
 
         match &first {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 20);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 20 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("cannot be resumed"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(first.unwrap_err().is_retryable());
         assert!(!dir.path().join("disk.img.part").exists());
@@ -4823,13 +4838,15 @@ mod tests {
         .await;
 
         match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 30);
-                assert_eq!(*received, 30);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 30 bytes")
+                        && reason.contains("server's copy is 30 bytes")
+                        && reason.contains("gives no size to confirm it"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(result.unwrap_err().is_retryable());
         assert!(!dir.path().join("test-item_files.xml.part").exists());
@@ -5116,13 +5133,15 @@ mod tests {
         let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
 
         match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 35);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 35 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("cannot be resumed"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(result.unwrap_err().is_retryable());
         assert!(!dir.path().join("data.bin.part").exists());
@@ -5629,13 +5648,15 @@ mod tests {
         let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
 
         match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 32);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 32 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("gives no size to confirm it"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(result.unwrap_err().is_retryable());
         assert!(!dir.path().join("data.bin.part").exists());
@@ -5662,13 +5683,15 @@ mod tests {
         let result = run_download(&client, &file, dir.path(), &DownloadOpts::default()).await;
 
         match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 32);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 32 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("gives no size to confirm it"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(!dir.path().join("slow-item_files.xml.part").exists());
         server.await.unwrap();
@@ -6273,13 +6296,15 @@ mod tests {
         // The .part already holds at least the whole file. It is removed and
         // the error is retryable so the next attempt starts from byte 0.
         match &first {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 40);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 40 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("cannot be resumed"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(first.unwrap_err().is_retryable());
         assert!(!dir.path().join("disk.img.part").exists());
@@ -6389,13 +6414,15 @@ mod tests {
         .await;
 
         match result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(expected, 30);
-                assert_eq!(received, 40);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 40 bytes")
+                        && reason.contains("server's copy is 30 bytes")
+                        && reason.contains("gives no size to confirm it"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(!dir.path().join("test-item_files.xml.part").exists());
     }
@@ -6652,13 +6679,15 @@ mod tests {
         .await;
 
         match &result {
-            Err(IaError::DownloadSizeMismatch {
-                expected, received, ..
-            }) => {
-                assert_eq!(*expected, 32);
-                assert_eq!(*received, 32);
+            Err(IaError::ResumeFailed { reason, .. }) => {
+                assert!(
+                    reason.contains(".part file is 32 bytes")
+                        && reason.contains("server's copy is 32 bytes")
+                        && reason.contains("gives no size to confirm it"),
+                    "{reason}"
+                );
             }
-            other => panic!("expected DownloadSizeMismatch, got {other:?}"),
+            other => panic!("expected ResumeFailed, got {other:?}"),
         }
         assert!(result.unwrap_err().is_retryable());
         assert!(!dir.path().join("disk.img.part").exists());

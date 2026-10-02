@@ -7,6 +7,6 @@
 **Also:** the `range_not_satisfiable` doc comment, usage.md's 416 paragraph (the message it names), and a resolution note under the 2026-09-28 plan's observation.
 
 ## Tasks
-- [ ] Red: the six 416 tests that assert `DownloadSizeMismatch` on the delete arm assert `ResumeFailed` with a reason naming both lengths; the equal-length case asserts the reason does not read "expected N bytes, received N bytes". Run; fail.
-- [ ] Green: the arm, the doc comment, usage.md, the plan note.
+- [x] Red: the eight 416 tests (six found by their asserted values first, two more by the full download test run) that assert `DownloadSizeMismatch` on the delete arm assert `ResumeFailed` with a reason naming both lengths; the equal-length case asserts the reason does not read "expected N bytes, received N bytes". Run; all failed with the old variant.
+- [x] Green: the arm, the doc comment, usage.md, the plan note. 148 download tests pass.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup size-mismatch-message` after a confirmed merge.
