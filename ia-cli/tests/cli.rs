@@ -2081,6 +2081,18 @@ fn download_help_describes_retry_waits_and_retry_after() {
         .stdout(predicate::str::contains("up to a cap that doubles"));
 }
 
+// -- a multipart upload's assembled object is verified (#20) --
+
+#[test]
+fn upload_help_describes_multipart_verification() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not yet verified"))
+        .stdout(predicate::str::contains("5 minutes"))
+        .stdout(predicate::str::contains("size and md5"));
+}
+
 // -- a multipart resume is validated against the local file (#19) --
 
 #[test]

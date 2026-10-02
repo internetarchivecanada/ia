@@ -142,13 +142,14 @@ async fn create_with_image(
     .await?;
 
     match result.status {
-        UploadStatus::Uploaded | UploadStatus::Skipped | UploadStatus::Resumed => {
-            Ok(CreateCollectionResult {
-                identifier: identifier.to_string(),
-                status: 200,
-                url,
-            })
-        }
+        UploadStatus::Uploaded
+        | UploadStatus::UploadedUnverified
+        | UploadStatus::Skipped
+        | UploadStatus::Resumed => Ok(CreateCollectionResult {
+            identifier: identifier.to_string(),
+            status: 200,
+            url,
+        }),
         UploadStatus::DryRun => Ok(CreateCollectionResult {
             identifier: identifier.to_string(),
             status: 0,

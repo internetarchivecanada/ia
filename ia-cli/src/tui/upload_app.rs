@@ -750,7 +750,8 @@ async fn run_dashboard_and_summarize(
             Ok(Ok(results)) => {
                 for r in &results {
                     match &r.status {
-                        ia_core::upload::UploadStatus::Uploaded => {
+                        ia_core::upload::UploadStatus::Uploaded
+                        | ia_core::upload::UploadStatus::UploadedUnverified => {
                             total_uploaded += 1;
                             total_bytes += r.bytes;
                         }
@@ -818,6 +819,7 @@ fn finalize_item(
                         if matches!(
                             &r.status,
                             ia_core::upload::UploadStatus::Uploaded
+                                | ia_core::upload::UploadStatus::UploadedUnverified
                                 | ia_core::upload::UploadStatus::Resumed
                         ) {
                             for entry in &mut s.failed_files {

@@ -45,6 +45,11 @@ pub struct UploadOpts {
     /// Longest wait before any one retry. Default 60 s. A `Retry-After`
     /// header from the server overrides the computed wait regardless.
     pub retry_max_delay: Duration,
+    /// How long a multipart upload keeps asking the metadata API for the
+    /// assembled object (size and md5) after completion before reporting
+    /// `UploadedUnverified`. Default 5 minutes. Library configuration, not
+    /// a CLI flag; tests shrink it.
+    pub verify_timeout: Duration,
     /// Additional HTTP headers to include.
     pub headers: Vec<(String, String)>,
     /// Validate everything but don't actually upload.
@@ -72,6 +77,7 @@ impl Default for UploadOpts {
             retries: 10,
             retry_min_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(60),
+            verify_timeout: Duration::from_secs(300),
             headers: Vec::new(),
             dry_run: false,
         }
@@ -272,6 +278,12 @@ pub struct UploadResult {
 #[serde(rename_all = "snake_case", tag = "status", content = "detail")]
 pub enum UploadStatus {
     Uploaded,
+    /// A multipart upload whose parts all landed and whose completion IA
+    /// accepted, but whose assembled object had not appeared in the item's
+    /// metadata with the expected size and md5 within `verify_timeout`.
+    /// Treated as a success (exit 0) with a warning; a rerun's skip check
+    /// finds the md5 once IA has it, or uploads again if it never does.
+    UploadedUnverified,
     Skipped,
     Resumed,
     Failed(String),
@@ -361,6 +373,7 @@ mod tests {
         assert_eq!(opts.retries, 10);
         assert_eq!(opts.retry_min_delay, Duration::from_secs(1));
         assert_eq!(opts.retry_max_delay, Duration::from_secs(60));
+        assert_eq!(opts.verify_timeout, Duration::from_secs(300));
         assert!(opts.metadata.is_empty());
     }
 
@@ -409,6 +422,22 @@ mod tests {
         assert_eq!(val["status"], "uploaded");
         assert_eq!(val["bytes"], 1024);
         // Unit variants have no "detail" key
+        assert!(val.get("detail").is_none());
+    }
+
+    #[test]
+    fn upload_result_unverified_serializes_as_uploaded_unverified() {
+        let result = UploadResult {
+            identifier: "test-item".into(),
+            key: "big.bin".into(),
+            status: UploadStatus::UploadedUnverified,
+            bytes: 10,
+            md5: Some("abc".into()),
+            elapsed_ms: 5,
+            retries: 0,
+        };
+        let val: serde_json::Value = serde_json::to_value(&result).unwrap();
+        assert_eq!(val["status"], "uploaded_unverified");
         assert!(val.get("detail").is_none());
     }
 

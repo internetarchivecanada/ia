@@ -1,6 +1,6 @@
 use crate::error::{format_error_chain, IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
-use crate::upload::checksum::compute_file_md5_async;
+use crate::upload::checksum::{compute_file_md5_async, hash_file_and_parts_async, FileHashes};
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::{describe_parsed, parse_s3_error, strip_xml};
 use crate::upload::types::*;
@@ -45,30 +45,23 @@ pub async fn upload_file(
     size_hint: Option<u64>,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
 ) -> Result<UploadResult> {
-    if opts.multipart {
-        return crate::upload::multipart::upload_file_multipart(
-            client,
-            identifier,
-            file,
-            key,
-            opts,
-            crate::upload::multipart::DEFAULT_PART_SIZE,
-            is_first_file,
-            is_last_file,
-            size_hint,
-            progress,
-        )
-        .await;
-    }
-
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
-    // Compute local MD5 if needed for either checksum-skip or verify
+    // One read of the file when either the skip check or verification
+    // needs its md5 (`--clobber --no-verify` reads nothing). For a
+    // multipart upload the same pass yields every part's md5, which a
+    // resume compares against the parts IA holds (#19, #20). A md5 from
+    // --checksums is taken as given, with no part md5s; a resume then
+    // hashes the file itself.
     let needs_md5 = opts.checksum || opts.verify;
-    let md5_hex = if needs_md5 {
+    let hashes: Option<FileHashes> = if needs_md5 {
         if let Some(md5) = opts.checksum_file.as_ref().and_then(|cs| cs.get(key)) {
-            Some(md5.clone())
+            Some(FileHashes {
+                md5: md5.clone(),
+                parts: Vec::new(),
+                size: file_size,
+            })
         } else {
             if let Some(ref cb) = progress {
                 cb(UploadProgress {
@@ -79,11 +72,23 @@ pub async fn upload_file(
                     status: UploadProgressStatus::Verifying,
                 });
             }
-            Some(compute_file_md5_async(file).await?)
+            if opts.multipart {
+                Some(
+                    hash_file_and_parts_async(file, crate::upload::multipart::DEFAULT_PART_SIZE)
+                        .await?,
+                )
+            } else {
+                Some(FileHashes {
+                    md5: compute_file_md5_async(file).await?,
+                    parts: Vec::new(),
+                    size: file_size,
+                })
+            }
         }
     } else {
         None
     };
+    let md5_hex = hashes.as_ref().map(|h| h.md5.clone());
 
     // Checksum skip: compare local MD5 with remote, skip if match
     if opts.checksum {
@@ -127,6 +132,24 @@ pub async fn upload_file(
     }
 
     // Dry run: validate everything but don't upload
+    // Multipart from here: the skip check above applies to both paths.
+    if opts.multipart {
+        return crate::upload::multipart::upload_file_multipart(
+            client,
+            identifier,
+            file,
+            key,
+            opts,
+            crate::upload::multipart::DEFAULT_PART_SIZE,
+            is_first_file,
+            is_last_file,
+            size_hint,
+            progress,
+            hashes.as_ref(),
+        )
+        .await;
+    }
+
     if opts.dry_run {
         return Ok(UploadResult {
             identifier: identifier.to_string(),
