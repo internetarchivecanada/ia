@@ -1339,6 +1339,12 @@ impl UploadBatchDisplay {
                 UploadStatus::DryRun => {
                     bytes_total += r.bytes;
                 }
+                // UploadStatus is #[non_exhaustive]; a status this binary
+                // does not know is not known to be a success.
+                _ => {
+                    files_failed += 1;
+                    item_had_failure.insert(r.identifier.clone(), true);
+                }
             }
         }
 

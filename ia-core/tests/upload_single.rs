@@ -45,10 +45,11 @@ async fn upload_single_file_success() {
 
     let f = temp_file(b"hello world");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        checksum: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.checksum = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -82,10 +83,11 @@ async fn upload_dry_run_no_http() {
 
     let f = temp_file(b"test data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        dry_run: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.dry_run = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -120,9 +122,10 @@ async fn upload_503_spam_detection() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let err = upload::upload_file(
@@ -159,10 +162,11 @@ async fn upload_no_backup_omits_keep_old_version() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_backup: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_backup = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -198,9 +202,10 @@ async fn upload_with_content_md5() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -240,9 +245,10 @@ async fn upload_derive_header_last_file() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -273,9 +279,10 @@ async fn upload_derive_header_not_last_file() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -306,10 +313,11 @@ async fn upload_no_derive_always_zero() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_derive: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_derive = true;
+        o
     };
 
     // Even with is_last_file=true, no_derive forces derive=0
@@ -343,9 +351,10 @@ async fn upload_auto_make_bucket_first_file() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -378,10 +387,11 @@ async fn upload_metadata_headers_on_first_file() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        metadata: vec![("mediatype".into(), "texts".into())],
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.metadata = vec![("mediatype".into(), "texts".into())];
+        o
     };
 
     let result = upload::upload_file(
@@ -414,9 +424,10 @@ async fn upload_size_hint_header() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -450,9 +461,10 @@ async fn upload_no_auth_returns_error() {
     config.general.secure = false;
     let client = IaClient::from_config_no_retry(config).unwrap();
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let err = upload::upload_file(
@@ -485,10 +497,11 @@ async fn upload_custom_headers() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        headers: vec![("x-custom-header".into(), "custom-value".into())],
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.headers = vec![("x-custom-header".into(), "custom-value".into())];
+        o
     };
 
     let result = upload::upload_file(
@@ -524,10 +537,11 @@ async fn upload_delete_after_upload() {
     assert!(file_path.exists());
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        delete_after_upload: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.delete_after_upload = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -564,9 +578,10 @@ async fn upload_progress_callback_fires() {
 
     let f = temp_file(b"progress data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = true;
+        o
     };
 
     let statuses: Arc<Mutex<Vec<ia_core::upload::UploadProgressStatus>>> =
@@ -645,12 +660,14 @@ async fn upload_503_rate_limit_retry() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2), // fast for tests
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        // fast for tests
+        o
     };
 
     let result = upload::upload_file(
@@ -685,9 +702,10 @@ async fn upload_content_length_header() {
 
     let f = temp_file(b"hello, world!"); // 13 bytes
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -724,12 +742,13 @@ async fn upload_403_is_not_retried() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let result = upload::upload_file(
@@ -766,12 +785,13 @@ async fn upload_400_bad_digest_is_not_retried() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let result = upload::upload_file(
@@ -817,10 +837,11 @@ async fn upload_checksum_skip_when_md5_matches() {
 
     let f = temp_file(b"hello"); // MD5 = 5d41402abc4b2a76b9719d911017c592
     let client = test_client(&server);
-    let opts = UploadOpts {
-        checksum: true,
-        verify: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = true;
+        o.verify = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -862,10 +883,11 @@ async fn upload_checksum_no_skip_when_md5_differs() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        checksum: true,
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = true;
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -907,10 +929,11 @@ async fn upload_checksum_no_skip_when_file_not_on_remote() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        checksum: true,
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = true;
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -952,10 +975,12 @@ async fn upload_checksum_no_verify_still_computes_md5_for_skip() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        checksum: true,
-        verify: false, // no Content-MD5 header, but still compute for skip
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = true;
+        o.verify = false;
+        // no Content-MD5 header, but still compute for skip
+        o
     };
 
     let result = upload::upload_file(
@@ -1031,10 +1056,11 @@ async fn upload_precomputed_checksum_used_for_content_md5() {
     let mut checksum_file = std::collections::HashMap::new();
     checksum_file.insert("test.txt".into(), "5d41402abc4b2a76b9719d911017c592".into());
 
-    let opts = UploadOpts {
-        verify: true,
-        checksum_file: Some(checksum_file),
-        ..UploadOpts::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = true;
+        o.checksum_file = Some(checksum_file);
+        o
     };
 
     let result = upload::upload_file(
@@ -1091,12 +1117,13 @@ async fn upload_retries_on_server_error() {
 
     let f = temp_file(b"retry content");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let result = upload::upload_file(
@@ -1144,12 +1171,13 @@ async fn upload_503_retries_exhausted() {
 
     let f = temp_file(b"exhaust");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 2,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 2;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let err = upload::upload_file(
@@ -1187,10 +1215,11 @@ async fn upload_no_auto_make_bucket_omits_header() {
 
     let f = temp_file(b"bucket test");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_auto_make_bucket: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_auto_make_bucket = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -1227,10 +1256,11 @@ async fn dry_run_with_verify_computes_md5() {
     let server = MockServer::start().await;
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: true,
-        dry_run: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = true;
+        o.dry_run = true;
+        o
     };
 
     let result = upload::upload_file(
@@ -1313,10 +1343,11 @@ async fn upload_file_multipart_flag_dispatches() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        multipart: true,
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.multipart = true;
+        o.verify = false;
+        o
     };
 
     let result = upload::upload_file(
@@ -1456,12 +1487,13 @@ async fn upload_503_with_non_retryable_code_is_not_retried() {
 
     let f = temp_file(b"hello");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let result = upload::upload_file(
@@ -1519,12 +1551,13 @@ async fn upload_503_retry_honors_retry_after() {
 
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let started = std::time::Instant::now();
@@ -1597,14 +1630,13 @@ async fn mount_503_then_200(server: &MockServer, retry_after: &str) {
 }
 
 fn fast_opts(retries: u32) -> UploadOpts {
-    UploadOpts {
-        verify: false,
-        checksum: false,
-        retries,
-        retry_min_delay: Duration::from_millis(1),
-        retry_max_delay: Duration::from_millis(2),
-        ..Default::default()
-    }
+    let mut o = UploadOpts::default();
+    o.verify = false;
+    o.checksum = false;
+    o.retries = retries;
+    o.retry_min_delay = Duration::from_millis(1);
+    o.retry_max_delay = Duration::from_millis(2);
+    o
 }
 
 /// While the upload sleeps out a Retry-After before polling check_limit,
@@ -1672,10 +1704,11 @@ async fn upload_500_retry_after_zero_retries_at_once() {
         .await;
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        retry_min_delay: Duration::from_secs(10),
-        retry_max_delay: Duration::from_secs(10),
-        ..fast_opts(3)
+    let opts = {
+        let mut o = fast_opts(3);
+        o.retry_min_delay = Duration::from_secs(10);
+        o.retry_max_delay = Duration::from_secs(10);
+        o
     };
 
     let started = Instant::now();
@@ -1812,10 +1845,11 @@ async fn check_limit_exhaustion_does_not_sleep_after_the_last_poll() {
         .await;
     let f = temp_file(b"data");
     let client = test_client(&server);
-    let opts = UploadOpts {
-        retry_min_delay: Duration::from_secs(10),
-        retry_max_delay: Duration::from_secs(10),
-        ..fast_opts(1)
+    let opts = {
+        let mut o = fast_opts(1);
+        o.retry_min_delay = Duration::from_secs(10);
+        o.retry_max_delay = Duration::from_secs(10);
+        o
     };
 
     let started = Instant::now();

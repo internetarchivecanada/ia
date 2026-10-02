@@ -55,10 +55,11 @@ async fn batch_upload_single_item() {
         "texts",
         "test_collection",
     )];
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o
     };
 
     let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
@@ -89,10 +90,11 @@ async fn batch_upload_multiple_items() {
         record("item-1", f1.to_str().unwrap(), "texts", "test_collection"),
         record("item-2", f2.to_str().unwrap(), "texts", "test_collection"),
     ];
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o
     };
 
     let results = upload::upload_batch(&client, records, &opts, 2, None, None, None)
@@ -123,10 +125,11 @@ async fn batch_upload_grouped_by_identifier() {
         record("item-1", f1.to_str().unwrap(), "texts", "test_collection"),
         record("item-1", f2.to_str().unwrap(), "texts", "test_collection"),
     ];
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o
     };
 
     let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
@@ -151,9 +154,10 @@ async fn batch_upload_empty_records() {
 async fn batch_upload_missing_file_field() {
     let server = MockServer::start().await;
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let mut fields = HashMap::new();
@@ -172,9 +176,10 @@ async fn batch_upload_missing_file_field() {
 async fn batch_upload_nonexistent_file() {
     let server = MockServer::start().await;
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let records = vec![record(
@@ -206,9 +211,10 @@ async fn batch_upload_invalid_identifier() {
         "texts",
         "test_collection",
     )];
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
@@ -243,10 +249,11 @@ async fn batch_upload_merges_metadata_with_opts() {
     let records = vec![("item-1".into(), fields)];
 
     // Base opts have some extra header metadata
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o
     };
 
     let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)
@@ -272,11 +279,12 @@ async fn batch_upload_dry_run() {
         "texts",
         "test_collection",
     )];
-    let opts = UploadOpts {
-        verify: false,
-        dry_run: true,
-        no_collection_check: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.dry_run = true;
+        o.no_collection_check = true;
+        o
     };
 
     let results = upload::upload_batch(&client, records, &opts, 1, None, None, None)

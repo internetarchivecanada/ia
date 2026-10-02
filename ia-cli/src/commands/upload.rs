@@ -561,26 +561,27 @@ async fn run_bare_upload(
     let (files, _temp_file) = handle_stdin_files(&args.files, args.remote_name.as_deref())?;
 
     // Build UploadOpts
-    let opts = UploadOpts {
-        metadata,
-        remote_name: args.remote_name.clone(),
-        remote_dir: args.remote_dir.clone(),
-        keep_directories: args.keep_directories,
-        verify: !args.no_verify,
-        checksum: !args.clobber,
-        checksum_file,
-        delete_after_upload: args.delete_after_upload,
-        no_derive: args.no_derive,
-        no_backup: args.no_backup,
-        no_auto_make_bucket: args.no_auto_make_bucket,
-        no_size_hint: args.no_size_hint,
-        no_collection_check: args.no_collection_check,
-        test_item: args.test_item,
-        multipart: args.multipart,
-        retries: args.retries,
-        headers,
-        dry_run: args.dry_run,
-        ..UploadOpts::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.metadata = metadata;
+        o.remote_name = args.remote_name.clone();
+        o.remote_dir = args.remote_dir.clone();
+        o.keep_directories = args.keep_directories;
+        o.verify = !args.no_verify;
+        o.checksum = !args.clobber;
+        o.checksum_file = checksum_file;
+        o.delete_after_upload = args.delete_after_upload;
+        o.no_derive = args.no_derive;
+        o.no_backup = args.no_backup;
+        o.no_auto_make_bucket = args.no_auto_make_bucket;
+        o.no_size_hint = args.no_size_hint;
+        o.no_collection_check = args.no_collection_check;
+        o.test_item = args.test_item;
+        o.multipart = args.multipart;
+        o.retries = args.retries;
+        o.headers = headers;
+        o.dry_run = args.dry_run;
+        o
     };
 
     // Build auto-resume skip set from joblog (if available)
@@ -758,23 +759,24 @@ async fn run_import(
         .map(|p| load_checksums(p))
         .transpose()?;
 
-    let opts = UploadOpts {
-        metadata: extra_metadata,
-        headers,
-        checksum_file,
-        verify: !args.no_verify,
-        checksum: !args.clobber,
-        delete_after_upload: args.delete_after_upload,
-        no_derive: args.no_derive,
-        no_backup: args.no_backup,
-        no_auto_make_bucket: args.no_auto_make_bucket,
-        no_size_hint: args.no_size_hint,
-        no_collection_check: args.no_collection_check,
-        test_item: args.test_item,
-        multipart: args.multipart,
-        retries: args.retries,
-        dry_run: args.dry_run,
-        ..UploadOpts::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.metadata = extra_metadata;
+        o.headers = headers;
+        o.checksum_file = checksum_file;
+        o.verify = !args.no_verify;
+        o.checksum = !args.clobber;
+        o.delete_after_upload = args.delete_after_upload;
+        o.no_derive = args.no_derive;
+        o.no_backup = args.no_backup;
+        o.no_auto_make_bucket = args.no_auto_make_bucket;
+        o.no_size_hint = args.no_size_hint;
+        o.no_collection_check = args.no_collection_check;
+        o.test_item = args.test_item;
+        o.multipart = args.multipart;
+        o.retries = args.retries;
+        o.dry_run = args.dry_run;
+        o
     };
 
     // Dry run (interactive): validate and print what would be uploaded
@@ -1515,6 +1517,14 @@ fn print_result_line(r: &UploadResult) {
                 crate::output::format_bytes(r.bytes),
             );
         }
+        // UploadStatus is #[non_exhaustive]; a status this binary does not
+        // know is still reported, by its Debug form.
+        other => eprintln!(
+            " {} {}/{}: {other:?}",
+            style("?").yellow(),
+            r.identifier,
+            r.key
+        ),
     }
 }
 
@@ -1527,6 +1537,9 @@ pub(crate) fn write_upload_result(jl: &JoblogWriter, r: &UploadResult) {
         UploadStatus::Resumed => return, // don't write resumed files to joblog
         UploadStatus::Failed(msg) => entry.error(msg, r.retries as usize),
         UploadStatus::DryRun => entry.skipped(), // dry runs logged as skipped
+        // A status this binary does not know is logged as an error, never
+        // as ok: a later run must not skip the file on its account.
+        other => entry.error(&format!("unrecognized upload status {other:?}"), 0),
     };
     jl.write(&entry);
 }

@@ -2884,3 +2884,13 @@ fn search_help_names_no_json_code_in_prose() {
             .stdout(predicate::str::contains("1 s to 60 s"));
     }
 }
+
+// -- 0.21.0: the series' public API changes ship under one version --
+
+#[test]
+fn version_is_0_21_0() {
+    ia().arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0.21.0"));
+}

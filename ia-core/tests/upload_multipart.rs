@@ -406,9 +406,10 @@ async fn upload_file_multipart_success() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -486,12 +487,14 @@ async fn upload_file_multipart_part_retry_on_503() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2), // fast for tests
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        // fast for tests
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -563,12 +566,13 @@ async fn upload_file_multipart_part_retry_honors_retry_after() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let started = std::time::Instant::now();
@@ -647,12 +651,13 @@ async fn upload_file_multipart_part_429_retry_honors_retry_after() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
     };
 
     let started = std::time::Instant::now();
@@ -742,10 +747,11 @@ async fn part_permanent_refusal_leaves_the_upload_for_cleanup() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o
     };
     let err = multipart::upload_file_multipart(
         &client,
@@ -808,10 +814,11 @@ async fn part_exhausted_budget_leaves_the_upload_for_resume() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 2,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 2;
+        o
     };
     let err = multipart::upload_file_multipart(
         &client,
@@ -874,10 +881,11 @@ async fn spam_rejection_on_a_part_stays_fatal_and_does_not_abort() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        retries: 3,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.retries = 3;
+        o
     };
     let err = multipart::upload_file_multipart(
         &client,
@@ -948,9 +956,10 @@ async fn rerun_after_part_failure_resumes_from_existing_parts() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
     let result = multipart::upload_file_multipart(
         &client,
@@ -1047,9 +1056,10 @@ async fn upload_file_multipart_resumes_from_existing() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -1115,9 +1125,10 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -1183,9 +1194,10 @@ async fn upload_file_multipart_new_item_no_such_bucket_starts_fresh() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -1232,9 +1244,10 @@ async fn upload_file_multipart_list_uploads_other_error_still_fails() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let err = multipart::upload_file_multipart(
@@ -1316,9 +1329,10 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
         .mount(&server)
         .await;
 
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let result = multipart::upload_file_multipart(
@@ -1426,13 +1440,12 @@ async fn mock_resume_empty_and_initiate(server: &MockServer, upload_id: &str) {
 }
 
 fn fast_opts(retries: u32) -> UploadOpts {
-    UploadOpts {
-        verify: false,
-        retries,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
-    }
+    let mut o = UploadOpts::default();
+    o.verify = false;
+    o.retries = retries;
+    o.retry_min_delay = std::time::Duration::from_millis(1);
+    o.retry_max_delay = std::time::Duration::from_millis(2);
+    o
 }
 
 /// A non-retryable S3 code must fail on the first attempt even though the
@@ -2281,9 +2294,10 @@ async fn mount_fresh_upload_of_three_parts(server: &MockServer) {
 async fn upload_thirty(server: &MockServer) -> ia_core::upload::UploadResult {
     let client = test_client(server);
     let f = temp_file(THIRTY);
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
     multipart::upload_file_multipart(
         &client,
@@ -2686,11 +2700,12 @@ async fn upload_file_multipart_via_upload_file(
 ) -> ia_core::upload::UploadResult {
     let client = test_client(server);
     let f = temp_file(THIRTY);
-    let opts = UploadOpts {
-        multipart: true,
-        checksum,
-        verify,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.multipart = true;
+        o.checksum = checksum;
+        o.verify = verify;
+        o
     };
     ia_core::upload::upload_file(
         &client,
@@ -2800,13 +2815,12 @@ async fn upload_thirty_via_upload_file(
 }
 
 fn no_skip_check_opts() -> UploadOpts {
-    UploadOpts {
-        multipart: true,
-        checksum: false,
-        retry_min_delay: std::time::Duration::from_millis(1),
-        retry_max_delay: std::time::Duration::from_millis(2),
-        ..Default::default()
-    }
+    let mut o = UploadOpts::default();
+    o.multipart = true;
+    o.checksum = false;
+    o.retry_min_delay = std::time::Duration::from_millis(1);
+    o.retry_max_delay = std::time::Duration::from_millis(2);
+    o
 }
 
 /// A 2xx on complete is the upload: IA compared every part's md5 from the
@@ -2825,9 +2839,10 @@ async fn multipart_complete_2xx_is_uploaded_without_reading_metadata() {
         .expect(0)
         .mount(&server)
         .await;
-    let opts = UploadOpts {
-        delete_after_upload: true,
-        ..no_skip_check_opts()
+    let opts = {
+        let mut o = no_skip_check_opts();
+        o.delete_after_upload = true;
+        o
     };
     let (result, f) = upload_thirty_via_upload_file(&server, opts).await;
     let result = result.unwrap();
@@ -2866,10 +2881,11 @@ async fn multipart_uses_a_supplied_checksum_for_the_skip_check() {
         "data.bin".to_string(),
         "00000000000000000000000000000001".to_string(),
     );
-    let opts = UploadOpts {
-        multipart: true,
-        checksum_file: Some(checksums),
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.multipart = true;
+        o.checksum_file = Some(checksums);
+        o
     };
     let result = ia_core::upload::upload_file(
         &client,
@@ -2898,11 +2914,12 @@ async fn multipart_dry_run_reports_the_md5() {
     let server = MockServer::start().await;
     let client = test_client(&server);
     let f = temp_file(THIRTY);
-    let opts = UploadOpts {
-        multipart: true,
-        checksum: false,
-        dry_run: true,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.multipart = true;
+        o.checksum = false;
+        o.dry_run = true;
+        o
     };
     let result = ia_core::upload::upload_file(
         &client,
