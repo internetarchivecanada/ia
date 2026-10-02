@@ -261,3 +261,5 @@ Two observations from the audit, recorded for Jake, not changed here:
 - The delete arm's `DownloadSizeMismatch { expected: 30, received: 30 }` renders as "expected 30 bytes, received 30 bytes", which reads as a contradiction. A dedicated reason would be clearer. Not testable deterministically: the `.part` growing between the length check and the hash (`seed_hasher_from_part` reads exactly the measured length, so the hash covers what is reported). By design, not a defect: without `--checksum` a full-length `.part` with wrong bytes is renamed into place, as any unverified download is; #13 (md5 by default) is the answer.
 
 - [x] `just ci`; code-reviewer pass asked for cells still missing and got the round-2 rows above; PR with `Part of #12`; merge after checks; `scripts/ia-cleanup size-416-corner-cases` after a confirmed merge.
+
+Resolved 2026-10-02 (Part 2, PR 3, plan `docs/plans/2026-10-02-size-mismatch-message-plan.md`): the delete arm returns `ResumeFailed` with a reason naming both lengths; `DownloadSizeMismatch` is only ever a body with the wrong byte count.
