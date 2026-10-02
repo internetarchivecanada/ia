@@ -198,13 +198,36 @@ pub struct UploadArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart)
+    /// Retry attempts per IA-S3 request (per part with --multipart); a stall
+    /// (see --min-speed) spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
-    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
+    /// stalled send is re-sent at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
+
+    /// Abandon and retry a body send slower than this (10K, 1M, bytes; 0 disables)
+    ///
+    /// Once a send is 30 s old, its average rate over the last 60 s (or over
+    /// its whole life while younger than that) is compared with this floor
+    /// once a second. Below it, the request is abandoned (the connection is
+    /// closed) and sent again at once, spending one of --retries; with
+    /// --multipart that is the part, and the parts already on IA stay. When
+    /// the retries are gone the file fails with "upload of <item>/<key>
+    /// stalled N times: ..." (N counts every stall; in --json output the
+    /// file's error message is this text), and a multipart upload is kept
+    /// on IA for a rerun to resume. Only the body send is judged: once the
+    /// last byte is handed to the connection, waiting for IA's answer is
+    /// not a stall.
+    ///
+    /// RATE is bytes per second: a plain number, or a number followed by K,
+    /// M, or G for powers of 1024 (10K is 10240 bytes per second). 0
+    /// disables the check, and a send to a server that stops reading can
+    /// then hang for as long as the connection stays open.
+    #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
+    pub min_speed: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -382,13 +405,36 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart)
+    /// Retry attempts per IA-S3 request (per part with --multipart); a stall
+    /// (see --min-speed) spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
-    /// as given, even above 60 s; Retry-After: 0 means re-send at once.
+    /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
+    /// stalled send is re-sent at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
+
+    /// Abandon and retry a body send slower than this (10K, 1M, bytes; 0 disables)
+    ///
+    /// Once a send is 30 s old, its average rate over the last 60 s (or over
+    /// its whole life while younger than that) is compared with this floor
+    /// once a second. Below it, the request is abandoned (the connection is
+    /// closed) and sent again at once, spending one of --retries; with
+    /// --multipart that is the part, and the parts already on IA stay. When
+    /// the retries are gone the file fails with "upload of <item>/<key>
+    /// stalled N times: ..." (N counts every stall; in --json output the
+    /// file's error message is this text), and a multipart upload is kept
+    /// on IA for a rerun to resume. Only the body send is judged: once the
+    /// last byte is handed to the connection, waiting for IA's answer is
+    /// not a stall.
+    ///
+    /// RATE is bytes per second: a plain number, or a number followed by K,
+    /// M, or G for powers of 1024 (10K is 10240 bytes per second). 0
+    /// disables the check, and a send to a server that stops reading can
+    /// then hang for as long as the connection stays open.
+    #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
+    pub min_speed: u64,
 
     /// Output results as JSONL
     #[arg(long)]
@@ -530,6 +576,7 @@ pub async fn run(
             open_after_upload: false,
             dry_run: sub.dry_run,
             retries: sub.retries,
+            min_speed: sub.min_speed,
             json: sub.json,
             multipart: sub.multipart,
             dashboard: args.dashboard,
@@ -611,6 +658,7 @@ async fn run_bare_upload(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
+        min_speed: args.min_speed,
         headers,
         dry_run: args.dry_run,
         ..UploadOpts::default()
@@ -806,6 +854,7 @@ async fn run_import(
         test_item: args.test_item,
         multipart: args.multipart,
         retries: args.retries,
+        min_speed: args.min_speed,
         dry_run: args.dry_run,
         ..UploadOpts::default()
     };

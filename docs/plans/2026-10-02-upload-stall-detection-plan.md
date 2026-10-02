@@ -23,13 +23,13 @@
 
 ### Task 1: the detector is shared
 
-- [ ] `git mv ia-core/src/download/stall.rs ia-core/src/stall.rs`; `mod stall;` at the crate root; download imports `crate::stall`; module doc generalized. Tests move with it; `cargo test -p ia-core --lib stall` and the download stall tests stay green. Commit: `refactor(stall): the stall detector is a crate module`.
+- [x] `git mv ia-core/src/download/stall.rs ia-core/src/stall.rs`; `mod stall;` at the crate root; download imports `crate::stall`; module doc generalized. Tests move with it; `cargo test -p ia-core --lib stall` and the download stall tests stay green. Commit: `refactor(stall): the stall detector is a crate module`.
 
 ### Task 2: the error, the option, the shared parser
 
-- [ ] **Step 1: Failing tests.** `error.rs`: display of `UploadStalled` (singular and plural), `is_retryable() == false`, JSON code `upload_stalled`, `size_of::<IaError>()` unchanged. `types.rs`: `UploadOpts::default().min_speed == 10 * 1024`. `ia-cli`: `parse_rate` tests move to the shared module; `upload --help` and `upload --spreadsheet --help` show `--min-speed`.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `feat(upload): --min-speed option, UploadStalled error, shared rate parser`.
+- [x] **Step 1: Failing tests.** `error.rs`: display of `UploadStalled` (singular and plural), `is_retryable() == false`, JSON code `upload_stalled`, `size_of::<IaError>()` unchanged. `types.rs`: `UploadOpts::default().min_speed == 10 * 1024`. `ia-cli`: `parse_rate` tests move to the shared module; `upload --help` and `upload --spreadsheet --help` show `--min-speed`.
+- [x] **Step 2: Run**; the error and option tests failed to compile; the help test failed on the missing flag.
+- [x] **Step 3: Implement.** `parse_rate` and its tests live in `ia-cli/src/commands/rate.rs`; the `--spreadsheet` struct's flag cannot be reached by a separate help page (it shares the parent's), so the help test checks `ia upload --help` only. Commit: `feat(upload): --min-speed option, UploadStalled error, shared rate parser`.
 
 ### Task 3: the watch, the part PUT, the single PUT
 

@@ -2809,3 +2809,24 @@ fn metadata_export_resume_skips_a_logged_item() {
     .success();
     fx.rt.block_on(fx.server.verify());
 }
+
+// -- upload --min-speed (#38) --
+
+#[test]
+fn upload_help_describes_min_speed() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--min-speed"))
+        .stdout(predicate::str::contains("stalled"))
+        .stdout(predicate::str::contains("0 disables"));
+}
+
+#[test]
+fn upload_rejects_a_bad_min_speed() {
+    ia().args(["upload", "my-item", "Cargo.toml", "--min-speed", "10KB"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("10K"));
+}
