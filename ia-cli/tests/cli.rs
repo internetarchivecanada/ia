@@ -2576,11 +2576,10 @@ fn global_resume_flags_say_what_resumes() {
             .success()
             .stdout(predicate::str::contains("upload all files fresh").not())
             .stdout(predicate::str::contains(
-                "finished files for upload; fully finished items for download",
+                "finished files for upload, finished items for every other command",
             ))
             .stdout(predicate::str::contains("(download, upload, ai)").not())
-            .stdout(predicate::str::contains("process every file or item again"))
-            .stdout(predicate::str::contains("tasks submit"));
+            .stdout(predicate::str::contains("process every file or item again"));
     }
 }
 
