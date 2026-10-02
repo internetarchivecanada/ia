@@ -52,7 +52,13 @@ Three of four right; the remaining gap was real: usage.md said what a plain uplo
 
 > For download: "Each file streams to <name>.part and is renamed into place once its byte count matches the item metadata. A dropped connection is resumed with a Range request from the bytes on disk." With `--joblog`, a rerun "skips the files it lists as done (download resumes a partial file from its .part regardless)." For upload without `--multipart`: "a single-PUT file is sent again from byte 0 on the rerun, except that a file the item already lists with the same md5 is skipped." For upload with `--multipart`: "A rerun resumes only when every part IA holds matches the local file by size and md5; otherwise a fresh upload starts and the stale one is left for cleanup." Summary: download always resumes from .part; upload without --multipart restarts from zero unless the file exists remotely with matching md5; upload with --multipart resumes if all parts match, otherwise restarts. With `--joblog`, files logged as done are skipped independently of the above mechanics.
 
-Every part right. The issue's acceptance criterion ("the fresh-agent test gives correct answers for both download and upload") is met.
+Every part right except one sentence the code review then caught: the joblog rule it echoed for download ("files logged as done are skipped") was upload's rule; download's joblog skips fully finished items. The check had validated the docs against themselves.
+
+**After, third pass** (same model, with the corrected joblog wording, and the question extended to ask what exactly the joblog skips for each):
+
+> Download without `--joblog` resumes from the bytes on disk via Range request to the `.part` file; with `--joblog`, fully finished items are skipped, though a partial file still resumes from `.part` regardless. Upload with a single PUT (without `--multipart`) starts from byte 0 on rerun, except when the item already lists the file with matching md5 (which is skipped); with `--joblog`, files the previous run finished are additionally skipped. Upload with `--multipart` resumes from parts already on IA, but only if every part matches the local file by size and md5; otherwise a fresh upload starts. The file does not state the combined behavior of `--joblog` with `--multipart` upload explicitly.
+
+Every part right, including the per-item rule for download. (The combined case it calls unstated is covered by "--joblog adds a layer on top of either" in the upload long help; a reader could miss it, and it is a note, not a gap.) The issue's acceptance criterion ("the fresh-agent test gives correct answers for both download and upload") is met.
 
 ### Review findings (2026-10-02), closed before the PR
 
