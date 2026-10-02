@@ -24,8 +24,16 @@ pub enum IaError {
     #[error("item not found: {0}")]
     NotFound(String),
 
+    /// A non-success HTTP response. `retry_after` is the response's
+    /// `Retry-After` header in seconds when it had one, so a loop that
+    /// retries on the error can wait what the server asked instead of its
+    /// own backoff (see [`IaError::retry_after`]).
     #[error("HTTP error {status}: {message}")]
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        message: String,
+        retry_after: Option<u64>,
+    },
 
     #[error("rate limited (retry after {retry_after}s)")]
     RateLimited { retry_after: u64 },
@@ -374,6 +382,18 @@ impl IaError {
         }
     }
 
+    /// The server's `Retry-After`, in seconds, when this error came from a
+    /// response that carried one: an [`IaError::Http`] with the header, or
+    /// an [`IaError::RateLimited`]. A retry loop sleeps this instead of its
+    /// computed backoff when it is `Some`.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            IaError::Http { retry_after, .. } => *retry_after,
+            IaError::RateLimited { retry_after } => Some(*retry_after),
+            _ => None,
+        }
+    }
+
     /// Convert this error into a structured `JsonError` for `--json` mode.
     pub fn to_json_error(&self) -> JsonError {
         let mut extra = serde_json::Map::new();
@@ -382,8 +402,15 @@ impl IaError {
                 extra.insert("identifier".into(), id.clone().into());
                 "not_found"
             }
-            IaError::Http { status, .. } => {
+            IaError::Http {
+                status,
+                retry_after,
+                ..
+            } => {
                 extra.insert("status".into(), (*status).into());
+                if let Some(secs) = retry_after {
+                    extra.insert("retry_after".into(), (*secs).into());
+                }
                 "http_error"
             }
             IaError::RateLimited { retry_after } => {
@@ -722,6 +749,7 @@ mod tests {
         let err = IaError::Http {
             status: 503,
             message: "Service Unavailable".to_string(),
+            retry_after: None,
         };
         assert_eq!(err.to_string(), "HTTP error 503: Service Unavailable");
     }
@@ -862,6 +890,7 @@ mod tests {
         let err = IaError::Http {
             status: 503,
             message: "Service Unavailable".into(),
+            retry_after: None,
         };
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "http_error");
@@ -875,6 +904,43 @@ mod tests {
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "rate_limited");
         assert_eq!(v["error"]["retry_after"], 30);
+    }
+
+    /// An HTTP error that came with a Retry-After header carries it, so a
+    /// loop retrying on the error object can honor it; the JSON form shows
+    /// it the way `rate_limited` does, and omits it when there was none.
+    #[test]
+    fn http_error_carries_retry_after() {
+        let err = IaError::Http {
+            status: 503,
+            message: "Service Unavailable".into(),
+            retry_after: Some(7),
+        };
+        assert_eq!(err.retry_after(), Some(7));
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "http_error");
+        assert_eq!(v["error"]["retry_after"], 7);
+    }
+
+    #[test]
+    fn http_error_without_retry_after_has_none_and_no_json_key() {
+        let err = IaError::Http {
+            status: 503,
+            message: "Service Unavailable".into(),
+            retry_after: None,
+        };
+        assert_eq!(err.retry_after(), None);
+        let v = parse_json_error(&err);
+        assert!(v["error"].get("retry_after").is_none());
+    }
+
+    #[test]
+    fn retry_after_reads_rate_limited_too() {
+        assert_eq!(
+            IaError::RateLimited { retry_after: 3 }.retry_after(),
+            Some(3)
+        );
+        assert_eq!(IaError::NotFound("x".into()).retry_after(), None);
     }
 
     #[test]
@@ -989,6 +1055,7 @@ mod tests {
         let err = IaError::Http {
             status: 403,
             message: "Forbidden".into(),
+            retry_after: None,
         };
         assert!(!err.is_retryable());
     }
@@ -998,6 +1065,7 @@ mod tests {
         let err = IaError::Http {
             status: 401,
             message: "Unauthorized".into(),
+            retry_after: None,
         };
         assert!(!err.is_retryable());
     }
@@ -1007,6 +1075,7 @@ mod tests {
         let err = IaError::Http {
             status: 404,
             message: "Not Found".into(),
+            retry_after: None,
         };
         assert!(!err.is_retryable());
     }
@@ -1016,6 +1085,7 @@ mod tests {
         let err = IaError::Http {
             status: 410,
             message: "Gone".into(),
+            retry_after: None,
         };
         assert!(!err.is_retryable());
     }
@@ -1025,6 +1095,7 @@ mod tests {
         let err = IaError::Http {
             status: 500,
             message: "Internal Server Error".into(),
+            retry_after: None,
         };
         assert!(err.is_retryable());
     }
@@ -1034,6 +1105,7 @@ mod tests {
         let err = IaError::Http {
             status: 503,
             message: "Service Unavailable".into(),
+            retry_after: None,
         };
         assert!(err.is_retryable());
     }
@@ -1043,6 +1115,7 @@ mod tests {
         let err = IaError::Http {
             status: 429,
             message: "Too Many Requests".into(),
+            retry_after: None,
         };
         assert!(err.is_retryable());
     }
@@ -1142,6 +1215,7 @@ mod tests {
         let err = IaError::Http {
             status: 502,
             message: "Bad Gateway".into(),
+            retry_after: None,
         };
         // 5xx through Http is retryable (proxy for network issues reaching server)
         assert!(err.is_retryable());

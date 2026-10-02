@@ -75,7 +75,10 @@ enum QaContentPart {
 #[command(
     about = "AI metadata extraction QA and configuration",
     long_about = "Verify AI-extracted metadata using vision-based LLM QA, manage AI extraction \
-        configurations for collections, and promote confirmed metadata to items.",
+        configurations for collections, and promote confirmed metadata to items.\n\n\
+        An LLM request that fails with a 429, a 5xx or a connection failure is retried up to five times. The wait \
+        before each retry is random, up to a cap that doubles from 1 s to 60 s; when the \
+        response carried a Retry-After header, that wait is used instead, as given.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># QA extraction results for an item</dim>\n  <bold>$ ia ai qa my-item</bold>\

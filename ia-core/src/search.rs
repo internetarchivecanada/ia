@@ -8,6 +8,70 @@ use tracing::{debug, warn};
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
 
+/// Retries of one search request after a 429, before it fails as
+/// [`IaError::RateLimited`]. The transport's own budget for a 5xx is the
+/// same three.
+const THROTTLE_RETRIES: u32 = 3;
+
+/// Send one search request, retrying a 429.
+///
+/// The transport middleware retries a 5xx and leaves a 429 to the
+/// application layer. For a search there is no shared `RateLimiter` to
+/// pause (one stream, one worker), so the page request itself is retried:
+/// up to [`THROTTLE_RETRIES`] times, waiting the server's `Retry-After`
+/// when the response carried one, otherwise the standard backoff. Past the
+/// budget the error is [`IaError::RateLimited`] with the last header's
+/// value, 0 when there was none (as the tasks API reports a 429; metadata
+/// reads use 30 there, a pause length rather than a report).
+async fn send_page(req: RequestBuilder, client: &IaClient) -> Result<reqwest::Response> {
+    let req = with_s3_auth(req, client);
+    let backoff = crate::retry::backoff_policy(
+        crate::retry::STANDARD_MIN_DELAY,
+        crate::retry::STANDARD_MAX_DELAY,
+        THROTTLE_RETRIES,
+    );
+    let mut n_past_retries: u32 = 0;
+    loop {
+        // Every search request has a cloneable body (query parameters, or
+        // a JSON document), so this cannot fail in practice. `Config` is the
+        // variant the crate uses for internal invariants (see `upload::single`).
+        let attempt = req.try_clone().ok_or_else(|| {
+            IaError::Config("internal error: search request body is not cloneable".into())
+        })?;
+        let resp = attempt.send().await?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(resp);
+        }
+        let retry_after = crate::retry::retry_after_wait(resp.headers());
+        if n_past_retries >= THROTTLE_RETRIES {
+            return Err(IaError::RateLimited {
+                retry_after: retry_after.map(|d| d.as_secs()).unwrap_or(0),
+            });
+        }
+        let wait = crate::retry::wait_before_retry(retry_after, &backoff, n_past_retries);
+        warn!(
+            retry = n_past_retries + 1,
+            wait_ms = wait.as_millis() as u64,
+            retry_after = retry_after.is_some(),
+            "search rate limited (429), retrying"
+        );
+        tokio::time::sleep(wait).await;
+        n_past_retries += 1;
+    }
+}
+
+/// Turn a non-success search response into [`IaError::Http`], keeping its
+/// `Retry-After` for the caller.
+async fn http_error(resp: reqwest::Response) -> IaError {
+    let status = resp.status().as_u16();
+    let retry_after = crate::retry::extract_retry_after(resp.headers());
+    IaError::Http {
+        status,
+        message: resp.text().await.unwrap_or_default(),
+        retry_after,
+    }
+}
+
 /// Attach S3 auth header if credentials are configured.
 fn with_s3_auth(req: RequestBuilder, client: &IaClient) -> RequestBuilder {
     if let Some(auth) = client
@@ -78,13 +142,10 @@ pub async fn num_found(client: &IaClient, query: &str, params: &[(String, String
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = with_s3_auth(req, client).send().await?;
+    let resp = send_page(req, client).await?;
 
     if !resp.status().is_success() {
-        return Err(IaError::Http {
-            status: resp.status().as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-        });
+        return Err(http_error(resp).await);
     }
 
     let body: ScrapeResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
@@ -107,13 +168,10 @@ pub async fn advanced_num_found(
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = with_s3_auth(req, client).send().await?;
+    let resp = send_page(req, client).await?;
 
     if !resp.status().is_success() {
-        return Err(IaError::Http {
-            status: resp.status().as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-        });
+        return Err(http_error(resp).await);
     }
 
     let body: AdvancedSearchResponse =
@@ -142,13 +200,10 @@ pub async fn fts_num_found(
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = with_s3_auth(req, client).send().await?;
+    let resp = send_page(req, client).await?;
 
     if !resp.status().is_success() {
-        return Err(IaError::Http {
-            status: resp.status().as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-        });
+        return Err(http_error(resp).await);
     }
 
     let body: FtsResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
@@ -195,13 +250,10 @@ pub fn scrape<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = with_s3_auth(req, client).send().await?;
+            let resp = send_page(req, client).await?;
 
             if !resp.status().is_success() {
-                Err(IaError::Http {
-                    status: resp.status().as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
-                })?;
+                Err(http_error(resp).await)?;
                 return; // unreachable but needed for type inference
             }
 
@@ -301,13 +353,10 @@ pub fn advanced<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = with_s3_auth(req, client).send().await?;
+            let resp = send_page(req, client).await?;
 
             if !resp.status().is_success() {
-                Err(IaError::Http {
-                    status: resp.status().as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
-                })?;
+                Err(http_error(resp).await)?;
                 return;
             }
 
@@ -425,13 +474,10 @@ pub fn fts<'a>(
                     .header("content-type", "application/json")
                     .body(body)
             };
-            let resp: reqwest::Response = with_s3_auth(req, client).send().await?;
+            let resp: reqwest::Response = send_page(req, client).await?;
 
             if !resp.status().is_success() {
-                Err(IaError::Http {
-                    status: resp.status().as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
-                })?;
+                Err(http_error(resp).await)?;
                 return;
             }
 
@@ -1046,5 +1092,174 @@ mod tests {
             requests[0].headers.get("Authorization").is_none(),
             "Authorization header should not be sent without S3 credentials"
         );
+    }
+
+    // -- 429 handling: retried with Retry-After, not a terminal error --
+
+    /// Serve `status` (with `Retry-After: 1`) for the first `times`
+    /// requests to `path_`, then the given JSON body.
+    async fn mount_throttled_then(
+        mock_server: &MockServer,
+        http_method: &str,
+        path_: &str,
+        times: u64,
+        body: serde_json::Value,
+    ) {
+        Mock::given(method(http_method))
+            .and(path(path_))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .set_body_string("slow down"),
+            )
+            .up_to_n_times(times)
+            .expect(times)
+            .mount(mock_server)
+            .await;
+        Mock::given(method(http_method))
+            .and(path(path_))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(mock_server)
+            .await;
+    }
+
+    fn scrape_body(ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "items": ids.iter().map(|id| serde_json::json!({"identifier": id})).collect::<Vec<_>>(),
+            "cursor": "",
+            "total": ids.len()
+        })
+    }
+
+    /// A 429 on a scrape page is retried after the server's Retry-After and
+    /// the stream completes.
+    #[tokio::test]
+    async fn scrape_429_with_retry_after_is_retried() {
+        let mock_server = MockServer::start().await;
+        mount_throttled_then(
+            &mock_server,
+            "POST",
+            "/services/search/v1/scrape",
+            1,
+            scrape_body(&["item1", "item2"]),
+        )
+        .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let started = std::time::Instant::now();
+        let results: Vec<Result<SearchResult>> =
+            scrape(&client, "collection:test", &SearchOpts::default())
+                .collect()
+                .await;
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().identifier.as_str())
+            .collect();
+        assert_eq!(ids, ["item1", "item2"]);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "Retry-After: 1 was not waited for ({:?})",
+            started.elapsed()
+        );
+        mock_server.verify().await;
+    }
+
+    /// Three retries, then the stream yields `RateLimited` with the header's
+    /// value. `Retry-After: 0` keeps the test fast; the budget is the point.
+    #[tokio::test]
+    async fn scrape_429_past_the_budget_is_rate_limited() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/services/search/v1/scrape"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .set_body_string("slow down"),
+            )
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+
+        let results: Vec<Result<SearchResult>> =
+            scrape(&client, "collection:test", &SearchOpts::default())
+                .collect()
+                .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], Err(IaError::RateLimited { retry_after: 0 })),
+            "got {:?}",
+            results[0]
+        );
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn num_found_429_with_retry_after_is_retried() {
+        let mock_server = MockServer::start().await;
+        mount_throttled_then(
+            &mock_server,
+            "POST",
+            "/services/search/v1/scrape",
+            1,
+            serde_json::json!({"items": [], "total": 42}),
+        )
+        .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            num_found(&client, "collection:test", &[]).await.unwrap(),
+            42
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn advanced_429_with_retry_after_is_retried() {
+        let mock_server = MockServer::start().await;
+        mount_throttled_then(
+            &mock_server,
+            "GET",
+            "/advancedsearch.php",
+            1,
+            serde_json::json!({"response": {"numFound": 1, "docs": [{"identifier": "a1"}]}}),
+        )
+        .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let started = std::time::Instant::now();
+        let results: Vec<Result<SearchResult>> =
+            advanced(&client, "test query", &SearchOpts::default())
+                .collect()
+                .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "a1");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn fts_429_with_retry_after_is_retried() {
+        let mock_server = MockServer::start().await;
+        mount_throttled_then(
+            &mock_server,
+            "POST",
+            "/ia-pub-fts-api",
+            1,
+            serde_json::json!({
+                "hits": {"total": 1, "hits": [{"_id": "item1|abc", "_source": {}, "fields": {"identifier": ["item1"]}}]},
+                "_scroll_id": ""
+            }),
+        )
+        .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let started = std::time::Instant::now();
+        let results: Vec<Result<SearchResult>> = fts(&client, "test query", &SearchOpts::default())
+            .collect()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        mock_server.verify().await;
     }
 }

@@ -116,20 +116,24 @@ pub async fn fetch_ai_config(client: &IaClient, collection_id: &str) -> Result<I
         .map_err(|e| IaError::Http {
             status: 0,
             message: format!("failed to fetch AI config: {e}"),
+            retry_after: None,
         })?;
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to fetch AI config from {collection_id}: {body}"),
+            retry_after,
         });
     }
 
     let body = response.text().await.map_err(|e| IaError::Http {
         status: 0,
         message: format!("failed to read AI config body: {e}"),
+        retry_after: None,
     })?;
 
     // Try wrapped format first (`{"result": {...}}`), then unwrapped (fields at top level).
@@ -255,14 +259,17 @@ pub async fn delete_ai_config(client: &IaClient, collection_id: &str) -> Result<
         .map_err(|e| IaError::Http {
             status: 0,
             message: format!("failed to delete AI config: {e}"),
+            retry_after: None,
         })?;
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to delete AI config from {collection_id}: {body}"),
+            retry_after,
         });
     }
 
@@ -376,14 +383,17 @@ async fn write_ai_config(
         .map_err(|e| IaError::Http {
             status: 0,
             message: format!("failed to upload AI config: {e}"),
+            retry_after: None,
         })?;
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to upload AI config to {collection_id}: {body}"),
+            retry_after,
         });
     }
 

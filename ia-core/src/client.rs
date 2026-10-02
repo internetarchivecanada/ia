@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use reqwest_retry::policies::ExponentialBackoff;
 
 use crate::config::IaConfig;
 use crate::error::Result;
-use crate::retry::{LoggingRetryStrategy, RetryStats, TimingMiddleware};
+use crate::retry::{LoggingRetryStrategy, RetryMiddleware, RetryStats, TimingMiddleware};
 use crate::user_agent::build_user_agent;
 
 /// Maximum time to establish a TCP connection (incl. TLS handshake).
@@ -224,8 +224,8 @@ impl IaClient {
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(60),
+                crate::retry::STANDARD_MIN_DELAY,
+                crate::retry::STANDARD_MAX_DELAY,
             )
             .build_with_max_retries(3);
 
@@ -237,7 +237,7 @@ impl IaClient {
 
         let http = ClientBuilder::new(transports.api)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+            .with(RetryMiddleware::new(
                 retry_policy,
                 LoggingRetryStrategy::new(stats.clone()),
             ))
@@ -249,7 +249,7 @@ impl IaClient {
         // client. Timing is kept so writes still appear in -v diagnostics.
         let api_no_retry = ClientBuilder::new(api_for_writes)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+            .with(RetryMiddleware::new(
                 retry_policy,
                 crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
             ))

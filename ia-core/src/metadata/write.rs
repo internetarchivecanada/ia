@@ -340,10 +340,12 @@ pub async fn modify_compound(
         return Err(IaError::NotFound(identifier.to_string()));
     }
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status: status.as_u16(),
             message: body,
+            retry_after,
         });
     }
     let item: serde_json::Value = response
@@ -403,10 +405,12 @@ pub async fn modify_compound(
     // ModifyResponse, so decoding first turns "503 Service Unavailable" into
     // "error decoding response body" and loses the status entirely.
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status: status.as_u16(),
             message: body,
+            retry_after,
         });
     }
 

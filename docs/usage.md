@@ -45,7 +45,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
 | `-C, --checksum` | Verify md5 checksums (slower, reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` |
-| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5) |
+| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5). Waits are random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header sets the wait instead, as given |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
@@ -55,6 +55,15 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--zip-convert <EXT>` | Convert format when downloading a zip member (e.g., `jpg` for JP2 → JPEG; requires `--zip-member`) |
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
+
+#### Retries
+
+A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5). The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carried a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. In `--json` output an `http_error` that carried the header shows it as `retry_after`.
+
+```bash
+# Ride out a flaky link: 20 retries per file
+ia download nasa --retries 20
+```
 
 #### Partial files and the size check
 
@@ -139,6 +148,8 @@ ia search scrape <QUERY> [OPTIONS]     # scrape API (cursor-based, auto-paginate
 ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
+
+Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting what the server's `Retry-After` header says (seconds or an HTTP date, as given) or else a random wait up to a cap that doubles from 1 s; past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
 
 #### Shared flags (all backends)
 
@@ -1007,6 +1018,8 @@ curl -H "$(ia config print-auth)" https://s3.us.archive.org/...
 
 Check for updates, list available versions, or install a specific version. This command is only available in standalone release builds (feature-gated behind `self-update`). If you installed via `cargo install`, use cargo to update instead.
 
+Requests to GitHub's release API are retried up to three times on a `5xx`, a `429` or a connection failure. The wait before each retry is random, up to a cap that doubles from 1 s to 30 s; a `Retry-After` header on the failed response sets the wait instead, as given.
+
 ```sh
 ia update [OPTIONS]
 ia update list [OPTIONS]
@@ -1054,6 +1067,8 @@ ia update install 0.5.1
 ### `ia ai`
 
 AI tooling for Internet Archive metadata. **Experimental** — only available in builds with the `alpha` feature.
+
+LLM requests that fail with a `429`, a `5xx` or a connection failure are retried up to five times. The wait before each retry is random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header on the failed response (seconds or an HTTP date) sets the wait instead, as given.
 
 ```sh
 ia ai qa <IDENTIFIER>... [OPTIONS]

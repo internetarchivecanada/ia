@@ -197,3 +197,146 @@ async fn verbosity_propagated_through_client() {
     let client = IaClient::from_config_with_verbosity(IaConfig::default(), 2).unwrap();
     assert_eq!(client.retry_stats().summary().requests_total, 0);
 }
+
+// ── Retry-After on middleware retries ─────────────────────────────────────
+//
+// The transport middleware retries a 5xx. The wait before the retry is the
+// server's Retry-After when the response carried one, otherwise the standard
+// backoff. These run through `IaClient::from_config`, the production stack.
+
+/// A 503 with `Retry-After: 1` is retried after at least one second, not
+/// after the backoff's own draw.
+#[tokio::test]
+async fn middleware_503_with_retry_after_waits_the_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/slow"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/slow"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let started = std::time::Instant::now();
+    let resp = client
+        .http()
+        .get(format!("{}/metadata/slow", server.uri()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "Retry-After: 1 was not waited for ({:?})",
+        started.elapsed()
+    );
+    server.verify().await;
+}
+
+/// The HTTP-date form is honored too. The date is fixed right before the
+/// request, 3 s ahead, so the wait is at least 1 s even on a slow runner
+/// (one-second granularity; see the PR #31 plan doc).
+#[tokio::test]
+async fn middleware_503_with_http_date_retry_after_waits() {
+    let server = MockServer::start().await;
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let when = std::time::SystemTime::now() + Duration::from_secs(3);
+    Mock::given(method("GET"))
+        .and(path("/metadata/dated"))
+        .respond_with(
+            ResponseTemplate::new(503).insert_header("retry-after", httpdate::fmt_http_date(when)),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/dated"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let started = std::time::Instant::now();
+    let resp = client
+        .http()
+        .get(format!("{}/metadata/dated", server.uri()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "HTTP-date Retry-After was not waited for ({:?})",
+        started.elapsed()
+    );
+    server.verify().await;
+}
+
+/// `Retry-After: 0` means re-send at once, and the budget is still three
+/// retries: four requests in all, then the last response is handed back.
+/// (Without the header the three waits would be a jittered 1 s + 2 s + 4 s.)
+#[tokio::test]
+async fn middleware_retry_after_zero_resends_at_once_within_the_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/down"))
+        .respond_with(ResponseTemplate::new(500).insert_header("retry-after", "0"))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let started = std::time::Instant::now();
+    let resp = client
+        .http()
+        .get(format!("{}/metadata/down", server.uri()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500, "the final response is handed back");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "Retry-After: 0 was not honored as an immediate retry ({:?})",
+        started.elapsed()
+    );
+    // The mock's expect(4) is the attempt count; `requests_total` counts
+    // outer calls (the timing middleware wraps the retry middleware).
+    assert_eq!(client.retry_stats().summary().status_5xx_count, 4);
+    server.verify().await;
+}
+
+/// When the budget is spent, the error handed to the caller carries the
+/// last response's Retry-After, so a caller retrying on the error object
+/// can honor it. Here through `get_item`, whose error is built in
+/// `metadata::read`. (`Retry-After: 0` keeps the three honored waits at
+/// zero; `Some(0)` against `None` is what is being proved.)
+#[tokio::test]
+async fn http_error_after_the_budget_carries_retry_after() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/busy"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "0")
+                .set_body_string("busy"),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let err = client
+        .get_item("busy")
+        .await
+        .expect_err("503 after the budget");
+    assert_eq!(err.retry_after(), Some(0), "got {err:?}");
+    server.verify().await;
+}

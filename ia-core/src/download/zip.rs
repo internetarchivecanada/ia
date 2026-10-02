@@ -50,6 +50,7 @@ pub async fn list_zip_contents(
     let html = response.text().await.map_err(|e| IaError::Http {
         status: 0,
         message: format!("failed to read zip listing body: {e}"),
+        retry_after: None,
     })?;
 
     Ok(parse_zip_listing_html(&html))
@@ -83,6 +84,7 @@ pub async fn download_zip_member(
         .map_err(|e| IaError::Http {
             status: 0,
             message: format!("failed to read zip member body: {e}"),
+            retry_after: None,
         })
 }
 
@@ -119,6 +121,7 @@ pub async fn download_zip_member_converted(
         .map_err(|e| IaError::Http {
             status: 0,
             message: format!("failed to read converted zip member body: {e}"),
+            retry_after: None,
         })
 }
 

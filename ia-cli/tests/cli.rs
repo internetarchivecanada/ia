@@ -2034,6 +2034,53 @@ fn download_help_describes_md5_mismatch_handling() {
         ));
 }
 
+// -- update: GitHub requests honor Retry-After --
+
+#[cfg(feature = "self-update")]
+#[test]
+fn update_help_describes_retries() {
+    ia().args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Retry-After"))
+        .stdout(predicate::str::contains("1 s to 30 s"));
+}
+
+// -- ai: LLM request retries honor Retry-After --
+
+#[cfg(feature = "alpha")]
+#[test]
+fn ai_help_describes_llm_retries() {
+    ia().args(["ai", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Retry-After"));
+}
+
+// -- search retries a 429 with Retry-After --
+
+#[test]
+fn search_help_describes_429_handling() {
+    for backend in ["scrape", "advanced", "fts"] {
+        ia().args(["search", backend, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("429"))
+            .stdout(predicate::str::contains("Retry-After"));
+    }
+}
+
+// -- download retries honor Retry-After --
+
+#[test]
+fn download_help_describes_retry_waits_and_retry_after() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Retry-After"))
+        .stdout(predicate::str::contains("up to a cap that doubles"));
+}
+
 // -- upload retries back off; --retry-sleep is gone --
 
 #[test]

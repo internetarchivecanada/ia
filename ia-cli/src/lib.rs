@@ -97,8 +97,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on AiArgs. Both live on the struct.
     #[cfg(feature = "alpha")]
-    /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
     /// Create and manage collections
     #[command(visible_alias = "col")]
@@ -135,7 +136,8 @@ enum Commands {
     /// Configure credentials and settings
     #[command(visible_alias = "co")]
     Config(commands::config::ConfigArgs),
-    /// Update ia to a specific or latest version
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on UpdateArgs. Both live on the struct.
     #[cfg(feature = "self-update")]
     Update(commands::update::UpdateArgs),
 }
