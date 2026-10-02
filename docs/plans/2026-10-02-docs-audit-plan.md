@@ -48,6 +48,12 @@ Download is right already (the help written in #11 to #14 carries it; the issue'
 
 Three of four right; the remaining gap was real: usage.md said what a plain upload does after an interruption, but `ia upload --help` did not, and the check gives the agent only the help and the README. `ia upload --help`'s `long_about` gained a paragraph: one PUT per file unless `--multipart`; an interrupted single-PUT file is sent again from byte 0 on the rerun, except a file the item already lists with the same md5, which is skipped; a `--multipart` file resumes from the parts on IA after checking them; `--joblog` skips finished files on top of either. Test: `upload_help_says_what_an_interrupted_single_put_does`.
 
+**After, second pass** (same model, same question, with the upload long_about paragraph):
+
+> For download: "Each file streams to <name>.part and is renamed into place once its byte count matches the item metadata. A dropped connection is resumed with a Range request from the bytes on disk." With `--joblog`, a rerun "skips the files it lists as done (download resumes a partial file from its .part regardless)." For upload without `--multipart`: "a single-PUT file is sent again from byte 0 on the rerun, except that a file the item already lists with the same md5 is skipped." For upload with `--multipart`: "A rerun resumes only when every part IA holds matches the local file by size and md5; otherwise a fresh upload starts and the stale one is left for cleanup." Summary: download always resumes from .part; upload without --multipart restarts from zero unless the file exists remotely with matching md5; upload with --multipart resumes if all parts match, otherwise restarts. With `--joblog`, files logged as done are skipped independently of the above mechanics.
+
+Every part right. The issue's acceptance criterion ("the fresh-agent test gives correct answers for both download and upload") is met.
+
 ### Task 3: the fresh-agent check, verification, review
 
-- [ ] Before/after answers recorded here; `just ci`; code-reviewer pass; fix or record; PR; squash-merge after checks pass; `scripts/ia-cleanup docs-audit` only after a confirmed merge.
+- [x] Before/after answers recorded here. [ ] `just ci`; code-reviewer pass; fix or record; PR; squash-merge after checks pass; `scripts/ia-cleanup docs-audit` only after a confirmed merge.
