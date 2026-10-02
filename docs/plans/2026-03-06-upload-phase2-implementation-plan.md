@@ -1655,6 +1655,8 @@ complete. On permanent part failure, aborts the upload for cleanup.
 
 > **2026-10-02 (#18):** reversed. A part that fails for good leaves the upload on IA for resume or `ia upload cleanup`; see `docs/plans/2026-10-02-upload-part-failure-plan.md`.
 
+> **2026-10-02 (#19):** resume no longer trusts the listed parts. Each is checked against the local file by size and md5 before it is skipped; see `docs/plans/2026-10-02-upload-resume-validation-plan.md`.
+
 Part of #214.
 ```
 

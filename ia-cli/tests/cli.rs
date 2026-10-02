@@ -2081,6 +2081,17 @@ fn download_help_describes_retry_waits_and_retry_after() {
         .stdout(predicate::str::contains("up to a cap that doubles"));
 }
 
+// -- a multipart resume is validated against the local file (#19) --
+
+#[test]
+fn upload_help_describes_resume_validation() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("matches the local file"))
+        .stdout(predicate::str::contains("size and md5"));
+}
+
 // -- a failed multipart part leaves the upload on IA (#18) --
 
 #[test]

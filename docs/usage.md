@@ -559,7 +559,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-size-hint` | Don't send x-archive-size-hint header |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
-| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; a part that fails for good leaves the upload on IA for a rerun to resume (see below) |
+| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; a rerun resumes from the parts IA holds once they are checked against the local file, and a part that fails for good leaves the upload on IA for that rerun (see below) |
 | `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
@@ -573,6 +573,10 @@ Every IA-S3 request in an upload (the single PUT, or each multipart request: ini
 # Ride out a flaky link: 20 attempts per part
 ia upload my-item big.iso --multipart --retries 20
 ```
+
+#### Resuming a multipart upload
+
+Before sending any part, `--multipart` asks IA for unfinished multipart uploads of the same file name in the item and checks each part IA already holds against the local file: the part number must fall within the file's parts at the current part size (100 MiB), the part's size on IA must equal the local range's size, and its ETag must equal the md5 of the local range. The md5s come from one read of the local file. Every part passes → those parts are skipped and the rest are sent under the same upload ID. Any part fails (the local file changed, the part size changed, a different file has the same name) → a fresh upload starts and the stale one is left on IA, named in a warning: `not resuming multipart upload <id>: part 1 has ETag <etag> on IA but the local range's md5 differs; it is left on IA, discard it with: ia upload cleanup <item> <file>`. With several unfinished uploads for the name, the newest one that passes is resumed. A listing without a part size is checked by md5 alone.
 
 #### Multipart part failures
 

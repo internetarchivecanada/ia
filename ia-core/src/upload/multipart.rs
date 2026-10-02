@@ -7,6 +7,8 @@
 //! - Resume: GET /{id}?uploads → list, GET /{id}/{key}?uploadId={ID} → parts
 //! - Abort: DELETE /{id}/{key}?uploadId={ID}
 //! - Cleanup: GET /{id}?uploads (list all), then abort
+//!
+//! Both listings follow S3 pagination (`IsTruncated` and the next marker).
 
 use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
 use crate::error::{IaError, Result};
@@ -517,40 +519,77 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     list_uploads_with_ctx(client, &default_ctx(identifier, "")).await
 }
 
-/// List in-progress uploads with the caller's retry budget.
+/// Whether a listing page says more follows, and the marker for the next
+/// request: `<IsTruncated>true</IsTruncated>` plus the named marker
+/// element. S3 pages at 1000 entries; whether IA does is unknown, so the
+/// protocol is followed either way. A page that is truncated but gives no
+/// marker ends the walk with what was read rather than asking for the same
+/// page again.
+fn next_page_marker(body: &str, marker_tag: &str) -> Option<String> {
+    let truncated =
+        extract_xml_field(body, "IsTruncated").is_some_and(|t| t.eq_ignore_ascii_case("true"));
+    if !truncated {
+        return None;
+    }
+    extract_xml_field(body, marker_tag).filter(|m| !m.is_empty())
+}
+
+/// List in-progress uploads with the caller's retry budget, following
+/// pagination (`key-marker` and `upload-id-marker`).
 pub(crate) async fn list_uploads_with_ctx(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
 ) -> Result<Vec<MultipartUploadInfo>> {
     let identifier = ctx.identifier;
     let (access, secret) = client.require_auth()?;
-    let url = format!("{}?uploads", build_s3_item_url(client, identifier));
+    let base = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let result = send_with_retry(ctx, "list multipart uploads", || {
-        client
-            .upload_http()
-            .get(&url)
-            .header("Authorization", format!("LOW {access}:{secret}"))
-            .send()
-    })
-    .await;
+    let mut uploads = Vec::new();
+    let mut marker: Option<(String, String)> = None;
+    loop {
+        let url = match &marker {
+            Some((key, id)) => format!(
+                "{base}&key-marker={}&upload-id-marker={}",
+                urlencoding::encode(key),
+                urlencoding::encode(id)
+            ),
+            None => base.clone(),
+        };
+        let result = send_with_retry(ctx, "list multipart uploads", || {
+            client
+                .upload_http()
+                .get(&url)
+                .header("Authorization", format!("LOW {access}:{secret}"))
+                .send()
+        })
+        .await;
 
-    match result {
-        Ok(sent) => {
-            let body = sent.response.text().await.unwrap_or_default();
-            Ok(parse_list_uploads_response(&body))
+        let body = match result {
+            Ok(sent) => sent.response.text().await.unwrap_or_default(),
+            // A brand-new item has no bucket yet, so there is nothing in
+            // progress to list. Treat that as an empty result; the initiate
+            // POST that follows carries x-archive-auto-make-bucket and
+            // creates the item.
+            Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
+                tracing::debug!(
+                    identifier,
+                    "item does not exist yet; no multipart uploads to resume"
+                );
+                return Ok(Vec::new());
+            }
+            Err(f) => return Err(*f.error),
+        };
+        uploads.extend(parse_list_uploads_response(&body));
+        let next_key = next_page_marker(&body, "NextKeyMarker");
+        let next_id = next_page_marker(&body, "NextUploadIdMarker");
+        match (next_key, next_id) {
+            // A marker equal to the one just sent would fetch the same
+            // page forever; stop with what was read.
+            (Some(key), Some(id)) if marker.as_ref() != Some(&(key.clone(), id.clone())) => {
+                marker = Some((key, id))
+            }
+            _ => return Ok(uploads),
         }
-        // A brand-new item has no bucket yet, so there is nothing in progress
-        // to list. Treat that as an empty result; the initiate POST that
-        // follows carries x-archive-auto-make-bucket and creates the item.
-        Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
-            tracing::debug!(
-                identifier,
-                "item does not exist yet; no multipart uploads to resume"
-            );
-            Ok(Vec::new())
-        }
-        Err(f) => Err(*f.error),
     }
 }
 
@@ -566,30 +605,44 @@ pub async fn list_parts(
     list_parts_with_ctx(client, &default_ctx(identifier, key), upload_id).await
 }
 
-/// List completed parts with the caller's retry budget.
+/// List completed parts with the caller's retry budget, following
+/// pagination (`part-number-marker`).
 pub(crate) async fn list_parts_with_ctx(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
     upload_id: &str,
 ) -> Result<Vec<PartInfo>> {
     let (access, secret) = client.require_auth()?;
-    let url = format!(
+    let base = format!(
         "{}?uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let sent = send_with_retry(ctx, "list parts", || {
-        client
-            .upload_http()
-            .get(&url)
-            .header("Authorization", format!("LOW {access}:{secret}"))
-            .send()
-    })
-    .await?;
-    let body = sent.response.text().await.unwrap_or_default();
-
-    Ok(parse_list_parts_response(&body))
+    let mut parts = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let url = match &marker {
+            Some(m) => format!("{base}&part-number-marker={}", urlencoding::encode(m)),
+            None => base.clone(),
+        };
+        let sent = send_with_retry(ctx, "list parts", || {
+            client
+                .upload_http()
+                .get(&url)
+                .header("Authorization", format!("LOW {access}:{secret}"))
+                .send()
+        })
+        .await?;
+        let body = sent.response.text().await.unwrap_or_default();
+        parts.extend(parse_list_parts_response(&body));
+        match next_page_marker(&body, "NextPartNumberMarker") {
+            // A marker equal to the one just sent would fetch the same
+            // page forever; stop with what was read.
+            Some(m) if marker.as_deref() != Some(m.as_str()) => marker = Some(m),
+            _ => return Ok(parts),
+        }
+    }
 }
 
 // ── Full multipart upload ───────────────────────────────────────────────
@@ -677,8 +730,9 @@ pub async fn upload_file_multipart(
         });
     }
 
-    // Try to resume an existing upload
-    let (upload_id, existing_parts) = try_resume(client, &control_ctx).await?;
+    // Try to resume an existing upload whose parts match this file.
+    let (upload_id, existing_parts) =
+        try_resume(client, &control_ctx, file, file_size, part_size).await?;
 
     // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
     let extra_headers = {
@@ -993,26 +1047,104 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
     Ok(buf)
 }
 
-/// Check for an existing in-progress upload for this key and return it.
+/// Find an in-progress upload for this key whose parts match the local file,
+/// and return it with those parts.
 ///
-/// If multiple uploads exist for the same key, returns the most recent one.
+/// Candidates are the item's unfinished uploads for `ctx.key`, newest first
+/// by their `Initiated` time (ties and missing times keep the listing's
+/// reverse order, S3 listing chronologically). Each candidate's parts are
+/// checked with [`validate_parts`] against the local file's size and the
+/// md5 of each local range; the first candidate that validates is resumed.
+/// One that does not is left in place (an abort would be #18's mistake
+/// again) and reported at warn with its upload ID, so `ia upload cleanup`
+/// can discard it. With no valid candidate, `None`: the caller initiates a
+/// fresh upload.
+///
+/// The local hashes come from one read of the file
+/// ([`super::checksum::hash_file_and_parts`]), done only when there is a
+/// candidate to check.
 async fn try_resume(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
+    file: &Path,
+    file_size: u64,
+    part_size: u64,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
     let uploads = list_uploads_with_ctx(client, ctx).await?;
-
-    // Find uploads matching this key, take the most recent
-    // Take the last matching upload (most recent, S3 returns chronological order)
-    let matching = uploads.iter().rfind(|u| u.key == ctx.key);
-
-    match matching {
-        Some(info) => {
-            let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
-            Ok((Some(info.upload_id.clone()), parts))
-        }
-        None => Ok((None, Vec::new())),
+    let mut candidates: Vec<&MultipartUploadInfo> =
+        uploads.iter().rev().filter(|u| u.key == ctx.key).collect();
+    // ISO 8601 timestamps sort as strings; the sort is stable.
+    candidates.sort_by(|a, b| b.initiated.cmp(&a.initiated));
+    if candidates.is_empty() {
+        return Ok((None, Vec::new()));
     }
+
+    let hashes = super::checksum::hash_file_and_parts_async(file, part_size).await?;
+    for info in candidates {
+        let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
+        match validate_parts(&parts, file_size, part_size, &hashes.parts) {
+            Ok(()) => return Ok((Some(info.upload_id.clone()), parts)),
+            Err(reason) => tracing::warn!(
+                identifier = ctx.identifier,
+                key = ctx.key,
+                upload_id = %info.upload_id,
+                "not resuming multipart upload {}: {reason}; it is left on IA, discard it \
+                 with: ia upload cleanup {} {}",
+                info.upload_id,
+                ctx.identifier,
+                shell_word(ctx.key)
+            ),
+        }
+    }
+    Ok((None, Vec::new()))
+}
+
+/// Whether every part IA lists for an upload matches the local file.
+///
+/// For each part: its number must be within the file's part count at
+/// `part_size`; its size, when the listing gave one (0 means it did not),
+/// must be the expected size of that part (`part_size`, or what is left of
+/// the file for the last part); and its ETag, quotes stripped and case
+/// ignored, must equal the md5 of the local range (`local[n - 1]`). A part
+/// number listed twice is a mismatch. `Err` names the first offending part
+/// and why.
+fn validate_parts(
+    parts: &[PartInfo],
+    file_size: u64,
+    part_size: u64,
+    local: &[String],
+) -> std::result::Result<(), String> {
+    let part_count = file_size.div_ceil(part_size).max(1);
+    let mut seen = std::collections::HashSet::new();
+    for part in parts {
+        let n = part.part_number;
+        if n == 0 || u64::from(n) > part_count {
+            return Err(format!(
+                "part {n} is outside this file's {part_count} parts of {part_size} bytes"
+            ));
+        }
+        if !seen.insert(n) {
+            return Err(format!("part {n} is listed twice"));
+        }
+        let offset = u64::from(n - 1) * part_size;
+        let expected = part_size.min(file_size - offset);
+        if part.size != 0 && part.size != expected {
+            return Err(format!(
+                "part {n} is {} bytes on IA but {expected} bytes locally",
+                part.size
+            ));
+        }
+        let etag = part.etag.trim().trim_matches('"').to_ascii_lowercase();
+        match local.get((n - 1) as usize) {
+            Some(md5) if *md5 == etag => {}
+            _ => {
+                return Err(format!(
+                    "part {n} has ETag {etag} on IA but the local range's md5 differs"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1302,5 +1434,101 @@ mod tests {
             kept(2, 2, 1, "f.bin").describe(spam),
             IaError::SpamDetected { .. }
         ));
+    }
+
+    // -- validate_parts: a listed part is reused only when it matches --
+
+    fn part(n: u32, etag: &str, size: u64) -> PartInfo {
+        PartInfo {
+            part_number: n,
+            etag: etag.to_string(),
+            size,
+        }
+    }
+
+    fn local() -> Vec<String> {
+        vec!["aa".repeat(16), "bb".repeat(16), "cc".repeat(16)]
+    }
+
+    #[test]
+    fn validate_parts_accepts_matching_parts() {
+        let parts = [
+            part(1, &format!("\"{}\"", "aa".repeat(16)), 10),
+            part(3, &"cc".repeat(16), 5),
+        ];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
+    }
+
+    #[test]
+    fn validate_parts_ignores_etag_quotes_and_case() {
+        let parts = [part(2, &format!("\"{}\"", "BB".repeat(16)), 10)];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_wrong_md5() {
+        let parts = [part(1, &"dd".repeat(16), 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(
+            reason.contains("part 1") && reason.contains("md5"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_wrong_size() {
+        let parts = [part(1, &"aa".repeat(16), 9)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(
+            reason.contains("part 1") && reason.contains("9 bytes"),
+            "{reason}"
+        );
+        // The last part is shorter; its expected size is what is left.
+        let parts = [part(3, &"cc".repeat(16), 10)];
+        assert!(validate_parts(&parts, 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_an_out_of_range_part_number() {
+        assert!(validate_parts(&[part(0, &"aa".repeat(16), 10)], 25, 10, &local()).is_err());
+        assert!(validate_parts(&[part(4, &"aa".repeat(16), 10)], 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_duplicate_part_number() {
+        let parts = [part(1, &"aa".repeat(16), 10), part(1, &"aa".repeat(16), 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(reason.contains("twice"), "{reason}");
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_part_from_a_different_part_size() {
+        // A 15-byte part can only come from an upload made with another part
+        // size; at 10 bytes per part it is wrong by size.
+        let parts = [part(1, &"aa".repeat(16), 15)];
+        assert!(validate_parts(&parts, 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_handles_an_empty_file() {
+        const EMPTY: &str = "d41d8cd98f00b204e9800998ecf8427e";
+        let local = vec![EMPTY.to_string()];
+        assert_eq!(validate_parts(&[part(1, EMPTY, 0)], 0, 10, &local), Ok(()));
+        // With an expected size of 0, a listed size of 5 is a real mismatch,
+        // not "size not given".
+        assert!(validate_parts(&[part(1, EMPTY, 5)], 0, 10, &local).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_composite_etag() {
+        let parts = [part(1, "\"abc-3\"", 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(reason.contains("ETag abc-3"), "{reason}");
+    }
+
+    #[test]
+    fn validate_parts_treats_a_missing_size_as_not_given() {
+        let parts = [part(1, &"aa".repeat(16), 0)];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
     }
 }
