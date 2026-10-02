@@ -68,22 +68,7 @@ fn build_skip_set(
         resumes from the parts already on IA after checking them against the local file. --joblog adds a \
         layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
-        "<bold><underline>Integrity & Skip Behavior:</underline></bold>\n\
-         \n  By default, ia computes a local MD5 for each file and:\n\
-         \n    1. Skips the upload if the remote file already has the same MD5\
-         \n    2. Sends Content-MD5 so the server verifies integrity on receipt\n\
-         \n  <bold>--clobber</bold>         Force re-upload even if remote MD5 matches.\
-         \n                    Still sends Content-MD5 for integrity verification.\
-         \n  <bold>--no-verify</bold>       Skip Content-MD5 header (no server-side check).\
-         \n                    Still skips files matching remote MD5.\
-         \n  <bold>--clobber --no-verify</bold>  Skip all MD5 computation. Maximum speed\
-         \n                    for bulk uploads where integrity isn't a concern.\
-         \n  <bold>--joblog FILE</bold>     Separate resume mechanism — skips files logged\
-         \n                    as successful in previous runs. Works independently\
-         \n                    of checksum/verify. Disable with --no-resume.\
-         \n  <bold>--multipart</bold>       Same skip check from the same single read; IA checks\
-         \n                    every part's md5 when the upload is completed.\n\
-         \n<bold><underline>Examples:</underline></bold>\n\
+        "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Upload a file to an existing or new item</dim>\
          \n  <bold>$ ia upload my-item file.pdf -m mediatype:texts -m collection:opensource</bold>\
          \n\n  <dim># Upload a directory, preserving structure</dim>\
@@ -96,15 +81,13 @@ fn build_skip_set(
          \n  <bold>$ ia upload template ./files/ -o template.csv</bold>\
          \n\n  <dim># Dry run — validate without uploading</dim>\
          \n  <bold>$ ia upload my-item file.pdf --dry-run</bold>\
-         \n\n  <dim># Resume interrupted uploads (automatic with --joblog)</dim>\
+         \n\n  <dim># Skip the files a previous run finished: rerun with the same --joblog</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl</bold>\
-         \n  <dim># (re-run same command — already-uploaded files are skipped)</dim>\
          \n\n  <dim># Force re-upload everything (ignore remote MD5)</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
          \n\n  <dim># Force re-upload ignoring joblog</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
-         \n\n  <dim># Ride out a flaky link: 20 attempts per part; waits are random, up to a</dim>\
-         \n  <dim># cap that doubles from 1 s to 60 s, or exactly what Retry-After says</dim>\
+         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
@@ -174,7 +157,7 @@ pub struct UploadArgs {
     #[arg(long = "checksum-file", alias = "checksums")]
     pub checksum_file: Option<PathBuf>,
 
-    /// Force re-upload even when remote file has matching MD5
+    /// Force re-upload even when remote file has matching MD5 (with --no-verify too, no md5 is computed at all)
     #[arg(long)]
     pub clobber: bool,
 
@@ -208,7 +191,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Use multipart upload (recommended for files >5 GB)
+    /// Use multipart upload (for large files or unreliable connections)
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -217,15 +200,14 @@ pub struct UploadArgs {
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead; one left alone may be cleaned up by
     /// IA after 30 days or more. A rerun resumes only when every
-    /// part IA holds matches the local file by size and md5 (one read of
-    /// the file); otherwise a fresh upload starts and the stale one is
-    /// left for cleanup, named in a warning.
+    /// part IA holds matches the local file by size and md5; otherwise a
+    /// fresh upload starts and the stale one is left for cleanup, named in
+    /// a warning.
     ///
-    /// The same read gives the md5 for the skip check, so a file the item
-    /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway; --clobber --no-verify also skips the read). Each part's md5
-    /// goes to IA with the completion request, and IA checks every part
-    /// against it before accepting; an accepted completion is the upload.
+    /// A file the item already has is skipped, as with a single PUT
+    /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
+    /// completion request, and IA checks every part against it before
+    /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 
@@ -329,7 +311,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub no_collection_check: bool,
 
-    /// Force re-upload even when remote file has matching MD5
+    /// Force re-upload even when remote file has matching MD5 (with --no-verify too, no md5 is computed at all)
     #[arg(long)]
     pub clobber: bool,
 
@@ -341,7 +323,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub test_item: bool,
 
-    /// Use multipart upload (recommended for files >5 GB)
+    /// Use multipart upload (for large files or unreliable connections)
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -350,15 +332,14 @@ pub struct ImportArgs {
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead; one left alone may be cleaned up by
     /// IA after 30 days or more. A rerun resumes only when every
-    /// part IA holds matches the local file by size and md5 (one read of
-    /// the file); otherwise a fresh upload starts and the stale one is
-    /// left for cleanup, named in a warning.
+    /// part IA holds matches the local file by size and md5; otherwise a
+    /// fresh upload starts and the stale one is left for cleanup, named in
+    /// a warning.
     ///
-    /// The same read gives the md5 for the skip check, so a file the item
-    /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway; --clobber --no-verify also skips the read). Each part's md5
-    /// goes to IA with the completion request, and IA checks every part
-    /// against it before accepting; an accepted completion is the upload.
+    /// A file the item already has is skipped, as with a single PUT
+    /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
+    /// completion request, and IA checks every part against it before
+    /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 

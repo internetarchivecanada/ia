@@ -63,7 +63,7 @@ The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install
 
 `--json` works on every command. Output is JSONL, one object per line, with errors as structured JSON on stderr. Exit codes are meaningful.
 
-`--dry-run` previews any write. `--joblog <file>` records each operation, and re-running the same command resumes instead of starting over. Concurrency is adaptive by default; `-j N` pins it.
+`--dry-run` previews any write. `--joblog <file>` records each operation, and re-running the same command skips what the log records as done. Concurrency is adaptive by default; `-j N` pins it.
 
 Flags and their behavior are documented in `--help` at every level, so there is no need to read these docs to drive the tool.
 

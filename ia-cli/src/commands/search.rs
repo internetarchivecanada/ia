@@ -69,7 +69,7 @@ pub enum SearchCommand {
             pagination and automatically streams all matching results. This is the default \
             backend when no subcommand is specified. A 429 (rate limited) on any request is retried up to three times, waiting \
             what the server's Retry-After header says (or a random wait up to a cap that doubles \
-            from 1 s), then fails as rate_limited.",
+            from 1 s to 60 s), then the page fails with a rate-limit error.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Search a collection</dim>\n  <bold>$ ia search scrape \"collection:nasa\"</bold>\
@@ -85,7 +85,7 @@ pub enum SearchCommand {
             single page of results. Use --rows to control page size (default 50) and \
             -p page=N to select a page. A 429 (rate limited) on any request is retried up to three times, waiting \
             what the server's Retry-After header says (or a random wait up to a cap that doubles \
-            from 1 s), then fails as rate_limited.",
+            from 1 s to 60 s), then the page fails with a rate-limit error.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Single page of results</dim>\n  <bold>$ ia search advanced \"collection:nasa\"</bold>\
@@ -99,7 +99,7 @@ pub enum SearchCommand {
         long_about = "Search the Internet Archive using the full-text search backend. Searches \
             inside file contents, not just item metadata. Uses scroll-based pagination. A 429 (rate limited) on any request is retried up to three times, waiting \
             what the server's Retry-After header says (or a random wait up to a cap that doubles \
-            from 1 s), then fails as rate_limited.",
+            from 1 s to 60 s), then the page fails with a rate-limit error.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Full-text search</dim>\n  <bold>$ ia search fts \"apollo 11 landing\"</bold>\
