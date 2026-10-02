@@ -840,6 +840,52 @@ async fn part_exhausted_budget_leaves_the_upload_for_resume() {
     server.verify().await;
 }
 
+/// IA's spam rejection on a part is permanent and fatal for the whole item
+/// (the item loop stops on `SpamDetected`); it must pass through unchanged,
+/// not be reworded as a part failure that asks for a rerun. The upload is
+/// still not aborted.
+#[tokio::test]
+async fn spam_rejection_on_a_part_stays_fatal_and_does_not_abort() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    mount_two_part_upload_with_no_abort(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "Upload rejected: this item appears to be spam. Please contact info@archive.org.",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        ..Default::default()
+    };
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("spam rejection fails the upload");
+    assert!(
+        matches!(err, ia_core::IaError::SpamDetected { .. }),
+        "got {err:?}"
+    );
+    server.verify().await;
+}
+
 /// The rerun after such a failure finds the upload and its part 1 on IA,
 /// sends only part 2, and completes.
 #[tokio::test]

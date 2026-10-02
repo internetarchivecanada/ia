@@ -41,6 +41,14 @@
 
 - [x] `--multipart` help on both arg structs; an example; `docs/usage.md` (`--multipart` row and a "Multipart part failures" section with both message shapes); dated notes in the two design docs; function doc comment. CLI test `upload_help_describes_kept_multipart_upload_on_part_failure` asserts the wording (red first). Commit: `docs(upload): a failed part no longer aborts the multipart upload`.
 
+### Review findings (2026-10-02), closed before the PR
+
+Important, fixed: `KeptUpload::describe` reworded every error from the part request, including IA's spam rejection (`SpamDetected`), which the item loop treats as fatal and which on main passed through unchanged; wrapped into `UploadFailed` it became a per-file failure telling the user to rerun a permanent rejection. Now only an `UploadFailed` is reworded; anything else passes through. Test: `spam_rejection_on_a_part_stays_fatal_and_does_not_abort` (red first), plus `describe_passes_other_errors_through_unchanged` (unit).
+
+Suggestions, taken: unit tests of `describe` pin every wording branch without a network (transport failure past the budget, a single attempt, no parts on IA, a refusal); "kept with 0 parts on IA" became "is kept on IA with no parts yet"; the suggested cleanup command is `discard it with: ia upload cleanup <item> <key>` with the key single-quoted (shell-style) when it holds whitespace or quote characters, instead of the whole command in quotes around a raw key. For the #24 plan: the message string, the usage.md section and the two help examples name `ia upload cleanup ITEM FILE` as the way to discard; #24 changes that invocation and must update all four.
+
+Noted, no change: `abort_upload_with_ctx` stays reachable through the public `abort_upload` used by `ia upload cleanup`; the `require_auth` wrap in `upload_part_with_retry` (attempts 0) is unreachable from the loop because `try_resume` already required auth, and it now passes through `describe` unchanged anyway.
+
 ### Task 3: verification and review
 
 - [ ] `just ci`; code-reviewer pass (default model); fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-part-failure` only after a confirmed merge.

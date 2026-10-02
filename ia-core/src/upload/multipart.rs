@@ -893,23 +893,29 @@ impl KeptUpload<'_> {
     /// `BadDigest`, ...) says "refused by IA" and asks the user to fix the
     /// cause before rerunning; a spent budget says how many attempts were
     /// made. Both carry the upload ID and name `ia upload cleanup`.
+    ///
+    /// Only an `UploadFailed` is reworded. Anything else the part request
+    /// produced, in practice IA's spam rejection (`SpamDetected`), is fatal
+    /// for the whole item and passes through unchanged so the item loop
+    /// still stops on it.
     fn describe(&self, failure: S3Failure) -> IaError {
         let refused = failure
             .code
             .as_deref()
             .is_some_and(|code| !super::s3_error::is_retryable_code(code));
-        let (status, detail) = match failure.error.as_ref() {
+        let (status, detail) = match *failure.error {
             IaError::UploadFailed {
                 status, message, ..
             } => (
-                *status,
-                Self::detail(message, self.part_num, failure.attempts),
+                status,
+                Self::detail(&message, self.part_num, failure.attempts),
             ),
-            other => (None, other.to_string()),
+            other => return other,
         };
-        let parts = match self.parts_on_ia {
-            1 => "1 part".to_string(),
-            n => format!("{n} parts"),
+        let kept = match self.parts_on_ia {
+            0 => "is kept on IA with no parts yet".to_string(),
+            1 => "is kept with 1 part on IA".to_string(),
+            n => format!("is kept with {n} parts on IA"),
         };
         let what = if refused {
             format!(
@@ -932,9 +938,11 @@ impl KeptUpload<'_> {
             identifier: self.identifier.into(),
             key: self.key.into(),
             message: format!(
-                "{what}: multipart upload {} is kept with {parts} on IA; {fix}rerun the same \
-                 command to resume, or discard it with 'ia upload cleanup {} {}'",
-                self.upload_id, self.identifier, self.key
+                "{what}: multipart upload {} {kept}; {fix}rerun the same command to resume, \
+                 or discard it with: ia upload cleanup {} {}",
+                self.upload_id,
+                self.identifier,
+                shell_word(self.key)
             ),
             status,
         }
@@ -958,6 +966,20 @@ impl KeptUpload<'_> {
         text.strip_suffix(suffix.as_str())
             .unwrap_or(text)
             .to_string()
+    }
+}
+
+/// `word` as it can be pasted into a shell: as is when it is a plain word,
+/// in single quotes when it holds whitespace or quote characters (a remote
+/// key may, with `--remote-dir` or `--keep-directories`).
+fn shell_word(word: &str) -> String {
+    if word
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    } else {
+        word.to_string()
     }
 }
 
@@ -1158,5 +1180,127 @@ mod tests {
     #[test]
     fn default_part_size_is_100mib() {
         assert_eq!(DEFAULT_PART_SIZE, 100 * 1024 * 1024);
+    }
+
+    // -- KeptUpload::describe: the message for a part that failed for good --
+
+    fn kept<'a>(
+        part_num: u32,
+        part_count: u32,
+        parts_on_ia: usize,
+        key: &'a str,
+    ) -> KeptUpload<'a> {
+        KeptUpload {
+            identifier: "item",
+            key,
+            upload_id: "mp-1",
+            part_num,
+            part_count,
+            parts_on_ia,
+        }
+    }
+
+    fn failure(message: &str, status: Option<u16>, code: Option<&str>, attempts: u32) -> S3Failure {
+        S3Failure {
+            error: Box::new(IaError::UploadFailed {
+                identifier: "item".into(),
+                key: "f.bin".into(),
+                message: message.into(),
+                status,
+            }),
+            code: code.map(str::to_string),
+            attempts,
+        }
+    }
+
+    #[test]
+    fn describe_transport_failure_past_the_budget() {
+        let err = kept(2, 3, 1, "f.bin").describe(failure(
+            "upload part 2: connection reset by peer (after 3 attempts)",
+            None,
+            None,
+            3,
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("part 2 of 3 failed after 3 attempts (connection reset by peer): "),
+            "{msg}"
+        );
+        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin"), "{msg}");
+        assert!(!msg.contains("fix the cause"), "{msg}");
+    }
+
+    #[test]
+    fn describe_single_attempt_has_no_attempt_count() {
+        let err = kept(1, 1, 0, "f.bin").describe(failure(
+            "upload part 1 failed: SlowDown: Please reduce your request rate.",
+            Some(503),
+            Some("SlowDown"),
+            1,
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("part 1 of 1 failed (SlowDown: Please reduce your request rate.): "),
+            "{msg}"
+        );
+        assert!(!msg.contains("after 1 attempts"), "{msg}");
+    }
+
+    #[test]
+    fn describe_with_no_parts_on_ia_says_so() {
+        let err = kept(1, 4, 0, "f.bin").describe(failure(
+            "upload part 1 failed: InternalError: boom (after 11 attempts)",
+            Some(500),
+            Some("InternalError"),
+            11,
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("is kept on IA with no parts yet;"), "{msg}");
+        assert!(!msg.contains("0 parts"), "{msg}");
+    }
+
+    #[test]
+    fn describe_refusal_asks_to_fix_the_cause_and_quotes_an_awkward_key() {
+        let err = kept(3, 7, 2, "dir/my file.bin").describe(failure(
+            "upload part 3 failed: AccessDenied: Access Denied",
+            Some(403),
+            Some("AccessDenied"),
+            1,
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("part 3 of 7 refused by IA (AccessDenied: Access Denied): "),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("kept with 2 parts on IA; fix the cause and rerun"),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with("ia upload cleanup item 'dir/my file.bin'"),
+            "{msg}"
+        );
+        assert!(matches!(
+            err,
+            IaError::UploadFailed {
+                status: Some(403),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn describe_passes_other_errors_through_unchanged() {
+        let spam = S3Failure {
+            error: Box::new(IaError::SpamDetected {
+                identifier: "item".into(),
+            }),
+            code: None,
+            attempts: 1,
+        };
+        assert!(matches!(
+            kept(2, 2, 1, "f.bin").describe(spam),
+            IaError::SpamDetected { .. }
+        ));
     }
 }
