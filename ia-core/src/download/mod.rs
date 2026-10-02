@@ -437,6 +437,8 @@ pub(crate) async fn fetch_response(
 /// are replaced by the status's canonical reason phrase.
 async fn http_error_from(response: reqwest::Response) -> IaError {
     let status = response.status();
+    // Read before the body is consumed; the per-file retry loop honors it.
+    let retry_after = crate::retry::extract_retry_after(response.headers());
     let body = response.text().await.unwrap_or_default();
     let message = if body.contains("<!DOCTYPE") || body.contains("<html") {
         status
@@ -449,7 +451,7 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
     IaError::Http {
         status: status.as_u16(),
         message,
-        retry_after: None,
+        retry_after,
     }
 }
 
@@ -1489,11 +1491,30 @@ pub async fn download_item_with_metadata(
             // means the wire is fine and the source is wrong; downloading
             // again cannot change that. Any other outcome forgets it.
             let mut last_wrong_md5: Option<String> = None;
+            // The wait before a retry: the standard schedule (random, up to
+            // a cap that doubles from 1 s to 60 s), or the server's
+            // Retry-After when the failed response carried one.
+            let backoff = crate::retry::backoff_policy(
+                crate::retry::STANDARD_MIN_DELAY,
+                crate::retry::STANDARD_MAX_DELAY,
+                opts.retries as u32,
+            );
 
             for attempt in 0..=opts.retries {
                 if attempt > 0 {
-                    let delay = Duration::from_secs(2u64.pow(attempt as u32).min(60));
-                    warn!(file = %file.name, attempt, "retrying after {:?}", delay);
+                    let retry_after = last_err
+                        .as_ref()
+                        .and_then(IaError::retry_after)
+                        .map(Duration::from_secs);
+                    let delay =
+                        crate::retry::wait_before_retry(retry_after, &backoff, attempt as u32 - 1);
+                    warn!(
+                        file = %file.name,
+                        attempt,
+                        retry_after = retry_after.is_some(),
+                        "retrying after {:?}",
+                        delay
+                    );
                     tokio::time::sleep(delay).await;
                 }
 
@@ -6857,5 +6878,135 @@ mod tests {
 
         assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(result.bytes, 20);
+    }
+
+    // -- Retry-After on the per-file retry loop --
+
+    /// Mount the item metadata for one 5-byte file and serve the download
+    /// GET with `status` (and `retry_after`, when given) once, then 200.
+    async fn mount_flaky_file(
+        mock_server: &MockServer,
+        item: &str,
+        status: u16,
+        retry_after: Option<&str>,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{item}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": item},
+                "files": [{"name": "f.txt", "size": "5", "source": "original"}]
+            })))
+            .mount(mock_server)
+            .await;
+        let mut first = ResponseTemplate::new(status).set_body_string("later");
+        if let Some(value) = retry_after {
+            first = first.insert_header("Retry-After", value);
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/f.txt")))
+            .respond_with(first)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{item}/f.txt")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .expect(1)
+            .mount(mock_server)
+            .await;
+    }
+
+    async fn download_flaky_item(
+        mock_server: &MockServer,
+        item: &str,
+        retries: usize,
+    ) -> (ItemDownloadResult, Duration, tempfile::TempDir) {
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            retries,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let result = download_item(&client, item, &opts, Arc::new(Semaphore::new(1)), None)
+            .await
+            .unwrap();
+        (result, started.elapsed(), dir)
+    }
+
+    /// A 429 on the file GET is retried after the server's Retry-After.
+    #[tokio::test]
+    async fn file_429_with_retry_after_waits_the_header() {
+        let mock_server = MockServer::start().await;
+        mount_flaky_file(&mock_server, "ra-429", 429, Some("3")).await;
+        let (result, elapsed, dir) = download_flaky_item(&mock_server, "ra-429", 3).await;
+        assert_eq!(result.files_downloaded, 1, "{:?}", result.results);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ra-429").join("f.txt")).unwrap(),
+            "hello"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "Retry-After: 3 was not waited for ({elapsed:?})"
+        );
+        mock_server.verify().await;
+    }
+
+    /// So is a 503 with Retry-After: the header, not the schedule. Three
+    /// seconds, because the old fixed first wait was 2 s and a 1 s header
+    /// could not tell the two apart.
+    #[tokio::test]
+    async fn file_503_with_retry_after_waits_the_header() {
+        let mock_server = MockServer::start().await;
+        mount_flaky_file(&mock_server, "ra-503", 503, Some("3")).await;
+        let (result, elapsed, _dir) = download_flaky_item(&mock_server, "ra-503", 3).await;
+        assert_eq!(result.files_downloaded, 1, "{:?}", result.results);
+        assert!(
+            elapsed >= Duration::from_secs(3),
+            "Retry-After: 3 was not waited for ({elapsed:?})"
+        );
+        mock_server.verify().await;
+    }
+
+    /// Without the header the first retry waits a jittered draw of at most
+    /// 1 s (the standard schedule), not the old fixed 2 s.
+    #[tokio::test]
+    async fn file_retry_without_retry_after_uses_the_standard_schedule() {
+        let mock_server = MockServer::start().await;
+        mount_flaky_file(&mock_server, "ra-none", 503, None).await;
+        let (result, elapsed, _dir) = download_flaky_item(&mock_server, "ra-none", 1).await;
+        assert_eq!(result.files_downloaded, 1, "{:?}", result.results);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the first retry waited {elapsed:?}; the schedule's first cap is 1 s"
+        );
+        mock_server.verify().await;
+    }
+
+    /// The error built from a non-success response carries its Retry-After,
+    /// so the loop above can read it after the response is gone.
+    #[tokio::test]
+    async fn http_error_from_carries_retry_after() {
+        let response: reqwest::Response = http::Response::builder()
+            .status(503)
+            .header("Retry-After", "5")
+            .body("busy")
+            .unwrap()
+            .into();
+        let err = http_error_from(response).await;
+        assert!(
+            matches!(
+                err,
+                IaError::Http {
+                    status: 503,
+                    retry_after: Some(5),
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(err.retry_after(), Some(5));
     }
 }

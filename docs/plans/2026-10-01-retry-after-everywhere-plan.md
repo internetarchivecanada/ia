@@ -50,9 +50,9 @@ Observations from Task 2, no change: (1) `RetryStats::requests_total` counts out
 
 **Files:** `ia-core/src/download/mod.rs` (its `tests` module holds the per-file tests), `ia-cli/src/commands/download.rs`, `ia-cli/tests/cli.rs`
 
-- [ ] **Step 1: Failing tests.** (a) the file GET answers 429 with `Retry-After: 1` once then 200 → file downloaded, at least 1 s; (b) 503 with `Retry-After: 1` once → same; (c) 503 without a header once, `--retries 1` → file downloaded and the wait was under 2 s (the jittered first retry is at most 1 s; before the fix it was exactly 2 s); (d) `IaError::Http` from `http_error_from` carries the header (unit); (e) `ia download --help` mentions `Retry-After` and the wait rule.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(download): per-file retries back off on the standard schedule and honor Retry-After`.
+- [x] **Step 1: Failing tests.** (a) the file GET answers 429 with `Retry-After: 3` once then 200 → file downloaded, at least 3 s; (b) 503 with `Retry-After: 3` once → same (3 s, not 1 s: the old fixed first wait was 2 s, so a 1 s header could not tell old from new); (c) 503 without a header once, `--retries 1` → file downloaded and the wait was under 2 s (the jittered first retry is at most 1 s; before the fix it was exactly 2 s); (d) `IaError::Http` from `http_error_from` carries the header (unit); (e) `ia download --help` mentions `Retry-After` and the wait rule.
+- [x] **Step 2: Run**; all five failed (a, b: 2.02 s waits; c: 2.02 s; d: `retry_after: None`; e: wording).
+- [x] **Step 3: Implement.** The redirect and body-read `Http` errors in `download/mod.rs` and `download/zip.rs` keep `retry_after: None`: no response header applies to them. Commit: `fix(download): per-file retries back off on the standard schedule and honor Retry-After`.
 
 ### Task 4: search
 

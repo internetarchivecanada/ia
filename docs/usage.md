@@ -45,7 +45,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
 | `-C, --checksum` | Verify md5 checksums (slower, reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` |
-| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5) |
+| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5). Waits are random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header sets the wait instead, as given |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
@@ -55,6 +55,15 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--zip-convert <EXT>` | Convert format when downloading a zip member (e.g., `jpg` for JP2 → JPEG; requires `--zip-member`) |
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
+
+#### Retries
+
+A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5). The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carried a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. In `--json` output an `http_error` that carried the header shows it as `retry_after`.
+
+```bash
+# Ride out a flaky link: 20 retries per file
+ia download nasa --retries 20
+```
 
 #### Partial files and the size check
 

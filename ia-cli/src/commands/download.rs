@@ -39,7 +39,10 @@ use crate::output::DownloadDisplay;
         spends one of the file's --retries, and when they are gone the file fails and keeps \
         its .part for a later run. With --checksum, a download whose md5 does not match is \
         kept as <name>.md5-mismatch and downloaded again; the same wrong md5 twice means the \
-        source is wrong and the file fails.",
+        source is wrong and the file fails.\n\n\
+        A failed attempt is retried up to --retries times. The wait before each retry is \
+        random, up to a cap that doubles from 1 s to 60 s; when the failed response carried a \
+        Retry-After header (seconds or an HTTP date) that wait is used instead, as given.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -50,6 +53,8 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Batch download from piped identifiers</dim>\n  <bold>$ ia search -q collection:nasa --json | ia download</bold>\
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
+         \n\n  <dim># Ride out a flaky link: 20 retries per file; waits are random, up to a cap that</dim>\
+         \n  <dim># doubles from 1 s to 60 s, or exactly what a Retry-After header says</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
@@ -114,6 +119,11 @@ pub struct DownloadArgs {
     checksum: bool,
 
     /// Max retries per file (also the number of stalls allowed, see --min-speed)
+    ///
+    /// Each retry waits a random time, up to a cap that doubles from 1 s to
+    /// 60 s. A Retry-After header on the failed response (a 429 or a 503,
+    /// in seconds or as an HTTP date) sets the wait instead, as given;
+    /// Retry-After: 0 means try again at once.
     #[arg(short = 'R', long, default_value = "5")]
     retries: usize,
 

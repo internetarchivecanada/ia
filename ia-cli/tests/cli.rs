@@ -2034,6 +2034,17 @@ fn download_help_describes_md5_mismatch_handling() {
         ));
 }
 
+// -- download retries honor Retry-After --
+
+#[test]
+fn download_help_describes_retry_waits_and_retry_after() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Retry-After"))
+        .stdout(predicate::str::contains("up to a cap that doubles"));
+}
+
 // -- upload retries back off; --retry-sleep is gone --
 
 #[test]
