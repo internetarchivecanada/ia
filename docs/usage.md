@@ -559,7 +559,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-size-hint` | Don't send x-archive-size-hint header |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
-| `--multipart` | Use multipart upload (recommended for files >5 GB) |
+| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; a part that fails for good leaves the upload on IA for a rerun to resume (see below) |
 | `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
@@ -572,6 +572,17 @@ Every IA-S3 request in an upload (the single PUT, or each multipart request: ini
 ```bash
 # Ride out a flaky link: 20 attempts per part
 ia upload my-item big.iso --multipart --retries 20
+```
+
+#### Multipart part failures
+
+With `--multipart`, a part that fails for good does not abort the upload, because an abort tells IA to delete every part already uploaded. The upload stays on IA, and the file fails with a message that names it. When IA refused the part (`AccessDenied`, `InvalidAccessKeyId`, `BadDigest`, any non-retryable S3 code): `part 3 of 7 refused by IA (AccessDenied: Access Denied): multipart upload <id> is kept with 2 parts on IA; fix the cause and rerun the same command to resume, or discard it with 'ia upload cleanup <item> <file>'`. When the part's `--retries` ran out: `part 3 of 7 failed after 11 attempts (SlowDown: ...): multipart upload <id> is kept with 2 parts on IA; rerun the same command to resume, or discard it with 'ia upload cleanup <item> <file>'`. In `--json` output and the joblog this text is the failure message. Rerunning the same command finds the upload, skips the parts IA already holds, and sends the rest. Killing the process mid-upload has always behaved this way; the two paths now match.
+
+```bash
+# After a part failure: rerun to resume from the parts already on IA ...
+ia upload my-item big.iso --multipart
+# ... or discard the kept upload
+ia upload cleanup my-item big.iso
 ```
 
 #### Batch mode and subcommands

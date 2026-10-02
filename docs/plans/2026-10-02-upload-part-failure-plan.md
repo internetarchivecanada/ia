@@ -39,7 +39,7 @@
 
 ### Task 2: help and docs
 
-- [ ] `--multipart` help on both arg structs; an example; `docs/usage.md`; dated notes in the two design docs; module and function doc comments. CLI test asserts the wording. Commit: `docs(upload): a failed part no longer aborts the multipart upload`.
+- [x] `--multipart` help on both arg structs; an example; `docs/usage.md` (`--multipart` row and a "Multipart part failures" section with both message shapes); dated notes in the two design docs; function doc comment. CLI test `upload_help_describes_kept_multipart_upload_on_part_failure` asserts the wording (red first). Commit: `docs(upload): a failed part no longer aborts the multipart upload`.
 
 ### Task 3: verification and review
 

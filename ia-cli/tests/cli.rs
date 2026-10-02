@@ -2081,6 +2081,18 @@ fn download_help_describes_retry_waits_and_retry_after() {
         .stdout(predicate::str::contains("up to a cap that doubles"));
 }
 
+// -- a failed multipart part leaves the upload on IA (#18) --
+
+#[test]
+fn upload_help_describes_kept_multipart_upload_on_part_failure() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("names its upload ID"))
+        .stdout(predicate::str::contains("ia upload cleanup"))
+        .stdout(predicate::str::contains("resumes from the parts"));
+}
+
 // -- upload retries back off; --retry-sleep is gone --
 
 #[test]
