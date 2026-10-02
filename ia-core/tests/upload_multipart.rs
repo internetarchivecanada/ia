@@ -419,6 +419,7 @@ async fn upload_file_multipart_success() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -501,6 +502,7 @@ async fn upload_file_multipart_part_retry_on_503() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -576,6 +578,7 @@ async fn upload_file_multipart_part_retry_honors_retry_after() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -659,6 +662,7 @@ async fn upload_file_multipart_part_429_retry_honors_retry_after() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -751,6 +755,7 @@ async fn part_permanent_refusal_leaves_the_upload_for_cleanup() {
         true,
         None,
         None,
+        None,
     )
     .await
     .expect_err("AccessDenied on part 2 fails the upload");
@@ -816,6 +821,7 @@ async fn part_exhausted_budget_leaves_the_upload_for_resume() {
         true,
         None,
         None,
+        None,
     )
     .await
     .expect_err("a spent budget fails the upload");
@@ -879,6 +885,7 @@ async fn spam_rejection_on_a_part_stays_fatal_and_does_not_abort() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -951,6 +958,7 @@ async fn rerun_after_part_failure_resumes_from_existing_parts() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1052,6 +1060,7 @@ async fn upload_file_multipart_resumes_from_existing() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1117,6 +1126,7 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1186,6 +1196,7 @@ async fn upload_file_multipart_new_item_no_such_bucket_starts_fresh() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1232,6 +1243,7 @@ async fn upload_file_multipart_list_uploads_other_error_still_fails() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1317,6 +1329,7 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1362,6 +1375,7 @@ async fn zero_part_size_returns_error_not_panic() {
         0, // invalid part_size
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1455,6 +1469,7 @@ async fn part_with_non_retryable_code_fails_without_retrying() {
         true,
         None,
         None,
+        None,
     )
     .await;
 
@@ -1495,6 +1510,7 @@ async fn part_retries_exactly_the_configured_budget() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1566,6 +1582,7 @@ async fn initiate_retries_on_slowdown_then_succeeds() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1645,6 +1662,7 @@ async fn complete_no_such_upload_after_a_retry_is_success_when_the_object_exists
         true,
         None,
         None,
+        None,
     )
     .await
     .expect("NoSuchUpload after a retry, with the object present, is a completed upload");
@@ -1707,6 +1725,7 @@ async fn complete_no_such_upload_after_a_retry_fails_when_the_object_is_missing(
         true,
         None,
         None,
+        None,
     )
     .await;
 
@@ -1756,6 +1775,7 @@ async fn complete_surfaces_no_such_upload_on_the_first_attempt() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -1903,6 +1923,7 @@ async fn initiate_spam_rejection_is_not_retried() {
         true,
         None,
         None,
+        None,
     )
     .await;
 
@@ -1940,6 +1961,7 @@ async fn resume_check_uses_the_configured_retry_budget() {
         1024,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -2029,6 +2051,7 @@ async fn retries_counts_control_call_attempts() {
         true,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -2097,6 +2120,7 @@ async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
         true,
         None,
         Some(progress),
+        None,
     )
     .await
     .unwrap();
@@ -2266,6 +2290,7 @@ async fn upload_thirty(server: &MockServer) -> ia_core::upload::UploadResult {
         10,
         true,
         true,
+        None,
         None,
         None,
     )
@@ -2589,5 +2614,150 @@ async fn resume_prefers_the_newest_by_initiated_time() {
         .await;
     let result = upload_thirty(&server).await;
     assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+// ── The skip check and one read apply to --multipart too (#20) ──────────
+//
+// These go through `upload::upload_file` with `multipart: true`, the way
+// the CLI does, because the skip-if-already-uploaded check lives there.
+
+async fn mount_metadata_with(server: &MockServer, md5: Option<&str>, size: u64) {
+    let mut file =
+        serde_json::json!({"name": "data.bin", "size": size.to_string(), "source": "original"});
+    if let Some(md5) = md5 {
+        file["md5"] = serde_json::Value::String(md5.to_string());
+    }
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [file]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The whole single-part multipart flow under the default part size:
+/// list_uploads empty, initiate `mp-1`, part 1, complete.
+async fn mount_fresh_single_part_upload(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>mp-1</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+async fn upload_file_multipart_via_upload_file(
+    server: &MockServer,
+    checksum: bool,
+    verify: bool,
+) -> ia_core::upload::UploadResult {
+    let client = test_client(server);
+    let f = temp_file(THIRTY);
+    let opts = UploadOpts {
+        multipart: true,
+        checksum,
+        verify,
+        ..Default::default()
+    };
+    ia_core::upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// A file whose md5 the item already lists is skipped, as for a single
+/// PUT; no S3 request is made.
+#[tokio::test]
+async fn multipart_skips_a_file_whose_md5_matches() {
+    let server = MockServer::start().await;
+    mount_metadata_with(&server, Some(&md5_hex(THIRTY)), 30).await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    let result = upload_file_multipart_via_upload_file(&server, true, true).await;
+    assert!(matches!(result.status, UploadStatus::Skipped), "{result:?}");
+    assert_eq!(result.md5.as_deref(), Some(md5_hex(THIRTY).as_str()));
+    server.verify().await;
+}
+
+/// `--clobber` uploads despite the matching md5, and the result carries the
+/// local md5 like a single PUT's does.
+#[tokio::test]
+async fn multipart_clobber_uploads_despite_a_matching_md5_and_sets_md5() {
+    let server = MockServer::start().await;
+    mount_metadata_with(&server, Some(&md5_hex(THIRTY)), 30).await;
+    mount_fresh_single_part_upload(&server).await;
+    let result = upload_file_multipart_via_upload_file(&server, false, true).await;
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.md5.as_deref(), Some(md5_hex(THIRTY).as_str()));
+    server.verify().await;
+}
+
+/// `--clobber --no-verify` reads nothing before uploading: no metadata
+/// lookup, no md5 in the result.
+#[tokio::test]
+async fn multipart_clobber_no_verify_reads_nothing_before_uploading() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"files": []})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    mount_fresh_single_part_upload(&server).await;
+    let result = upload_file_multipart_via_upload_file(&server, false, false).await;
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.md5, None);
     server.verify().await;
 }

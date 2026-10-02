@@ -27,9 +27,9 @@
 
 **Files:** `ia-core/src/upload/single.rs`, `ia-core/src/upload/multipart.rs`, `ia-core/tests/upload_multipart.rs`, `ia-core/tests/upload_single.rs`
 
-- [ ] **Step 1: Failing tests.** `multipart_skips_a_file_whose_md5_matches` (metadata lists the key with the local md5 → `Skipped`, no S3 request); `multipart_clobber_uploads_despite_a_matching_md5`; `multipart_sets_result_md5`; `multipart_clobber_no_verify_reads_nothing_before_uploading` (observable: no metadata GET; the resume path still hashes when an unfinished upload exists); existing single-PUT skip tests unchanged.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(upload): the skip check and one read of the file apply to --multipart too`.
+- [x] **Step 1: Failing tests.** `multipart_skips_a_file_whose_md5_matches` (metadata lists the key with the local md5 → `Skipped`, no S3 request); `multipart_clobber_uploads_despite_a_matching_md5`; `multipart_sets_result_md5`; `multipart_clobber_no_verify_reads_nothing_before_uploading` (observable: no metadata GET; the resume path still hashes when an unfinished upload exists); existing single-PUT skip tests unchanged.
+- [x] **Step 2: Run**; the skip test and the md5 test failed (the upload proceeded to S3; `md5` was `None`); the `--clobber --no-verify` test passed already and pins it. A separate `multipart_sets_result_md5` was folded into the clobber test. The "resume still hashes under `--clobber --no-verify`" case is covered by #19's rejection tests, which call the entry point with no hashes.
+- [x] **Step 3: Implement.** `upload_file` reads the file once before the branch (`hash_file_and_parts_async` at the default part size for multipart; `compute_file_md5_async` for a single PUT; a `--checksums` md5 as given with no part md5s), runs the skip check for both paths, then branches with `hashes.as_ref()`. `upload_file_multipart` takes `hashes: Option<&FileHashes>` (public API: one new parameter; 25 test call sites updated) and sets `UploadResult.md5`; `try_resume` takes the part md5s and hashes only when none were given. Commit: `fix(upload): the skip check and one read of the file apply to --multipart too`.
 
 ### Task 2: verify the assembled object
 

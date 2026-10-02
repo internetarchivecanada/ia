@@ -12,6 +12,7 @@
 
 use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
 use crate::error::{IaError, Result};
+use crate::upload::checksum::FileHashes;
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
 use bytes::Bytes;
@@ -672,6 +673,12 @@ use std::time::Instant;
 /// headers as the single-PUT path (`x-archive-auto-make-bucket`,
 /// `x-archive-queue-derive`, `x-archive-size-hint`), plus metadata headers
 /// on the initiate POST.
+///
+/// `hashes` is the file's md5 and per-part md5s at `part_size` when the
+/// caller already read the file (`upload_file` does, for the skip check);
+/// `None` when it did not (`--clobber --no-verify`). With hashes whose
+/// `parts` is empty (a md5 from `--checksums`), a resume check hashes the
+/// file itself. The whole-file md5, when known, becomes `UploadResult.md5`.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_file_multipart(
     client: &IaClient,
@@ -684,6 +691,7 @@ pub async fn upload_file_multipart(
     is_last_file: bool,
     size_hint: Option<u64>,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
+    hashes: Option<&FileHashes>,
 ) -> Result<UploadResult> {
     if part_size == 0 {
         return Err(IaError::UploadFailed {
@@ -731,8 +739,11 @@ pub async fn upload_file_multipart(
     }
 
     // Try to resume an existing upload whose parts match this file.
+    let part_md5s = hashes
+        .filter(|h| !h.parts.is_empty())
+        .map(|h| h.parts.as_slice());
     let (upload_id, existing_parts) =
-        try_resume(client, &control_ctx, file, file_size, part_size).await?;
+        try_resume(client, &control_ctx, file, file_size, part_size, part_md5s).await?;
 
     // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
     let extra_headers = {
@@ -923,7 +934,7 @@ pub async fn upload_file_multipart(
         key: key.into(),
         status: UploadStatus::Uploaded,
         bytes: file_size,
-        md5: None,
+        md5: hashes.map(|h| h.md5.clone()),
         elapsed_ms: start.elapsed().as_millis() as u64,
         retries: total_retries,
     })
@@ -1060,7 +1071,8 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
 /// can discard it. With no valid candidate, `None`: the caller initiates a
 /// fresh upload.
 ///
-/// The local hashes come from one read of the file
+/// The local part md5s are `part_md5s` when the caller already read the
+/// file; otherwise they come from one read here
 /// ([`super::checksum::hash_file_and_parts`]), done only when there is a
 /// candidate to check.
 async fn try_resume(
@@ -1069,6 +1081,7 @@ async fn try_resume(
     file: &Path,
     file_size: u64,
     part_size: u64,
+    part_md5s: Option<&[String]>,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
     let uploads = list_uploads_with_ctx(client, ctx).await?;
     let mut candidates: Vec<&MultipartUploadInfo> =
@@ -1079,10 +1092,17 @@ async fn try_resume(
         return Ok((None, Vec::new()));
     }
 
-    let hashes = super::checksum::hash_file_and_parts_async(file, part_size).await?;
+    let hashed;
+    let local: &[String] = match part_md5s {
+        Some(md5s) => md5s,
+        None => {
+            hashed = super::checksum::hash_file_and_parts_async(file, part_size).await?;
+            &hashed.parts
+        }
+    };
     for info in candidates {
         let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
-        match validate_parts(&parts, file_size, part_size, &hashes.parts) {
+        match validate_parts(&parts, file_size, part_size, local) {
             Ok(()) => return Ok((Some(info.upload_id.clone()), parts)),
             Err(reason) => tracing::warn!(
                 identifier = ctx.identifier,
