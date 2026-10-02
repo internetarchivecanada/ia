@@ -114,8 +114,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Options for downloading files.
 ///
-/// Build one with `..Default::default()`; the struct is `#[non_exhaustive]`,
-/// so fields may be added without a breaking change.
+/// The struct is `#[non_exhaustive]`, so fields may be added without a
+/// breaking change. Outside this crate that rules out struct expressions,
+/// `..Default::default()` included: start from [`DownloadOpts::default()`]
+/// and assign the fields to change.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DownloadOpts {

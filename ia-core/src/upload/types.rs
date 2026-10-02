@@ -5,9 +5,10 @@ use std::time::Duration;
 
 /// Options for upload operations.
 ///
-/// Build one with `..Default::default()` or [`UploadOptsBuilder`]; the
-/// struct is `#[non_exhaustive]`, so fields may be added without a
-/// breaking change.
+/// The struct is `#[non_exhaustive]`, so fields may be added without a
+/// breaking change. Outside this crate that rules out struct expressions,
+/// `..Default::default()` included: start from [`UploadOpts::default()`]
+/// and assign the fields to change, or use [`UploadOptsBuilder`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UploadOpts {
