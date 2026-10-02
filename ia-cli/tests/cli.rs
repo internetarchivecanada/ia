@@ -2116,7 +2116,20 @@ fn upload_help_describes_kept_multipart_upload_on_part_failure() {
             "ia upload cleanup my-item big.iso --abort",
         ))
         .stdout(predicate::str::contains("ITEM FILE --abort"))
+        .stdout(predicate::str::contains(
+            "cleaned up by IA after 30 days or more",
+        ))
         .stdout(predicate::str::contains("resumes from the parts"));
+}
+
+#[test]
+fn cleanup_help_says_unfinished_uploads_may_be_cleaned_up() {
+    ia().args(["upload", "cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "cleaned up by IA after 30 days or more",
+        ));
 }
 
 // -- upload retries back off; --retry-sleep is gone --
@@ -2564,9 +2577,11 @@ fn global_resume_flags_say_what_resumes() {
             .success()
             .stdout(predicate::str::contains("upload all files fresh").not())
             .stdout(predicate::str::contains(
-                "finished files for upload, fully finished items for download",
+                "finished files for upload; fully finished items for download",
             ))
-            .stdout(predicate::str::contains("process every file again"));
+            .stdout(predicate::str::contains("(download, upload, ai)").not())
+            .stdout(predicate::str::contains("process every file or item again"))
+            .stdout(predicate::str::contains("tasks submit"));
     }
 }
 
@@ -2576,4 +2591,221 @@ fn upload_help_says_what_an_interrupted_single_put_does() {
         .assert()
         .success()
         .stdout(predicate::str::contains("sent again from byte 0"));
+}
+
+// -- --no-resume is honored by every command that reads the joblog --
+//
+// metadata export, metadata modify and tasks submit skip items a joblog
+// records as done. --no-resume must make each of them process the item
+// again. Each test logs item1 as done, runs with --no-resume against
+// wiremock, and expects the item's request to be made.
+
+struct NoResumeFixture {
+    dir: tempfile::TempDir,
+    rt: tokio::runtime::Runtime,
+    server: wiremock::MockServer,
+    host: String,
+}
+
+fn no_resume_fixture(op: &str, ids: &str) -> NoResumeFixture {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("log.jsonl"),
+        format!(
+            "{{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"{op}\",\"item\":\"item1\",\"file\":\"\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":1}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("ids.txt"), ids).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    NoResumeFixture {
+        dir,
+        rt,
+        server,
+        host,
+    }
+}
+
+fn item1_json() -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {"identifier": "item1", "title": "T", "mediatype": "texts"},
+        "files": [], "server": "ia0.us.archive.org", "d1": "ia0.us.archive.org",
+        "d2": "ia1.us.archive.org", "dir": "/0/items/item1", "files_count": 0,
+        "item_size": 0, "is_dark": false
+    })
+}
+
+#[test]
+fn metadata_export_no_resume_exports_a_logged_item_again() {
+    let fx = no_resume_fixture("export", "item1\n");
+    fx.rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(item1_json()))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+    });
+    let out = fx.dir.path().join("out.jsonl");
+    ia().args([
+        "--insecure",
+        "--host",
+        &fx.host,
+        "--joblog",
+        fx.dir.path().join("log.jsonl").to_str().unwrap(),
+        "--no-resume",
+        "metadata",
+        "export",
+        "--itemlist",
+        fx.dir.path().join("ids.txt").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn metadata_modify_no_resume_modifies_a_logged_item_again() {
+    let fx = no_resume_fixture("modify", "item1\n");
+    fx.rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(item1_json()))
+            .mount(&fx.server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/metadata/item1"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("mock failure"))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+    });
+    ia().env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "--insecure",
+            "--host",
+            &fx.host,
+            "--joblog",
+            fx.dir.path().join("log.jsonl").to_str().unwrap(),
+            "--no-resume",
+            "metadata",
+            "modify",
+            "--itemlist",
+            fx.dir.path().join("ids.txt").to_str().unwrap(),
+            "-m",
+            "title:Test",
+        ])
+        .assert()
+        .failure();
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn tasks_submit_no_resume_submits_a_logged_item_again() {
+    let fx = no_resume_fixture("task-submit", "item1\n");
+    fx.rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/services/tasks.php"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("mock failure"))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+    });
+    ia().env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "--insecure",
+            "--host",
+            &fx.host,
+            "--joblog",
+            fx.dir.path().join("log.jsonl").to_str().unwrap(),
+            "--no-resume",
+            "tasks",
+            "submit",
+            "--cmd",
+            "derive",
+            "--itemlist",
+            fx.dir.path().join("ids.txt").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no identifiers provided").not());
+    fx.rt.block_on(fx.server.verify());
+}
+
+/// The default, pinned: without --no-resume a logged item is skipped and
+/// only the other one is submitted.
+#[test]
+fn tasks_submit_resume_skips_a_logged_item() {
+    let fx = no_resume_fixture("task-submit", "item1\nitem2\n");
+    fx.rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/services/tasks.php"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("mock failure"))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+    });
+    ia().env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "--insecure",
+            "--host",
+            &fx.host,
+            "--joblog",
+            fx.dir.path().join("log.jsonl").to_str().unwrap(),
+            "tasks",
+            "submit",
+            "--cmd",
+            "derive",
+            "--itemlist",
+            fx.dir.path().join("ids.txt").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("skipping 1 already-submitted"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+/// The default for export, against the mock rather than live archive.org:
+/// item1 is logged as done and not fetched; item2 is.
+#[test]
+fn metadata_export_resume_skips_a_logged_item() {
+    let fx = no_resume_fixture("export", "item1\nitem2\n");
+    fx.rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(item1_json()))
+            .expect(0)
+            .mount(&fx.server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/item2"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(item1_json()))
+            .expect(1)
+            .mount(&fx.server)
+            .await;
+    });
+    let out = fx.dir.path().join("out.jsonl");
+    ia().args([
+        "--insecure",
+        "--host",
+        &fx.host,
+        "--joblog",
+        fx.dir.path().join("log.jsonl").to_str().unwrap(),
+        "metadata",
+        "export",
+        "--itemlist",
+        fx.dir.path().join("ids.txt").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    fx.rt.block_on(fx.server.verify());
 }

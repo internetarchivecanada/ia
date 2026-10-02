@@ -217,7 +217,8 @@ pub struct UploadArgs {
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
-    /// discards a kept upload instead. A rerun resumes only when every
+    /// discards a kept upload instead; one left alone may be cleaned up by
+    /// IA after 30 days or more. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is
     /// left for cleanup, named in a warning.
@@ -276,7 +277,8 @@ pub enum UploadCommand {
             aborts FILE's upload(s), --abort-all aborts every upload of the item, and --dry-run \
             shows what either would abort without aborting. There is no interactive prompt. An \
             abort tells IA to delete every part already uploaded; a rerun of the upload resumes \
-            from those parts instead, so abort only what you mean to discard.",
+            from those parts instead, so abort only what you mean to discard. An unfinished \
+            upload left alone may be cleaned up by IA after 30 days or more.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># List all incomplete uploads for an item, with parts and bytes</dim>\
@@ -356,7 +358,8 @@ pub struct ImportArgs {
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
-    /// discards a kept upload instead. A rerun resumes only when every
+    /// discards a kept upload instead; one left alone may be cleaned up by
+    /// IA after 30 days or more. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is
     /// left for cleanup, named in a warning.
