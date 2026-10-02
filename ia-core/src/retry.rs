@@ -428,6 +428,85 @@ impl reqwest_middleware::Middleware for TimingMiddleware {
     }
 }
 
+/// The transport retry middleware: the library's loop with a wait that
+/// follows `Retry-After`.
+///
+/// `reqwest-retry`'s `RetryTransientMiddleware` computes every wait from its
+/// `RetryPolicy`, whose `should_retry(start_time, n_past_retries)` never
+/// sees the response, so a 5xx retried by it cannot follow the server's
+/// `Retry-After` by construction of that trait. This middleware keeps the
+/// pieces of that crate that do fit (the [`RetryableStrategy`] classifier
+/// and the [`ExponentialBackoff`] schedule) and owns the loop: clone the
+/// request, run it, classify the result, and before a retry sleep the
+/// server's `Retry-After` when the response carried one, otherwise the
+/// schedule's draw ([`wait_before_retry`]). The budget is the policy's.
+///
+/// A 429 is left to the strategy, which does not retry it: the application
+/// layer turns it into [`crate::error::IaError::RateLimited`] and pauses
+/// every concurrent worker through the shared `RateLimiter`.
+///
+/// A request whose body cannot be cloned (a streaming body) is sent once;
+/// there is nothing to resend.
+pub struct RetryMiddleware<S> {
+    policy: ExponentialBackoff,
+    strategy: S,
+}
+
+impl<S> RetryMiddleware<S> {
+    /// A middleware retrying what `strategy` classifies as transient, on
+    /// `policy`'s schedule and budget, honoring `Retry-After`.
+    pub fn new(policy: ExponentialBackoff, strategy: S) -> Self {
+        Self { policy, strategy }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> reqwest_middleware::Middleware for RetryMiddleware<S>
+where
+    S: RetryableStrategy + Send + Sync + 'static,
+{
+    async fn handle(
+        &self,
+        req: reqwest::Request,
+        extensions: &mut http::Extensions,
+        next: reqwest_middleware::Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        let mut n_past_retries: u32 = 0;
+        loop {
+            let Some(attempt) = req.try_clone() else {
+                return next.run(req, extensions).await;
+            };
+            let result = next.clone().run(attempt, extensions).await;
+
+            if !matches!(self.strategy.handle(&result), Some(Retryable::Transient)) {
+                return result;
+            }
+            if matches!(
+                self.policy
+                    .should_retry(std::time::SystemTime::now(), n_past_retries),
+                RetryDecision::DoNotRetry
+            ) {
+                return result;
+            }
+
+            let retry_after = result
+                .as_ref()
+                .ok()
+                .and_then(|response| retry_after_wait(response.headers()));
+            let wait = wait_before_retry(retry_after, &self.policy, n_past_retries);
+            tracing::debug!(
+                url = %req.url(),
+                retry = n_past_retries + 1,
+                wait_ms = wait.as_millis() as u64,
+                retry_after = retry_after.is_some(),
+                "transient failure, retrying"
+            );
+            tokio::time::sleep(wait).await;
+            n_past_retries += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

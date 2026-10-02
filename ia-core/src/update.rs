@@ -1,6 +1,6 @@
 use crate::error::IaError;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use reqwest_retry::{policies::ExponentialBackoff, DefaultRetryableStrategy};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -34,7 +34,10 @@ fn github_client(current_version: &str) -> crate::Result<ClientWithMiddleware> {
         .build_with_max_retries(3);
 
     Ok(ClientBuilder::new(raw)
-        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .with(crate::retry::RetryMiddleware::new(
+            retry_policy,
+            DefaultRetryableStrategy,
+        ))
         .build())
 }
 

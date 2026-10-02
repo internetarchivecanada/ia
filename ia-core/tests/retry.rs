@@ -237,7 +237,6 @@ async fn middleware_503_with_retry_after_waits_the_header() {
         "Retry-After: 1 was not waited for ({:?})",
         started.elapsed()
     );
-    assert_eq!(client.retry_stats().summary().requests_total, 2);
     server.verify().await;
 }
 
@@ -308,8 +307,8 @@ async fn middleware_retry_after_zero_resends_at_once_within_the_budget() {
         "Retry-After: 0 was not honored as an immediate retry ({:?})",
         started.elapsed()
     );
-    let s = client.retry_stats().summary();
-    assert_eq!(s.requests_total, 4);
-    assert_eq!(s.status_5xx_count, 4);
+    // The mock's expect(4) is the attempt count; `requests_total` counts
+    // outer calls (the timing middleware wraps the retry middleware).
+    assert_eq!(client.retry_stats().summary().status_5xx_count, 4);
     server.verify().await;
 }

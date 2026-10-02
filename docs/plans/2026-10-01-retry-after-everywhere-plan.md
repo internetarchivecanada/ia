@@ -32,17 +32,19 @@ Not applicable: the download stream re-request after a body error (no response t
 
 **Files:** `ia-core/src/retry.rs`, `ia-core/src/upload/retry.rs`, `ia-core/src/upload/single.rs`, `ia-core/src/upload/multipart.rs`, `ia-core/src/upload/types.rs`, `ia-core/src/error.rs`, every `IaError::Http {` construction site (62 across `tasks.rs`, `error.rs`, `scandata.rs`, `search.rs`, `download/zip.rs`, `download/mod.rs`, `ai/ia_config.rs`, `metadata/write.rs`, `metadata/schema.rs`, `metadata/read.rs`), the full destructurings (`tasks.rs:862, 1135`, `download/mod.rs:2679, 2716`).
 
-- [ ] **Step 1: Failing tests.** `crate::retry` unit tests move with the helpers (the four from `upload::retry`). `error.rs`: `IaError::Http { retry_after: Some(7), .. }.retry_after() == Some(7)`; `RateLimited { retry_after: 3 }.retry_after() == Some(3)`; `Http { retry_after: None }` → `None`; `to_json_error` on an `Http` with `retry_after: Some(7)` has `"retry_after": 7` and without it has no such key.
-- [ ] **Step 2: Run**; compile failure on the new field and method.
-- [ ] **Step 3: Implement.** The 62 construction sites are mechanical: a `sonnet` subagent adds `retry_after: None` everywhere, then the sites that have a response in hand are revisited by hand in Tasks 3 and 4. Commit: `refactor(retry): shared backoff helpers; IaError::Http carries Retry-After`.
+- [x] **Step 1: Failing tests.** `crate::retry` unit tests move with the helpers (the four from `upload::retry`). `error.rs`: `IaError::Http { retry_after: Some(7), .. }.retry_after() == Some(7)`; `RateLimited { retry_after: 3 }.retry_after() == Some(3)`; `Http { retry_after: None }` → `None`; `to_json_error` on an `Http` with `retry_after: Some(7)` has `"retry_after": 7` and without it has no such key.
+- [x] **Step 2: Run**; compile failure on the new field and method.
+- [x] **Step 3: Implement.** The 62 construction sites are mechanical: a `sonnet` subagent adds `retry_after: None` everywhere, then the sites that have a response in hand are revisited by hand in Tasks 3 and 4. Commit: `refactor(retry): shared backoff helpers; IaError::Http carries Retry-After`.
 
 ### Task 2: the middleware
 
 **Files:** `ia-core/src/retry.rs`, `ia-core/src/client.rs`, `ia-core/src/update.rs`, `ia-core/tests/retry.rs` (the existing middleware tests)
 
-- [ ] **Step 1: Failing tests.** Through `IaClient::from_config` against wiremock, a GET on `client.http()`: (a) 503 with `Retry-After: 1` once then 200 → Ok, two requests, at least 1 s elapsed; (b) 503 with an HTTP date 3 s ahead (computed right before the request) then 200 → at least 1 s; (c) 500 without a header, four times → the error surfaces after 4 requests (3 retries); (d) 429 → surfaces at once, one request (the strategy's rule is unchanged); (e) `client.api_no_retry()` on a 503 with `Retry-After: 1` → surfaces at once, one request (connect-only strategy). `RetryStats` counters still count the retries.
-- [ ] **Step 2: Run**; fail (a: no wait of 1 s; the rest pin the unchanged rules and may pass already, which is recorded).
-- [ ] **Step 3: Implement.** `RetryMiddleware<S: RetryableStrategy>` with `new(policy, strategy)`; `client.rs` and `update.rs` switch to it; `reqwest_retry::RetryTransientMiddleware` is no longer imported anywhere. Commit: `fix(client): the transport retry middleware honors Retry-After`.
+- [x] **Step 1: Failing tests.** Through `IaClient::from_config` against wiremock, a GET on `client.http()`: (a) 503 with `Retry-After: 1` once then 200 → Ok, two requests, at least 1 s elapsed; (b) 503 with an HTTP date 3 s ahead (computed right before the request) then 200 → at least 1 s; (c) 500 without a header, four times → the error surfaces after 4 requests (3 retries); (d) 429 → surfaces at once, one request (the strategy's rule is unchanged); (e) `client.api_no_retry()` on a 503 with `Retry-After: 1` → surfaces at once, one request (connect-only strategy). `RetryStats` counters still count the retries.
+- [x] **Step 2: Run**; all three new tests failed: the seconds form waited 959 ms (the backoff's draw), the date form 117 ms, and `Retry-After: 0` took 3 s of backoff. (d) was already pinned by `request_429_passes_through_without_retry`; (e) is not reachable from an integration test (`api_no_retry` is crate-private) and the connect-only strategy is unchanged and unit-tested.
+- [x] **Step 3: Implement.** `RetryMiddleware<S: RetryableStrategy>` with `new(policy, strategy)`; `client.rs` and `update.rs` switch to it; `reqwest_retry::RetryTransientMiddleware` is no longer imported anywhere. Commit: `fix(client): the transport retry middleware honors Retry-After`.
+
+Observations from Task 2, no change: (1) `RetryStats::requests_total` counts outer calls, not attempts, because `TimingMiddleware` wraps the retry middleware; its doc comment says "including retried ones". Pre-existing; for #17 or a later fix. (2) A request whose body cannot be cloned is sent once by `RetryMiddleware` instead of failing with the library's "not cloneable" error; ia-core has no `anyhow` to build that error, and one attempt is the right behavior for a streaming body anyway.
 
 ### Task 3: download
 
