@@ -1088,10 +1088,11 @@ impl KeptUpload<'_> {
     /// cause before rerunning; a spent budget says how many attempts were
     /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
-    /// Only an `UploadFailed` is reworded. Anything else the part request
-    /// produced, in practice IA's spam rejection (`SpamDetected`), is fatal
-    /// for the whole item and passes through unchanged so the item loop
-    /// still stops on it.
+    /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38) as
+    /// "part N of M stalled K times (<the stall measurement>)". Anything
+    /// else the part request produced, in practice IA's spam rejection
+    /// (`SpamDetected`), is fatal for the whole item and passes through
+    /// unchanged so the item loop still stops on it.
     fn describe(&self, failure: S3Failure) -> IaError {
         let refused = failure
             .code
@@ -1104,13 +1105,35 @@ impl KeptUpload<'_> {
                 status,
                 Self::detail(&message, self.part_num, failure.attempts),
             ),
+            IaError::UploadStalled {
+                observed_bytes_per_sec,
+                min_bytes_per_sec,
+                window_secs,
+                stalls,
+                ..
+            } => {
+                let kept = self.kept_sentence();
+                return IaError::UploadFailed {
+                    identifier: self.identifier.into(),
+                    key: self.key.into(),
+                    message: format!(
+                        "part {} of {} stalled {stalls} {} ({observed_bytes_per_sec} B/s over the \
+                         last {window_secs} s is below the --min-speed floor of \
+                         {min_bytes_per_sec} B/s): multipart upload {} {kept}; rerun the same \
+                         command to resume, or discard it with: ia upload cleanup {} {} --abort",
+                        self.part_num,
+                        self.part_count,
+                        if stalls == 1 { "time" } else { "times" },
+                        self.upload_id,
+                        self.identifier,
+                        shell_word(self.key)
+                    ),
+                    status: None,
+                };
+            }
             other => return other,
         };
-        let kept = match self.parts_on_ia {
-            0 => "is kept on IA with no parts yet".to_string(),
-            1 => "is kept with 1 part on IA".to_string(),
-            n => format!("is kept with {n} parts on IA"),
-        };
+        let kept = self.kept_sentence();
         let what = if refused {
             format!(
                 "part {} of {} refused by IA ({detail})",
@@ -1139,6 +1162,15 @@ impl KeptUpload<'_> {
                 shell_word(self.key)
             ),
             status,
+        }
+    }
+
+    /// "is kept with N parts on IA", or "is kept on IA with no parts yet".
+    fn kept_sentence(&self) -> String {
+        match self.parts_on_ia {
+            0 => "is kept on IA with no parts yet".to_string(),
+            1 => "is kept with 1 part on IA".to_string(),
+            n => format!("is kept with {n} parts on IA"),
         }
     }
 
@@ -1568,6 +1600,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A stalled part is a failed part: the upload is kept on IA and the
+    /// message carries the stall detail plus both ways forward.
+    #[test]
+    fn describe_stalled_part_is_a_kept_upload() {
+        let stalled = S3Failure {
+            error: Box::new(IaError::UploadStalled {
+                identifier: "item".into(),
+                key: "f.bin".into(),
+                observed_bytes_per_sec: 512,
+                min_bytes_per_sec: 10240,
+                window_secs: 60,
+                stalls: 2,
+            }),
+            code: None,
+            attempts: 2,
+        };
+        let err = kept(2, 3, 1, "f.bin").describe(stalled);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("part 2 of 3 stalled 2 times (512 B/s over the last 60 s is below the --min-speed floor of 10240 B/s): "),
+            "{msg}"
+        );
+        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin --abort"), "{msg}");
+        assert!(
+            matches!(err, IaError::UploadFailed { status: None, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
