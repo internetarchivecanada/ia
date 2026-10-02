@@ -547,6 +547,8 @@ struct WriteContext {
     quiet: u8,
     jobs: usize,
     joblog_path: Option<PathBuf>,
+    /// --no-resume: ignore what the joblog records as done.
+    no_resume: bool,
 }
 
 // ─── Main dispatch ───────────────────────────────────────────────────────────
@@ -558,11 +560,13 @@ pub async fn run(
     quiet: u8,
     jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     let ctx = WriteContext {
         quiet,
         jobs: jobs.unwrap_or(2), // writes use fixed concurrency
         joblog_path,
+        no_resume,
     };
 
     // Deprecated `import` subcommand → redirect to --spreadsheet path
@@ -605,6 +609,7 @@ pub async fn run(
                 ctx.quiet,
                 jobs, // pass Option for adaptive support
                 ctx.joblog_path,
+                ctx.no_resume,
             )
             .await
         }
@@ -1585,6 +1590,7 @@ async fn run_export(
     quiet: u8,
     jobs: Option<usize>,
     joblog_path: Option<PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     let mut identifiers = collect_identifiers_from_export(&args, client).await?;
 
@@ -1593,8 +1599,9 @@ async fn run_export(
         crate::commands::search::parse_extra_params(&args.parameters)?,
     );
 
-    // Auto-resume: skip items already successfully exported in this joblog
-    let skip_set: HashSet<String> = if let Some(ref path) = joblog_path {
+    // Auto-resume: skip items already successfully exported in this joblog,
+    // unless --no-resume.
+    let skip_set: HashSet<String> = if let (false, Some(path)) = (no_resume, joblog_path.as_ref()) {
         if path.exists() {
             completed_items_from_joblog(path, "export")?
         } else {
@@ -2146,16 +2153,18 @@ async fn run_write_inner(
         ));
     }
 
-    // Auto-resume: skip items already successfully modified in this joblog
-    let skip_set: HashSet<String> = if let Some(ref path) = ctx.joblog_path {
-        if path.exists() {
-            completed_items_from_joblog(path, MODIFY_OP)?
+    // Auto-resume: skip items already successfully modified in this joblog,
+    // unless --no-resume.
+    let skip_set: HashSet<String> =
+        if let (false, Some(path)) = (ctx.no_resume, ctx.joblog_path.as_ref()) {
+            if path.exists() {
+                completed_items_from_joblog(path, MODIFY_OP)?
+            } else {
+                HashSet::new()
+            }
         } else {
             HashSet::new()
-        }
-    } else {
-        HashSet::new()
-    };
+        };
 
     let before_skip = identifiers.len();
     if !skip_set.is_empty() {
@@ -2409,16 +2418,18 @@ async fn run_import(client: &IaClient, args: ImportArgs, ctx: &WriteContext) -> 
         }
     }
 
-    // Auto-resume: skip items already successfully modified in this joblog
-    let skip_set: HashSet<String> = if let Some(ref path) = ctx.joblog_path {
-        if path.exists() {
-            completed_items_from_joblog(path, MODIFY_OP)?
+    // Auto-resume: skip items already successfully modified in this joblog,
+    // unless --no-resume.
+    let skip_set: HashSet<String> =
+        if let (false, Some(path)) = (ctx.no_resume, ctx.joblog_path.as_ref()) {
+            if path.exists() {
+                completed_items_from_joblog(path, MODIFY_OP)?
+            } else {
+                HashSet::new()
+            }
         } else {
             HashSet::new()
-        }
-    } else {
-        HashSet::new()
-    };
+        };
 
     let before_skip = work_items.len();
     if !skip_set.is_empty() {

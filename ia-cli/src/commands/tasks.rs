@@ -296,10 +296,11 @@ pub async fn run(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     match args.command {
         Some(TasksCommand::Submit(submit_args)) => {
-            run_submit(client, submit_args, quiet, jobs, joblog).await
+            run_submit(client, submit_args, quiet, jobs, joblog, no_resume).await
         }
         Some(TasksCommand::Log(log_args)) => run_log(client, log_args).await,
         Some(TasksCommand::Rerun(rerun_args)) => run_rerun(client, rerun_args, quiet, jobs).await,
@@ -556,10 +557,11 @@ async fn run_submit(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     // For spreadsheet mode, cmd comes from the spreadsheet rows
     if args.spreadsheet.is_some() {
-        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog).await;
+        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog, no_resume).await;
     }
 
     // Outside spreadsheet mode, cmd is required
@@ -602,8 +604,9 @@ async fn run_submit(
     )
     .await?;
 
-    // Auto-resume: skip identifiers already successfully submitted in this joblog
-    if let Some(ref path) = joblog {
+    // Auto-resume: skip identifiers already successfully submitted in this
+    // joblog, unless --no-resume.
+    if let (false, Some(path)) = (no_resume, joblog.as_ref()) {
         if path.exists() {
             let entries =
                 joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
@@ -935,6 +938,7 @@ async fn run_submit_spreadsheet(
     quiet: u8,
     jobs: usize,
     joblog: Option<std::path::PathBuf>,
+    no_resume: bool,
 ) -> Result<()> {
     let spreadsheet_path = args
         .spreadsheet
@@ -1001,8 +1005,9 @@ async fn run_submit_spreadsheet(
         });
     }
 
-    // Auto-resume: skip identifiers already successfully submitted in this joblog
-    if let Some(ref path) = joblog {
+    // Auto-resume: skip identifiers already successfully submitted in this
+    // joblog, unless --no-resume.
+    if let (false, Some(path)) = (no_resume, joblog.as_ref()) {
         if path.exists() {
             let entries =
                 joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;

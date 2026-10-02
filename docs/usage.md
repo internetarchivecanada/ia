@@ -588,7 +588,7 @@ The skip check applies to `--multipart` as to a single PUT: the one read that gi
 
 #### Multipart part failures
 
-With `--multipart`, a part that fails for good does not abort the upload, because an abort tells IA to delete every part already uploaded. The upload stays on IA, and the file fails with a message that names it. When IA refused the part (`AccessDenied`, `InvalidAccessKeyId`, `BadDigest`, any non-retryable S3 code): `part 3 of 7 refused by IA (AccessDenied: Access Denied): multipart upload <id> is kept with 2 parts on IA; fix the cause and rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When the part's `--retries` ran out: `part 3 of 7 failed after 11 attempts (SlowDown: ...): multipart upload <id> is kept with 2 parts on IA; rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When part 1 fails on a fresh upload the message says the upload `is kept on IA with no parts yet`. A remote name with spaces or quote characters is single-quoted in the suggested command. IA's spam rejection on a part is not a part failure: it stops the whole item, as it does for a single PUT. In `--json` output and the joblog this text is the failure message. Rerunning the same command finds the upload, skips the parts IA already holds, and sends the rest. Killing the process mid-upload has always behaved this way; the two paths now match.
+With `--multipart`, a part that fails for good does not abort the upload, because an abort tells IA to delete every part already uploaded. The upload stays on IA, and the file fails with a message that names it. When IA refused the part (`AccessDenied`, `InvalidAccessKeyId`, `BadDigest`, any non-retryable S3 code): `part 3 of 7 refused by IA (AccessDenied: Access Denied): multipart upload <id> is kept with 2 parts on IA; fix the cause and rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When the part's `--retries` ran out: `part 3 of 7 failed after 11 attempts (SlowDown: ...): multipart upload <id> is kept with 2 parts on IA; rerun the same command to resume, or discard it with: ia upload cleanup <item> <file> --abort`. When part 1 fails on a fresh upload the message says the upload `is kept on IA with no parts yet`. A remote name with spaces or quote characters is single-quoted in the suggested command. IA's spam rejection on a part is not a part failure: it stops the whole item, as it does for a single PUT. In `--json` output and the joblog this text is the failure message. Rerunning the same command finds the upload, skips the parts IA already holds, and sends the rest. Killing the process mid-upload has always behaved this way; the two paths now match. An unfinished upload left alone may be cleaned up by IA after 30 days or more.
 
 ```bash
 # After a part failure: rerun to resume from the parts already on IA ...
@@ -617,7 +617,7 @@ Supports the same options as the bare command: `-m`, `--header`, `--checksum-fil
 | `--identifier-from-dirname` | Generate identifiers from parent directory names |
 | `--json` | Output template as JSONL |
 
-**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item. Lists by default, with or without FILE: each unfinished upload with its upload ID, when it started, and the parts IA holds (count and bytes). Nothing is aborted unless asked, and there is no interactive prompt. An abort tells IA to delete every part already uploaded; a rerun of the upload resumes from those parts instead, so abort only what you mean to discard.
+**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item. Lists by default, with or without FILE: each unfinished upload with its upload ID, when it started, and the parts IA holds (count and bytes). Nothing is aborted unless asked, and there is no interactive prompt. An abort tells IA to delete every part already uploaded; a rerun of the upload resumes from those parts instead, so abort only what you mean to discard. An unfinished upload left alone may be cleaned up by IA after 30 days or more.
 
 | Flag | Description |
 |------|-------------|
@@ -1215,8 +1215,8 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done: finished files for upload, fully finished items for download (a partial file resumes from its `.part` regardless) |
-| `--no-resume` | Ignore the joblog's record of finished work and process every file again (download, upload, ai) |
+| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done: finished files for upload; fully finished items for download (a partial file resumes from its `.part` regardless), `metadata export`, `metadata modify`, `tasks submit` and `ai qa` |
+| `--no-resume` | Ignore the joblog's record of finished work and process every file or item again |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
 | `-v, --verbose` | Increase output verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
@@ -1241,7 +1241,7 @@ ia --config-file ~/my-ia.ini download nasa
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload, fully finished items for download. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit` and `ai qa`. `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging

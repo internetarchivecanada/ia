@@ -78,14 +78,14 @@ struct Cli {
     /// Write operation results to a JSONL log file
     ///
     /// A rerun with the same --joblog skips what it records as done:
-    /// finished files for upload, fully finished items for download (a
+    /// finished files for upload; fully finished items for download (a
     /// partial file resumes from its .part regardless, see `ia download
-    /// --help`).
+    /// --help`), metadata export, metadata modify, tasks submit and ai qa.
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
     /// Ignore the joblog's record of finished work and process every file
-    /// again (download, upload, ai)
+    /// or item again
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
@@ -326,13 +326,14 @@ pub async fn run() -> Result<()> {
                 cli.quiet,
                 cli.jobs, // pass Option<usize> for adaptive support
                 cli.joblog.clone(),
+                cli.no_resume,
             )
             .await?
         }
         Commands::Search(args) => commands::search::run(&client, args, cli.quiet).await?,
         Commands::Status(args) => commands::status::run(args, cli.quiet).await?,
         Commands::Tasks(args) => {
-            commands::tasks::run(&client, args, cli.quiet, jobs, cli.joblog).await?
+            commands::tasks::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
         }
         Commands::Upload(args) => {
             commands::upload::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
