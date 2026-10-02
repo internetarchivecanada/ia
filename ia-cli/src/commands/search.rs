@@ -175,6 +175,7 @@ pub struct FtsArgs {
 
 #[derive(Args)]
 #[command(
+    about = "Search the Internet Archive",
     long_about = "Search the Internet Archive. Uses the scrape API by default. \
         Choose a subcommand for a different backend.",
     after_long_help = cstr!(

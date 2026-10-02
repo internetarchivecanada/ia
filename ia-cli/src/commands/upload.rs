@@ -58,6 +58,7 @@ fn build_skip_set(
 
 #[derive(Debug, Args)]
 #[command(
+    about = "Upload files to the Internet Archive",
     long_about = "Upload files to the Internet Archive. Uploads one or more files to a single item, \
         with options for metadata, checksum verification, directory structure, and retry logic. Supports batch \
         uploads from spreadsheets and template generation for bulk workflows.",

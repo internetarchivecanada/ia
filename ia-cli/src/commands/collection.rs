@@ -12,7 +12,7 @@ use ia_core::IaClient;
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Manage Internet Archive collections",
+    about = "Create and manage collections",
     long_about = "Create and manage Internet Archive collections. Collections are items with \
         mediatype=collection that group related items together."
 )]

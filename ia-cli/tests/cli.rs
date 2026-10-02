@@ -2469,3 +2469,101 @@ fn cleanup_help_says_which_flags_abort() {
         .stdout(predicate::str::contains("without confirmation").not())
         .stdout(predicate::str::contains("Lists by default"));
 }
+
+// -- every command's long help renders (#17) --
+//
+// A doc comment on a `Commands` variant in lib.rs becomes that command's
+// `about` and clears the `long_about` on its argument struct, so the
+// paragraphs written for `ia <cmd> --help` silently vanish. Each row is a
+// phrase from the struct's long_about; the one-liners `ia --help` shows are
+// pinned too, so moving them onto the structs changes nothing visible.
+
+#[test]
+fn every_command_renders_its_long_help() {
+    let table: &[(&str, &str, &str)] = &[
+        (
+            "collection",
+            "Collections are items",
+            "Create and manage collections",
+        ),
+        ("list", "Displays a table of files", "List files in an item"),
+        (
+            "metadata",
+            "Read or modify Internet Archive item metadata",
+            "Read or modify item metadata",
+        ),
+        (
+            "search",
+            "Uses the scrape API by default",
+            "Search the Internet Archive",
+        ),
+        (
+            "status",
+            "Show a summary of a job log file",
+            "Show job log summary",
+        ),
+        (
+            "tasks",
+            "Lists, submits, reruns, and inspects tasks",
+            "Manage archive.org catalog tasks",
+        ),
+        (
+            "upload",
+            "Uploads one or more files to a single item",
+            "Upload files to the Internet Archive",
+        ),
+        (
+            "verify",
+            "Verify that local files exist on archive.org",
+            "Verify local files exist",
+        ),
+        (
+            "completions",
+            "Prints a completion script to stdout",
+            "Generate shell completions",
+        ),
+        ("man", "Writes one page per", "Generate roff man pages"),
+        (
+            "config",
+            "Log in to archive.org",
+            "Configure credentials and settings",
+        ),
+        (
+            "download",
+            "Each file streams to <name>.part",
+            "Download files from an item",
+        ),
+    ];
+    for (cmd, long_phrase, _) in table {
+        ia().args([cmd, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(*long_phrase).name(cmd));
+    }
+    let top = ia().arg("--help").output().unwrap();
+    let top = String::from_utf8_lossy(&top.stdout);
+    for (cmd, _, one_liner) in table {
+        assert!(
+            top.contains(one_liner),
+            "ia --help lost the one-liner for {cmd}: {top}"
+        );
+    }
+}
+
+// -- the global --joblog and --no-resume help say what resumes (#17) --
+
+#[test]
+fn global_resume_flags_say_what_resumes() {
+    for cmd in [
+        vec!["--help"],
+        vec!["download", "--help"],
+        vec!["upload", "--help"],
+    ] {
+        ia().args(&cmd)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("upload all files fresh").not())
+            .stdout(predicate::str::contains("skips the files it lists as done"))
+            .stdout(predicate::str::contains("process every file again"));
+    }
+}

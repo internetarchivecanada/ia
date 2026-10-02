@@ -8,6 +8,7 @@ use ia_core::joblog;
 
 #[derive(Args)]
 #[command(
+    about = "Show job log summary and failed operations",
     long_about = "Show a summary of a job log file. Displays total operations, success/failure/skip \
         counts, and lists any failed files with error messages.",
     after_long_help = cstr!(

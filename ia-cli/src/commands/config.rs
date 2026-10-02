@@ -9,6 +9,7 @@ use console::style;
 /// Configure Internet Archive credentials and settings.
 #[derive(Debug, Args)]
 #[command(
+    about = "Configure credentials and settings",
     long_about = "Configure Internet Archive credentials and settings.\n\n\
         Log in to archive.org, view configuration, validate credentials, and \
         retrieve account information.",

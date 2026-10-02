@@ -5,6 +5,7 @@ use color_print::cstr;
 
 #[derive(Args)]
 #[command(
+    about = "Generate shell completions for bash, zsh, fish, etc.",
     long_about = "Generate shell completion scripts. Prints a completion script to stdout \u{2014} \
         redirect it to the appropriate file for your shell.",
     after_long_help = cstr!(

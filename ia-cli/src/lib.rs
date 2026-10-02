@@ -75,11 +75,14 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     user_agent_suffix: Option<String>,
 
-    /// Write operation results to a JSONL log file (enables auto-resume)
+    /// Write operation results to a JSONL log file; a rerun with the same
+    /// --joblog skips the files it lists as done (download resumes a
+    /// partial file from its .part regardless, see `ia download --help`)
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
-    /// Don't resume from joblog — upload all files fresh
+    /// Ignore the joblog's record of finished files and process every file
+    /// again
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
@@ -101,39 +104,50 @@ enum Commands {
     // `long_about` set on AiArgs. Both live on the struct.
     #[cfg(feature = "alpha")]
     Ai(commands::ai::AiArgs),
-    /// Create and manage collections
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on CollectionArgs. Both live on the struct.
     #[command(visible_alias = "col")]
     Collection(commands::collection::CollectionArgs),
     // No doc comment here: clap would turn it into `about` and clear the
     // `long_about` set on DownloadArgs. Both live on the struct.
     #[command(visible_alias = "do")]
     Download(commands::download::DownloadArgs),
-    /// List files in an item with filtering and formatting
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on ListArgs. Both live on the struct.
     #[command(visible_alias = "ls")]
     List(commands::list::ListArgs),
-    /// Read or modify item metadata
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on MetadataArgs. Both live on the struct.
     #[command(visible_alias = "md")]
     Metadata(commands::metadata::MetadataArgs),
-    /// Search the Internet Archive
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on SearchArgs. Both live on the struct.
     #[command(visible_alias = "se")]
     Search(commands::search::SearchArgs),
-    /// Show job log summary and failed operations
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on StatusArgs. Both live on the struct.
     Status(commands::status::StatusArgs),
-    /// Manage archive.org catalog tasks
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on TasksArgs. Both live on the struct.
     #[command(visible_alias = "ta")]
     Tasks(commands::tasks::TasksArgs),
-    /// Upload files to the Internet Archive
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on UploadArgs. Both live on the struct.
     #[command(visible_alias = "up")]
     Upload(commands::upload::UploadArgs),
-    /// Verify local files exist on archive.org with matching checksums
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on VerifyArgs. Both live on the struct.
     #[command(visible_alias = "ve")]
     Verify(commands::verify::VerifyArgs),
-    /// Generate shell completions for bash, zsh, fish, etc.
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on CompletionsArgs. Both live on the struct.
     Completions(commands::completions::CompletionsArgs),
 
-    /// Generate roff man pages from the command tree
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on ManArgs. Both live on the struct.
     Man(commands::man::ManArgs),
-    /// Configure credentials and settings
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on ConfigArgs. Both live on the struct.
     #[command(visible_alias = "co")]
     Config(commands::config::ConfigArgs),
     // No doc comment here: clap would turn it into `about` and clear the
