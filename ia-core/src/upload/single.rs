@@ -315,7 +315,7 @@ pub async fn upload_file(
         // stall watch so a server that stops reading is caught (#38). The
         // Arc<dyn Fn> is cloned into the move closure, satisfying the
         // 'static bound required by reqwest::Body::wrap_stream().
-        let watch = BodyWatch::new(opts.min_speed);
+        let watch = BodyWatch::new();
         let progress_cb = progress.clone();
         let id = identifier.to_string();
         let k = key.to_string();
@@ -340,19 +340,14 @@ pub async fn upload_file(
         .await
         {
             SendEnd::Done(response) => response,
-            SendEnd::Stalled {
-                observed,
-                window_secs,
-            } => {
+            SendEnd::Stalled { window_secs } => {
                 stalls += 1;
                 tracing::warn!(
                     identifier,
                     key,
                     retry = retries + 1,
-                    observed_bytes_per_sec = observed,
-                    min_bytes_per_sec = opts.min_speed,
                     window_secs,
-                    "body send stalled, {}",
+                    "body send moved no bytes for the whole window, {}",
                     if retries < opts.retries {
                         "re-sending"
                     } else {
@@ -378,8 +373,6 @@ pub async fn upload_file(
                 return Err(IaError::UploadStalled {
                     identifier: identifier.to_string(),
                     key: key.to_string(),
-                    observed_bytes_per_sec: observed,
-                    min_bytes_per_sec: opts.min_speed,
                     window_secs,
                     stalls,
                 });
@@ -764,7 +757,6 @@ mod tests {
             verify: false,
             checksum: false,
             retries: 1,
-            min_speed: 10 * 1024,
             ..Default::default()
         };
         let err = tokio::time::timeout(
@@ -789,7 +781,6 @@ mod tests {
                 err,
                 IaError::UploadStalled {
                     stalls: 2,
-                    min_bytes_per_sec: 10240,
                     window_secs: 2,
                     ..
                 }

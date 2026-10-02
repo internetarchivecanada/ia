@@ -50,11 +50,6 @@ pub struct UploadOpts {
     /// `UploadedUnverified`. Default 5 minutes. Library configuration, not
     /// a CLI flag; tests shrink it.
     pub verify_timeout: Duration,
-    /// Floor for a body send, in bytes per second: once a send is 30 s old,
-    /// its average over the last 60 s (or its whole life while younger) is
-    /// compared with this once a second; below it the request is abandoned
-    /// and retried under `retries` (#38). Default 10 KiB/s; 0 disables.
-    pub min_speed: u64,
     /// Additional HTTP headers to include.
     pub headers: Vec<(String, String)>,
     /// Validate everything but don't actually upload.
@@ -83,7 +78,6 @@ impl Default for UploadOpts {
             retry_min_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(60),
             verify_timeout: Duration::from_secs(300),
-            min_speed: 10 * 1024,
             headers: Vec::new(),
             dry_run: false,
         }
@@ -234,13 +228,6 @@ impl UploadOptsBuilder {
         self
     }
 
-    /// Set the body-send floor in bytes per second (0 disables stall
-    /// detection).
-    pub fn min_speed(mut self, min_speed: u64) -> Self {
-        self.opts.min_speed = min_speed;
-        self
-    }
-
     /// Set additional HTTP headers.
     pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.opts.headers = headers;
@@ -387,7 +374,6 @@ mod tests {
         assert_eq!(opts.retry_min_delay, Duration::from_secs(1));
         assert_eq!(opts.retry_max_delay, Duration::from_secs(60));
         assert_eq!(opts.verify_timeout, Duration::from_secs(300));
-        assert_eq!(opts.min_speed, 10 * 1024, "10 KiB/s, as for download");
         assert!(opts.metadata.is_empty());
     }
 

@@ -14,4 +14,4 @@
 
 **Tests.** Red first: `UploadOpts` has no `min_speed` (compile), `upload --help` has no `--min-speed` and states "moves no bytes for 60 s", `--min-speed` is rejected as an unknown argument, the error display and JSON carry the new fields, the stalled-part message reads "no bytes sent for". The stall tests keep passing with the shrunk policy (the upload watch then uses 2 s for both window and grace).
 
-- [ ] Tests, red; implement; `just ci`; review; PR; squash-merge; `scripts/ia-cleanup upload-dead-send` only after a confirmed merge.
+- [x] Tests, red (compile failures on the removed field and the error's old fields; the help tests on the flag and the rule); implement. [ ] `just ci`; review; PR; squash-merge; `scripts/ia-cleanup upload-dead-send` only after a confirmed merge.

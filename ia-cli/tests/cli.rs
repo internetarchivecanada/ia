@@ -2810,31 +2810,23 @@ fn metadata_export_resume_skips_a_logged_item() {
     fx.rt.block_on(fx.server.verify());
 }
 
-// -- upload --min-speed (#38) --
+// -- upload: a dead send is abandoned; there is no --min-speed on upload --
 
 #[test]
-fn upload_help_describes_min_speed() {
+fn upload_help_states_the_dead_send_rule_and_has_no_min_speed() {
     ia().args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--min-speed"))
-        .stdout(predicate::str::contains("stalled"))
-        .stdout(predicate::str::contains("0 disables"));
+        .stdout(predicate::str::contains("--min-speed").not())
+        .stdout(predicate::str::contains("moves no bytes for 60 s"))
+        .stdout(predicate::str::contains("stalled"));
 }
 
 #[test]
-fn upload_rejects_a_bad_min_speed() {
-    ia().args(["upload", "my-item", "Cargo.toml", "--min-speed", "10KB"])
+fn upload_rejects_min_speed() {
+    ia().args(["upload", "my-item", "Cargo.toml", "--min-speed", "10K"])
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("10K"));
-}
-
-#[test]
-fn upload_help_shows_a_min_speed_example() {
-    ia().args(["upload", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--multipart --min-speed 1M"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }

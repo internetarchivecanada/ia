@@ -36,9 +36,6 @@ pub(crate) struct S3RetryCtx<'a> {
     pub retries: u32,
     /// The wait schedule between attempts (see [`backoff_policy`]).
     pub backoff: ExponentialBackoff,
-    /// Floor for the body send in bytes per second; 0 disables stall
-    /// detection (see [`BodyWatch`]).
-    pub min_speed: u64,
     /// Bytes already sent, for the progress callback during a backoff.
     pub bytes_sent: u64,
     pub total_bytes: u64,
@@ -52,7 +49,6 @@ impl std::fmt::Debug for S3RetryCtx<'_> {
             .field("key", &self.key)
             .field("retries", &self.retries)
             .field("backoff", &self.backoff)
-            .field("min_speed", &self.min_speed)
             .field("bytes_sent", &self.bytes_sent)
             .field("total_bytes", &self.total_bytes)
             .field("progress", &self.progress.is_some())
@@ -100,7 +96,7 @@ impl From<S3Failure> for IaError {
 /// with a body worth watching wraps its stream with it, the others ignore
 /// it.
 ///
-/// A body send that stalls below `ctx.min_speed` (see [`BodyWatch`]) is
+/// A body send that moves no bytes for a minute (see [`BodyWatch`]) is
 /// abandoned and re-sent at once while the budget lasts; past it the
 /// failure is [`IaError::UploadStalled`].
 ///
@@ -123,22 +119,17 @@ where
 
         // Every attempt is judged on its own clock: a re-send is a new
         // connection and gets the full grace.
-        let watch = BodyWatch::new(ctx.min_speed);
+        let watch = BodyWatch::new();
         let sent = match watch_send(&watch, send(&watch)).await {
             SendEnd::Done(result) => result,
-            SendEnd::Stalled {
-                observed,
-                window_secs,
-            } => {
+            SendEnd::Stalled { window_secs } => {
                 stalls += 1;
                 tracing::warn!(
                     identifier = ctx.identifier,
                     key = ctx.key,
                     attempt,
-                    observed_bytes_per_sec = observed,
-                    min_bytes_per_sec = ctx.min_speed,
                     window_secs,
-                    "body send stalled, {}",
+                    "body send moved no bytes for the whole window, {}",
                     if attempt <= ctx.retries {
                         "re-sending"
                     } else {
@@ -154,8 +145,6 @@ where
                     error: Box::new(IaError::UploadStalled {
                         identifier: ctx.identifier.into(),
                         key: ctx.key.into(),
-                        observed_bytes_per_sec: observed,
-                        min_bytes_per_sec: ctx.min_speed,
                         window_secs,
                         stalls,
                     }),
@@ -316,7 +305,6 @@ mod stall_tests {
                 std::time::Duration::from_millis(2),
                 retries,
             ),
-            min_speed: 10 * 1024,
             bytes_sent: 0,
             total_bytes: 16 * 1024 * 1024,
             progress: None,
@@ -363,7 +351,6 @@ mod stall_tests {
                 IaError::UploadStalled {
                     stalls: 2,
                     window_secs: 2,
-                    min_bytes_per_sec: 10240,
                     ..
                 }
             ),

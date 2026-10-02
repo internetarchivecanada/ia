@@ -161,20 +161,17 @@ pub enum IaError {
         stalls: usize,
     },
 
-    /// The body send of an upload kept falling below the `--min-speed`
-    /// floor until the retries were spent (#38). `stalls` counts every
-    /// stall, so it is one more than the retries when every attempt
-    /// stalled; `observed_bytes_per_sec` is the last average measured.
+    /// The body send of an upload kept dying (no bytes sent for
+    /// `window_secs`) until the retries were spent (#38). `stalls` counts
+    /// every stall, so it is one more than the retries when every attempt
+    /// stalled.
     #[error(
-        "upload of {identifier}/{key} stalled {stalls} {}: {observed_bytes_per_sec} B/s over the \
-         last {window_secs} s is below the --min-speed floor of {min_bytes_per_sec} B/s",
+        "upload of {identifier}/{key} stalled {stalls} {}: no bytes were sent for {window_secs} s",
         if *.stalls == 1 { "time" } else { "times" }
     )]
     UploadStalled {
         identifier: String,
         key: String,
-        observed_bytes_per_sec: u64,
-        min_bytes_per_sec: u64,
         window_secs: u64,
         stalls: usize,
     },
@@ -572,18 +569,11 @@ impl IaError {
             IaError::UploadStalled {
                 identifier,
                 key,
-                observed_bytes_per_sec,
-                min_bytes_per_sec,
                 window_secs,
                 stalls,
             } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("key".into(), key.clone().into());
-                extra.insert(
-                    "observed_bytes_per_sec".into(),
-                    (*observed_bytes_per_sec).into(),
-                );
-                extra.insert("min_bytes_per_sec".into(), (*min_bytes_per_sec).into());
                 extra.insert("window_secs".into(), (*window_secs).into());
                 extra.insert("stalls".into(), (*stalls).into());
                 "upload_stalled"
@@ -1860,14 +1850,12 @@ mod tests {
         assert!(!msg.contains("1 times"), "{msg}");
     }
 
-    // -- UploadStalled (#38) --
+    // -- UploadStalled (#38, fixed rule after #41) --
 
     fn upload_stalled(stalls: usize) -> IaError {
         IaError::UploadStalled {
             identifier: "item".into(),
             key: "big.iso".into(),
-            observed_bytes_per_sec: 512,
-            min_bytes_per_sec: 10240,
             window_secs: 60,
             stalls,
         }
@@ -1876,14 +1864,10 @@ mod tests {
     #[test]
     fn upload_stalled_displays_details() {
         let msg = upload_stalled(5).to_string();
-        assert!(
-            msg.contains("upload of item/big.iso stalled 5 times:"),
-            "{msg}"
+        assert_eq!(
+            msg,
+            "upload of item/big.iso stalled 5 times: no bytes were sent for 60 s"
         );
-        assert!(msg.contains("512 B/s"), "{msg}");
-        assert!(msg.contains("60 s"), "{msg}");
-        assert!(msg.contains("--min-speed"), "{msg}");
-        assert!(msg.contains("10240 B/s"), "{msg}");
     }
 
     #[test]
@@ -1904,11 +1888,11 @@ mod tests {
         assert_eq!(v["error"]["code"], "upload_stalled");
         assert_eq!(v["error"]["identifier"], "item");
         assert_eq!(v["error"]["key"], "big.iso");
+        assert_eq!(v["error"]["window_secs"], 60);
+        assert_eq!(v["error"]["stalls"], 2);
+        assert!(v["error"].get("min_bytes_per_sec").is_none());
     }
 
-    /// The new variant must not grow the error: clippy's result_large_err
-    /// draws the line at 128 bytes for a Result's Err, and S3Failure boxes
-    /// an IaError that was 104 bytes when this was written.
     #[test]
     fn upload_stalled_does_not_grow_the_error() {
         assert!(std::mem::size_of::<IaError>() <= 104);

@@ -6,19 +6,20 @@
 //! cost is that a server that stops *reading* the body hangs the request for
 //! as long as the connection stays open, and no retry ever fires.
 //!
-//! [`BodyWatch`] closes that gap the way download's chunk loop does (#11):
-//! the body stream reports every chunk it hands to the transport into a
-//! [`StallDetector`], and [`watch_send`] runs the request under a
-//! once-a-second ticker that asks the detector. A send judged below the
-//! floor is abandoned: the request future is dropped, which closes the
-//! connection, and the caller retries. The clock starts at the first body
-//! poll, so a slow connect and TLS handshake are neither a stall nor part
-//! of the window's divisor (a connect that hangs is bounded by the connect
-//! timeout). Only the body send is judged: once the last chunk has been
-//! handed over, the wait for the server's response is not a stall (a part
-//! PUT's answer legitimately arrives seconds after the body, while IA
-//! hashes it), and nothing bounds that wait: a server that takes the whole
-//! body and never answers hangs until the connection dies.
+//! [`BodyWatch`] closes that gap with one fixed rule: a send that moves no
+//! bytes for [`stall::WINDOW`] (60 s) is dead and is abandoned. The body
+//! stream reports every chunk it hands to the transport into a
+//! [`StallDetector`] with a floor of one byte per second and both window
+//! and grace at 60 s, and [`watch_send`] runs the request under a
+//! once-a-second ticker that asks it; a dead send's future is dropped,
+//! which closes the connection, and the caller retries. There is no rate
+//! floor to tune, unlike download's `--min-speed`: a re-send goes to the
+//! same endpoint, so "slow" is not a signal of anything fixable, only
+//! "dead" is. The clock starts at the first body poll, so a slow connect
+//! is not counted. Only the body send is judged: once the last chunk has
+//! been handed over, the wait for the server's response is not a stall (a
+//! part PUT's answer legitimately arrives seconds after the body, while IA
+//! hashes it), and nothing bounds that wait (#40).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,31 +48,21 @@ pub(crate) struct BodyWatch {
     /// The body length given to `wrap`.
     expected: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
-    min_speed: u64,
     window: std::time::Duration,
-    grace: std::time::Duration,
 }
 
 impl BodyWatch {
-    /// A watch with the given floor in bytes per second; 0 disables it.
-    /// The clock starts at the first body poll, not now: connecting is not
-    /// judged and does not dilute the window.
-    pub(crate) fn new(min_speed: u64) -> Self {
-        let (window, grace) = stall::policy();
+    /// A watch for one attempt's body send. The clock starts at the first
+    /// body poll, not now: connecting is not judged.
+    pub(crate) fn new() -> Self {
+        let (window, _grace) = stall::policy();
         Self {
             detector: Arc::new(Mutex::new(None)),
             done: Arc::new(AtomicBool::new(false)),
             expected: Arc::new(AtomicU64::new(u64::MAX)),
             sent: Arc::new(AtomicU64::new(0)),
-            min_speed,
             window,
-            grace,
         }
-    }
-
-    /// Whether the watch judges anything (a zero floor does not).
-    pub(crate) fn is_active(&self) -> bool {
-        self.min_speed > 0
     }
 
     /// Wrap a body stream of `body_len` bytes so every chunk it yields is
@@ -89,14 +80,13 @@ impl BodyWatch {
     }
 
     fn record(&self, bytes: u64) {
-        if self.min_speed > 0 {
-            if let Ok(mut guard) = self.detector.lock() {
-                let now = Instant::now();
-                let d = guard.get_or_insert_with(|| {
-                    StallDetector::new(self.min_speed, self.window, self.grace, now)
-                });
-                d.record(now, bytes);
-            }
+        if let Ok(mut guard) = self.detector.lock() {
+            let now = Instant::now();
+            // Floor of one byte per second, grace equal to the window: a
+            // send is judged dead when the last window holds no bytes.
+            let d =
+                guard.get_or_insert_with(|| StallDetector::new(1, self.window, self.window, now));
+            d.record(now, bytes);
         }
         let sent = self.sent.fetch_add(bytes, Ordering::SeqCst) + bytes;
         if sent >= self.expected.load(Ordering::SeqCst) {
@@ -104,17 +94,16 @@ impl BodyWatch {
         }
     }
 
-    /// `Some((observed, window_secs))` when the send is below the floor.
-    /// `None` while nothing has been polled yet, within the grace, while
-    /// keeping up, and once the body is done.
-    fn check(&self) -> Option<(u64, u64)> {
+    /// `Some(window_secs)` when the send is dead: nothing moved over the
+    /// window. `None` while nothing has been polled yet, within the first
+    /// window, while bytes keep moving, and once the body is done.
+    fn check(&self) -> Option<u64> {
         if self.done.load(Ordering::SeqCst) {
             return None;
         }
         let mut guard = self.detector.lock().ok()?;
         let d = guard.as_mut()?;
-        d.check(Instant::now())
-            .map(|observed| (observed, d.window_secs()))
+        d.check(Instant::now()).map(|_observed| d.window_secs())
     }
 }
 
@@ -151,22 +140,17 @@ where
 pub(crate) enum SendEnd<T> {
     /// The request future finished with this result.
     Done(T),
-    /// The detector judged the body send below the floor; the request was
-    /// dropped, closing the connection. `observed` is the average measured
-    /// over `window_secs`.
-    Stalled { observed: u64, window_secs: u64 },
+    /// The body send moved no bytes for `window_secs`; the request was
+    /// dropped, closing the connection.
+    Stalled { window_secs: u64 },
 }
 
 /// Run `send` under `watch`: the future races a once-a-second check of the
-/// detector, and a stall drops the future. With a zero floor the future is
-/// simply awaited.
+/// detector, and a dead send drops the future.
 pub(crate) async fn watch_send<F, T>(watch: &BodyWatch, send: F) -> SendEnd<T>
 where
     F: Future<Output = T>,
 {
-    if !watch.is_active() {
-        return SendEnd::Done(send.await);
-    }
     tokio::pin!(send);
     let mut ticker = tokio::time::interval(stall::CHECK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -174,8 +158,8 @@ where
         tokio::select! {
             result = &mut send => return SendEnd::Done(result),
             _ = ticker.tick() => {
-                if let Some((observed, window_secs)) = watch.check() {
-                    return SendEnd::Stalled { observed, window_secs };
+                if let Some(window_secs) = watch.check() {
+                    return SendEnd::Stalled { window_secs };
                 }
             }
         }
@@ -277,7 +261,7 @@ mod tests {
         let _policy = shrink_policy();
         let (addr, connections) = stalling_listener().await;
         let client = plain_client();
-        let watch = BodyWatch::new(10 * 1024);
+        let watch = BodyWatch::new();
         let body = watch.wrap(bytes_chunks(big_body()), 16 * 1024 * 1024);
         let started = std::time::Instant::now();
         let end = tokio::time::timeout(
@@ -294,13 +278,7 @@ mod tests {
         .await
         .expect("the stalled send must be judged within a minute");
         match end {
-            SendEnd::Stalled {
-                observed,
-                window_secs,
-            } => {
-                assert_eq!(window_secs, 2);
-                assert!(observed < 10 * 1024, "observed {observed}");
-            }
+            SendEnd::Stalled { window_secs } => assert_eq!(window_secs, 2),
             SendEnd::Done(r) => panic!("expected a stall, got {r:?}"),
         }
         assert!(
@@ -322,7 +300,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = plain_client();
-        let watch = BodyWatch::new(10 * 1024);
+        let watch = BodyWatch::new();
         let payload = Bytes::from(vec![1u8; 200 * 1024]);
         let body = watch.wrap(bytes_chunks(payload), 200 * 1024);
         let end = watch_send(
@@ -345,33 +323,6 @@ mod tests {
         server.verify().await;
     }
 
-    /// A zero floor builds no detector: the send is awaited as is, even
-    /// against a peer that stops reading would hang (so this one uses a
-    /// server that reads).
-    #[tokio::test]
-    async fn zero_floor_disables_the_watch() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-        let client = plain_client();
-        let watch = BodyWatch::new(0);
-        assert!(!watch.is_active());
-        assert!(watch.check().is_none());
-        let body = watch.wrap(bytes_chunks(Bytes::from_static(b"abc")), 3);
-        let end = watch_send(
-            &watch,
-            client
-                .put(format!("{}/x", server.uri()))
-                .header("Content-Length", "3")
-                .body(reqwest::Body::wrap_stream(body))
-                .send(),
-        )
-        .await;
-        assert!(matches!(end, SendEnd::Done(Ok(_))));
-    }
-
     /// Once the body has been handed over, waiting for the response is not
     /// judged: a slow server that has read everything is not a stall.
     #[tokio::test]
@@ -386,7 +337,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = plain_client();
-        let watch = BodyWatch::new(10 * 1024);
+        let watch = BodyWatch::new();
         let body = watch.wrap(bytes_chunks(Bytes::from_static(b"tiny")), 4);
         let end = watch_send(
             &watch,
@@ -404,13 +355,12 @@ mod tests {
     }
 
     /// The clock starts at the first body poll, not when the watch is
-    /// built: a slow connect and TLS handshake are not a stall, and must not
-    /// sit in the window's divisor either. Past the grace with nothing
+    /// built: a slow connect and TLS handshake are not a stall. With nothing
     /// polled yet, there is nothing to judge.
     #[tokio::test]
     async fn the_clock_starts_at_the_first_body_poll() {
         let _policy = shrink_policy();
-        let watch = BodyWatch::new(10 * 1024);
+        let watch = BodyWatch::new();
         let _body = watch.wrap(bytes_chunks(Bytes::from_static(b"x")), 1);
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(
@@ -419,11 +369,11 @@ mod tests {
         );
         // The first poll starts the clock; the grace runs from here.
         watch.record(0);
-        assert!(watch.check().is_none(), "within the grace");
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(watch.check().is_none(), "within the first window");
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         assert!(
             watch.check().is_some(),
-            "past the grace with no bytes: a stall"
+            "a whole window with no bytes: a dead send"
         );
     }
 
