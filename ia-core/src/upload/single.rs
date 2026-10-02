@@ -3,6 +3,7 @@ use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
 use crate::upload::checksum::{compute_file_md5_async, hash_file_and_parts_async, FileHashes};
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::{describe_parsed, parse_s3_error, strip_xml};
+use crate::upload::stall_watch::{watch_send, BodyWatch, SendEnd};
 use crate::upload::types::*;
 use crate::IaClient;
 use std::path::Path;
@@ -193,10 +194,16 @@ pub async fn upload_file(
     let mut retries = 0u32;
     let mut last_was_503 = false;
     let mut retry_after: Option<std::time::Duration> = None;
+    // Stalled sends (#38): re-sent at once, counted for the final error.
+    let mut stalls: usize = 0;
+    let mut last_was_stall = false;
     loop {
         // On retry: after a 503, wait out any Retry-After and then poll
-        // check_limit until the rate limit clears; otherwise just back off.
-        if retries > 0 {
+        // check_limit until the rate limit clears; after a stall, re-send
+        // at once (the problem is the peer, not load); otherwise back off.
+        if retries > 0 && last_was_stall {
+            last_was_stall = false;
+        } else if retries > 0 {
             if last_was_503 {
                 if retry_after.is_some() {
                     let wait = super::retry::wait_before_retry(retry_after, &backoff, retries - 1);
@@ -303,14 +310,18 @@ pub async fn upload_file(
         // file_size, so IA S3's no-chunked-transfer requirement is satisfied.
         let file_handle = tokio::fs::File::open(file).await?;
 
-        let response = if let Some(cb) = progress.clone() {
-            // Wrap with ProgressBody for byte-level progress callbacks.
-            // The Arc<dyn Fn> is cloned into the move closure, satisfying
-            // the 'static bound required by reqwest::Body::wrap_stream().
-            let id = identifier.to_string();
-            let k = key.to_string();
-            let fs = file_size;
-            let stream = super::progress_body::ProgressBody::new(file_handle, move |bytes_sent| {
+        // The body always streams through ProgressBody, with the progress
+        // callback when the caller gave one, wrapped by this attempt's
+        // stall watch so a server that stops reading is caught (#38). The
+        // Arc<dyn Fn> is cloned into the move closure, satisfying the
+        // 'static bound required by reqwest::Body::wrap_stream().
+        let watch = BodyWatch::new(opts.min_speed);
+        let progress_cb = progress.clone();
+        let id = identifier.to_string();
+        let k = key.to_string();
+        let fs = file_size;
+        let stream = super::progress_body::ProgressBody::new(file_handle, move |bytes_sent| {
+            if let Some(cb) = &progress_cb {
                 cb(UploadProgress {
                     identifier: id.clone(),
                     key: k.clone(),
@@ -318,13 +329,61 @@ pub async fn upload_file(
                     total_bytes: fs,
                     status: UploadProgressStatus::Uploading,
                 });
-            });
+            }
+        });
+        let response = match watch_send(
+            &watch,
             request
-                .body(reqwest::Body::wrap_stream(stream))
-                .send()
-                .await
-        } else {
-            request.body(reqwest::Body::from(file_handle)).send().await
+                .body(reqwest::Body::wrap_stream(watch.wrap(stream, file_size)))
+                .send(),
+        )
+        .await
+        {
+            SendEnd::Done(response) => response,
+            SendEnd::Stalled {
+                observed,
+                window_secs,
+            } => {
+                stalls += 1;
+                tracing::warn!(
+                    identifier,
+                    key,
+                    retry = retries + 1,
+                    observed_bytes_per_sec = observed,
+                    min_bytes_per_sec = opts.min_speed,
+                    window_secs,
+                    "body send stalled, {}",
+                    if retries < opts.retries {
+                        "re-sending"
+                    } else {
+                        "giving up"
+                    }
+                );
+                if retries < opts.retries {
+                    if let Some(ref cb) = progress {
+                        cb(UploadProgress {
+                            identifier: identifier.to_string(),
+                            key: key.to_string(),
+                            bytes_sent: 0,
+                            total_bytes: file_size,
+                            status: UploadProgressStatus::Retrying,
+                        });
+                    }
+                    last_was_503 = false;
+                    last_was_stall = true;
+                    retry_after = None;
+                    retries += 1;
+                    continue;
+                }
+                return Err(IaError::UploadStalled {
+                    identifier: identifier.to_string(),
+                    key: key.to_string(),
+                    observed_bytes_per_sec: observed,
+                    min_bytes_per_sec: opts.min_speed,
+                    window_secs,
+                    stalls,
+                });
+            }
         };
 
         match response {
@@ -666,5 +725,73 @@ mod tests {
             url,
             "https://s3.us.archive.org/test-item/path/to/my%20file.txt"
         );
+    }
+
+    // -- Stall detection on the body send (#38) --
+
+    use crate::upload::stall_watch::test_support::{shrink_policy, stalling_listener};
+
+    fn stalling_client(addr: std::net::SocketAddr) -> crate::IaClient {
+        let mut config = crate::IaConfig::default();
+        config.s3_access = Some("a".into());
+        config.s3_secret = Some("s".into());
+        config.general.host = addr.to_string();
+        config.general.secure = false;
+        crate::IaClient::from_config_no_retry(config).unwrap()
+    }
+
+    /// 16 MiB on disk: larger than the loopback socket buffers, so the
+    /// send really stops when the server stops reading.
+    fn big_temp_file() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&crate::upload::stall_watch::test_support::big_body())
+            .unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// A single-file PUT whose body send stalls is abandoned and re-sent;
+    /// when the retries are spent the file fails as stalled, with one stall
+    /// per attempt.
+    #[tokio::test]
+    async fn stalled_single_put_is_retried_then_fails_as_stalled() {
+        let _policy = shrink_policy();
+        let (addr, connections) = stalling_listener().await;
+        let client = stalling_client(addr);
+        let f = big_temp_file();
+        let opts = UploadOpts {
+            verify: false,
+            checksum: false,
+            retries: 1,
+            min_speed: 10 * 1024,
+            ..Default::default()
+        };
+        let err = upload_file(
+            &client,
+            "test-item",
+            f.path(),
+            "big.bin",
+            &opts,
+            true,
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a stalled send must fail once the retries are spent");
+        assert!(
+            matches!(
+                err,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    min_bytes_per_sec: 10240,
+                    window_secs: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

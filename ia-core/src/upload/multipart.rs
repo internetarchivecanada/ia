@@ -11,6 +11,7 @@
 //! Both listings follow S3 pagination (`IsTruncated` and the next marker).
 
 use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
+use super::stall_watch::bytes_chunks;
 use crate::error::{IaError, Result};
 use crate::upload::checksum::FileHashes;
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
@@ -193,7 +194,7 @@ pub(crate) async fn initiate_upload_with_retry(
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!("{}?uploads", build_s3_url(client, identifier, key));
 
-    let sent = send_with_retry(ctx, "initiate multipart", || {
+    let sent = send_with_retry(ctx, "initiate multipart", |_watch| {
         let mut req = client
             .upload_http()
             .post(&url)
@@ -282,13 +283,17 @@ pub(crate) async fn upload_part_with_retry(
         format!("\"{:x}\"", Md5::digest(&body))
     };
 
-    let sent = send_with_retry(ctx, &format!("upload part {part_number}"), || {
+    // The part goes out as a watched stream of 64 KiB slices (no copy), so a
+    // server that stops reading is caught by the stall detector. The
+    // explicit Content-Length keeps the transfer unchunked, as IA requires.
+    let sent = send_with_retry(ctx, &format!("upload part {part_number}"), |watch| {
+        let stream = watch.wrap(bytes_chunks(body.clone()), content_length as u64);
         client
             .upload_http()
             .put(&url)
             .header("Authorization", format!("LOW {access}:{secret}"))
             .header("Content-Length", content_length.to_string())
-            .body(body.clone())
+            .body(reqwest::Body::wrap_stream(stream))
             .send()
     })
     .await?;
@@ -359,7 +364,7 @@ pub(crate) async fn complete_upload_with_retry(
     );
 
     let manifest = build_complete_manifest(parts);
-    let result = send_with_retry(ctx, "complete multipart", || {
+    let result = send_with_retry(ctx, "complete multipart", |_watch| {
         let mut req = client
             .upload_http()
             .post(&url)
@@ -454,7 +459,7 @@ pub(crate) async fn abort_upload_with_ctx(
         upload_id,
     );
 
-    let result = send_with_retry(ctx, "abort multipart", || {
+    let result = send_with_retry(ctx, "abort multipart", |_watch| {
         client
             .upload_http()
             .delete(&url)
@@ -499,6 +504,7 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
             DEFAULT_RETRY_MAX_DELAY,
             DEFAULT_RETRIES,
         ),
+        min_speed: DEFAULT_MIN_SPEED,
         bytes_sent: 0,
         total_bytes: 0,
         progress: None,
@@ -509,6 +515,8 @@ fn default_ctx<'a>(identifier: &'a str, key: &'a str) -> S3RetryCtx<'a> {
 const DEFAULT_RETRIES: u32 = 3;
 const DEFAULT_RETRY_MIN_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DEFAULT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+/// The body-send floor the public wrappers use: download's and upload's default.
+const DEFAULT_MIN_SPEED: u64 = 10 * 1024;
 
 /// List all in-progress multipart uploads for an item.
 ///
@@ -556,7 +564,7 @@ pub(crate) async fn list_uploads_with_ctx(
             ),
             None => base.clone(),
         };
-        let result = send_with_retry(ctx, "list multipart uploads", || {
+        let result = send_with_retry(ctx, "list multipart uploads", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -627,7 +635,7 @@ pub(crate) async fn list_parts_with_ctx(
             Some(m) => format!("{base}&part-number-marker={}", urlencoding::encode(m)),
             None => base.clone(),
         };
-        let sent = send_with_retry(ctx, "list parts", || {
+        let sent = send_with_retry(ctx, "list parts", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -709,6 +717,7 @@ pub async fn upload_file_multipart(
         key,
         retries: opts.retries,
         backoff: opts.backoff(),
+        min_speed: opts.min_speed,
         bytes_sent: 0,
         total_bytes: file_size,
         progress: progress.clone(),
@@ -846,6 +855,7 @@ pub async fn upload_file_multipart(
             key,
             retries: opts.retries,
             backoff: opts.backoff(),
+            min_speed: opts.min_speed,
             bytes_sent: offset,
             total_bytes: file_size,
             progress: progress.clone(),

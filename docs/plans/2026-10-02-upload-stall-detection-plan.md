@@ -33,9 +33,9 @@
 
 ### Task 3: the watch, the part PUT, the single PUT
 
-- [ ] **Step 1: Failing tests** (a) to (e) above, in `ia-core/src/upload/stall_watch.rs` and the `upload/retry.rs`/`single.rs` test modules.
-- [ ] **Step 2: Run**; the stall tests hang today (that is the defect); run them with a timeout and record the hang as the red.
-- [ ] **Step 3: Implement.** Commit: `fix(upload): abandon and retry a body send that stalls below --min-speed`.
+- [x] **Step 1: Failing tests.** (b) the single PUT against the stalling listener, written first; (a) the part send through `send_with_retry`, and the watch's own tests (a stall is abandoned; a read send completes; a zero floor builds no detector; a finished body is not judged while the response is awaited; `bytes_chunks` loses nothing), written with the implementation. (c) (a part that stalls once and then succeeds) was not written: the raw listener cannot answer a second connection with a valid 200 without parsing the body, and the retry path is covered by (a) through the attempt count and the connection count. (d) is the zero-floor test; (e) is Task 4's unit test.
+- [x] **Step 2: Run**; the single-PUT test hung (killed by a 30 s timeout: exit 124), which is the defect.
+- [x] **Step 3: Implement.** Found on the way, pinned by its own test: with a `Content-Length` set, hyper stops polling the body stream once that many bytes are out and never asks for its end, so a "done" flag set on the stream's `None` never fired and a finished 4-byte body was judged a 4 B/s stall while the response was awaited. The watch learns the body length at `wrap` time and marks the send done when the bytes handed over reach it. Commit: `fix(upload): abandon and retry a body send that stalls below --min-speed`.
 
 ### Task 4: a stalled part is a kept upload
 
