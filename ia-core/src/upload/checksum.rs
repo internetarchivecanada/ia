@@ -74,6 +74,82 @@ pub fn compute_file_md5(path: &Path) -> Result<String, std::io::Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// The md5 of a whole file and of each of its parts at a given part size,
+/// from one read of the file (see [`hash_file_and_parts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHashes {
+    /// Hex md5 of the whole file.
+    pub md5: String,
+    /// Hex md5 of each part in order: part `n` (1-based) is `parts[n - 1]`.
+    /// An empty file has one part, the empty md5.
+    pub parts: Vec<String>,
+}
+
+/// Compute the whole-file md5 and the md5 of every `part_size` slice in one
+/// sequential read.
+///
+/// A multipart resume needs the md5 of each local range to compare with the
+/// ETags IA lists (#19), and the skip-if-already-uploaded check and the
+/// post-completion check need the whole-file md5 (#20). One pass gives all
+/// of them, so a file is read once per upload instead of once per use.
+///
+/// `part_size` must be greater than 0.
+pub fn hash_file_and_parts(path: &Path, part_size: u64) -> Result<FileHashes, std::io::Error> {
+    if part_size == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "part_size must be greater than 0",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut whole = Md5::new();
+    let mut part = Md5::new();
+    let mut in_part: u64 = 0;
+    let mut parts = Vec::new();
+    let mut buffer = [0u8; 1024 * 1024]; // 1 MiB chunks
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        whole.update(&buffer[..n]);
+        // Feed the part hasher up to each boundary, finalizing at every one
+        // a chunk crosses.
+        let mut chunk = &buffer[..n];
+        while !chunk.is_empty() {
+            let room = (part_size - in_part) as usize;
+            let take = chunk.len().min(room);
+            part.update(&chunk[..take]);
+            in_part += take as u64;
+            chunk = &chunk[take..];
+            if in_part == part_size {
+                parts.push(format!("{:x}", part.finalize_reset()));
+                in_part = 0;
+            }
+        }
+    }
+    // The tail part, or the single part of an empty file. A file that is an
+    // exact multiple of part_size ends on a boundary and has no tail.
+    if in_part > 0 || parts.is_empty() {
+        parts.push(format!("{:x}", part.finalize()));
+    }
+    Ok(FileHashes {
+        md5: format!("{:x}", whole.finalize()),
+        parts,
+    })
+}
+
+/// Async wrapper for [`hash_file_and_parts`] that runs on a blocking thread.
+pub async fn hash_file_and_parts_async(
+    path: &Path,
+    part_size: u64,
+) -> std::result::Result<FileHashes, std::io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || hash_file_and_parts(&path, part_size))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Compute the SHA-1 hex digest of a file.
 pub fn compute_file_sha1(path: &Path) -> Result<String, std::io::Error> {
     let mut file = std::fs::File::open(path)?;
@@ -570,5 +646,62 @@ mod tests {
         let map = parse_checksums_multi(input, None);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("file.txt"));
+    }
+
+    // -- hash_file_and_parts: one pass, whole-file md5 and one md5 per part --
+
+    fn md5_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Md5::digest(bytes))
+    }
+
+    fn file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn hash_file_and_parts_splits_at_part_boundaries() {
+        let bytes: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
+        let f = file_with(&bytes);
+        let hashes = hash_file_and_parts(f.path(), 1024).unwrap();
+        assert_eq!(hashes.md5, md5_hex(&bytes));
+        assert_eq!(
+            hashes.parts,
+            vec![
+                md5_hex(&bytes[..1024]),
+                md5_hex(&bytes[1024..2048]),
+                md5_hex(&bytes[2048..]),
+            ]
+        );
+        assert_eq!(hashes.md5, compute_file_md5(f.path()).unwrap());
+    }
+
+    #[test]
+    fn hash_file_and_parts_exact_multiple_has_no_empty_tail() {
+        let bytes = vec![7u8; 2048];
+        let f = file_with(&bytes);
+        let hashes = hash_file_and_parts(f.path(), 1024).unwrap();
+        assert_eq!(hashes.parts.len(), 2);
+        assert_eq!(hashes.parts[1], md5_hex(&bytes[1024..]));
+    }
+
+    #[test]
+    fn hash_file_and_parts_empty_file_is_one_empty_part() {
+        let f = file_with(b"");
+        let hashes = hash_file_and_parts(f.path(), 1024).unwrap();
+        assert_eq!(hashes.md5, "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            hashes.parts,
+            vec!["d41d8cd98f00b204e9800998ecf8427e".to_string()]
+        );
+    }
+
+    #[test]
+    fn hash_file_and_parts_rejects_zero_part_size() {
+        let f = file_with(b"abc");
+        assert!(hash_file_and_parts(f.path(), 0).is_err());
     }
 }

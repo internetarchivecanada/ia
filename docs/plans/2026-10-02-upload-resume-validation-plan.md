@@ -23,9 +23,9 @@
 
 **Files:** `ia-core/src/upload/checksum.rs` (+ unit tests)
 
-- [ ] **Step 1: Failing tests.** `hash_file_and_parts` on 2500 bytes with `part_size` 1024 → three part md5s equal to `md5` of each range and a whole-file md5 equal to `compute_file_md5`; a file exactly 2 × 1024 → two parts; an empty file → one part with the empty md5; `part_size == 0` → `Err`.
-- [ ] **Step 2: Run**; compile failure.
-- [ ] **Step 3: Implement.** Commit: `feat(upload): one read pass yields the whole-file md5 and every part's md5`.
+- [x] **Step 1: Failing tests.** `hash_file_and_parts` on 2500 bytes with `part_size` 1024 → three part md5s equal to `md5` of each range and a whole-file md5 equal to `compute_file_md5`; a file exactly 2 × 1024 → two parts; an empty file → one part with the empty md5; `part_size == 0` → `Err`.
+- [x] **Step 2: Run**; compile failure.
+- [x] **Step 3: Implement.** `FileHashes { md5, parts }`, `hash_file_and_parts`, and `hash_file_and_parts_async` (blocking thread, as `compute_file_md5_async`). Commit: `feat(upload): one read pass yields the whole-file md5 and every part's md5`.
 
 ### Task 2: validate before reusing
 
