@@ -564,7 +564,8 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; the same skip check as a single PUT; a rerun resumes from the parts IA holds once they are checked against the local file; a part that fails for good leaves the upload on IA for that rerun; after completion the assembled file is confirmed by size and md5 (see below) |
-| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10). Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once |
+| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10); a stall (see `--min-speed`) spends one. Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once; a stalled send is re-sent at once |
+| `--min-speed <RATE>` | Abandon and re-send a body send averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
@@ -576,6 +577,15 @@ Every IA-S3 request in an upload (the single PUT, or each multipart request: ini
 ```bash
 # Ride out a flaky link: 20 attempts per part
 ia upload my-item big.iso --multipart --retries 20
+```
+
+#### Slow and stalled uploads
+
+The upload transport has no read timeout, on purpose: the server is legitimately silent while a body uploads, and a timeout that only reads would abort a large send. So a server that stops *reading* could otherwise hang a send for as long as the connection stays open. `--min-speed` (default `10K`: 10 KiB/s) closes that gap. Once a send is 30 s old, its average rate over the last 60 s (or over its whole life while younger than that) is compared with the floor once a second. Below it, the request is abandoned (the connection is closed) and sent again at once, spending one of `--retries`; with `--multipart` that is the part, and the parts already on IA stay. Only the body send is judged: once the last byte is handed to the connection, waiting for IA's answer is not a stall (a part's answer legitimately arrives seconds after the body, while IA hashes it). When the retries are gone the file fails with `upload of <item>/<key> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries` when every attempt stalled (in `--json` output the file's error message is this text); a multipart upload is then kept on IA, and the message says so (see "Multipart part failures"). RATE is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024. `0` disables the check, and a send to a server that stops reading can then hang.
+
+```bash
+# Give up on a part whose send averages under 1 MiB/s and re-send it
+ia upload my-item big.iso --multipart --min-speed 1M
 ```
 
 #### Resuming a multipart upload

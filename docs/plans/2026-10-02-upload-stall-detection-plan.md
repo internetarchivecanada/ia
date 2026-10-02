@@ -39,13 +39,13 @@
 
 ### Task 4: a stalled part is a kept upload
 
-- [ ] **Step 1: Failing test.** `KeptUpload::describe` on an `UploadStalled` failure produces the kept-upload message with the stall detail.
-- [ ] **Step 2: Run**; fail (passes through today).
-- [ ] **Step 3: Implement.** Commit: `fix(upload): a stalled part leaves the multipart upload on IA like any failed part`.
+- [x] **Step 1: Failing test.** `describe_stalled_part_is_a_kept_upload`.
+- [x] **Step 2: Run**; failed (the stall passed through as `UploadStalled`).
+- [x] **Step 3: Implement.** `describe` matches `UploadStalled` and words it "part N of M stalled K time(s) (<measurement>)" with the kept-upload sentence and both ways forward; `kept_sentence` is shared. Commit: `fix(upload): a stalled part leaves the multipart upload on IA like any failed part`.
 
 ### Task 5: help and docs
 
-- [ ] `--min-speed` help on both structs (mirroring download's), `--retries` help, an example, `docs/usage.md` row and "Slow and stalled uploads" section; CLI tests assert the wording. Commit: `docs(upload): --min-speed`.
+- [x] `--min-speed` help on both structs and the `--retries` help landed in Task 2 with their tests; this task adds the example (`--multipart --min-speed 1M`, asserted by `upload_help_shows_a_min_speed_example`, written with the example rather than before it: a doc example), the usage.md `--min-speed` row, the `--retries` row's stall clause, and the "Slow and stalled uploads" section. Commit: `docs(upload): --min-speed`.
 
 ### Task 6: verification and review
 

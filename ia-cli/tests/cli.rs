@@ -2830,3 +2830,11 @@ fn upload_rejects_a_bad_min_speed() {
         .code(2)
         .stderr(predicate::str::contains("10K"));
 }
+
+#[test]
+fn upload_help_shows_a_min_speed_example() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--multipart --min-speed 1M"));
+}
