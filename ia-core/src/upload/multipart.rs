@@ -8,7 +8,7 @@
 //! - Abort: DELETE /{id}/{key}?uploadId={ID}
 //! - Cleanup: GET /{id}?uploads (list all), then abort
 
-use super::retry::{send_with_retry, S3RetryCtx};
+use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
 use crate::error::{IaError, Result};
 use crate::upload::types::{MultipartUploadInfo, PartInfo};
 use crate::IaClient;
@@ -241,6 +241,7 @@ pub async fn upload_part(
     upload_part_with_retry(client, &ctx, upload_id, part_number, body)
         .await
         .map(|(etag, _attempts)| etag)
+        .map_err(IaError::from)
 }
 
 /// Upload one part, retrying per the shared IA-S3 policy.
@@ -250,14 +251,22 @@ pub async fn upload_part(
 /// is deliberate: re-reading it from disk would cost an I/O round trip on
 /// every attempt, including the common single-attempt case, and the caller
 /// already has the buffer in hand.
+///
+/// Returns the [`S3Failure`] rather than a flattened error so the part loop
+/// can tell a permanent refusal (the S3 code) from a spent budget (the
+/// attempt count) and word its message accordingly.
 pub(crate) async fn upload_part_with_retry(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
     upload_id: &str,
     part_number: u32,
     body: Bytes,
-) -> Result<(String, u32)> {
-    let (access, secret) = client.require_auth()?;
+) -> std::result::Result<(String, u32), S3Failure> {
+    let (access, secret) = client.require_auth().map_err(|e| S3Failure {
+        error: Box::new(e),
+        code: None,
+        attempts: 0,
+    })?;
     let url = format!(
         "{}?partNumber={}&uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
@@ -596,8 +605,12 @@ use std::time::Instant;
 ///
 /// Flow: check for resume → initiate (if fresh) → split into parts → upload
 /// each part with retry → complete.
-/// On permanent part failure, aborts the upload (best-effort cleanup).
-/// Retries individual parts on transient errors.
+///
+/// A part that fails for good, whether IA refused it or its retry budget
+/// ran out, does not abort the upload: the parts IA already holds stay, the
+/// error names the upload ID, a rerun resumes from those parts, and
+/// `ia upload cleanup` discards them (#18). Killing the process never
+/// aborted, so the two paths now behave alike.
 ///
 /// `part_size` controls the split size. Use [`DEFAULT_PART_SIZE`] for production.
 /// A smaller value can be passed for testing.
@@ -753,7 +766,7 @@ pub async fn upload_file_multipart(
 
         // Retry lives in upload_part_with_retry, which uses the same policy
         // as every other IA-S3 request. This loop owns orchestration only:
-        // progress, accounting, and aborting the upload when a part is lost.
+        // progress, accounting, and the message when a part is lost.
         let data = read_file_range(file, offset, this_part_size).await?;
         tracing::debug!(
             identifier,
@@ -782,26 +795,28 @@ pub async fn upload_file_multipart(
                     tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
                     etag
                 }
-                Err(e) => {
+                Err(failure) => {
+                    // Not aborted: an abort would delete every part IA holds,
+                    // which is what multipart exists to avoid. The error says
+                    // where the upload stands and both ways forward (#18).
+                    let kept = KeptUpload {
+                        identifier,
+                        key,
+                        upload_id: &upload_id,
+                        part_num,
+                        part_count,
+                        parts_on_ia: completed_parts.len(),
+                    };
+                    let err = kept.describe(failure);
                     tracing::warn!(
                         identifier,
                         key,
-                        part_num,
-                        "multipart part failed, aborting upload"
+                        %upload_id,
+                        part = part_num,
+                        parts_on_ia = completed_parts.len(),
+                        "multipart part failed; upload kept on IA for resume or cleanup"
                     );
-                    if let Err(abort_err) =
-                        abort_upload_with_ctx(client, &control_ctx, &upload_id).await
-                    {
-                        tracing::warn!(
-                            identifier,
-                            key,
-                            %upload_id,
-                            error = %abort_err,
-                            "failed to abort multipart upload after part failure — \
-                             run `ia upload cleanup` to clean up orphaned uploads"
-                        );
-                    }
-                    return Err(e);
+                    return Err(err);
                 }
             };
 
@@ -858,6 +873,92 @@ pub async fn upload_file_multipart(
         elapsed_ms: start.elapsed().as_millis() as u64,
         retries: total_retries,
     })
+}
+
+/// What the user needs to know when a part fails for good and the upload is
+/// left on IA: which part, why, the upload ID, how many parts IA holds, and
+/// the two ways forward.
+struct KeptUpload<'a> {
+    identifier: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+    part_num: u32,
+    part_count: u32,
+    parts_on_ia: usize,
+}
+
+impl KeptUpload<'_> {
+    /// The error for a part failure. Two wordings, chosen on the S3 code:
+    /// a permanent refusal (`AccessDenied`, `InvalidAccessKeyId`,
+    /// `BadDigest`, ...) says "refused by IA" and asks the user to fix the
+    /// cause before rerunning; a spent budget says how many attempts were
+    /// made. Both carry the upload ID and name `ia upload cleanup`.
+    fn describe(&self, failure: S3Failure) -> IaError {
+        let refused = failure
+            .code
+            .as_deref()
+            .is_some_and(|code| !super::s3_error::is_retryable_code(code));
+        let (status, detail) = match failure.error.as_ref() {
+            IaError::UploadFailed {
+                status, message, ..
+            } => (
+                *status,
+                Self::detail(message, self.part_num, failure.attempts),
+            ),
+            other => (None, other.to_string()),
+        };
+        let parts = match self.parts_on_ia {
+            1 => "1 part".to_string(),
+            n => format!("{n} parts"),
+        };
+        let what = if refused {
+            format!(
+                "part {} of {} refused by IA ({detail})",
+                self.part_num, self.part_count
+            )
+        } else if failure.attempts > 1 {
+            format!(
+                "part {} of {} failed after {} attempts ({detail})",
+                self.part_num, self.part_count, failure.attempts
+            )
+        } else {
+            format!(
+                "part {} of {} failed ({detail})",
+                self.part_num, self.part_count
+            )
+        };
+        let fix = if refused { "fix the cause and " } else { "" };
+        IaError::UploadFailed {
+            identifier: self.identifier.into(),
+            key: self.key.into(),
+            message: format!(
+                "{what}: multipart upload {} is kept with {parts} on IA; {fix}rerun the same \
+                 command to resume, or discard it with 'ia upload cleanup {} {}'",
+                self.upload_id, self.identifier, self.key
+            ),
+            status,
+        }
+    }
+
+    /// The failure's own text without the wrapping `send_with_retry` adds
+    /// (the "upload part N failed: " or "upload part N: " prefix and the
+    /// "(after N attempts)" suffix), since the message built here says
+    /// both in its own words.
+    fn detail(message: &str, part_num: u32, attempts: u32) -> String {
+        let mut text = message;
+        for prefix in [
+            format!("upload part {part_num} failed: "),
+            format!("upload part {part_num}: "),
+        ] {
+            if let Some(rest) = text.strip_prefix(prefix.as_str()) {
+                text = rest;
+            }
+        }
+        let suffix = format!(" (after {attempts} attempts)");
+        text.strip_suffix(suffix.as_str())
+            .unwrap_or(text)
+            .to_string()
+    }
 }
 
 /// Read a range of bytes from a file.

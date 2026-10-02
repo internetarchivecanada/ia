@@ -27,14 +27,15 @@
 
 **Files:** `ia-core/src/upload/multipart.rs`, `ia-core/tests/upload_multipart.rs`
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - `part_exhausted_budget_leaves_the_upload_for_resume`: initiate OK; part 1 OK; part 2 answers `503 SlowDown` with `Retry-After: 0` on every attempt; `retries: 2`; a `DELETE ?uploadId=` mock with `expect(0)`. Result: `Err(UploadFailed)` whose message contains the upload ID, "after 3 attempts", "kept with 1 part", "rerun" and "ia upload cleanup"; `server.verify()` proves no abort.
   - `part_permanent_refusal_leaves_the_upload_for_cleanup`: part 2 answers `403` with an `AccessDenied` S3 body once; `DELETE` `expect(0)`. Message contains "AccessDenied", the upload ID, "refused", "ia upload cleanup"; the part PUT was sent once.
   - `rerun_after_part_failure_resumes_from_existing_parts`: `list_uploads` returns the upload; `list_parts` returns part 1; part 1 PUT `expect(0)`; part 2 PUT 200; complete 200 → `Uploaded`, `retries == 0`.
   - `transport_failure_past_the_budget_leaves_the_upload`: a part PUT that never gets a response. wiremock cannot drop a connection, but the crate's tests already use a raw `tokio::net::TcpListener` that accepts and closes (`client.rs` and `download/mod.rs` tests); here the whole upload must go to one server, so this test is feasible only if the retry context can target the part URL alone. If not, record it: the exhausted-budget path is the same code for a transport failure and a `503`, and the first test covers it.
   - The existing `upload_file_multipart_aborts_on_permanent_error` asserts the abort (`DELETE` `expect(1)`); it becomes `part_permanent_refusal_leaves_the_upload_for_cleanup` (`expect(0)`), so the red is a failing existing test turned around, not only new tests.
-- [ ] **Step 2: Run**; fail (the DELETE is sent today, and the message has no upload ID).
-- [ ] **Step 3: Implement.** Commit: `fix(upload): a failed part leaves the multipart upload on IA for resume or cleanup`.
+- [x] **Step 1** written: the existing abort test became `part_permanent_refusal_leaves_the_upload_for_cleanup`; `part_exhausted_budget_leaves_the_upload_for_resume` and `rerun_after_part_failure_resumes_from_existing_parts` added. The transport-failure test was not written: every upload request goes to one wiremock server and the crate's accept-and-close listener trick cannot target one part URL; the spent-budget path is the same code for a transport failure and a `503`, which the second test covers.
+- [x] **Step 2: Run**; the two new failure tests failed on the message (no upload ID, no ways forward); the rerun test passed already (resume existed) and pins the scenario.
+- [x] **Step 3: Implement.** `upload_part_with_retry` returns `S3Failure`; `s3_error::is_retryable_code` is the code-only form of `S3Error::is_retryable`; `KeptUpload::describe` builds the message in two wordings. Commit: `fix(upload): a failed part leaves the multipart upload on IA for resume or cleanup`.
 
 ### Task 2: help and docs
 
