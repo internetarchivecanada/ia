@@ -7,6 +7,8 @@
 //! - Resume: GET /{id}?uploads → list, GET /{id}/{key}?uploadId={ID} → parts
 //! - Abort: DELETE /{id}/{key}?uploadId={ID}
 //! - Cleanup: GET /{id}?uploads (list all), then abort
+//!
+//! Both listings follow S3 pagination (`IsTruncated` and the next marker).
 
 use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
 use crate::error::{IaError, Result};
@@ -517,40 +519,73 @@ pub async fn list_uploads(client: &IaClient, identifier: &str) -> Result<Vec<Mul
     list_uploads_with_ctx(client, &default_ctx(identifier, "")).await
 }
 
-/// List in-progress uploads with the caller's retry budget.
+/// Whether a listing page says more follows, and the marker for the next
+/// request: `<IsTruncated>true</IsTruncated>` plus the named marker
+/// element. S3 pages at 1000 entries; whether IA does is unknown, so the
+/// protocol is followed either way. A page that is truncated but gives no
+/// marker ends the walk with what was read rather than asking for the same
+/// page again.
+fn next_page_marker(body: &str, marker_tag: &str) -> Option<String> {
+    let truncated =
+        extract_xml_field(body, "IsTruncated").is_some_and(|t| t.eq_ignore_ascii_case("true"));
+    if !truncated {
+        return None;
+    }
+    extract_xml_field(body, marker_tag).filter(|m| !m.is_empty())
+}
+
+/// List in-progress uploads with the caller's retry budget, following
+/// pagination (`key-marker` and `upload-id-marker`).
 pub(crate) async fn list_uploads_with_ctx(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
 ) -> Result<Vec<MultipartUploadInfo>> {
     let identifier = ctx.identifier;
     let (access, secret) = client.require_auth()?;
-    let url = format!("{}?uploads", build_s3_item_url(client, identifier));
+    let base = format!("{}?uploads", build_s3_item_url(client, identifier));
 
-    let result = send_with_retry(ctx, "list multipart uploads", || {
-        client
-            .upload_http()
-            .get(&url)
-            .header("Authorization", format!("LOW {access}:{secret}"))
-            .send()
-    })
-    .await;
+    let mut uploads = Vec::new();
+    let mut marker: Option<(String, String)> = None;
+    loop {
+        let url = match &marker {
+            Some((key, id)) => format!(
+                "{base}&key-marker={}&upload-id-marker={}",
+                urlencoding::encode(key),
+                urlencoding::encode(id)
+            ),
+            None => base.clone(),
+        };
+        let result = send_with_retry(ctx, "list multipart uploads", || {
+            client
+                .upload_http()
+                .get(&url)
+                .header("Authorization", format!("LOW {access}:{secret}"))
+                .send()
+        })
+        .await;
 
-    match result {
-        Ok(sent) => {
-            let body = sent.response.text().await.unwrap_or_default();
-            Ok(parse_list_uploads_response(&body))
+        let body = match result {
+            Ok(sent) => sent.response.text().await.unwrap_or_default(),
+            // A brand-new item has no bucket yet, so there is nothing in
+            // progress to list. Treat that as an empty result; the initiate
+            // POST that follows carries x-archive-auto-make-bucket and
+            // creates the item.
+            Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
+                tracing::debug!(
+                    identifier,
+                    "item does not exist yet; no multipart uploads to resume"
+                );
+                return Ok(Vec::new());
+            }
+            Err(f) => return Err(*f.error),
+        };
+        uploads.extend(parse_list_uploads_response(&body));
+        let next_key = next_page_marker(&body, "NextKeyMarker");
+        let next_id = next_page_marker(&body, "NextUploadIdMarker");
+        match (next_key, next_id) {
+            (Some(key), Some(id)) => marker = Some((key, id)),
+            _ => return Ok(uploads),
         }
-        // A brand-new item has no bucket yet, so there is nothing in progress
-        // to list. Treat that as an empty result; the initiate POST that
-        // follows carries x-archive-auto-make-bucket and creates the item.
-        Err(f) if f.code.as_deref() == Some("NoSuchBucket") => {
-            tracing::debug!(
-                identifier,
-                "item does not exist yet; no multipart uploads to resume"
-            );
-            Ok(Vec::new())
-        }
-        Err(f) => Err(*f.error),
     }
 }
 
@@ -566,30 +601,42 @@ pub async fn list_parts(
     list_parts_with_ctx(client, &default_ctx(identifier, key), upload_id).await
 }
 
-/// List completed parts with the caller's retry budget.
+/// List completed parts with the caller's retry budget, following
+/// pagination (`part-number-marker`).
 pub(crate) async fn list_parts_with_ctx(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
     upload_id: &str,
 ) -> Result<Vec<PartInfo>> {
     let (access, secret) = client.require_auth()?;
-    let url = format!(
+    let base = format!(
         "{}?uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
         upload_id,
     );
 
-    let sent = send_with_retry(ctx, "list parts", || {
-        client
-            .upload_http()
-            .get(&url)
-            .header("Authorization", format!("LOW {access}:{secret}"))
-            .send()
-    })
-    .await?;
-    let body = sent.response.text().await.unwrap_or_default();
-
-    Ok(parse_list_parts_response(&body))
+    let mut parts = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let url = match &marker {
+            Some(m) => format!("{base}&part-number-marker={}", urlencoding::encode(m)),
+            None => base.clone(),
+        };
+        let sent = send_with_retry(ctx, "list parts", || {
+            client
+                .upload_http()
+                .get(&url)
+                .header("Authorization", format!("LOW {access}:{secret}"))
+                .send()
+        })
+        .await?;
+        let body = sent.response.text().await.unwrap_or_default();
+        parts.extend(parse_list_parts_response(&body));
+        match next_page_marker(&body, "NextPartNumberMarker") {
+            Some(m) => marker = Some(m),
+            None => return Ok(parts),
+        }
+    }
 }
 
 // ── Full multipart upload ───────────────────────────────────────────────

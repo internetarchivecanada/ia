@@ -2420,3 +2420,105 @@ async fn resume_with_a_missing_size_relies_on_the_md5() {
     assert!(matches!(result.status, UploadStatus::Uploaded));
     server.verify().await;
 }
+
+// ── Pagination (#19) ────────────────────────────────────────────────────
+//
+// S3 returns at most 1000 entries per listing and marks the page with
+// IsTruncated and a marker for the next request. Whether IA paginates is
+// unknown; the protocol is followed either way.
+
+/// Page 1 is truncated with NextPartNumberMarker 1; page 2, requested
+/// with part-number-marker=1, holds part 2.
+#[tokio::test]
+async fn list_parts_follows_pagination() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "paged"))
+        .and(query_param("part-number-marker", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult><IsTruncated>false</IsTruncated>
+<Part><PartNumber>2</PartNumber><ETag>"e2"</ETag><Size>10</Size></Part></ListPartsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "paged"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult><IsTruncated>true</IsTruncated><NextPartNumberMarker>1</NextPartNumberMarker>
+<Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part></ListPartsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let parts = multipart::list_parts(&client, "test-item", "data.bin", "paged")
+        .await
+        .unwrap();
+    let numbers: Vec<u32> = parts.iter().map(|p| p.part_number).collect();
+    assert_eq!(numbers, [1, 2]);
+    server.verify().await;
+}
+
+/// Page 1 is truncated with key and upload-id markers; page 2 is requested
+/// with key-marker and upload-id-marker.
+#[tokio::test]
+async fn list_uploads_follows_pagination() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .and(query_param("key-marker", "a.bin"))
+        .and(query_param("upload-id-marker", "u1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>
+<Upload><Key>b.bin</Key><UploadId>u2</UploadId></Upload></ListMultipartUploadsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>
+<NextKeyMarker>a.bin</NextKeyMarker><NextUploadIdMarker>u1</NextUploadIdMarker>
+<Upload><Key>a.bin</Key><UploadId>u1</UploadId></Upload></ListMultipartUploadsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let uploads = multipart::list_uploads(&client, "test-item").await.unwrap();
+    let ids: Vec<&str> = uploads.iter().map(|u| u.upload_id.as_str()).collect();
+    assert_eq!(ids, ["u1", "u2"]);
+    server.verify().await;
+}
+
+/// A page that claims to be truncated but gives no marker ends the walk
+/// with what was read rather than asking for the same page again.
+#[tokio::test]
+async fn list_parts_truncated_without_a_marker_stops() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "odd"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult><IsTruncated>true</IsTruncated>
+<Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part></ListPartsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let parts = multipart::list_parts(&client, "test-item", "data.bin", "odd")
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 1);
+    server.verify().await;
+}

@@ -47,9 +47,9 @@
 
 **Files:** `ia-core/src/upload/multipart.rs`, `ia-core/tests/upload_multipart.rs`
 
-- [ ] **Step 1: Failing tests.** `list_parts` over two pages (`IsTruncated` + `NextPartNumberMarker`; the second request carries `part-number-marker`) returns both pages' parts; `list_uploads` over two pages likewise with the key and upload-id markers; a truncated page with no marker returns what was read.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(upload): follow S3 pagination when listing multipart uploads and parts`.
+- [x] **Step 1: Failing tests.** `list_parts` over two pages (`IsTruncated` + `NextPartNumberMarker`; the second request carries `part-number-marker`) returns both pages' parts; `list_uploads` over two pages likewise with the key and upload-id markers; a truncated page with no marker returns what was read.
+- [x] **Step 2: Run**; the two two-page tests failed (one request each, one entry returned); the no-marker guard passed already (no loop existed) and pins the guard.
+- [x] **Step 3: Implement.** `next_page_marker` reads `IsTruncated` and the named marker; both listings loop, appending `part-number-marker` or `key-marker` + `upload-id-marker` (url-encoded). Commit: `fix(upload): follow S3 pagination when listing multipart uploads and parts`.
 
 ### Task 4: docs, verification, review
 
