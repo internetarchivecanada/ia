@@ -37,7 +37,8 @@ use crate::output::DownloadDisplay;
         on disk. So is a stream that stays below --min-speed (default 10K: 10 KiB/s averaged \
         over the last 60 s, after a 30 s grace at the start of each stream); each such stall \
         spends one of the file's --retries, and when they are gone the file fails and keeps \
-        its .part for a later run. With --checksum, a download whose md5 does not match is \
+        its .part for a later run. A .part that is a symlink is removed and the file starts over. \
+        With --checksum, a download whose md5 does not match is \
         kept as <name>.md5-mismatch and downloaded again; the same wrong md5 twice means the \
         source is wrong and the file fails.\n\n\
         A failed attempt is retried up to --retries times. The wait before each retry is \

@@ -19,6 +19,7 @@ use ia_core::IaClient;
 
 #[derive(Debug, Args)]
 #[command(
+    about = "Manage archive.org catalog tasks",
     long_about = "Manage archive.org catalog tasks. Lists, submits, reruns, and inspects tasks.\n\n\
         With no subcommand, lists your pending tasks (or tasks for a given item).",
     after_long_help = cstr!(

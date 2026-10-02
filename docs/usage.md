@@ -56,6 +56,10 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
+#### After an interruption
+
+Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and with `--checksum` its md5 too. `--joblog` adds a second layer on top: an item whose files a previous run all finished is skipped without a request (an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). A `.part` that is a symlink is removed and that file starts over; nothing is ever written through a link. The sections below give the rules in detail.
+
 #### Retries
 
 A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5). The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carried a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. In `--json` output an `http_error` that carried the header shows it as `retry_after`.
@@ -81,7 +85,7 @@ A connection that drops is resumed: the bytes already in the `.part` file stay, 
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
-Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
+Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt, after short fixed waits (0.5 s, 1.5 s, 4.5 s), and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
 
 #### Checksum mismatches
 
@@ -549,8 +553,8 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
 | `--keep-directories` | Preserve relative path structure |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
-| `--checksums <PATH>` | Path to pre-computed MD5 checksums file |
-| `--delete-after-upload` | Delete local file after verified upload |
+| `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
+| `--delete-after-upload` | Delete local file after verified upload (with `--multipart`, only once IA lists the assembled file with the expected size and md5; a file reported "not yet verified" is kept) |
 | `--no-verify` | Skip Content-MD5 verification |
 | `--no-derive` | Skip derivative generation |
 | `--no-backup` | Don't keep old file versions |
@@ -599,7 +603,7 @@ ia upload cleanup my-item big.iso --abort
 
 Required columns: `identifier`, `file`. All other columns become metadata.
 
-Supports the same options as the bare command: `-m`, `--header`, `--checksums`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
 **`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
 
@@ -661,9 +665,11 @@ ia upload my-item file.pdf --dry-run
 ia upload my-item ./files/ --dashboard
 ```
 
-#### Resuming Uploads
+#### Resuming uploads
 
-When `--joblog` is provided, uploads automatically resume from where they left off. Files that were successfully uploaded in a previous run (recorded in the joblog) are skipped, so you can safely re-run the same command after an interruption.
+Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished.
+
+When `--joblog` is provided, files the joblog lists as uploaded are skipped, so you can safely re-run the same command after an interruption.
 
 ```sh
 # First run — uploads all files, logs results
@@ -1209,8 +1215,8 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file (enables auto-resume) |
-| `--no-resume` | Don't resume from joblog — process all items fresh |
+| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done: finished files for upload, fully finished items for download (a partial file resumes from its `.part` regardless) |
+| `--no-resume` | Ignore the joblog's record of finished work and process every file again (download, upload, ai) |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
 | `-v, --verbose` | Increase output verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
@@ -1235,7 +1241,7 @@ ia --config-file ~/my-ia.ini download nasa
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, auto-resume is enabled — re-running the same command automatically skips already-completed items.
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload, fully finished items for download. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging
@@ -1244,7 +1250,7 @@ ia download nasa --joblog downloads.jsonl
 # View job log summary
 ia status --joblog downloads.jsonl
 
-# Re-run to retry failures (auto-resume skips completed items)
+# Re-run to retry failures (what the joblog records as done is skipped)
 ia download nasa --joblog downloads.jsonl
 ```
 

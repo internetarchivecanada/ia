@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 #[command(
+    about = "Generate roff man pages from the command tree",
     long_about = "Generate roff man pages from the command tree. Writes one page per \
         command \u{2014} ia-cli.1, ia-cli-metadata.1, ia-cli-metadata-modify.1, and so on \
         \u{2014} so `man ia-cli-metadata-modify` works the way it does for git and cargo.\n\n\

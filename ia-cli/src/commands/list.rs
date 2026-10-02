@@ -10,6 +10,7 @@ use ia_core::IaClient;
 
 #[derive(Args)]
 #[command(
+    about = "List files in an item with filtering and formatting",
     long_about = "List files in an Internet Archive item. Displays a table of files with name, \
         size, and format by default. Use --columns to customize output, --glob to filter, or \
         --all for full file metadata as JSON.",

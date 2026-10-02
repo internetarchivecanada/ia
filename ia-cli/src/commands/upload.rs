@@ -58,9 +58,15 @@ fn build_skip_set(
 
 #[derive(Debug, Args)]
 #[command(
+    about = "Upload files to the Internet Archive",
     long_about = "Upload files to the Internet Archive. Uploads one or more files to a single item, \
         with options for metadata, checksum verification, directory structure, and retry logic. Supports batch \
-        uploads from spreadsheets and template generation for bulk workflows.",
+        uploads from spreadsheets and template generation for bulk workflows.\n\n\
+        Each file is sent in one PUT unless --multipart is given. If an upload is interrupted (the process \
+        is killed, the network drops past the retries), a single-PUT file is sent again from byte 0 on the \
+        rerun, except that a file the item already lists with the same md5 is skipped; a --multipart file \
+        resumes from the parts already on IA after checking them against the local file. --joblog adds a \
+        layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Integrity & Skip Behavior:</underline></bold>\n\
          \n  By default, ia computes a local MD5 for each file and:\n\

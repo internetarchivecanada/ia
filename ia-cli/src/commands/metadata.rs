@@ -416,6 +416,7 @@ pub struct AuditArgs {
 
 #[derive(Debug, Args)]
 #[command(
+    about = "Read or modify item metadata",
     long_about = "Read or modify Internet Archive item metadata.\n\n\
         Without -m, reads metadata (JSON output). With -m, modifies metadata \
         (shorthand for 'ia metadata modify').\n\n\
