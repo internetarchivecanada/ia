@@ -2034,6 +2034,17 @@ fn download_help_describes_md5_mismatch_handling() {
         ));
 }
 
+// -- ai: LLM request retries honor Retry-After --
+
+#[cfg(feature = "alpha")]
+#[test]
+fn ai_help_describes_llm_retries() {
+    ia().args(["ai", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Retry-After"));
+}
+
 // -- search retries a 429 with Retry-After --
 
 #[test]

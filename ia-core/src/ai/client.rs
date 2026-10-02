@@ -217,7 +217,8 @@ impl LlmClient {
     /// Send a text-only chat request and return the parsed response.
     ///
     /// Dispatches to the appropriate provider format (OpenAI or Anthropic).
-    /// Retries with exponential backoff on 429/5xx errors.
+    /// A 429 or 5xx is retried on the standard backoff, honoring
+    /// `Retry-After` (see `send_request`).
     pub async fn chat(&self, system_prompt: &str, user_message: &str) -> Result<LlmResponse> {
         let url = self.config.provider.endpoint_url(&self.config.base_url);
 
@@ -313,13 +314,31 @@ impl LlmClient {
     /// Adds provider-appropriate auth headers, retries on transient errors,
     /// and dispatches response parsing to the correct provider format.
     async fn send_request<T: Serialize>(&self, url: &str, request: &T) -> Result<LlmResponse> {
-        let mut last_error = None;
-        let delays = [1, 2, 4, 8, 16];
+        /// Retries after the first attempt on a 429, a 5xx, or a transport
+        /// failure.
+        const LLM_RETRIES: u32 = 5;
 
-        for (attempt, delay) in std::iter::once(&0).chain(delays.iter()).enumerate() {
+        let mut last_error = None;
+        // The wait before a retry: the server's Retry-After when the failed
+        // response carried one, otherwise the standard schedule (random, up
+        // to a cap that doubles from 1 s to 60 s).
+        let backoff = crate::retry::backoff_policy(
+            crate::retry::STANDARD_MIN_DELAY,
+            crate::retry::STANDARD_MAX_DELAY,
+            LLM_RETRIES,
+        );
+        let mut retry_after: Option<std::time::Duration> = None;
+
+        for attempt in 0..=LLM_RETRIES {
             if attempt > 0 {
-                debug!(attempt, delay_secs = delay, "retrying LLM request");
-                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                let wait = crate::retry::wait_before_retry(retry_after, &backoff, attempt - 1);
+                debug!(
+                    attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    retry_after = retry_after.is_some(),
+                    "retrying LLM request"
+                );
+                tokio::time::sleep(wait).await;
             }
 
             let mut req = self
@@ -345,6 +364,7 @@ impl LlmClient {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(attempt, error = %e, "LLM request failed");
+                    retry_after = None;
                     last_error = Some(IaError::LlmApi {
                         status: 0,
                         message: e.to_string(),
@@ -356,6 +376,7 @@ impl LlmClient {
             let status = response.status().as_u16();
 
             if status == 429 || status >= 500 {
+                retry_after = crate::retry::retry_after_wait(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 warn!(attempt, status, body = %body, "LLM API retryable error");
                 last_error = Some(IaError::LlmApi {
@@ -835,5 +856,78 @@ mod tests {
         assert_eq!(oai["text"], "hello");
         assert_eq!(ant["type"], "text");
         assert_eq!(ant["text"], "hello");
+    }
+
+    // -- Retry-After on LLM request retries --
+
+    /// A 429 with `Retry-After: 3` is retried after at least three seconds
+    /// (three, because the old fixed table's first wait was 1 s and a 1 s
+    /// header could not tell old from new).
+    #[tokio::test]
+    async fn openai_429_with_retry_after_waits_the_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "3")
+                    .set_body_string("rate limited"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oai_chat_response_body("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(test_config(&server.uri())).unwrap();
+        let started = std::time::Instant::now();
+        let resp = client.chat("system", "user").await.unwrap();
+        assert_eq!(resp.content, "ok");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(3),
+            "Retry-After: 3 was not waited for ({:?})",
+            started.elapsed()
+        );
+        server.verify().await;
+    }
+
+    /// `Retry-After: 0` on a 500 means re-send at once. The old fixed table
+    /// waited 1 s before the first retry regardless.
+    #[tokio::test]
+    async fn openai_500_with_retry_after_zero_resends_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("Retry-After", "0")
+                    .set_body_string("oops"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(oai_chat_response_body("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(test_config(&server.uri())).unwrap();
+        let started = std::time::Instant::now();
+        let resp = client.chat("system", "user").await.unwrap();
+        assert_eq!(resp.content, "ok");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "Retry-After: 0 was not honored as an immediate retry ({:?})",
+            started.elapsed()
+        );
+        server.verify().await;
     }
 }

@@ -97,8 +97,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on AiArgs. Both live on the struct.
     #[cfg(feature = "alpha")]
-    /// AI-assisted metadata cleanup
     Ai(commands::ai::AiArgs),
     /// Create and manage collections
     #[command(visible_alias = "col")]

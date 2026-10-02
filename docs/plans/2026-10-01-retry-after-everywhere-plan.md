@@ -66,9 +66,11 @@ Observations from Task 2, no change: (1) `RetryStats::requests_total` counts out
 
 **Files:** `ia-core/src/ai/client.rs`, its tests, `ia-core/src/update.rs`, `ia-cli/src/commands/ai.rs`
 
-- [ ] **Step 1: Failing tests.** AI: 429 with `Retry-After: 1` then 200 → response, at least 1 s; 500 without a header then 200 → response, under 2 s (the table's first wait was exactly 1 s, so this one may pass already; recorded). Updater: covered by Task 2's middleware tests; one test through `update.rs`'s client builder if a seam exists, otherwise recorded as covered by construction.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(ai,update): LLM and release requests honor Retry-After`.
+- [x] **Step 1: Failing tests.** AI: 429 with `Retry-After: 3` then 200 → response, at least 3 s (a 1 s header passed on the old table, whose first wait was 1 s); 500 with `Retry-After: 0` then 200 → response, under 500 ms (the old table waited 1 s). `ia ai --help` mentions Retry-After (gated on the `alpha` feature like every `ai` CLI test). Updater: `update.rs` has no seam for a wiremock client; its middleware is the one Task 2 tests, recorded as covered by construction.
+- [x] **Step 2: Run**; both AI tests failed (1.01 s waits), the help test failed.
+- [x] **Step 3: Implement.** Five retries on the standard schedule; `retry_after_wait` read from a 429 or 5xx before the body is consumed. The updater switched in Task 2. Commit: `fix(ai): LLM request retries honor Retry-After`.
+
+Observation from Task 5, fixed here: the `Commands::Ai` variant in `ia-cli/src/lib.rs` had a doc comment, which clap turns into `about` and which clears the `long_about` on `AiArgs`, so `ia ai --help` never rendered its long text (the defect #11 fixed for download; #17 lists the rest). Removed, with the same comment as on `Download`. Process slip, recorded: the Task 5 commit was first made with the help test still red, because the commit was chained on a grep of the test output rather than the test's exit code (the lesson from PR #30); caught on the next run and amended.
 
 ### Task 6: docs
 

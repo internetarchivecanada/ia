@@ -1066,6 +1066,8 @@ ia update install 0.5.1
 
 AI tooling for Internet Archive metadata. **Experimental** — only available in builds with the `alpha` feature.
 
+LLM requests that fail with a `429` or a `5xx` are retried up to five times. The wait before each retry is random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header on the failed response (seconds or an HTTP date) sets the wait instead, as given.
+
 ```sh
 ia ai qa <IDENTIFIER>... [OPTIONS]
 ia ai config <show|create|edit> <COLLECTION> [OPTIONS]
