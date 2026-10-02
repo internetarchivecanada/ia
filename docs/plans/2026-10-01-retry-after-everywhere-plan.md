@@ -58,9 +58,9 @@ Observations from Task 2, no change: (1) `RetryStats::requests_total` counts out
 
 **Files:** `ia-core/src/search.rs` (its `tests` module), `ia-cli/src/commands/search.rs`, `docs/usage.md`
 
-- [ ] **Step 1: Failing tests.** For scrape (and one each for advanced and fts): (a) first page 429 with `Retry-After: 1` then 200 → full results, two requests, at least 1 s; (b) 429 four times → the stream yields `IaError::RateLimited { retry_after }`; (c) `num_found` on a 429 then 200 → the count; (d) `ia search --help` mentions the 429 handling.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(search): retry a 429 with Retry-After instead of failing the stream`.
+- [x] **Step 1: Failing tests.** For scrape (and one each for advanced and fts): (a) first page 429 with `Retry-After: 1` then 200 → full results, two requests, at least 1 s; (b) 429 four times (`Retry-After: 0`, so the budget is what is measured) → the stream yields `IaError::RateLimited { retry_after: 0 }`; (c) `num_found` on a 429 then 200 → the count; (d) `ia search <backend> --help` mentions 429 and Retry-After for all three backends.
+- [x] **Step 2: Run**; all six failed (the 429 surfaced as `Http { status: 429, retry_after: None }` at once).
+- [x] **Step 3: Implement.** `send_page` is the one sender for all six request sites; `http_error` builds the non-success error with the header. Commit: `fix(search): retry a 429 with Retry-After instead of failing the stream`.
 
 ### Task 5: AI client and updater
 

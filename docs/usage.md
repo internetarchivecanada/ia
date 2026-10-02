@@ -149,6 +149,8 @@ ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
+Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting what the server's `Retry-After` header says (seconds or an HTTP date, as given) or else a random wait up to a cap that doubles from 1 s; past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
+
 #### Shared flags (all backends)
 
 | Flag | Description |

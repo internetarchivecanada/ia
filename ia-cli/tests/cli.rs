@@ -2034,6 +2034,19 @@ fn download_help_describes_md5_mismatch_handling() {
         ));
 }
 
+// -- search retries a 429 with Retry-After --
+
+#[test]
+fn search_help_describes_429_handling() {
+    for backend in ["scrape", "advanced", "fts"] {
+        ia().args(["search", backend, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("429"))
+            .stdout(predicate::str::contains("Retry-After"));
+    }
+}
+
 // -- download retries honor Retry-After --
 
 #[test]
