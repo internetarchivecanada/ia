@@ -94,7 +94,7 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_directories: bool,
 
-    /// Verify md5 checksums (without it only the size is checked)
+    /// Verify md5 checksums (without it the md5 is never checked)
     ///
     /// Before downloading, a local file whose md5 matches the item metadata
     /// is skipped; this reads every local file, so it is slower. While

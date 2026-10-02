@@ -2837,7 +2837,7 @@ fn download_checksum_short_help_says_what_is_checked_without_it() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Verify md5 checksums (without it only the size is checked)",
+            "Verify md5 checksums (without it the md5 is never checked)",
         ))
         .stdout(predicate::str::contains("slower, reads every local file").not());
 }

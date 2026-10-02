@@ -204,11 +204,10 @@ pub struct UploadArgs {
     /// fresh upload starts and the stale one is left for cleanup, named in
     /// a warning.
     ///
-    /// The same read gives the md5 for the skip check, so a file the item
-    /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway; --clobber --no-verify also skips the read). Each part's md5
-    /// goes to IA with the completion request, and IA checks every part
-    /// against it before accepting; an accepted completion is the upload.
+    /// A file the item already has is skipped, as with a single PUT
+    /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
+    /// completion request, and IA checks every part against it before
+    /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 
@@ -337,11 +336,10 @@ pub struct ImportArgs {
     /// fresh upload starts and the stale one is left for cleanup, named in
     /// a warning.
     ///
-    /// The same read gives the md5 for the skip check, so a file the item
-    /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway; --clobber --no-verify also skips the read). Each part's md5
-    /// goes to IA with the completion request, and IA checks every part
-    /// against it before accepting; an accepted completion is the upload.
+    /// A file the item already has is skipped, as with a single PUT
+    /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
+    /// completion request, and IA checks every part against it before
+    /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 

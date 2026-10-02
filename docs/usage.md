@@ -44,7 +44,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--exclude-source <TYPE>` | Exclude by source type |
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
-| `-C, --checksum` | Verify md5 checksums; without it only the size is checked. A local file with a matching md5 is skipped (this reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` (see "Checksum mismatches") |
+| `-C, --checksum` | Verify md5 checksums; without it the md5 is never checked (a local file is skipped on size and mtime, a download accepted on size). See "Checksum mismatches" |
 | `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
@@ -85,7 +85,7 @@ A connection that drops is resumed: the bytes already in the `.part` file stay, 
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
-Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message). A dropped connection is re-requested up to three times per attempt without spending a stall. `--retries 0` means the first stall fails the file.
+Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message). A dropped connection is re-requested up to three times per attempt, after waits of 0.5 s, 1.5 s and 4.5 s, without spending a stall. `--retries 0` means the first stall fails the file.
 
 #### Checksum mismatches
 
@@ -153,7 +153,7 @@ ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
-Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting what the server's `Retry-After` header says (seconds or an HTTP date, as given) or else a random wait up to a cap that doubles from 1 s; past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
+Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting what the server's `Retry-After` header says (seconds or an HTTP date, as given) or else a random wait up to a cap that doubles from 1 s to 60 s; past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
 
 #### Shared flags (all backends)
 
@@ -580,7 +580,7 @@ ia upload my-item big.iso --multipart --retries 20
 
 #### Stalled uploads
 
-A body send that moves no bytes for 60 s is abandoned and sent again at once, spending one of `--retries`; with `--multipart` that is the part, and the parts already on IA stay. The clock starts at the send's first byte, and only the body send is judged: once the last byte is handed to the connection, waiting for IA's answer is not a stall (a part's answer legitimately arrives seconds after the body, while IA hashes it). There is no knob: a re-send goes to the same endpoint, so only a dead send is a signal. When the retries are gone, a single PUT fails with `upload of <item>/<key> stalled N times: no bytes were sent for 60 s` (in `--json` output the file's error message is this text); with `--multipart` the part's message reads `part N of M stalled K times (no bytes sent for 60 s, after A attempts): multipart upload <id> is kept ...` and the upload is kept on IA (see "Multipart part failures").
+A body send that moves no bytes for 60 s is abandoned and sent again at once, spending one of `--retries`; with `--multipart` that is the part, and the parts already on IA stay. The clock starts at the send's first byte, and only the body send is judged: once the last byte is handed to the connection, waiting for IA's answer is not a stall (a part's answer legitimately arrives seconds after the body, while IA hashes it). When the retries are gone, a single PUT fails with `upload of <item>/<key> stalled N times: no bytes were sent for 60 s` (in `--json` output the file's error message is this text); with `--multipart` the part's message reads `part N of M stalled K times (no bytes sent for 60 s, after A attempts): multipart upload <id> is kept ...` and the upload is kept on IA (see "Multipart part failures").
 
 #### Resuming a multipart upload
 

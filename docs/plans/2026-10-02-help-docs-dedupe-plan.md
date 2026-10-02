@@ -24,3 +24,11 @@
 - [ ] Red: `ia-cli/tests/cli.rs` tests for the `--checksum` short help, no ">5 GB" / "Integrity & Skip" / "rate_limited" in the upload, download and search help, the download `long_about` not carrying "up to a cap that doubles" twice.
 - [ ] Green: the edits above; fix any help test that pinned removed wording.
 - [ ] `just ci`; code-reviewer pass (help rendered, docs read against code); PR; merge after checks; `scripts/ia-cleanup help-docs-dedupe` after a confirmed merge.
+
+## Review (2026-10-02), closed before merge
+
+Important, fixed: "without it only the size is checked" was wrong for the skip check (a local file is skipped on size and mtime; only the finished download is accepted on size alone): the short help now says "without it the md5 is never checked", and the usage.md row gives both rules in a parenthesis and points to "Checksum mismatches". The dropped-connection re-request waits (0.5 s, 1.5 s, 4.5 s) had been lost from usage.md; restored.
+
+Suggestions, taken: "--clobber --no-verify also skips the read" and "The same read gives the md5" left `--multipart`'s help (the fact is on `--clobber`); usage.md's search section states the 60 s cap; the "There is no knob" rationale left "Stalled uploads"; the `--checksum` row is a pointer. Not taken: the two older tests' `contains("up to a cap that doubles")` assertions are redundant with the new count-of-one tests but harmless.
+
+Noted, left as is: the 30-day note stays in `--multipart` help, cleanup help and usage.md (one statement per command page; Jake asked for the note in #39); usage.md states the `.part`/Range resume in the overview and in the two sections whose rule it is; the Job logging paragraph points to both sections after a one-line summary.
