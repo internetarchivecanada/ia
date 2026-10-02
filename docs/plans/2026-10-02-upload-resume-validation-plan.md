@@ -51,6 +51,12 @@
 - [x] **Step 2: Run**; the two two-page tests failed (one request each, one entry returned); the no-marker guard passed already (no loop existed) and pins the guard.
 - [x] **Step 3: Implement.** `next_page_marker` reads `IsTruncated` and the named marker; both listings loop, appending `part-number-marker` or `key-marker` + `upload-id-marker` (url-encoded). Commit: `fix(upload): follow S3 pagination when listing multipart uploads and parts`.
 
+### Review findings (2026-10-02), closed before the PR
+
+Important, fixed: in the hasher, `(part_size - in_part) as usize` would truncate on a 32-bit target (a 4 GiB part gives a room of 0 and the inner loop never advances); now `usize::try_from(..).unwrap_or(usize::MAX)`. Production passes 100 MiB; the function is a public entry point.
+
+Suggestions, taken: a listing page whose marker repeats the one just sent ends the walk (the red for that test was an infinite loop); candidates are sorted newest first by `Initiated` (stable, so ties and missing times keep the reversed listing order) instead of trusting the listing order; `FileHashes` carries `size`, the bytes actually hashed, so #20 can hand one struct to the skip check and `try_resume` and the sizes and hashes always describe the same bytes; the hasher is split into `hash_reader_and_parts(reader, part_size, chunk_len)` so tests cover both shapes without large files (a part carrying across reads, the production shape; several boundaries in one chunk).
+
 ### Task 4: docs, verification, review
 
 - [ ] usage.md, help, the phase-2 plan's dated note; `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-resume-validation` only after a confirmed merge.

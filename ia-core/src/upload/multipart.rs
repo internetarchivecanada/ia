@@ -583,7 +583,11 @@ pub(crate) async fn list_uploads_with_ctx(
         let next_key = next_page_marker(&body, "NextKeyMarker");
         let next_id = next_page_marker(&body, "NextUploadIdMarker");
         match (next_key, next_id) {
-            (Some(key), Some(id)) => marker = Some((key, id)),
+            // A marker equal to the one just sent would fetch the same
+            // page forever; stop with what was read.
+            (Some(key), Some(id)) if marker.as_ref() != Some(&(key.clone(), id.clone())) => {
+                marker = Some((key, id))
+            }
             _ => return Ok(uploads),
         }
     }
@@ -633,8 +637,10 @@ pub(crate) async fn list_parts_with_ctx(
         let body = sent.response.text().await.unwrap_or_default();
         parts.extend(parse_list_parts_response(&body));
         match next_page_marker(&body, "NextPartNumberMarker") {
-            Some(m) => marker = Some(m),
-            None => return Ok(parts),
+            // A marker equal to the one just sent would fetch the same
+            // page forever; stop with what was read.
+            Some(m) if marker.as_deref() != Some(m.as_str()) => marker = Some(m),
+            _ => return Ok(parts),
         }
     }
 }
@@ -1045,7 +1051,8 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
 /// and return it with those parts.
 ///
 /// Candidates are the item's unfinished uploads for `ctx.key`, newest first
-/// (S3 lists them in chronological order). Each candidate's parts are
+/// by their `Initiated` time (ties and missing times keep the listing's
+/// reverse order, S3 listing chronologically). Each candidate's parts are
 /// checked with [`validate_parts`] against the local file's size and the
 /// md5 of each local range; the first candidate that validates is resumed.
 /// One that does not is left in place (an abort would be #18's mistake
@@ -1064,8 +1071,10 @@ async fn try_resume(
     part_size: u64,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
     let uploads = list_uploads_with_ctx(client, ctx).await?;
-    let candidates: Vec<&MultipartUploadInfo> =
+    let mut candidates: Vec<&MultipartUploadInfo> =
         uploads.iter().rev().filter(|u| u.key == ctx.key).collect();
+    // ISO 8601 timestamps sort as strings; the sort is stable.
+    candidates.sort_by(|a, b| b.initiated.cmp(&a.initiated));
     if candidates.is_empty() {
         return Ok((None, Vec::new()));
     }

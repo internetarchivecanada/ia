@@ -2522,3 +2522,72 @@ async fn list_parts_truncated_without_a_marker_stops() {
     assert_eq!(parts.len(), 1);
     server.verify().await;
 }
+
+/// A server that keeps answering the same marker would otherwise be asked
+/// for the same page forever; the walk stops when the marker repeats.
+#[tokio::test]
+async fn list_parts_stops_when_the_marker_repeats() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "loop"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListPartsResult><IsTruncated>true</IsTruncated><NextPartNumberMarker>1</NextPartNumberMarker>
+<Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part></ListPartsResult>"#,
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let parts = multipart::list_parts(&client, "test-item", "data.bin", "loop")
+        .await
+        .unwrap();
+    assert_eq!(parts.len(), 2, "two pages were read, then the walk stopped");
+    server.verify().await;
+}
+
+/// "Newest" follows each upload's Initiated time, not the listing order:
+/// IA may list newest first. Two valid uploads, the newer listed first →
+/// the newer is resumed.
+#[tokio::test]
+async fn resume_prefers_the_newest_by_initiated_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult>\
+             <Upload><Key>data.bin</Key><UploadId>newer</UploadId><Initiated>2026-10-02T02:00:00.000Z</Initiated></Upload>\
+             <Upload><Key>data.bin</Key><UploadId>older</UploadId><Initiated>2026-10-02T01:00:00.000Z</Initiated></Upload>\
+             </ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+    let part1 = format!(
+        r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>"#,
+        md5_hex(b"aaaaabbbbb")
+    );
+    mount_list_parts(&server, "newer", &part1).await;
+    mount_list_parts(&server, "older", &part1).await;
+    for n in 2..=3 {
+        Mock::given(method("PUT"))
+            .and(path("/test-item/data.bin"))
+            .and(query_param("partNumber", n.to_string()))
+            .and(query_param("uploadId", "newer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "newer"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}

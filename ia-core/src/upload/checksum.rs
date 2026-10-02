@@ -83,6 +83,9 @@ pub struct FileHashes {
     /// Hex md5 of each part in order: part `n` (1-based) is `parts[n - 1]`.
     /// An empty file has one part, the empty md5.
     pub parts: Vec<String>,
+    /// Bytes hashed: the file's size as it was read, so size and hashes
+    /// describe the same bytes even if the file changes afterwards.
+    pub size: u64,
 }
 
 /// Compute the whole-file md5 and the md5 of every `part_size` slice in one
@@ -95,29 +98,46 @@ pub struct FileHashes {
 ///
 /// `part_size` must be greater than 0.
 pub fn hash_file_and_parts(path: &Path, part_size: u64) -> Result<FileHashes, std::io::Error> {
+    let file = std::fs::File::open(path)?;
+    hash_reader_and_parts(file, part_size, 1024 * 1024)
+}
+
+/// [`hash_file_and_parts`] over any reader, reading `chunk_len` bytes at a
+/// time. The chunk length is a parameter so tests can exercise both shapes
+/// without large files: a part larger than a chunk (production: 100 MiB
+/// parts, 1 MiB chunks), where a part carries across reads, and several
+/// part boundaries inside one chunk.
+fn hash_reader_and_parts(
+    mut reader: impl Read,
+    part_size: u64,
+    chunk_len: usize,
+) -> Result<FileHashes, std::io::Error> {
     if part_size == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "part_size must be greater than 0",
         ));
     }
-    let mut file = std::fs::File::open(path)?;
     let mut whole = Md5::new();
     let mut part = Md5::new();
     let mut in_part: u64 = 0;
+    let mut size: u64 = 0;
     let mut parts = Vec::new();
-    let mut buffer = [0u8; 1024 * 1024]; // 1 MiB chunks
+    let mut buffer = vec![0u8; chunk_len.max(1)];
     loop {
-        let n = file.read(&mut buffer)?;
+        let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         whole.update(&buffer[..n]);
+        size += n as u64;
         // Feed the part hasher up to each boundary, finalizing at every one
         // a chunk crosses.
         let mut chunk = &buffer[..n];
         while !chunk.is_empty() {
-            let room = (part_size - in_part) as usize;
+            // A part can be larger than usize on a 32-bit target; the room
+            // left is then at least the whole chunk.
+            let room = usize::try_from(part_size - in_part).unwrap_or(usize::MAX);
             let take = chunk.len().min(room);
             part.update(&chunk[..take]);
             in_part += take as u64;
@@ -136,6 +156,7 @@ pub fn hash_file_and_parts(path: &Path, part_size: u64) -> Result<FileHashes, st
     Ok(FileHashes {
         md5: format!("{:x}", whole.finalize()),
         parts,
+        size,
     })
 }
 
@@ -677,6 +698,36 @@ mod tests {
             ]
         );
         assert_eq!(hashes.md5, compute_file_md5(f.path()).unwrap());
+        assert_eq!(hashes.size, 2500);
+    }
+
+    /// The production shape: a part larger than one read chunk, so a part
+    /// carries across reads. Driven through the reader seam with tiny
+    /// chunks instead of a multi-megabyte file.
+    #[test]
+    fn hash_reader_and_parts_carries_a_part_across_reads() {
+        let bytes: Vec<u8> = (0..60u32).map(|i| i as u8).collect();
+        let hashes = hash_reader_and_parts(&bytes[..], 25, 10).unwrap();
+        assert_eq!(
+            hashes.parts,
+            vec![
+                md5_hex(&bytes[..25]),
+                md5_hex(&bytes[25..50]),
+                md5_hex(&bytes[50..])
+            ]
+        );
+        assert_eq!(hashes.md5, md5_hex(&bytes));
+        assert_eq!(hashes.size, 60);
+    }
+
+    /// The other shape: several part boundaries inside one read chunk.
+    #[test]
+    fn hash_reader_and_parts_splits_several_parts_in_one_chunk() {
+        let bytes: Vec<u8> = (0..23u32).map(|i| i as u8).collect();
+        let hashes = hash_reader_and_parts(&bytes[..], 5, 64).unwrap();
+        let expected: Vec<String> = bytes.chunks(5).map(md5_hex).collect();
+        assert_eq!(hashes.parts, expected);
+        assert_eq!(hashes.parts.len(), 5);
     }
 
     #[test]
