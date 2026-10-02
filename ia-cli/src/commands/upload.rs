@@ -99,7 +99,7 @@ fn build_skip_set(
          \n  <dim># cap that doubles from 1 s to 60 s, or exactly what Retry-After says</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
-         \n  <dim># the parts already there, or discard it</dim>\
+         \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
          \n  <bold>$ ia upload cleanup my-item big.iso</bold>\n"
     ),

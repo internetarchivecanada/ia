@@ -1088,8 +1088,11 @@ async fn try_resume(
                 identifier = ctx.identifier,
                 key = ctx.key,
                 upload_id = %info.upload_id,
-                "not resuming multipart upload: {reason}; it is left on IA, \
-                 discard it with `ia upload cleanup`"
+                "not resuming multipart upload {}: {reason}; it is left on IA, discard it \
+                 with: ia upload cleanup {} {}",
+                info.upload_id,
+                ctx.identifier,
+                shell_word(ctx.key)
             ),
         }
     }
@@ -1136,7 +1139,7 @@ fn validate_parts(
             Some(md5) if *md5 == etag => {}
             _ => {
                 return Err(format!(
-                    "part {n} has md5 {etag} on IA but the local range hashes differently"
+                    "part {n} has ETag {etag} on IA but the local range's md5 differs"
                 ))
             }
         }
@@ -1496,6 +1499,31 @@ mod tests {
         let parts = [part(1, &"aa".repeat(16), 10), part(1, &"aa".repeat(16), 10)];
         let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
         assert!(reason.contains("twice"), "{reason}");
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_part_from_a_different_part_size() {
+        // A 15-byte part can only come from an upload made with another part
+        // size; at 10 bytes per part it is wrong by size.
+        let parts = [part(1, &"aa".repeat(16), 15)];
+        assert!(validate_parts(&parts, 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_handles_an_empty_file() {
+        const EMPTY: &str = "d41d8cd98f00b204e9800998ecf8427e";
+        let local = vec![EMPTY.to_string()];
+        assert_eq!(validate_parts(&[part(1, EMPTY, 0)], 0, 10, &local), Ok(()));
+        // With an expected size of 0, a listed size of 5 is a real mismatch,
+        // not "size not given".
+        assert!(validate_parts(&[part(1, EMPTY, 5)], 0, 10, &local).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_composite_etag() {
+        let parts = [part(1, "\"abc-3\"", 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(reason.contains("ETag abc-3"), "{reason}");
     }
 
     #[test]
