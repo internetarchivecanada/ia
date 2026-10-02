@@ -47,8 +47,8 @@ The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install
 
 | Command | What it does |
 |---|---|
-| `download` | Concurrent downloads with resume, checksum verification, glob/format filters, multi-disk pool, ZIP-member extraction, TUI dashboard |
-| `upload` | Single file or batch from a spreadsheet; multipart for large files, automatic resume |
+| `download` | Concurrent downloads that resume a partial file from where it stopped, md5 verification, glob/format filters, multi-disk pool, ZIP-member extraction, TUI dashboard |
+| `upload` | Single file or batch from a spreadsheet; opt-in multipart for large files, resumed from the parts already on IA and verified once assembled; a joblog skips files already done |
 | `metadata` | Read and write, compound `+` operations in one request, bulk import/export, schema lookup and audit |
 | `search` | Three backends: scrape (cursor), advanced (paged), full-text (scroll) |
 | `list` | File listings with column selection, filters, and download URLs |

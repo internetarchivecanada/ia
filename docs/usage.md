@@ -56,6 +56,10 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--dashboard` | Full-screen dashboard mode |
 | `--json` | Output results as JSONL (one object per line) |
 
+#### After an interruption
+
+Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and with `--checksum` its md5 too. `--joblog` adds a second layer on top: files a previous run finished are skipped without a request. The sections below give the rules in detail.
+
 #### Retries
 
 A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5). The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carried a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. In `--json` output an `http_error` that carried the header shows it as `retry_after`.
@@ -661,7 +665,9 @@ ia upload my-item file.pdf --dry-run
 ia upload my-item ./files/ --dashboard
 ```
 
-#### Resuming Uploads
+#### Resuming uploads
+
+Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished.
 
 When `--joblog` is provided, uploads automatically resume from where they left off. Files that were successfully uploaded in a previous run (recorded in the joblog) are skipped, so you can safely re-run the same command after an interruption.
 
@@ -1209,8 +1215,8 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file (enables auto-resume) |
-| `--no-resume` | Don't resume from joblog — process all items fresh |
+| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips the files it lists as done (download resumes a partial file from its `.part` regardless) |
+| `--no-resume` | Ignore the joblog's record of finished files and process every file again |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
 | `-v, --verbose` | Increase output verbosity (`-v` info, `-vv` debug, `-vvv` trace) |
@@ -1235,7 +1241,7 @@ ia --config-file ~/my-ia.ini download nasa
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, auto-resume is enabled — re-running the same command automatically skips already-completed items.
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips the files it lists as done. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging
@@ -1244,7 +1250,7 @@ ia download nasa --joblog downloads.jsonl
 # View job log summary
 ia status --joblog downloads.jsonl
 
-# Re-run to retry failures (auto-resume skips completed items)
+# Re-run to retry failures (files the joblog lists as done are skipped)
 ia download nasa --joblog downloads.jsonl
 ```
 

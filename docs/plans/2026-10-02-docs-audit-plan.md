@@ -24,15 +24,23 @@
 
 ### Task 1: long help renders for every command
 
-- [ ] **Step 1: Failing tests.** `ia-cli/tests/cli.rs`: one test, a table of `(command, phrase)` with a phrase unique to each struct's `long_about`, asserting `ia <command> --help` contains it; also that `ia --help` still shows each one-liner.
-- [ ] **Step 2: Run**; fail for the eleven.
-- [ ] **Step 3: Implement** (mechanical, cheaper model). Commit: `fix(cli): every command's long help renders`.
+- [x] **Step 1: Failing tests.** `ia-cli/tests/cli.rs`: one test, a table of `(command, phrase)` with a phrase unique to each struct's `long_about`, asserting `ia <command> --help` contains it; also that `ia --help` still shows each one-liner.
+- [x] **Step 2: Run**; failed on the first command checked (collection).
+- [x] **Step 3: Implement** (mechanical, a `sonnet` model moved the eleven one-liners onto the structs as `about` with the exact text; `ia --help` unchanged, verified). Committed together with Task 2's code as `fix(cli): every command's long help renders; the resume flags say what resumes`.
 
 ### Task 2: global help, README, usage.md
 
-- [ ] **Step 1: Failing tests.** `ia --help` contains the new `--joblog`/`--no-resume` wording and not "upload all files fresh"; `ia download --help` likewise (global options render there).
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement**; README and usage.md edits with it. Commit: `docs: say what resumes, where, for download and upload`.
+- [x] **Step 1: Failing tests.** `ia --help`, `ia download --help` and `ia upload --help` contain the new `--joblog`/`--no-resume` wording and not "upload all files fresh".
+- [x] **Step 2: Run**; fail.
+- [x] **Step 3: Implement**; the code in the Task 1 commit; README and usage.md (the download "After an interruption" paragraph, the "Resuming uploads" opening, the global options table, the Job logging section) in `docs: say what resumes, where, for download and upload`.
+
+### The fresh-agent check
+
+**Before** (2026-10-02, a `haiku` model given only `ia --help`, `ia download --help`, `ia upload --help` and the README as rendered at main after PR #36; question: "If a 7 GB download or a 7 GB upload is interrupted, what happens on rerun? Does it start over or continue? Does it differ for download versus upload, for `--multipart`, for `--joblog`?"):
+
+> For download: when rerun, a dropped connection resumes from bytes on disk using a Range request, and the partial file is kept as `.part` for later runs. For upload without `--multipart`: the file does not explicitly state what happens on interruption; it only describes the resume behavior with `--multipart`, which resumes from parts already on IA if every part matches by size and md5, otherwise starts fresh and leaves the stale upload for cleanup. Both download and upload support `--joblog`, which "enables auto-resume"; the file does not explain what auto-resume means without `--joblog`. The file does not distinguish between how download and upload handle interruption except where noted above.
+
+Download is right already (the help written in #11 to #14 carries it; the issue's original wrong answer predates them). The two gaps left are the ones this audit closes: a plain upload's behavior after an interruption, and what the joblog's "auto-resume" means. The `--multipart` text the agent quotes correctly was hidden in `ia upload --help`'s `long_about` and reached it only through the flag's own doc comment.
 
 ### Task 3: the fresh-agent check, verification, review
 
