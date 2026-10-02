@@ -542,7 +542,7 @@ async fn range_not_satisfiable(
                 "the .part file is as long as the file but the item metadata has no size \
                  that can confirm it"
             } else {
-                "the .part file cannot be resumed from there"
+                "the server refused to resume it although it is shorter than the file"
             };
             let removal = match fs::remove_file(part_path).await {
                 Ok(()) => "so the .part file was removed".to_string(),
@@ -4799,7 +4799,7 @@ mod tests {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
                     reason.contains("416 to a resume from byte 20 of its 32-byte copy")
-                        && reason.contains("cannot be resumed from there")
+                        && reason.contains("refused to resume it although it is shorter")
                         && reason.contains("was removed")
                         && !reason.contains("restarts"),
                     "{reason}"
