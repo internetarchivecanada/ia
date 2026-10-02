@@ -2813,13 +2813,13 @@ fn metadata_export_resume_skips_a_logged_item() {
 // -- upload: a dead send is abandoned; there is no --min-speed on upload --
 
 #[test]
-fn upload_help_states_the_dead_send_rule_and_has_no_min_speed() {
+fn upload_help_keeps_the_dead_send_rule_out_except_what_retries_counts() {
     ia().args(["upload", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--min-speed").not())
-        .stdout(predicate::str::contains("moves no bytes for 60 s"))
-        .stdout(predicate::str::contains("stalled"));
+        .stdout(predicate::str::contains("moves no bytes").not())
+        .stdout(predicate::str::contains("a send dead for 60 s spends one"));
 }
 
 #[test]
