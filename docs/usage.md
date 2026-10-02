@@ -44,8 +44,8 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--exclude-source <TYPE>` | Exclude by source type |
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
-| `-C, --checksum` | Verify md5 checksums (slower, reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` |
-| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5). Waits are random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header sets the wait instead, as given |
+| `-C, --checksum` | Verify md5 checksums; without it only the size is checked. A local file with a matching md5 is skipped (this reads every local file); a mismatch keeps the bytes as `<name>.md5-mismatch` (see "Checksum mismatches") |
+| `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
@@ -81,11 +81,11 @@ Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml
 
 #### Slow and stalled downloads
 
-A connection that drops is resumed: the bytes already in the `.part` file stay, and the file is re-requested with a `Range` header from that offset. A connection that keeps sending bytes too slowly gets the same treatment. Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace. No byte is lost or fetched twice, and the md5 comparison made with `--checksum` still covers the whole file.
+A connection that drops is resumed: the bytes already in the `.part` file stay, and the file is re-requested with a `Range` header from that offset. A connection that keeps sending bytes too slowly gets the same treatment. Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
-Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall and so is one more than `--retries`; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message, as for every per-file failure). Dropped connections have their own budget of three re-requests per attempt, after short fixed waits (0.5 s, 1.5 s, 4.5 s), and do not count against the stalls. `--retries 0` means the first stall fails the file, with `stalled 1 time`.
+Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message). A dropped connection is re-requested up to three times per attempt without spending a stall. `--retries 0` means the first stall fails the file.
 
 #### Checksum mismatches
 
@@ -563,8 +563,8 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-size-hint` | Don't send x-archive-size-hint header |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
-| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; the same skip check as a single PUT; a rerun resumes from the parts IA holds once they are checked against the local file; a part that fails for good leaves the upload on IA for that rerun; IA checks every part's md5 when the upload is completed (see below) |
-| `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10); a dead send (no bytes for 60 s, see "Stalled uploads") spends one. Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once; a dead send is re-sent at once |
+| `--multipart` | Use multipart upload, for large files or unreliable connections: 100 MiB parts, each retried and resumed on its own (see the multipart sections below) |
+| `--retries <N>` | Retry attempts per IA-S3 request, per file or per part with `--multipart` (default: 10); a send dead for 60 s spends one (see "Retries" and "Stalled uploads") |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
@@ -580,7 +580,7 @@ ia upload my-item big.iso --multipart --retries 20
 
 #### Stalled uploads
 
-The upload transport has no read timeout, on purpose: the server is legitimately silent while a body uploads, and a timeout that only reads would abort a large send. So a server that stops *reading* could otherwise hang a send for as long as the connection stays open. One fixed rule closes that gap: a body send that moves no bytes for 60 s is abandoned (the connection is closed) and sent again at once, spending one of `--retries`; with `--multipart` that is the part, and the parts already on IA stay. There is nothing to tune, unlike download's `--min-speed`: a re-send goes to the same endpoint, so a slow send is not a signal of anything fixable, only a dead one is. The clock starts at the send's first byte (connecting is not counted), and only the body send is judged: once the last byte is handed to the connection, waiting for IA's answer is not a stall (a part's answer legitimately arrives seconds after the body, while IA hashes it), and nothing bounds that wait. When the retries are gone, a single PUT fails with `upload of <item>/<key> stalled N times: no bytes were sent for 60 s`, where N counts every stall and so is one more than `--retries` when every attempt stalled (in `--json` output the file's error message is this text); with `--multipart` the part's message reads `part N of M stalled K times (no bytes sent for 60 s, after A attempts): multipart upload <id> is kept ...` and the upload is kept on IA (see "Multipart part failures").
+A body send that moves no bytes for 60 s is abandoned and sent again at once, spending one of `--retries`; with `--multipart` that is the part, and the parts already on IA stay. The clock starts at the send's first byte, and only the body send is judged: once the last byte is handed to the connection, waiting for IA's answer is not a stall (a part's answer legitimately arrives seconds after the body, while IA hashes it). There is no knob: a re-send goes to the same endpoint, so only a dead send is a signal. When the retries are gone, a single PUT fails with `upload of <item>/<key> stalled N times: no bytes were sent for 60 s` (in `--json` output the file's error message is this text); with `--multipart` the part's message reads `part N of M stalled K times (no bytes sent for 60 s, after A attempts): multipart upload <id> is kept ...` and the upload is kept on IA (see "Multipart part failures").
 
 #### Resuming a multipart upload
 
@@ -671,9 +671,7 @@ ia upload my-item ./files/ --dashboard
 
 #### Resuming uploads
 
-Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished.
-
-When `--joblog` is provided, files the joblog lists as uploaded are skipped, so you can safely re-run the same command after an interruption.
+Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished, so the same command can be rerun after an interruption; `--no-resume` turns that off.
 
 ```sh
 # First run — uploads all files, logs results
@@ -688,8 +686,6 @@ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume
 # Single-item resume works the same way
 ia upload my-item ./files/ --joblog upload.jsonl
 ```
-
-The resume mechanism reads the joblog at startup and builds a set of `(identifier, filename)` pairs that completed successfully. Any file matching a pair in the set is skipped with a `Resumed` status. The `--no-resume` flag disables this behavior, forcing all files to be re-uploaded.
 
 Use `ia status --joblog upload.jsonl` to see a summary of completed, failed, and skipped files.
 
@@ -1219,7 +1215,7 @@ These options can be used with any subcommand:
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
-| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done: finished files for upload; fully finished items for download (a partial file resumes from its `.part` regardless), `metadata export`, `metadata modify`, `tasks submit` and `ai qa` |
+| `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done (see "Job logging") |
 | `--no-resume` | Ignore the joblog's record of finished work and process every file or item again |
 | `-q, --quiet` | Suppress output (repeat for more quiet: `-q` summary only, `-qq` silent) |
 | `-l, --log` | Enable logging |
@@ -1311,7 +1307,5 @@ The project is a Cargo workspace with two crates:
 
 - **ia-core** -- Library crate with the client, API types, download engine, search backends, and utilities. Designed as a standalone library for external consumers.
 - **ia-cli** -- Binary crate with the CLI interface, progress display, and TUI dashboard
-
-A desktop GUI is developed separately (not yet public) and consumes `ia-core` as a library dependency.
 
 See [the design doc](plans/2026-02-20-ia-rust-port-design.md) for full architectural details.

@@ -2829,3 +2829,59 @@ fn upload_rejects_min_speed() {
         .code(2)
         .stderr(predicate::str::contains("unexpected argument"));
 }
+
+// -- help states each rule once, on the flag it belongs to (Part 2, PR 2) --
+
+#[test]
+fn download_checksum_short_help_says_what_is_checked_without_it() {
+    ia().args(["download", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Verify md5 checksums (without it only the size is checked)",
+        ))
+        .stdout(predicate::str::contains("slower, reads every local file").not());
+}
+
+#[test]
+fn download_help_states_the_retry_wait_rule_once() {
+    let out = ia().args(["download", "--help"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.matches("up to a cap that doubles").count(),
+        1,
+        "the retry wait rule belongs on --retries alone:\n{text}"
+    );
+    assert!(!text.contains("No byte is lost"), "{text}");
+    assert!(!text.contains("one more than --retries"), "{text}");
+    assert!(!text.contains("own budget of three"), "{text}");
+}
+
+#[test]
+fn upload_help_has_no_size_recommendation_and_no_restated_flag_block() {
+    let out = ia().args(["upload", "--help"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("for large files or unreliable connections"),
+        "{text}"
+    );
+    assert!(!text.contains("5 GB"), "{text}");
+    assert!(!text.contains("Integrity & Skip Behavior"), "{text}");
+    assert!(!text.contains("automatic with --joblog"), "{text}");
+    assert_eq!(
+        text.matches("up to a cap that doubles").count(),
+        1,
+        "the retry wait rule belongs on --retries alone:\n{text}"
+    );
+}
+
+#[test]
+fn search_help_names_no_json_code_in_prose() {
+    for backend in ["scrape", "advanced", "fts"] {
+        ia().args(["search", backend, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("rate_limited").not())
+            .stdout(predicate::str::contains("1 s to 60 s"));
+    }
+}

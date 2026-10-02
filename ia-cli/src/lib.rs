@@ -78,9 +78,8 @@ struct Cli {
     /// Write operation results to a JSONL log file
     ///
     /// A rerun with the same --joblog skips what it records as done:
-    /// finished files for upload; fully finished items for download (a
-    /// partial file resumes from its .part regardless, see `ia download
-    /// --help`), metadata export, metadata modify, tasks submit and ai qa.
+    /// finished files for upload, finished items for every other command
+    /// that takes it.
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 

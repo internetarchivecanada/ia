@@ -33,17 +33,10 @@ use crate::output::DownloadDisplay;
         or specific files when file names are given. Supports batch downloads via search queries, \
         item lists, or piped identifiers from stdin.\n\n\
         Each file streams to <name>.part and is renamed into place once its byte count matches \
-        the item metadata. A dropped connection is resumed with a Range request from the bytes \
-        on disk. So is a stream that stays below --min-speed (default 10K: 10 KiB/s averaged \
-        over the last 60 s, after a 30 s grace at the start of each stream); each such stall \
-        spends one of the file's --retries, and when they are gone the file fails and keeps \
-        its .part for a later run. A .part that is a symlink is removed and the file starts over. \
-        With --checksum, a download whose md5 does not match is \
-        kept as <name>.md5-mismatch and downloaded again; the same wrong md5 twice means the \
-        source is wrong and the file fails.\n\n\
-        A failed attempt is retried up to --retries times. The wait before each retry is \
-        random, up to a cap that doubles from 1 s to 60 s; when the failed response carried a \
-        Retry-After header (seconds or an HTTP date) that wait is used instead, as given.",
+        the item metadata (its md5 too with --checksum). A dropped connection, or a stream slower \
+        than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
+        is retried up to --retries times. A .part that is a symlink is removed and the file \
+        starts over.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -54,8 +47,7 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Batch download from piped identifiers</dim>\n  <bold>$ ia search -q collection:nasa --json | ia download</bold>\
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
-         \n\n  <dim># Ride out a flaky link: 20 retries per file; waits are random, up to a cap that</dim>\
-         \n  <dim># doubles from 1 s to 60 s, or exactly what a Retry-After header says</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
+         \n\n  <dim># Ride out a flaky link: 20 retries per file</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
@@ -102,10 +94,11 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_directories: bool,
 
-    /// Verify md5 checksums (slower, reads every local file)
+    /// Verify md5 checksums (without it only the size is checked)
     ///
     /// Before downloading, a local file whose md5 matches the item metadata
-    /// is skipped. While downloading, the md5 is computed from the stream
+    /// is skipped; this reads every local file, so it is slower. While
+    /// downloading, the md5 is computed from the stream
     /// and compared when the stream ends. On a mismatch the bytes are kept
     /// beside the file as <name>.md5-mismatch and the error names that
     /// path, so a corrupt transfer can be told from a bad source file or
@@ -132,19 +125,13 @@ pub struct DownloadArgs {
     ///
     /// Once a stream is 30 s old, its average rate over the last 60 s (or over
     /// its whole life while younger than that) is compared with this floor
-    /// once a second. Below it, the stream is abandoned: the bytes received so
-    /// far stay in the .part file and the file is re-requested with a Range
-    /// header from that offset, exactly as a dropped connection is handled.
-    /// The new stream gets its own 30 s grace. No byte is lost or fetched
-    /// twice, and the md5 check (--checksum) still covers the whole file.
-    ///
-    /// Each stall spends one of the file's --retries. When they are gone the
-    /// file fails with "download of <name> stalled N times: ..." (N counts
-    /// every stall, so it is one more than --retries; in --json output the
-    /// file's error code is download_failed and this is its message), its
-    /// .part is kept for a later run, and it is not attempted again in this
-    /// one. Dropped connections have their own budget of three re-requests
-    /// and do not count here.
+    /// once a second. Below it, the stream is abandoned and the file is
+    /// re-requested with a Range header from the bytes already in the .part
+    /// file, as a dropped connection is. The new stream gets its own 30 s
+    /// grace. Each stall spends one of the file's --retries; when they are
+    /// gone the file fails with "download of <name> stalled N times: ...",
+    /// its .part is kept for a later run, and it is not attempted again in
+    /// this run.
     ///
     /// RATE is bytes per second: a plain number, or a number followed by K, M,
     /// or G for powers of 1024 (10K is 10240 bytes per second). 0 disables the
