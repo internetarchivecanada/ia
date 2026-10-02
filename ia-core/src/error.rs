@@ -1893,6 +1893,9 @@ mod tests {
         assert!(v["error"].get("min_bytes_per_sec").is_none());
     }
 
+    /// The variant must not grow the error: clippy's result_large_err
+    /// draws the line at 128 bytes for a Result's Err, and S3Failure boxes
+    /// an IaError that was 104 bytes when this was written.
     #[test]
     fn upload_stalled_does_not_grow_the_error() {
         assert!(std::mem::size_of::<IaError>() <= 104);

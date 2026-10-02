@@ -118,7 +118,7 @@ where
         attempt += 1;
 
         // Every attempt is judged on its own clock: a re-send is a new
-        // connection and gets the full grace.
+        // connection and gets a full window before it can be judged dead.
         let watch = BodyWatch::new();
         let sent = match watch_send(&watch, send(&watch)).await {
             SendEnd::Done(result) => result,

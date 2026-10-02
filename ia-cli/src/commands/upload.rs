@@ -66,7 +66,11 @@ fn build_skip_set(
         is killed, the network drops past the retries), a single-PUT file is sent again from byte 0 on the \
         rerun, except that a file the item already lists with the same md5 is skipped; a --multipart file \
         resumes from the parts already on IA after checking them against the local file. --joblog adds a \
-        layer on top of either: files a previous run finished are skipped without a request.",
+        layer on top of either: files a previous run finished are skipped without a request.\n\n\
+        A body send that moves no bytes for 60 s is abandoned (the connection is closed) and \
+        re-sent at once, spending one of --retries; the parts already on IA stay. Only the body \
+        send is judged, from its first byte: waiting for IA's answer after the last byte is not \
+        bounded.",
     after_long_help = cstr!(
         "<bold><underline>Integrity & Skip Behavior:</underline></bold>\n\
          \n  By default, ia computes a local MD5 for each file and:\n\
@@ -198,20 +202,17 @@ pub struct UploadArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart); a dead
-    /// send spends one
+    /// Retry attempts per IA-S3 request (per part with --multipart); a send
+    /// dead for 60 s spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// send that moves no bytes for 60 s is abandoned (the connection is
-    /// closed) and re-sent at once; when the retries are gone a single PUT
-    /// fails with "upload of <item>/<key> stalled N times: no bytes were
-    /// sent for 60 s", and with --multipart the part's message reads "part
-    /// N of M stalled K times (no bytes sent for 60 s)" and the upload is
-    /// kept on IA for a rerun to resume. Only the body send is judged, from
-    /// its first byte: waiting for IA's answer after the last byte is not a
-    /// stall, and nothing bounds that wait.
+    /// dead send is re-sent at once. When the retries are gone, a single
+    /// PUT fails with "upload of <item>/<key> stalled N times: no bytes were
+    /// sent for 60 s"; with --multipart the part's message reads "part N of
+    /// M stalled K times (no bytes sent for 60 s)" and the upload is kept on
+    /// IA for a rerun to resume.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -391,20 +392,17 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart); a dead
-    /// send spends one
+    /// Retry attempts per IA-S3 request (per part with --multipart); a send
+    /// dead for 60 s spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// send that moves no bytes for 60 s is abandoned (the connection is
-    /// closed) and re-sent at once; when the retries are gone a single PUT
-    /// fails with "upload of <item>/<key> stalled N times: no bytes were
-    /// sent for 60 s", and with --multipart the part's message reads "part
-    /// N of M stalled K times (no bytes sent for 60 s)" and the upload is
-    /// kept on IA for a rerun to resume. Only the body send is judged, from
-    /// its first byte: waiting for IA's answer after the last byte is not a
-    /// stall, and nothing bounds that wait.
+    /// dead send is re-sent at once. When the retries are gone, a single
+    /// PUT fails with "upload of <item>/<key> stalled N times: no bytes were
+    /// sent for 60 s"; with --multipart the part's message reads "part N of
+    /// M stalled K times (no bytes sent for 60 s)" and the upload is kept on
+    /// IA for a rerun to resume.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 

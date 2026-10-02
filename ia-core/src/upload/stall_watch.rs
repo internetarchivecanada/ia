@@ -19,7 +19,10 @@
 //! is not counted. Only the body send is judged: once the last chunk has
 //! been handed over, the wait for the server's response is not a stall (a
 //! part PUT's answer legitimately arrives seconds after the body, while IA
-//! hashes it), and nothing bounds that wait (#40).
+//! hashes it), and nothing bounds that wait (#40). In practice "no bytes"
+//! means no 64 KiB chunk was handed to the transport in the last 59 whole
+//! seconds, checked once a second; a link draining under about 1 KiB/s for
+//! a minute is judged dead too.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -229,8 +232,8 @@ pub(crate) mod test_support {
         bytes::Bytes::from(vec![0x5au8; 16 * 1024 * 1024])
     }
 
-    /// Window 2 s, grace 1 s: a stalled send is judged in about three
-    /// seconds instead of ninety.
+    /// Window 2 s (the upload watch uses the window for its grace too): a
+    /// dead send is judged in two to three seconds instead of a minute.
     pub(crate) fn shrink_policy() -> crate::stall::PolicyOverride {
         crate::stall::PolicyOverride::new(
             std::time::Duration::from_secs(2),
@@ -254,8 +257,8 @@ mod tests {
         .unwrap()
     }
 
-    /// A send whose peer stops reading is judged a stall once the grace has
-    /// passed and the window average has fallen below the floor.
+    /// A send whose peer stops reading is judged dead once a whole window
+    /// has passed with no chunk handed over.
     #[tokio::test]
     async fn stalled_send_is_abandoned() {
         let _policy = shrink_policy();
@@ -367,13 +370,34 @@ mod tests {
             watch.check().is_none(),
             "nothing was polled yet, so nothing is judged"
         );
-        // The first poll starts the clock; the grace runs from here.
+        // The first poll starts the clock; the window runs from here.
         watch.record(0);
         assert!(watch.check().is_none(), "within the first window");
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         assert!(
             watch.check().is_some(),
             "a whole window with no bytes: a dead send"
+        );
+    }
+
+    /// The branch's reason: a slow uplink that keeps moving bytes is not
+    /// abandoned. Chunks every 400 ms for over three windows: never dead;
+    /// then a whole window with nothing: dead.
+    #[tokio::test]
+    async fn a_slow_but_moving_send_is_not_judged_dead() {
+        let _policy = shrink_policy();
+        let watch = BodyWatch::new();
+        let _body = watch.wrap(bytes_chunks(big_body()), 16 * 1024 * 1024);
+        for _ in 0..8 {
+            watch.record(64 * 1024);
+            assert!(watch.check().is_none(), "bytes keep moving");
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        assert!(watch.check().is_none(), "still moving after three windows");
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        assert!(
+            watch.check().is_some(),
+            "then nothing for a whole window: dead"
         );
     }
 
