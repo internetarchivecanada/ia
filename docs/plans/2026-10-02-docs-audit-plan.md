@@ -54,6 +54,14 @@ Three of four right; the remaining gap was real: usage.md said what a plain uplo
 
 Every part right. The issue's acceptance criterion ("the fresh-agent test gives correct answers for both download and upload") is met.
 
+### Review findings (2026-10-02), closed before the PR
+
+Important, fixed: (1) the new `--joblog` wording said a rerun "skips the files it lists as done", which is upload's rule; download's joblog resume is per item (`joblog::items_fully_downloaded`: an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). The help, the four usage.md places and the test say "finished files for upload, fully finished items for download". The recorded "after" answer repeated the wrong sentence, so the check had validated the docs against themselves; it is rerun below. (2) The `config` row of the long-help test used "Log in to archive.org", which also appears in the `login` subcommand's one-liner that `ia config --help` lists even when the long help is hidden; the phrase is now "view configuration, validate credentials", which only the long help has.
+
+Suggestions, taken: `--no-resume`'s help names the commands that read it (download, upload, ai); the `--joblog` doc comment has a blank line after its first sentence so `-h` shows a short form; usage.md's "Resuming uploads" no longer says uploads "resume from where they left off" right after the paragraph that says a single PUT does not. From the whole-run audit: the symlink `.part` rule (#25) is now in `ia download --help` and in usage.md; the dropped-connection re-request's fixed waits are in usage.md; usage.md's `--delete-after-upload` row carries the multipart caveat the help has; the two `--checksums` rows name the real flag `--checksum-file`; design-philosophy's byte-range bullet says the size is checked always and the md5 with `--checksum`.
+
+For Jake (not blocking): `metadata export` and `tasks submit` auto-resume from the joblog but do not read `--no-resume`; a code gap for a follow-up issue. Noted, no change: the check_limit poll and which S3 codes retry are in usage.md but not in the `--retries` help; the control calls' fixed three retries are stated only in design-philosophy.
+
 ### Task 3: the fresh-agent check, verification, review
 
 - [x] Before/after answers recorded here. [ ] `just ci`; code-reviewer pass; fix or record; PR; squash-merge after checks pass; `scripts/ia-cleanup docs-audit` only after a confirmed merge.

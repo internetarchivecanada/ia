@@ -75,14 +75,17 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     user_agent_suffix: Option<String>,
 
-    /// Write operation results to a JSONL log file; a rerun with the same
-    /// --joblog skips the files it lists as done (download resumes a
-    /// partial file from its .part regardless, see `ia download --help`)
+    /// Write operation results to a JSONL log file
+    ///
+    /// A rerun with the same --joblog skips what it records as done:
+    /// finished files for upload, fully finished items for download (a
+    /// partial file resumes from its .part regardless, see `ia download
+    /// --help`).
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
-    /// Ignore the joblog's record of finished files and process every file
-    /// again
+    /// Ignore the joblog's record of finished work and process every file
+    /// again (download, upload, ai)
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 

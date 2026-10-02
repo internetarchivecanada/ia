@@ -2525,7 +2525,7 @@ fn every_command_renders_its_long_help() {
         ("man", "Writes one page per", "Generate roff man pages"),
         (
             "config",
-            "Log in to archive.org",
+            "view configuration, validate credentials",
             "Configure credentials and settings",
         ),
         (
@@ -2563,7 +2563,9 @@ fn global_resume_flags_say_what_resumes() {
             .assert()
             .success()
             .stdout(predicate::str::contains("upload all files fresh").not())
-            .stdout(predicate::str::contains("skips the files it lists as done"))
+            .stdout(predicate::str::contains(
+                "finished files for upload, fully finished items for download",
+            ))
             .stdout(predicate::str::contains("process every file again"));
     }
 }
