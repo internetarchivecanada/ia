@@ -439,7 +439,7 @@ impl reqwest_middleware::Middleware for TimingMiddleware {
 /// and the [`ExponentialBackoff`] schedule) and owns the loop: clone the
 /// request, run it, classify the result, and before a retry sleep the
 /// server's `Retry-After` when the response carried one, otherwise the
-/// schedule's draw ([`wait_before_retry`]). The budget is the policy's.
+/// schedule's draw (`wait_before_retry`). The budget is the policy's.
 ///
 /// A 429 is left to the strategy, which does not retry it: the application
 /// layer turns it into [`crate::error::IaError::RateLimited`] and pauses
