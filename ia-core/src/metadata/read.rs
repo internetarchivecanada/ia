@@ -88,11 +88,12 @@ async fn get_once(
         });
     }
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status: status.as_u16(),
             message: body,
-            retry_after: None,
+            retry_after,
         });
     }
 

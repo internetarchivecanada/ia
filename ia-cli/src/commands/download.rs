@@ -121,7 +121,7 @@ pub struct DownloadArgs {
     /// Max retries per file (also the number of stalls allowed, see --min-speed)
     ///
     /// Each retry waits a random time, up to a cap that doubles from 1 s to
-    /// 60 s. A Retry-After header on the failed response (a 429 or a 503,
+    /// 60 s. A Retry-After header on the failed response (a 429 or a 5xx,
     /// in seconds or as an HTTP date) sets the wait instead, as given;
     /// Retry-After: 0 means try again at once.
     #[arg(short = 'R', long, default_value = "5")]

@@ -21,7 +21,8 @@ const THROTTLE_RETRIES: u32 = 3;
 /// up to [`THROTTLE_RETRIES`] times, waiting the server's `Retry-After`
 /// when the response carried one, otherwise the standard backoff. Past the
 /// budget the error is [`IaError::RateLimited`] with the last header's
-/// value (0 when there was none), the way metadata reads report a 429.
+/// value, 0 when there was none (as the tasks API reports a 429; metadata
+/// reads use 30 there, a pause length rather than a report).
 async fn send_page(req: RequestBuilder, client: &IaClient) -> Result<reqwest::Response> {
     let req = with_s3_auth(req, client);
     let backoff = crate::retry::backoff_policy(
@@ -32,7 +33,8 @@ async fn send_page(req: RequestBuilder, client: &IaClient) -> Result<reqwest::Re
     let mut n_past_retries: u32 = 0;
     loop {
         // Every search request has a cloneable body (query parameters, or
-        // a JSON document), so this cannot fail in practice.
+        // a JSON document), so this cannot fail in practice. `Config` is the
+        // variant the crate uses for internal invariants (see `upload::single`).
         let attempt = req.try_clone().ok_or_else(|| {
             IaError::Config("internal error: search request body is not cloneable".into())
         })?;
@@ -47,7 +49,7 @@ async fn send_page(req: RequestBuilder, client: &IaClient) -> Result<reqwest::Re
             });
         }
         let wait = crate::retry::wait_before_retry(retry_after, &backoff, n_past_retries);
-        debug!(
+        warn!(
             retry = n_past_retries + 1,
             wait_ms = wait.as_millis() as u64,
             retry_after = retry_after.is_some(),

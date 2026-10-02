@@ -312,3 +312,31 @@ async fn middleware_retry_after_zero_resends_at_once_within_the_budget() {
     assert_eq!(client.retry_stats().summary().status_5xx_count, 4);
     server.verify().await;
 }
+
+/// When the budget is spent, the error handed to the caller carries the
+/// last response's Retry-After, so a caller retrying on the error object
+/// can honor it. Here through `get_item`, whose error is built in
+/// `metadata::read`. (`Retry-After: 0` keeps the three honored waits at
+/// zero; `Some(0)` against `None` is what is being proved.)
+#[tokio::test]
+async fn http_error_after_the_budget_carries_retry_after() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/busy"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "0")
+                .set_body_string("busy"),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let err = client
+        .get_item("busy")
+        .await
+        .expect_err("503 after the budget");
+    assert_eq!(err.retry_after(), Some(0), "got {err:?}");
+    server.verify().await;
+}

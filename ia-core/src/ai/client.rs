@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::ai::types::{AiConfig, Provider, TokenUsage};
 use crate::error::{IaError, Result};
@@ -332,7 +332,7 @@ impl LlmClient {
         for attempt in 0..=LLM_RETRIES {
             if attempt > 0 {
                 let wait = crate::retry::wait_before_retry(retry_after, &backoff, attempt - 1);
-                debug!(
+                warn!(
                     attempt,
                     wait_ms = wait.as_millis() as u64,
                     retry_after = retry_after.is_some(),
@@ -923,8 +923,10 @@ mod tests {
         let started = std::time::Instant::now();
         let resp = client.chat("system", "user").await.unwrap();
         assert_eq!(resp.content, "ok");
+        // Anything under the old table's fixed 1 s discriminates; 900 ms
+        // leaves room for a loaded runner.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            started.elapsed() < std::time::Duration::from_millis(900),
             "Retry-After: 0 was not honored as an immediate retry ({:?})",
             started.elapsed()
         );

@@ -6,7 +6,10 @@ use console::style;
 #[derive(Args)]
 #[command(
     about = "Update ia to a specific or latest version",
-    long_about = "Check for updates, list available versions, or install a specific version of ia.\n\n\
+    long_about = "Check for updates, list available versions, or install a specific version of ia. \
+        Requests to GitHub are retried up to three times on a 5xx, a 429 or a connection failure, \
+        waiting a random time up to a cap that doubles from 1 s to 30 s, or what a Retry-After \
+        header says.\n\n\
         This command is only available in standalone release builds. If you installed ia via \
         cargo install or a package manager, use that tool to update instead.",
     after_long_help = cstr!(

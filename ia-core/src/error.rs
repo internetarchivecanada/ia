@@ -303,18 +303,6 @@ impl IaError {
     /// Callers deciding whether to resend a *non-idempotent* request need
     /// that judgement separately; this answers only whether the failure looks
     /// temporary.
-    /// The server's `Retry-After`, in seconds, when this error came from a
-    /// response that carried one: an [`IaError::Http`] with the header, or
-    /// an [`IaError::RateLimited`]. A retry loop sleeps this instead of its
-    /// computed backoff when it is `Some`.
-    pub fn retry_after(&self) -> Option<u64> {
-        match self {
-            IaError::Http { retry_after, .. } => *retry_after,
-            IaError::RateLimited { retry_after } => Some(*retry_after),
-            _ => None,
-        }
-    }
-
     pub fn is_retryable(&self) -> bool {
         match self {
             // HTTP 4xx client errors are permanent (except 429 rate-limit)
@@ -391,6 +379,18 @@ impl IaError {
             IaError::MetadataWrite { .. } => false,
             IaError::NoChanges { .. } => false,
             IaError::Json(_) => false,
+        }
+    }
+
+    /// The server's `Retry-After`, in seconds, when this error came from a
+    /// response that carried one: an [`IaError::Http`] with the header, or
+    /// an [`IaError::RateLimited`]. A retry loop sleeps this instead of its
+    /// computed backoff when it is `Some`.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            IaError::Http { retry_after, .. } => *retry_after,
+            IaError::RateLimited { retry_after } => Some(*retry_after),
+            _ => None,
         }
     }
 

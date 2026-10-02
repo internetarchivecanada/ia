@@ -121,11 +121,12 @@ pub async fn fetch_ai_config(client: &IaClient, collection_id: &str) -> Result<I
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to fetch AI config from {collection_id}: {body}"),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -263,11 +264,12 @@ pub async fn delete_ai_config(client: &IaClient, collection_id: &str) -> Result<
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to delete AI config from {collection_id}: {body}"),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -386,11 +388,12 @@ async fn write_ai_config(
 
     let status = response.status().as_u16();
     if !response.status().is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         return Err(IaError::Http {
             status,
             message: format!("failed to upload AI config to {collection_id}: {body}"),
-            retry_after: None,
+            retry_after,
         });
     }
 

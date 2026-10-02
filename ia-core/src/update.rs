@@ -14,8 +14,9 @@ pub const GITHUB_REPO: &str = "internetarchivecanada/ia";
 
 /// Build a configured HTTP client for GitHub API requests.
 ///
-/// Includes retry middleware (3 retries with exponential backoff) so
-/// transient GitHub 5xx errors are handled automatically.
+/// Includes the crate's retry middleware: three retries on a 5xx, a 429,
+/// a 408 or a connection failure, waiting a random time up to a cap that
+/// doubles from 1 s to 30 s, or what a `Retry-After` header says.
 fn github_client(current_version: &str) -> crate::Result<ClientWithMiddleware> {
     let raw = crate::client::configure_transport(
         reqwest::Client::builder(),

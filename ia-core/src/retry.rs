@@ -1,4 +1,7 @@
-//! Retry diagnostics — all HTTP retry and latency data flows through [`RetryStats`].
+//! Retries and their diagnostics: the standard backoff schedule, the
+//! `Retry-After` reader, the transport retry middleware
+//! ([`RetryMiddleware`]), and the counters every retry feeds
+//! ([`RetryStats`]).
 //!
 //! [`RetryStats`] is a shared, lock-free (except for latency storage) counter
 //! collection that records per-request and per-retry events. Callers snapshot
@@ -275,7 +278,7 @@ impl RetryStats {
 /// Whether this `reqwest::Error` represents a transient body-read / decode
 /// failure that can be retried once the response has been returned.
 ///
-/// The retry middleware (`reqwest-retry`) only sees the initial response
+/// The retry middleware (`RetryMiddleware`) only sees the initial response
 /// status and send-level transport failures. Once it hands the response off
 /// to caller code, any failure reading the body (`bytes_stream`, `.json`,
 /// `.text`, `.bytes`) bypasses the middleware entirely — `is_body()` and
@@ -452,6 +455,15 @@ pub struct RetryMiddleware<S> {
     strategy: S,
 }
 
+impl<S> std::fmt::Debug for RetryMiddleware<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetryMiddleware")
+            .field("policy", &self.policy)
+            .field("strategy", &std::any::type_name::<S>())
+            .finish()
+    }
+}
+
 impl<S> RetryMiddleware<S> {
     /// A middleware retrying what `strategy` classifies as transient, on
     /// `policy`'s schedule and budget, honoring `Retry-After`.
@@ -474,28 +486,41 @@ where
         let mut n_past_retries: u32 = 0;
         loop {
             let Some(attempt) = req.try_clone() else {
-                return next.run(req, extensions).await;
+                // One attempt; still classified so the counters see it.
+                let result = next.run(req, extensions).await;
+                self.strategy.handle(&result);
+                return result;
             };
             let result = next.clone().run(attempt, extensions).await;
 
             if !matches!(self.strategy.handle(&result), Some(Retryable::Transient)) {
                 return result;
             }
-            if matches!(
-                self.policy
-                    .should_retry(std::time::SystemTime::now(), n_past_retries),
-                RetryDecision::DoNotRetry
-            ) {
+            let budget_spent = self
+                .policy
+                .max_n_retries
+                .is_some_and(|max| n_past_retries >= max);
+            if budget_spent {
                 return result;
             }
 
-            let retry_after = result
-                .as_ref()
-                .ok()
-                .and_then(|response| retry_after_wait(response.headers()));
+            let (status, retry_after) = match &result {
+                Ok(response) => (
+                    Some(response.status().as_u16()),
+                    retry_after_wait(response.headers()),
+                ),
+                Err(_) => (None, None),
+            };
             let wait = wait_before_retry(retry_after, &self.policy, n_past_retries);
-            tracing::debug!(
+            // The failed response (its body unread) would otherwise hold its
+            // connection for the whole wait, which a Retry-After can make long.
+            drop(result);
+            // At warn, as the library's middleware logged by default and as the
+            // download loop does: with the default log filter a user sees why
+            // the command is sitting in a wait.
+            tracing::warn!(
                 url = %req.url(),
+                status,
                 retry = n_past_retries + 1,
                 wait_ms = wait.as_millis() as u64,
                 retry_after = retry_after.is_some(),

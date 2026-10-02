@@ -227,11 +227,12 @@ pub async fn get_tasks(client: &IaClient, query: &TasksQuery) -> Result<TasksVal
     let resp = req.send().await?;
 
     let status = resp.status();
+    let retry_after = crate::retry::extract_retry_after(resp.headers());
     if !status.is_success() {
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -241,7 +242,7 @@ pub async fn get_tasks(client: &IaClient, query: &TasksQuery) -> Result<TasksVal
         return Err(IaError::Http {
             status: status.as_u16(),
             message: "Tasks API returned success: false".into(),
-            retry_after: None,
+            retry_after,
         });
     }
     Ok(parsed.value)
@@ -288,10 +289,11 @@ pub async fn list_tasks(
 
     let status = resp.status();
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(resp.headers());
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -398,10 +400,11 @@ pub async fn submit_task(
         return Err(IaError::RateLimited { retry_after });
     }
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(resp.headers());
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -455,10 +458,11 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         return Err(IaError::RateLimited { retry_after });
     }
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(resp.headers());
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -520,10 +524,11 @@ pub async fn get_task_log(client: &IaClient, task_id: u64) -> Result<String> {
         return Err(IaError::TaskNotFound { task_id });
     }
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(resp.headers());
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -550,10 +555,11 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
 
     let status = resp.status();
     if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(resp.headers());
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
-            retry_after: None,
+            retry_after,
         });
     }
 
