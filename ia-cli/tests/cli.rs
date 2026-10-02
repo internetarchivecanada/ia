@@ -2139,3 +2139,212 @@ fn upload_rejects_retry_sleep() {
         .code(2)
         .stderr(predicate::str::contains("--retry-sleep"));
 }
+
+// -- upload cleanup lists by default; aborting needs a flag (#24) --
+//
+// The binary runs against a wiremock server standing in for IA-S3:
+// `GET /<item>?uploads` lists the item's unfinished uploads,
+// `GET /<item>/<key>?uploadId=` lists an upload's parts, and
+// `DELETE /<item>/<key>?uploadId=` aborts one. Every test mounts the DELETE
+// with an exact expectation so an abort that must not happen is caught.
+
+struct CleanupFixture {
+    rt: tokio::runtime::Runtime,
+    server: wiremock::MockServer,
+    host: String,
+}
+
+/// Two unfinished uploads on `my-item`: `a.bin` (u1, parts of 10 and 5
+/// bytes) and `b.bin` (u2, one part of 7 bytes). `deletes` says how many
+/// aborts each may receive.
+fn cleanup_fixture(deletes_a: u64, deletes_b: u64) -> CleanupFixture {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/my-item"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<ListMultipartUploadsResult>\
+                 <Upload><Key>a.bin</Key><UploadId>u1</UploadId><Initiated>2026-10-02T01:00:00.000Z</Initiated></Upload>\
+                 <Upload><Key>b.bin</Key><UploadId>u2</UploadId><Initiated>2026-10-02T02:00:00.000Z</Initiated></Upload>\
+                 </ListMultipartUploadsResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/my-item/a.bin"))
+            .and(query_param("uploadId", "u1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part><Part><PartNumber>2</PartNumber><ETag>"e2"</ETag><Size>5</Size></Part></ListPartsResult>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/my-item/b.bin"))
+            .and(query_param("uploadId", "u2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>7</Size></Part></ListPartsResult>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/my-item/a.bin"))
+            .and(query_param("uploadId", "u1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(deletes_a)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/my-item/b.bin"))
+            .and(query_param("uploadId", "u2"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(deletes_b)
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    CleanupFixture { rt, server, host }
+}
+
+fn cleanup_cmd(fx: &CleanupFixture, args: &[&str]) -> Command {
+    let mut cmd = ia();
+    cmd.env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "--insecure",
+            "--host",
+            &fx.host,
+            "upload",
+            "cleanup",
+            "my-item",
+        ])
+        .args(args);
+    cmd
+}
+
+#[test]
+fn cleanup_with_file_lists_that_file_and_aborts_nothing() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["a.bin"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("u1"))
+        .stderr(predicate::str::contains("2 parts"))
+        .stderr(predicate::str::contains("15 B"))
+        .stderr(predicate::str::contains("u2").not())
+        .stderr(predicate::str::contains("aborted my-item").not())
+        .stderr(predicate::str::contains("Nothing aborted"))
+        .stderr(predicate::str::contains("--abort"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_without_file_lists_every_upload_with_parts_and_bytes() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &[])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("u1"))
+        .stderr(predicate::str::contains("u2"))
+        .stderr(predicate::str::contains("1 part"))
+        .stderr(predicate::str::contains("7 B"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_abort_requires_file() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["--abort"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("FILE"));
+}
+
+#[test]
+fn cleanup_abort_and_abort_all_conflict() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["a.bin", "--abort", "--abort-all"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn cleanup_abort_deletes_only_that_file() {
+    let fx = cleanup_fixture(1, 0);
+    cleanup_cmd(&fx, &["a.bin", "--abort"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("aborted my-item/a.bin"))
+        .stderr(predicate::str::contains("2 parts"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_abort_all_deletes_every_upload() {
+    let fx = cleanup_fixture(1, 1);
+    cleanup_cmd(&fx, &["--abort-all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("aborted my-item/a.bin"))
+        .stderr(predicate::str::contains("aborted my-item/b.bin"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_dry_run_abort_sends_nothing() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["a.bin", "--abort", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("would abort my-item/a.bin"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_json_listing_has_parts_and_bytes() {
+    let fx = cleanup_fixture(0, 0);
+    let out = cleanup_cmd(&fx, &["--json"]).output().unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let a = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["key"] == "a.bin")
+        .expect("a.bin listed");
+    assert_eq!(a["upload_id"], "u1");
+    assert_eq!(a["parts"], 2);
+    assert_eq!(a["bytes"], 15);
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_json_dry_run_reports_would_abort() {
+    let fx = cleanup_fixture(0, 0);
+    let out = cleanup_cmd(&fx, &["a.bin", "--abort", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let line = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert_eq!(v["action"], "would_abort");
+    assert_eq!(v["upload_id"], "u1");
+    assert_eq!(v["parts"], 2);
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_help_says_which_flags_abort() {
+    ia().args(["upload", "cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--abort"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("without confirmation").not())
+        .stdout(predicate::str::contains("Lists by default"));
+}

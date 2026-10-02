@@ -262,17 +262,25 @@ pub enum UploadCommand {
     )]
     Template(TemplateArgs),
 
-    /// Clean up incomplete multipart uploads
+    /// List or abort incomplete multipart uploads
     #[command(
-        long_about = "List or abort incomplete multipart uploads for an item. \
-            Use this to clean up uploads that were interrupted or abandoned.",
+        long_about = "List or abort incomplete multipart uploads for an item. Lists by default, \
+            with or without FILE: each unfinished upload with its upload ID, when it started, \
+            and the parts IA holds (count and bytes). Nothing is aborted unless asked: --abort \
+            aborts FILE's upload(s), --abort-all aborts every upload of the item, and --dry-run \
+            shows what either would abort without aborting. There is no interactive prompt. An \
+            abort tells IA to delete every part already uploaded; a rerun of the upload resumes \
+            from those parts instead, so abort only what you mean to discard.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
-             \n  <dim># List all incomplete uploads for an item</dim>\
+             \n  <dim># List all incomplete uploads for an item, with parts and bytes</dim>\
              \n  <bold>$ ia upload cleanup my-item</bold>\
-             \n\n  <dim># Abort a specific file's upload</dim>\
+             \n\n  <dim># List only one file's incomplete uploads (aborts nothing)</dim>\
              \n  <bold>$ ia upload cleanup my-item file.zip</bold>\
-             \n\n  <dim># Abort all incomplete uploads</dim>\
+             \n\n  <dim># Abort one file's incomplete upload</dim>\
+             \n  <bold>$ ia upload cleanup my-item file.zip --abort</bold>\
+             \n\n  <dim># See what --abort-all would discard, then do it</dim>\
+             \n  <bold>$ ia upload cleanup my-item --abort-all --dry-run</bold>\
              \n  <bold>$ ia upload cleanup my-item --abort-all</bold>\n"
         ),
     )]
@@ -422,15 +430,23 @@ pub struct CleanupArgs {
     #[arg()]
     pub identifier: String,
 
-    /// Specific file to clean up
+    /// Only this file's incomplete uploads (lists them; add --abort to abort)
     #[arg()]
     pub file: Option<String>,
 
-    /// Abort all incomplete uploads without confirmation
+    /// Abort FILE's incomplete upload(s); requires FILE
+    #[arg(long, requires = "file", conflicts_with = "abort_all")]
+    pub abort: bool,
+
+    /// Abort every incomplete upload of the item
     #[arg(long)]
     pub abort_all: bool,
 
-    /// Output as JSON
+    /// Show what --abort or --abort-all would abort; abort nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output as JSON (a listing is one array; aborts are one object per line)
     #[arg(long)]
     pub json: bool,
 }
@@ -1163,83 +1179,139 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
     let uploads = ia_core::upload::multipart::list_uploads(client, &args.identifier).await?;
 
-    if uploads.is_empty() {
-        if args.json {
-            println!("[]");
-        } else {
-            eprintln!(
-                "{} No incomplete multipart uploads for {}",
-                style("✓").green(),
-                args.identifier,
-            );
-        }
-        return Ok(());
-    }
-
-    // Filter by file if specified
-    let targets: Vec<_> = if let Some(ref file) = args.file {
-        uploads.into_iter().filter(|u| u.key == *file).collect()
-    } else {
-        uploads
+    // Narrow to one file when asked.
+    let targets: Vec<_> = match &args.file {
+        Some(file) => uploads.into_iter().filter(|u| u.key == *file).collect(),
+        None => uploads,
     };
 
     if targets.is_empty() {
         if args.json {
             println!("[]");
         } else {
-            eprintln!(
-                "{} No incomplete uploads matching '{}' for {}",
-                style("✓").green(),
-                args.file.as_deref().unwrap_or(""),
-                args.identifier,
-            );
+            match &args.file {
+                Some(file) => eprintln!(
+                    "{} No incomplete uploads of '{}' for {}",
+                    style("✓").green(),
+                    file,
+                    args.identifier,
+                ),
+                None => eprintln!(
+                    "{} No incomplete multipart uploads for {}",
+                    style("✓").green(),
+                    args.identifier,
+                ),
+            }
         }
         return Ok(());
     }
 
-    // List mode: no file and no --abort-all → just list
-    if args.file.is_none() && !args.abort_all {
+    // What IA holds for each upload: the listing shows it, and an abort
+    // says what it discarded.
+    let mut described = Vec::with_capacity(targets.len());
+    for u in targets {
+        let parts =
+            ia_core::upload::multipart::list_parts(client, &args.identifier, &u.key, &u.upload_id)
+                .await?;
+        let bytes: u64 = parts.iter().map(|p| p.size).sum();
+        described.push((u, parts.len(), bytes));
+    }
+
+    let aborting = args.abort || args.abort_all;
+    if !aborting {
         if args.json {
-            let json = serde_json::to_string(&targets)?;
-            println!("{json}");
+            let json: Vec<serde_json::Value> = described
+                .iter()
+                .map(|(u, parts, bytes)| {
+                    serde_json::json!({
+                        "key": u.key,
+                        "upload_id": u.upload_id,
+                        "initiated": u.initiated,
+                        "parts": parts,
+                        "bytes": bytes,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&json)?);
         } else {
             eprintln!(
                 "{} {} incomplete multipart upload(s) for {}:",
                 style("▸").cyan(),
-                targets.len(),
+                described.len(),
                 args.identifier,
             );
-            for u in &targets {
-                eprintln!("  {} {} (initiated: {})", u.upload_id, u.key, u.initiated,);
+            for (u, parts, bytes) in &described {
+                eprintln!(
+                    "  {} {} (initiated: {}, {}, {})",
+                    u.upload_id,
+                    u.key,
+                    u.initiated,
+                    plural(*parts, "part"),
+                    crate::output::format_bytes(*bytes),
+                );
             }
-            eprintln!("\nUse --abort-all or specify a file to abort.");
+            eprintln!("\nNothing aborted. Use --abort with FILE, or --abort-all, to abort.");
         }
         return Ok(());
     }
 
-    // Abort mode
-    for u in &targets {
-        ia_core::upload::multipart::abort_upload(client, &args.identifier, &u.key, &u.upload_id)
+    for (u, parts, bytes) in &described {
+        if !args.dry_run {
+            ia_core::upload::multipart::abort_upload(
+                client,
+                &args.identifier,
+                &u.key,
+                &u.upload_id,
+            )
             .await?;
+        }
+        let action = if args.dry_run {
+            "would_abort"
+        } else {
+            "aborted"
+        };
         if args.json {
             let json = serde_json::json!({
-                "action": "aborted",
+                "action": action,
                 "identifier": args.identifier,
                 "key": u.key,
                 "upload_id": u.upload_id,
+                "parts": parts,
+                "bytes": bytes,
             });
             println!("{}", serde_json::to_string(&json)?);
         } else {
             eprintln!(
-                " {} aborted {}/{}",
-                style("✓").green(),
+                " {} {} {}/{} ({}, {}, {})",
+                if args.dry_run {
+                    style("⊘").dim()
+                } else {
+                    style("✓").green()
+                },
+                if args.dry_run {
+                    "would abort"
+                } else {
+                    "aborted"
+                },
                 args.identifier,
                 u.key,
+                u.upload_id,
+                plural(*parts, "part"),
+                crate::output::format_bytes(*bytes),
             );
         }
     }
 
     Ok(())
+}
+
+/// "1 part" / "2 parts".
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
