@@ -2567,3 +2567,11 @@ fn global_resume_flags_say_what_resumes() {
             .stdout(predicate::str::contains("process every file again"));
     }
 }
+
+#[test]
+fn upload_help_says_what_an_interrupted_single_put_does() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sent again from byte 0"));
+}

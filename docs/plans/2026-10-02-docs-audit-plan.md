@@ -42,6 +42,12 @@
 
 Download is right already (the help written in #11 to #14 carries it; the issue's original wrong answer predates them). The two gaps left are the ones this audit closes: a plain upload's behavior after an interruption, and what the joblog's "auto-resume" means. The `--multipart` text the agent quotes correctly was hidden in `ia upload --help`'s `long_about` and reached it only through the flag's own doc comment.
 
+**After, first pass** (same model, same question, the help and README as of the Task 1 and Task 2 commits):
+
+> Download: when interrupted and rerun, `ia download` resumes a partial `.part` file from where it stopped, regardless of whether `--joblog` is used or what files the joblog lists as done. Upload without `--multipart`: the file does not explicitly state what happens when a single-file upload is interrupted and the command is rerun. Upload with `--multipart`: when rerun, it resumes from parts already on IA, but only if every part on IA matches the local file by size and md5; otherwise a fresh upload starts and the stale upload is left for cleanup. `--joblog` for both: a rerun skips files the log lists as done, the same way for download and upload (unless `--no-resume` overrides it), independently of the resumption mechanisms above.
+
+Three of four right; the remaining gap was real: usage.md said what a plain upload does after an interruption, but `ia upload --help` did not, and the check gives the agent only the help and the README. `ia upload --help`'s `long_about` gained a paragraph: one PUT per file unless `--multipart`; an interrupted single-PUT file is sent again from byte 0 on the rerun, except a file the item already lists with the same md5, which is skipped; a `--multipart` file resumes from the parts on IA after checking them; `--joblog` skips finished files on top of either. Test: `upload_help_says_what_an_interrupted_single_put_does`.
+
 ### Task 3: the fresh-agent check, verification, review
 
 - [ ] Before/after answers recorded here; `just ci`; code-reviewer pass; fix or record; PR; squash-merge after checks pass; `scripts/ia-cleanup docs-audit` only after a confirmed merge.
