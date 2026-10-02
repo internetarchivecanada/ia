@@ -474,8 +474,9 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
 /// - `total` equals the metadata size but the `.part` is longer, or the size
 ///   is unknown or exempt (see [`is_size_unknowable`]) so there is no third
 ///   party to agree: the `.part` is removed and the retryable
-///   [`IaError::ResumeFailed`] is returned, its reason naming both lengths,
-///   so the next attempt starts from byte 0. (Not `DownloadSizeMismatch`:
+///   [`IaError::ResumeFailed`] is returned, its reason naming the 416, both
+///   lengths and why the `.part` could not be resumed; the next attempt,
+///   if there is one, starts from byte 0. (Not `DownloadSizeMismatch`:
 ///   nothing was received, and with equal lengths that message would read
 ///   as a contradiction.)
 /// - no parseable total: the plain [`IaError::Http`] a 416 always was.
@@ -533,19 +534,24 @@ async fn range_not_satisfiable(
                 offset,
                 "416 on resume: .part is already at or past the file's length; deleting it"
             );
-            let _ = fs::remove_file(part_path).await;
-            let reason = match metadata_size {
-                Some(_) => format!(
-                    "the .part file is {offset} bytes and the server's copy is {server_size} \
-                     bytes; it cannot be resumed, so it was removed and the download restarts \
-                     from byte 0"
-                ),
-                None => format!(
-                    "the .part file is {offset} bytes and the server's copy is {server_size} \
-                     bytes, and the item metadata gives no size to confirm it; it was removed \
-                     and the download restarts from byte 0"
-                ),
+            // Facts only: the retry loop decides whether there is a next
+            // attempt, and this text is the file's failure when there is not.
+            let why = if offset > server_size {
+                "the .part file is longer than the file"
+            } else if offset == server_size {
+                "the .part file is as long as the file but the item metadata has no size \
+                 that can confirm it"
+            } else {
+                "the .part file cannot be resumed from there"
             };
+            let removal = match fs::remove_file(part_path).await {
+                Ok(()) => "so the .part file was removed".to_string(),
+                Err(e) => format!("and removing the .part file failed: {e}"),
+            };
+            let reason = format!(
+                "the server answered 416 to a resume from byte {offset} of its \
+                 {server_size}-byte copy; {why}, {removal}"
+            );
             Err(IaError::ResumeFailed {
                 file: file.name.clone(),
                 reason,
@@ -4792,9 +4798,10 @@ mod tests {
         match &first {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 20 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("cannot be resumed"),
+                    reason.contains("416 to a resume from byte 20 of its 32-byte copy")
+                        && reason.contains("cannot be resumed from there")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -4840,9 +4847,10 @@ mod tests {
         match &result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 30 bytes")
-                        && reason.contains("server's copy is 30 bytes")
-                        && reason.contains("gives no size to confirm it"),
+                    reason.contains("416 to a resume from byte 30 of its 30-byte copy")
+                        && reason.contains("has no size that can confirm it")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -5135,9 +5143,10 @@ mod tests {
         match &result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 35 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("cannot be resumed"),
+                    reason.contains("416 to a resume from byte 35 of its 32-byte copy")
+                        && reason.contains("longer than the file")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -5650,9 +5659,10 @@ mod tests {
         match &result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 32 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("gives no size to confirm it"),
+                    reason.contains("416 to a resume from byte 32 of its 32-byte copy")
+                        && reason.contains("has no size that can confirm it")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -5685,9 +5695,10 @@ mod tests {
         match &result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 32 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("gives no size to confirm it"),
+                    reason.contains("416 to a resume from byte 32 of its 32-byte copy")
+                        && reason.contains("has no size that can confirm it")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -6298,9 +6309,10 @@ mod tests {
         match &first {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 40 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("cannot be resumed"),
+                    reason.contains("416 to a resume from byte 40 of its 32-byte copy")
+                        && reason.contains("longer than the file")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -6416,9 +6428,10 @@ mod tests {
         match result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 40 bytes")
-                        && reason.contains("server's copy is 30 bytes")
-                        && reason.contains("gives no size to confirm it"),
+                    reason.contains("416 to a resume from byte 40 of its 30-byte copy")
+                        && reason.contains("longer than the file")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
@@ -6681,9 +6694,10 @@ mod tests {
         match &result {
             Err(IaError::ResumeFailed { reason, .. }) => {
                 assert!(
-                    reason.contains(".part file is 32 bytes")
-                        && reason.contains("server's copy is 32 bytes")
-                        && reason.contains("gives no size to confirm it"),
+                    reason.contains("416 to a resume from byte 32 of its 32-byte copy")
+                        && reason.contains("has no size that can confirm it")
+                        && reason.contains("was removed")
+                        && !reason.contains("restarts"),
                     "{reason}"
                 );
             }
