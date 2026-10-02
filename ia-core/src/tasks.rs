@@ -231,6 +231,7 @@ pub async fn get_tasks(client: &IaClient, query: &TasksQuery) -> Result<TasksVal
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -240,6 +241,7 @@ pub async fn get_tasks(client: &IaClient, query: &TasksQuery) -> Result<TasksVal
         return Err(IaError::Http {
             status: status.as_u16(),
             message: "Tasks API returned success: false".into(),
+            retry_after: None,
         });
     }
     Ok(parsed.value)
@@ -289,6 +291,7 @@ pub async fn list_tasks(
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -301,6 +304,7 @@ pub async fn list_tasks(
         let chunk = chunk.map_err(|e| IaError::Http {
             status: 0,
             message: format!("stream error: {e}"),
+            retry_after: None,
         })?;
         buf.extend_from_slice(&chunk);
 
@@ -397,6 +401,7 @@ pub async fn submit_task(
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -453,6 +458,7 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -517,6 +523,7 @@ pub async fn get_task_log(client: &IaClient, task_id: u64) -> Result<String> {
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -546,6 +553,7 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
         return Err(IaError::Http {
             status: status.as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -574,6 +582,7 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
     Err(IaError::Http {
         status: 200,
         message: "failed to parse rate limit response".into(),
+        retry_after: None,
     })
 }
 
@@ -859,7 +868,9 @@ mod tests {
         let result = get_tasks(&client, &query).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            IaError::Http { status, message } => {
+            IaError::Http {
+                status, message, ..
+            } => {
                 assert_eq!(status, 403);
                 assert_eq!(message, "Forbidden");
             }
@@ -1132,7 +1143,9 @@ mod tests {
         let result = get_tasks(&client, &query).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            IaError::Http { status, message } => {
+            IaError::Http {
+                status, message, ..
+            } => {
                 assert_eq!(status, 200);
                 assert!(message.contains("success: false"));
             }

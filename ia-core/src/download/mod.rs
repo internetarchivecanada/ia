@@ -370,6 +370,7 @@ pub(crate) async fn fetch_response(
                 .ok_or_else(|| IaError::Http {
                     status: r.status().as_u16(),
                     message: "redirect without Location header".to_string(),
+                    retry_after: None,
                 })?;
 
             let base = reqwest::Url::parse(&current_url)
@@ -395,6 +396,7 @@ pub(crate) async fn fetch_response(
                     return Err(IaError::Http {
                         status: r.status().as_u16(),
                         message: format!("redirect to non-archive.org domain: {new_url}"),
+                        retry_after: None,
                     });
                 }
             }
@@ -407,6 +409,7 @@ pub(crate) async fn fetch_response(
     let response = resp.ok_or_else(|| IaError::Http {
         status: 0,
         message: "too many redirects".to_string(),
+        retry_after: None,
     })?;
 
     let status = response.status();
@@ -446,6 +449,7 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
     IaError::Http {
         status: status.as_u16(),
         message,
+        retry_after: None,
     }
 }
 
@@ -2676,7 +2680,9 @@ mod tests {
         .unwrap_err();
 
         match &err {
-            IaError::Http { status, message } => {
+            IaError::Http {
+                status, message, ..
+            } => {
                 assert_eq!(*status, 403);
                 // Message should be the canonical reason, not HTML
                 assert_eq!(message, "Forbidden");
@@ -2713,7 +2719,9 @@ mod tests {
         .unwrap_err();
 
         match &err {
-            IaError::Http { status, message } => {
+            IaError::Http {
+                status, message, ..
+            } => {
                 assert_eq!(*status, 404);
                 assert_eq!(message, "No such file");
             }

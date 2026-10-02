@@ -84,6 +84,7 @@ pub async fn num_found(client: &IaClient, query: &str, params: &[(String, String
         return Err(IaError::Http {
             status: resp.status().as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -113,6 +114,7 @@ pub async fn advanced_num_found(
         return Err(IaError::Http {
             status: resp.status().as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -148,6 +150,7 @@ pub async fn fts_num_found(
         return Err(IaError::Http {
             status: resp.status().as_u16(),
             message: resp.text().await.unwrap_or_default(),
+            retry_after: None,
         });
     }
 
@@ -201,6 +204,7 @@ pub fn scrape<'a>(
                 Err(IaError::Http {
                     status: resp.status().as_u16(),
                     message: resp.text().await.unwrap_or_default(),
+                    retry_after: None,
                 })?;
                 return; // unreachable but needed for type inference
             }
@@ -307,6 +311,7 @@ pub fn advanced<'a>(
                 Err(IaError::Http {
                     status: resp.status().as_u16(),
                     message: resp.text().await.unwrap_or_default(),
+                    retry_after: None,
                 })?;
                 return;
             }
@@ -431,6 +436,7 @@ pub fn fts<'a>(
                 Err(IaError::Http {
                     status: resp.status().as_u16(),
                     message: resp.text().await.unwrap_or_default(),
+                    retry_after: None,
                 })?;
                 return;
             }

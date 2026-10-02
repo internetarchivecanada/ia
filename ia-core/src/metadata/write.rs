@@ -344,6 +344,7 @@ pub async fn modify_compound(
         return Err(IaError::Http {
             status: status.as_u16(),
             message: body,
+            retry_after: None,
         });
     }
     let item: serde_json::Value = response
@@ -407,6 +408,7 @@ pub async fn modify_compound(
         return Err(IaError::Http {
             status: status.as_u16(),
             message: body,
+            retry_after: None,
         });
     }
 

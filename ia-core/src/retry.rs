@@ -10,7 +10,93 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
-use reqwest_retry::{default_on_request_failure, Retryable, RetryableStrategy};
+use reqwest_retry::policies::ExponentialBackoff;
+use reqwest_retry::{
+    default_on_request_failure, Jitter, RetryDecision, RetryPolicy, Retryable, RetryableStrategy,
+};
+
+/// Bounds of the standard retry schedule: the first retry waits up to
+/// `STANDARD_MIN_DELAY`, each later one up to twice the previous, never more
+/// than `STANDARD_MAX_DELAY`. Every retry loop in the crate that has no
+/// caller-supplied bounds uses these.
+pub(crate) const STANDARD_MIN_DELAY: Duration = Duration::from_secs(1);
+pub(crate) const STANDARD_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// The standard retry schedule: truncated exponential backoff with full
+/// jitter. Retry `n` (1-based) waits a uniform random time between zero and
+/// `min × 2^(n-1)`, never more than `max`. Past `retries` the policy says do
+/// not retry; the loops here enforce their own budget, so that case yields
+/// no wait at all.
+///
+/// The library asserts `min <= max`. The bounds are public fields on
+/// `UploadOpts`, so a caller can set them the wrong way round; rather than
+/// panic, the larger value wins and `min` becomes the cap, with a warning.
+/// Build the policy through `UploadOpts::backoff` when the bounds come
+/// from upload options.
+pub(crate) fn backoff_policy(min: Duration, max: Duration, retries: u32) -> ExponentialBackoff {
+    let max = if max < min {
+        tracing::warn!(
+            min_ms = min.as_millis() as u64,
+            max_ms = max.as_millis() as u64,
+            "retry_max_delay is below retry_min_delay; using retry_min_delay as the cap"
+        );
+        min
+    } else {
+        max
+    };
+    ExponentialBackoff::builder()
+        .retry_bounds(min, max)
+        .jitter(Jitter::Full)
+        .build_with_max_retries(retries)
+}
+
+/// How long to wait before the next attempt, given how many retries have
+/// already been made. Zero when the policy's own budget is spent.
+///
+/// The policy returns an absolute instant; the wait is that instant minus
+/// now. Two `SystemTime::now()` calls are involved, and the wall clock can
+/// step between them, so the result is clipped to the policy's cap.
+pub(crate) fn backoff_wait(policy: &ExponentialBackoff, n_past_retries: u32) -> Duration {
+    match policy.should_retry(std::time::SystemTime::now(), n_past_retries) {
+        RetryDecision::Retry { execute_after } => execute_after
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+            .min(policy.max_retry_interval),
+        RetryDecision::DoNotRetry => Duration::ZERO,
+    }
+}
+
+/// The server's own instruction on how long to wait, if the failed response
+/// carried a `Retry-After` header (seconds, or an HTTP date). A pure read:
+/// whether the wait is taken is the caller's decision, made after the
+/// response is classified.
+pub(crate) fn retry_after_wait(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    crate::retry::extract_retry_after(headers).map(Duration::from_secs)
+}
+
+/// The wait before a retry: the server's `Retry-After` when it gave one,
+/// honored as given (`0` means re-send at once; a value above the
+/// schedule's cap is still waited out in full, with a warning so it shows
+/// up in `--log`), otherwise the schedule's draw for this retry.
+pub(crate) fn wait_before_retry(
+    retry_after: Option<Duration>,
+    policy: &ExponentialBackoff,
+    n_past_retries: u32,
+) -> Duration {
+    match retry_after {
+        Some(wait) => {
+            if wait > policy.max_retry_interval {
+                tracing::warn!(
+                    retry_after_s = wait.as_secs(),
+                    cap_s = policy.max_retry_interval.as_secs(),
+                    "server asked for a Retry-After above the backoff cap; honoring it as given"
+                );
+            }
+            wait
+        }
+        None => backoff_wait(policy, n_past_retries),
+    }
+}
 
 /// Lock-free counters and latency samples for HTTP retry diagnostics.
 ///
@@ -662,5 +748,73 @@ mod tests {
     fn retry_after_garbage_is_none() {
         assert_eq!(extract_retry_after(&headers_with_retry_after("soon")), None);
         assert_eq!(extract_retry_after(&HeaderMap::new()), None);
+    }
+
+    // ── The standard schedule ──────────────────────────────────────────────
+
+    const MIN: Duration = STANDARD_MIN_DELAY;
+    const MAX: Duration = STANDARD_MAX_DELAY;
+
+    /// The upper bound the schedule allows for retry number `n` (1-based):
+    /// min × 2^(n-1), no more than max.
+    fn upper_bound(n: u32) -> Duration {
+        std::cmp::min(MAX, MIN * 2u32.saturating_pow(n - 1))
+    }
+
+    #[test]
+    fn waits_never_exceed_the_schedule() {
+        let policy = backoff_policy(MIN, MAX, 100);
+        for retry in 1..=20u32 {
+            for _ in 0..50 {
+                let wait = backoff_wait(&policy, retry - 1);
+                assert!(
+                    wait <= upper_bound(retry),
+                    "retry {retry}: {wait:?} > {:?}",
+                    upper_bound(retry)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waits_are_jittered() {
+        let policy = backoff_policy(MIN, MAX, 100);
+        let draws: Vec<Duration> = (0..1000).map(|_| backoff_wait(&policy, 6)).collect();
+        let first = draws[0];
+        assert!(
+            draws.iter().any(|d| *d != first),
+            "1000 draws were all {first:?}"
+        );
+        assert!(draws.iter().all(|d| *d <= MAX));
+    }
+
+    #[test]
+    fn past_the_budget_the_wait_is_zero() {
+        // The loop's own budget check ends the loop; the policy just says
+        // "do not retry", which must not turn into a sleep.
+        let policy = backoff_policy(MIN, MAX, 3);
+        assert_eq!(backoff_wait(&policy, 3), Duration::ZERO);
+        assert_eq!(backoff_wait(&policy, 50), Duration::ZERO);
+    }
+
+    /// The library asserts min <= max. Those bounds are public fields on
+    /// `UploadOpts`, so a caller can set them the wrong way round; that
+    /// must not panic. The larger value wins: min becomes the cap.
+    #[test]
+    fn min_above_max_does_not_panic_and_caps_at_min() {
+        let policy = backoff_policy(Duration::from_secs(60), Duration::from_secs(1), 10);
+        assert_eq!(policy.min_retry_interval, Duration::from_secs(60));
+        assert_eq!(policy.max_retry_interval, Duration::from_secs(60));
+        for n in 0..10 {
+            assert!(backoff_wait(&policy, n) <= Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn millisecond_bounds_keep_tests_fast() {
+        let policy = backoff_policy(Duration::from_millis(1), Duration::from_millis(2), 10);
+        for n in 0..10 {
+            assert!(backoff_wait(&policy, n) <= Duration::from_millis(2));
+        }
     }
 }

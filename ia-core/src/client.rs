@@ -224,8 +224,8 @@ impl IaClient {
 
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(60),
+                crate::retry::STANDARD_MIN_DELAY,
+                crate::retry::STANDARD_MAX_DELAY,
             )
             .build_with_max_retries(3);
 

@@ -89,6 +89,7 @@ pub async fn fetch_schema(client: &IaClient) -> crate::Result<SchemaData> {
         return Err(IaError::Http {
             status: status.as_u16(),
             message: format!("failed to fetch metadata schema: {status}"),
+            retry_after: None,
         });
     }
     let body = resp.text().await.map_err(reqwest_middleware::Error::from)?;

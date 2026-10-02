@@ -101,6 +101,7 @@ pub async fn fetch_scandata(
     let body = response.text().await.map_err(|e| IaError::Http {
         status: 0,
         message: format!("failed to read scandata body: {e}"),
+        retry_after: None,
     })?;
 
     parse_scandata(&body)
