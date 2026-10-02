@@ -1301,6 +1301,18 @@ async fn upload_file_multipart_flag_dispatches() {
         .mount(&server)
         .await;
 
+    // After completion the upload asks the item's metadata for the
+    // assembled file (size only, with verify off); list it so the test
+    // finishes at once.
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [{"name": "file.bin", "size": content.len().to_string(), "source": "original"}]
+        })))
+        .mount(&server)
+        .await;
+
     let opts = UploadOpts {
         multipart: true,
         verify: false,

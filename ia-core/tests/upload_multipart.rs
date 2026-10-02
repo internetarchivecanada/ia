@@ -16,6 +16,20 @@ fn temp_file(content: &[u8]) -> NamedTempFile {
     f
 }
 
+/// After completion the upload polls `GET /metadata/{item}` until the file
+/// is listed with its size (and md5 when hashes were passed). Mount the
+/// answer so a test that completes an upload is verified at once.
+async fn mount_assembled(server: &MockServer, item: &str, key: &str, size: u64) {
+    Mock::given(method("GET"))
+        .and(path(format!("/metadata/{item}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": item},
+            "files": [{"name": key, "size": size.to_string(), "source": "original"}]
+        })))
+        .mount(server)
+        .await;
+}
+
 fn md5_hex(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     format!("{:x}", Md5::digest(bytes))
@@ -407,6 +421,7 @@ async fn upload_file_multipart_success() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 15).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -490,6 +505,7 @@ async fn upload_file_multipart_part_retry_on_503() {
         retry_max_delay: std::time::Duration::from_millis(2), // fast for tests
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 11).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -567,6 +583,7 @@ async fn upload_file_multipart_part_retry_honors_retry_after() {
         retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 21).await;
 
     let started = std::time::Instant::now();
     let result = multipart::upload_file_multipart(
@@ -651,6 +668,7 @@ async fn upload_file_multipart_part_429_retry_honors_retry_after() {
         retry_max_delay: std::time::Duration::from_millis(2),
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 21).await;
 
     let started = std::time::Instant::now();
     let result = multipart::upload_file_multipart(
@@ -949,6 +967,7 @@ async fn rerun_after_part_failure_resumes_from_existing_parts() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 1500).await;
     let result = multipart::upload_file_multipart(
         &client,
         "test-item",
@@ -1048,6 +1067,7 @@ async fn upload_file_multipart_resumes_from_existing() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 30).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -1116,6 +1136,7 @@ async fn upload_file_multipart_no_resume_starts_fresh() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 5).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -1184,6 +1205,7 @@ async fn upload_file_multipart_new_item_no_such_bucket_starts_fresh() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "new-item", "data.bin", 5).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -1317,6 +1339,7 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(&server, "test-item", "data.bin", 30).await;
 
     let result = multipart::upload_file_multipart(
         &client,
@@ -1573,6 +1596,7 @@ async fn initiate_retries_on_slowdown_then_succeeds() {
         .await;
 
     let f = temp_file(b"hello world");
+    mount_assembled(&server, "test-item", "data.bin", 11).await;
     let result = multipart::upload_file_multipart(
         &test_client(&server),
         "test-item",
@@ -2040,6 +2064,7 @@ async fn retries_counts_control_call_attempts() {
     .await;
 
     let f = temp_file(b"hello world");
+    mount_assembled(&server, "test-item", "data.bin", 11).await;
     let result = multipart::upload_file_multipart(
         &test_client(&server),
         "test-item",
@@ -2109,6 +2134,7 @@ async fn progress_distinguishes_rate_limit_waits_from_other_retries() {
         Arc::new(move |p| sink.lock().unwrap().push(p));
 
     let f = temp_file(b"hello world");
+    mount_assembled(&server, "test-item", "data.bin", 11).await;
     multipart::upload_file_multipart(
         &test_client(&server),
         "test-item",
@@ -2281,6 +2307,7 @@ async fn upload_thirty(server: &MockServer) -> ia_core::upload::UploadResult {
         verify: false,
         ..Default::default()
     };
+    mount_assembled(server, "test-item", "data.bin", 30).await;
     multipart::upload_file_multipart(
         &client,
         "test-item",
@@ -2741,19 +2768,194 @@ async fn multipart_clobber_uploads_despite_a_matching_md5_and_sets_md5() {
     server.verify().await;
 }
 
-/// `--clobber --no-verify` reads nothing before uploading: no metadata
-/// lookup, no md5 in the result.
+/// `--clobber --no-verify` reads nothing before uploading: no md5 is
+/// computed (none in the result), and the post-completion check compares
+/// the size only, so a listing without an md5 verifies it.
 #[tokio::test]
 async fn multipart_clobber_no_verify_reads_nothing_before_uploading() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/metadata/test-item"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"files": []})))
-        .expect(0)
-        .mount(&server)
-        .await;
+    mount_metadata_with(&server, None, 30).await;
     mount_fresh_single_part_upload(&server).await;
     let result = upload_file_multipart_via_upload_file(&server, false, false).await;
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.md5, None);
+    server.verify().await;
+}
+
+// ── The assembled object is verified after completion (#20) ─────────────
+//
+// IA assembles a multipart object asynchronously; a 200 on completion
+// proves nothing about the object. After completion the item's metadata is
+// polled until the file appears with the expected size and md5.
+
+fn metadata_body(files: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"metadata": {"identifier": "test-item"}, "files": files})
+}
+
+/// Serve one metadata response for the next request only (mount order is
+/// try order, so a sequence of these plays bodies in order).
+async fn mount_metadata_once(server: &MockServer, files: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata_body(files)))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+async fn upload_thirty_via_upload_file(
+    server: &MockServer,
+    opts: UploadOpts,
+) -> (
+    ia_core::Result<ia_core::upload::UploadResult>,
+    NamedTempFile,
+) {
+    let client = test_client(server);
+    let f = temp_file(THIRTY);
+    let result = ia_core::upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await;
+    (result, f)
+}
+
+fn clobber_opts() -> UploadOpts {
+    UploadOpts {
+        multipart: true,
+        checksum: false,
+        retry_min_delay: std::time::Duration::from_millis(1),
+        retry_max_delay: std::time::Duration::from_millis(2),
+        ..Default::default()
+    }
+}
+
+/// Not yet listed, then a placeholder of the wrong size without an md5,
+/// then the real entry: three polls, then `Uploaded`.
+#[tokio::test]
+async fn multipart_polls_metadata_until_the_object_appears() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    mount_metadata_once(&server, serde_json::json!([])).await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "137000", "source": "original"}]),
+    )
+    .await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": md5_hex(THIRTY), "source": "original"}]),
+    )
+    .await;
+    let (result, _f) = upload_thirty_via_upload_file(&server, clobber_opts()).await;
+    let result = result.unwrap();
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.md5.as_deref(), Some(md5_hex(THIRTY).as_str()));
+    server.verify().await;
+}
+
+/// The right size with a different md5 is not "not yet": the object on IA
+/// is wrong, and the file fails naming both md5s.
+#[tokio::test]
+async fn multipart_fails_when_the_assembled_md5_differs() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": "0123456789abcdef0123456789abcdef", "source": "original"}]),
+    )
+    .await;
+    let (result, _f) = upload_thirty_via_upload_file(&server, clobber_opts()).await;
+    let err = result.expect_err("a wrong assembled md5 fails the file");
+    let msg = err.to_string();
+    assert!(msg.contains("0123456789abcdef0123456789abcdef"), "{msg}");
+    assert!(msg.contains(&md5_hex(THIRTY)), "{msg}");
+    server.verify().await;
+}
+
+/// Never listed within the deadline: `UploadedUnverified`, and the local
+/// file is kept even with `delete_after_upload`.
+#[tokio::test]
+async fn multipart_reports_unverified_at_the_deadline_and_keeps_the_file() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_body(serde_json::json!([]))),
+        )
+        .mount(&server)
+        .await;
+    let opts = UploadOpts {
+        delete_after_upload: true,
+        verify_timeout: std::time::Duration::from_millis(300),
+        ..clobber_opts()
+    };
+    let (result, f) = upload_thirty_via_upload_file(&server, opts).await;
+    let result = result.unwrap();
+    assert!(
+        matches!(result.status, UploadStatus::UploadedUnverified),
+        "{result:?}"
+    );
+    assert!(
+        f.path().exists(),
+        "the local file must be kept until verified"
+    );
+}
+
+/// Verified → `delete_after_upload` deletes the local file.
+#[tokio::test]
+async fn multipart_deletes_the_local_file_only_once_verified() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": md5_hex(THIRTY), "source": "original"}]),
+    )
+    .await;
+    let opts = UploadOpts {
+        delete_after_upload: true,
+        ..clobber_opts()
+    };
+    let (result, f) = upload_thirty_via_upload_file(&server, opts).await;
+    assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
+    assert!(
+        !f.path().exists(),
+        "the local file is deleted once verified"
+    );
+}
+
+/// `--no-verify`: the size is still checked (IA's metadata gives it for
+/// free), the md5 is not.
+#[tokio::test]
+async fn multipart_no_verify_checks_size_only() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": "0123456789abcdef0123456789abcdef", "source": "original"}]),
+    )
+    .await;
+    let opts = UploadOpts {
+        verify: false,
+        ..clobber_opts()
+    };
+    let (result, _f) = upload_thirty_via_upload_file(&server, opts).await;
+    let result = result.unwrap();
     assert!(
         matches!(result.status, UploadStatus::Uploaded),
         "{result:?}"

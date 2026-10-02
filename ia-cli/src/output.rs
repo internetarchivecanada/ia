@@ -1326,7 +1326,7 @@ impl UploadBatchDisplay {
         let mut item_had_failure: HashMap<String, bool> = HashMap::new();
         for r in results {
             match &r.status {
-                UploadStatus::Uploaded => {
+                UploadStatus::Uploaded | UploadStatus::UploadedUnverified => {
                     bytes_total += r.bytes;
                 }
                 UploadStatus::Skipped | UploadStatus::Resumed => {
