@@ -11,11 +11,11 @@
 ## Tasks
 
 ### Task 1: red
-- [ ] `ia-core/tests/upload_multipart.rs`: `multipart_complete_2xx_is_uploaded_without_reading_metadata` — fresh single-part upload mocked, `GET /metadata/test-item` `expect(0)`, `delete_after_upload: true`, `clobber_opts()` (no skip check) → `Uploaded`, local file gone, `server.verify()`.
-- [ ] `ia-cli/tests/cli.rs`: `upload_help_describes_multipart_verification` becomes `upload_help_does_not_promise_a_post_completion_check` — help contains neither "not yet verified" nor "5 minutes".
-- [ ] Run; both fail (today the poll runs and the help carries the text).
+- [x] `ia-core/tests/upload_multipart.rs`: `multipart_complete_2xx_is_uploaded_without_reading_metadata` — fresh single-part upload mocked, `GET /metadata/test-item` `expect(0)`, `delete_after_upload: true`, `clobber_opts()` (no skip check) → `Uploaded`, local file gone, `server.verify()`.
+- [x] `ia-cli/tests/cli.rs`: `upload_help_describes_multipart_verification` becomes `upload_help_does_not_promise_a_post_completion_check` — help contains neither "not yet verified" nor "5 minutes".
+- [x] Run; both failed: the library test sat in the poll until a 90 s cap killed it (the default deadline is 5 minutes and the field that shortens it is the one being removed), the help test failed on "not yet verified".
 
 ### Task 2: green
-- [ ] Remove the poll, the enum, the second Verifying event, the field, the variant and every arm; delete the nine tests that pinned the poll (`multipart_polls_metadata_until_the_object_appears`, `multipart_fails_when_the_assembled_md5_differs`, `..._reports_unverified_at_the_deadline_and_keeps_the_file`, `..._deletes_the_local_file_only_once_verified`, `..._no_verify_checks_size_only`, `..._polls_through_a_404_before_the_object_appears`, `..._verification_honors_retry_after_on_the_metadata_api`, `..._does_not_poll_past_a_retry_after_beyond_the_deadline`, `..._floors_the_wait_between_polls`) and the three unit tests on the variant; drop `mount_assembled` and its callers.
-- [ ] Help, usage.md, README, the #35 plan doc (dated reversal note).
+- [x] Remove the poll, the enum, the second Verifying event, the field, the variant and every arm; delete the nine tests that pinned the poll (`multipart_polls_metadata_until_the_object_appears`, `multipart_fails_when_the_assembled_md5_differs`, `..._reports_unverified_at_the_deadline_and_keeps_the_file`, `..._deletes_the_local_file_only_once_verified`, `..._no_verify_checks_size_only`, `..._polls_through_a_404_before_the_object_appears`, `..._verification_honors_retry_after_on_the_metadata_api`, `..._does_not_poll_past_a_retry_after_beyond_the_deadline`, `..._floors_the_wait_between_polls`) and the three unit tests on the variant; drop `mount_assembled` and its callers.
+- [x] Help, usage.md ("Completing a multipart upload"), README row, the #35 plan doc (dated reversal note). The `--clobber --no-verify` test went back to `expect(0)` on the metadata endpoint: nothing reads it now.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup multipart-complete-is-uploaded` after a confirmed merge.

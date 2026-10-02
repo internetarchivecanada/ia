@@ -191,11 +191,8 @@ pub async fn upload_item(
             start,
         )
         .await?;
-        let first_uploaded = first_uploaded
-            || matches!(
-                first_result.status,
-                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
-            );
+        let first_uploaded =
+            first_uploaded || matches!(first_result.status, UploadStatus::Uploaded);
         results.push(first_result);
 
         // Phase 2: Upload middle files concurrently
@@ -354,10 +351,7 @@ pub async fn upload_item(
         .await
         {
             Ok(result) => {
-                if matches!(
-                    result.status,
-                    UploadStatus::Uploaded | UploadStatus::UploadedUnverified
-                ) {
+                if matches!(result.status, UploadStatus::Uploaded) {
                     first_file_succeeded = true;
                 }
                 if let Some(ref cb) = on_result {
@@ -494,10 +488,7 @@ async fn upload_one_file(
     .await
     {
         Ok(result) => {
-            let uploaded = matches!(
-                result.status,
-                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
-            );
+            let uploaded = matches!(result.status, UploadStatus::Uploaded);
             if let Some(ref cb) = on_result {
                 cb(&result);
             }

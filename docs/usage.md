@@ -554,7 +554,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--keep-directories` | Preserve relative path structure |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
-| `--delete-after-upload` | Delete local file after verified upload (with `--multipart`, only once IA lists the assembled file with the expected size and md5; a file reported "not yet verified" is kept) |
+| `--delete-after-upload` | Delete local file after verified upload |
 | `--no-verify` | Skip Content-MD5 verification |
 | `--no-derive` | Skip derivative generation |
 | `--no-backup` | Don't keep old file versions |
@@ -586,9 +586,9 @@ The upload transport has no read timeout, on purpose: the server is legitimately
 
 Before sending any part, `--multipart` asks IA for unfinished multipart uploads of the same file name in the item and checks each part IA already holds against the local file: the part number must fall within the file's parts at the current part size (100 MiB), the part's size on IA must equal the local range's size, and its ETag must equal the md5 of the local range. The md5s come from one read of the local file. Every part passes → those parts are skipped and the rest are sent under the same upload ID. Any part fails (the local file changed, the part size changed, a different file has the same name) → a fresh upload starts and the stale one is left on IA, named in a warning: `not resuming multipart upload <id>: part 1 has ETag <etag> on IA but the local range's md5 differs; it is left on IA, discard it with: ia upload cleanup <item> <file> --abort`. With several unfinished uploads for the name, the newest one that passes is resumed. A listing without a part size is checked by md5 alone.
 
-#### Verifying a multipart upload
+#### Completing a multipart upload
 
-The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). IA assembles a multipart object after completion, and for about a minute the URL may 404 or serve a placeholder, so a 200 on completion proves nothing. After completion `ia` therefore asks the item's metadata until the file appears with the expected size and md5, for up to 5 minutes, waiting on the retry schedule between polls (1 s to 60 s, as for retries; a `429` is honored through its `Retry-After`, and one that reaches past the 5 minutes ends the check). Three outcomes: listed with the right size and md5 → `uploaded`, and `--delete-after-upload` deletes the local file now; listed with the right size but another md5 → the file fails with `assembled file md5 X on IA does not match local md5 Y`, because the object on IA is wrong; not listed in time → `uploaded, not yet verified` (`--json`: `"status":"uploaded_unverified"`), exit 0 with a warning, the local file kept, and the joblog records the file as ok. A rerun's skip check then settles it: skipped once IA lists the md5, uploaded again if it never does. With `--joblog`, that rerun needs `--no-resume` (the joblog's ok would otherwise skip the file before the check runs). `--no-verify` checks the size only. The result's `md5` is the local md5, as for a single PUT.
+The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). Each part's md5 is sent to IA in the completion request, and IA compares it with the part it holds before accepting the completion. An accepted completion is the upload: the file is reported `uploaded`, `--delete-after-upload` deletes the local file then, and nothing is polled afterwards. IA assembles the object in the background, so the file may take a minute to appear in the item's listing. The result's `md5` is the local md5, as for a single PUT.
 
 #### Multipart part failures
 
