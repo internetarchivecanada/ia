@@ -19,3 +19,11 @@
 - [x] Remove the poll, the enum, the second Verifying event, the field, the variant and every arm; delete the nine tests that pinned the poll (`multipart_polls_metadata_until_the_object_appears`, `multipart_fails_when_the_assembled_md5_differs`, `..._reports_unverified_at_the_deadline_and_keeps_the_file`, `..._deletes_the_local_file_only_once_verified`, `..._no_verify_checks_size_only`, `..._polls_through_a_404_before_the_object_appears`, `..._verification_honors_retry_after_on_the_metadata_api`, `..._does_not_poll_past_a_retry_after_beyond_the_deadline`, `..._floors_the_wait_between_polls`) and the three unit tests on the variant; drop `mount_assembled` and its callers.
 - [x] Help, usage.md ("Completing a multipart upload"), README row, the #35 plan doc (dated reversal note). The `--clobber --no-verify` test went back to `expect(0)` on the metadata endpoint: nothing reads it now.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup multipart-complete-is-uploaded` after a confirmed merge.
+
+## Review (2026-10-02), closed before the PR
+
+Important, fixed: the `--multipart` row in usage.md's option table still promised the post-completion confirmation; the `upload_file_multipart_flag_dispatches` test in `upload_single.rs` still mounted the metadata listing with the poll's comment (now `expect(0)` + `server.verify()`); the `--clobber --no-verify` test's doc comment still described the size-only check.
+
+Suggestions, taken: `upload_part` always puts the local md5 in the manifest instead of preferring an `ETag` header from IA (the whole check rests on IA comparing against what was sent; an echoed value would compare IA against itself; IA sends no header today, a differing one is logged at debug); the `clobber_opts` test helper is `no_skip_check_opts` (it turns the checksum compare off, not a clobber flag).
+
+Noted: a resumed part's manifest ETag comes from IA's listing, and #19's `validate_parts` already requires it to equal the local range's md5; the removed second `Verifying` event was a no-op for the TUI's counting; 26 clippy lints under `--all-targets` are pre-existing in test files and outside the CI recipe.

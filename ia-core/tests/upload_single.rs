@@ -1301,15 +1301,15 @@ async fn upload_file_multipart_flag_dispatches() {
         .mount(&server)
         .await;
 
-    // After completion the upload asks the item's metadata for the
-    // assembled file (size only, with verify off); list it so the test
-    // finishes at once.
+    // The item's listing is read once, for the skip check before the
+    // upload; nothing is read after completion.
     Mock::given(method("GET"))
         .and(path("/metadata/test-item"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "metadata": {"identifier": "test-item"},
-            "files": [{"name": "file.bin", "size": content.len().to_string(), "source": "original"}]
+            "files": []
         })))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -1334,6 +1334,7 @@ async fn upload_file_multipart_flag_dispatches() {
     .unwrap();
 
     assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
 }
 
 // -- Regression: upload with retry middleware (from_config) must not fail --

@@ -563,7 +563,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-size-hint` | Don't send x-archive-size-hint header |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
-| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; the same skip check as a single PUT; a rerun resumes from the parts IA holds once they are checked against the local file; a part that fails for good leaves the upload on IA for that rerun; after completion the assembled file is confirmed by size and md5 (see below) |
+| `--multipart` | Use multipart upload (recommended for files >5 GB): 100 MiB parts, each retried on its own; the same skip check as a single PUT; a rerun resumes from the parts IA holds once they are checked against the local file; a part that fails for good leaves the upload on IA for that rerun; IA checks every part's md5 when the upload is completed (see below) |
 | `--retries <N>` | Retry attempts per IA-S3 request — per file, or per part with `--multipart` (default: 10); a dead send (no bytes for 60 s, see "Stalled uploads") spends one. Waits are random, up to a cap that doubles from 1 s to 60 s. A `Retry-After` header sets the wait instead, as given, even above 60 s; `Retry-After: 0` means re-send at once; a dead send is re-sent at once |
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |

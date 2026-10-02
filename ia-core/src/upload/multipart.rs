@@ -219,13 +219,16 @@ pub(crate) async fn initiate_upload_with_retry(
     Ok((id, attempts))
 }
 
-/// Upload a single part. Returns the ETag for the completion manifest.
+/// Upload a single part. Returns the ETag for the completion manifest: the
+/// quoted hex MD5 of the body as sent.
 ///
 /// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
 ///
-/// IA's S3 does not return an `ETag` header on part PUTs; its completion
-/// check compares the manifest entry against the part's MD5. When the header
-/// is absent, the quoted hex MD5 of the body is used instead.
+/// IA's completion check compares each manifest entry against the part it
+/// holds, and an accepted completion is the upload's verification. That
+/// only means something when the manifest carries what was sent, so the
+/// local MD5 is always used; an `ETag` header IA might return is not echoed
+/// back (IA returns none today; one that differs is logged at debug).
 ///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
 /// need a configurable budget go through `upload_file_multipart`.
@@ -298,15 +301,25 @@ pub(crate) async fn upload_part_with_retry(
     })
     .await?;
 
-    // Prefer the server's ETag; IA omits it, so fall back to the local MD5.
-    let etag = sent
+    // The manifest carries the MD5 of what was sent, never a value IA gave
+    // back: IA's completion check compares the manifest against the part it
+    // holds, which proves nothing if the manifest echoes IA's own value.
+    if let Some(server_etag) = sent
         .response
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or(local_md5);
-    Ok((etag, sent.attempts))
+    {
+        if !server_etag.eq_ignore_ascii_case(&local_md5) {
+            tracing::debug!(
+                part = part_number,
+                server_etag,
+                local_md5,
+                "part PUT returned an ETag that differs from the local md5"
+            );
+        }
+    }
+    Ok((local_md5, sent.attempts))
 }
 
 /// Complete a multipart upload by sending the manifest.

@@ -125,8 +125,11 @@ async fn public_initiate_upload_retries_a_throttle() {
 
 // ── Upload Part ─────────────────────────────────────────────────────────
 
+/// The manifest ETag is the md5 of the body as sent, never an ETag IA gave
+/// back: IA's completion check compares the manifest against the part it
+/// holds, which proves nothing if the manifest echoes IA's own value.
 #[tokio::test]
-async fn upload_part_success() {
+async fn upload_part_returns_the_local_md5_not_the_server_etag() {
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -150,13 +153,13 @@ async fn upload_part_success() {
     )
     .await
     .unwrap();
-    assert_eq!(etag, "\"etag-part1\"");
+    assert_eq!(etag, format!("\"{}\"", md5_hex(b"hello world")));
 }
 
 #[tokio::test]
-async fn upload_part_missing_etag_falls_back_to_body_md5() {
+async fn upload_part_returns_the_body_md5_without_an_etag_header() {
     // IA's S3 returns no ETag header on part PUTs; the completion check
-    // compares against the part's MD5, so that is what we must report.
+    // compares against the part's MD5, so that is what the manifest carries.
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -1878,7 +1881,8 @@ async fn part_put_retries_when_the_connection_closes_before_a_response() {
     .await
     .expect("a closed connection is transient and must be retried");
 
-    assert_eq!(etag, "\"etag-retry\"");
+    // The manifest ETag is the local md5, not the header the retry returned.
+    assert_eq!(etag, format!("\"{}\"", md5_hex(b"hello world")));
     server.await.unwrap();
 }
 
@@ -2741,9 +2745,9 @@ async fn multipart_clobber_uploads_despite_a_matching_md5_and_sets_md5() {
     server.verify().await;
 }
 
-/// `--clobber --no-verify` reads nothing before uploading: no md5 is
-/// computed (none in the result), and the post-completion check compares
-/// the size only, so a listing without an md5 verifies it.
+/// `--clobber --no-verify` reads nothing before uploading, and nothing
+/// after: no md5 is computed (none in the result) and the metadata API is
+/// never asked.
 #[tokio::test]
 async fn multipart_clobber_no_verify_reads_nothing_before_uploading() {
     let server = MockServer::start().await;
@@ -2795,7 +2799,7 @@ async fn upload_thirty_via_upload_file(
     (result, f)
 }
 
-fn clobber_opts() -> UploadOpts {
+fn no_skip_check_opts() -> UploadOpts {
     UploadOpts {
         multipart: true,
         checksum: false,
@@ -2823,7 +2827,7 @@ async fn multipart_complete_2xx_is_uploaded_without_reading_metadata() {
         .await;
     let opts = UploadOpts {
         delete_after_upload: true,
-        ..clobber_opts()
+        ..no_skip_check_opts()
     };
     let (result, f) = upload_thirty_via_upload_file(&server, opts).await;
     let result = result.unwrap();
