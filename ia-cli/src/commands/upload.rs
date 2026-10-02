@@ -205,7 +205,10 @@ pub struct UploadArgs {
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
-    /// discards a kept upload instead.
+    /// discards a kept upload instead. A rerun resumes only when every
+    /// part IA holds matches the local file by size and md5 (one read of
+    /// the file); otherwise a fresh upload starts and the stale one is
+    /// left for cleanup, named in a warning.
     #[arg(long)]
     pub multipart: bool,
 
@@ -319,7 +322,10 @@ pub struct ImportArgs {
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
     /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
-    /// discards a kept upload instead.
+    /// discards a kept upload instead. A rerun resumes only when every
+    /// part IA holds matches the local file by size and md5 (one read of
+    /// the file); otherwise a fresh upload starts and the stale one is
+    /// left for cleanup, named in a warning.
     #[arg(long)]
     pub multipart: bool,
 

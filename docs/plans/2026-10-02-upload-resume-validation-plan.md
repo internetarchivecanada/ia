@@ -31,7 +31,7 @@
 
 **Files:** `ia-core/src/upload/multipart.rs`, `ia-core/tests/upload_multipart.rs`, `ia-cli/src/commands/upload.rs`, `ia-cli/tests/cli.rs`, `docs/usage.md`
 
-- [ ] **Step 1: Failing tests.**
+- [x] **Step 1: Failing tests.**
   - `resume_with_matching_parts_skips_them` (the existing `upload_file_multipart_resumes_from_existing` and `..._resume_non_contiguous_parts` with ETags that are the real md5s of the local ranges and real sizes; today they use placeholder ETags, so they must be updated, and that is the red for the validation).
   - `resume_rejects_a_part_whose_md5_differs`: part 1 listed with a wrong ETag → no part skipped, a fresh initiate, both parts PUT, the old upload never aborted (`DELETE expect(0)`), and the warning names the old upload ID (observed through the new upload ID in the complete call).
   - `resume_rejects_a_part_whose_size_differs`: right ETag, wrong size.
@@ -40,8 +40,8 @@
   - `resume_with_a_missing_size_relies_on_the_md5`: `<Part>` without `<Size>`, right ETag → reused.
   - `validate_parts` unit tests for each rule, including a duplicate part number.
   - `upload --help` mentions the check.
-- [ ] **Step 2: Run**; fail.
-- [ ] **Step 3: Implement.** Commit: `fix(upload): resume a multipart upload only when every part on IA matches the local file`.
+- [x] **Step 2: Run**; the four rejection tests failed (every listed part was reused); the `validate_parts` unit tests failed to compile; the help test failed. The two existing resume tests and the #18 rerun test, given real md5 ETags, kept passing and pin "a valid resume still skips". The missing-size test passed already (nothing checked sizes); it pins the engineering call.
+- [x] **Step 3: Implement.** `try_resume(client, ctx, file, file_size, part_size)` hashes the file once (only when there is a candidate), checks candidates newest first with `validate_parts`, warns with the upload ID on a mismatch, and never aborts. The warning is not asserted (no log capture in the tree); the fresh initiate and the `DELETE expect(0)` are. Commit: `fix(upload): resume a multipart upload only when every part on IA matches the local file`.
 
 ### Task 3: pagination
 

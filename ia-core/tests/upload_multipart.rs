@@ -16,6 +16,11 @@ fn temp_file(content: &[u8]) -> NamedTempFile {
     f
 }
 
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(bytes))
+}
+
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
 ///
 /// Built with `from_config`, the way production builds one, so every test
@@ -905,9 +910,10 @@ async fn rerun_after_part_failure_resumes_from_existing_parts() {
     Mock::given(method("GET"))
         .and(path("/test-item/data.bin"))
         .and(query_param("uploadId", "mp-keep"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"etag1\"</ETag><Size>1024</Size></Part></ListPartsResult>",
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag><Size>1024</Size></Part></ListPartsResult>",
+            md5_hex(&[7u8; 1024])
+        )))
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -987,15 +993,16 @@ async fn upload_file_multipart_resumes_from_existing() {
     Mock::given(method("GET"))
         .and(path("/test-item/data.bin"))
         .and(query_param("uploadId", "resume-123"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
             r#"<ListPartsResult>
   <Part>
     <PartNumber>1</PartNumber>
-    <ETag>"existing-etag1"</ETag>
+    <ETag>"{}"</ETag>
     <Size>10</Size>
   </Part>
 </ListPartsResult>"#,
-        ))
+            md5_hex(b"aaaaabbbbb")
+        )))
         .mount(&server)
         .await;
 
@@ -1264,12 +1271,14 @@ async fn upload_file_multipart_resume_non_contiguous_parts() {
     Mock::given(method("GET"))
         .and(path("/test-item/data.bin"))
         .and(query_param("uploadId", "gap-resume"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
             r#"<ListPartsResult>
-  <Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part>
-  <Part><PartNumber>3</PartNumber><ETag>"e3"</ETag><Size>10</Size></Part>
+  <Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>
+  <Part><PartNumber>3</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>
 </ListPartsResult>"#,
-        ))
+            md5_hex(b"aaaaabbbbb"),
+            md5_hex(b"eeeeefffff")
+        )))
         .mount(&server)
         .await;
 
@@ -2161,4 +2170,253 @@ async fn abort_retries_a_throttle() {
         .expect("a throttled abort retries and succeeds");
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2, "{requests:#?}");
+}
+
+// ── Resume validation (#19) ─────────────────────────────────────────────
+//
+// 30-byte file "aaaaabbbbbcccccdddddeeeeefffff", part size 10: three parts
+// whose md5s are known. A listed part is reused only when its size and
+// md5 match the local range; otherwise a fresh upload starts and the stale
+// one is left for `ia upload cleanup`.
+
+const THIRTY: &[u8] = b"aaaaabbbbbcccccdddddeeeeefffff";
+
+fn uploads_xml(entries: &[(&str, &str)]) -> String {
+    let mut xml = String::from("<ListMultipartUploadsResult>");
+    for (key, id) in entries {
+        xml.push_str(&format!(
+            "<Upload><Key>{key}</Key><UploadId>{id}</UploadId><Initiated>2026-10-02T00:00:00.000Z</Initiated></Upload>"
+        ));
+    }
+    xml.push_str("</ListMultipartUploadsResult>");
+    xml
+}
+
+async fn mount_list_uploads(server: &MockServer, entries: &[(&str, &str)]) {
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(uploads_xml(entries)))
+        .mount(server)
+        .await;
+}
+
+async fn mount_list_parts(server: &MockServer, upload_id: &str, parts_xml: &str) {
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", upload_id))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("<ListPartsResult>{parts_xml}</ListPartsResult>")),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A fresh upload after a rejected resume: initiate → `fresh-1`, every
+/// part PUT once under it, complete once, and never an abort.
+async fn mount_fresh_upload_of_three_parts(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>fresh-1</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(server)
+        .await;
+    for n in 1..=3 {
+        Mock::given(method("PUT"))
+            .and(path("/test-item/data.bin"))
+            .and(query_param("partNumber", n.to_string()))
+            .and(query_param("uploadId", "fresh-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "fresh-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+async fn upload_thirty(server: &MockServer) -> ia_core::upload::UploadResult {
+    let client = test_client(server);
+    let f = temp_file(THIRTY);
+    let opts = UploadOpts {
+        verify: false,
+        ..Default::default()
+    };
+    multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn resume_rejects_a_part_whose_md5_differs() {
+    let server = MockServer::start().await;
+    mount_list_uploads(&server, &[("data.bin", "stale-1")]).await;
+    mount_list_parts(
+        &server,
+        "stale-1",
+        r#"<Part><PartNumber>1</PartNumber><ETag>"0123456789abcdef0123456789abcdef"</ETag><Size>10</Size></Part>"#,
+    )
+    .await;
+    mount_fresh_upload_of_three_parts(&server).await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn resume_rejects_a_part_whose_size_differs() {
+    let server = MockServer::start().await;
+    mount_list_uploads(&server, &[("data.bin", "stale-1")]).await;
+    mount_list_parts(
+        &server,
+        "stale-1",
+        &format!(
+            r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>9</Size></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    mount_fresh_upload_of_three_parts(&server).await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn resume_rejects_a_part_number_past_the_count() {
+    let server = MockServer::start().await;
+    mount_list_uploads(&server, &[("data.bin", "stale-1")]).await;
+    mount_list_parts(
+        &server,
+        "stale-1",
+        &format!(
+            r#"<Part><PartNumber>5</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    mount_fresh_upload_of_three_parts(&server).await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+/// Two unfinished uploads for the key: the newer one does not match, the
+/// older one does. The older one is resumed; nothing is initiated.
+#[tokio::test]
+async fn resume_picks_the_newest_valid_upload() {
+    let server = MockServer::start().await;
+    mount_list_uploads(&server, &[("data.bin", "old-ok"), ("data.bin", "new-bad")]).await;
+    mount_list_parts(
+        &server,
+        "new-bad",
+        r#"<Part><PartNumber>1</PartNumber><ETag>"0123456789abcdef0123456789abcdef"</ETag><Size>10</Size></Part>"#,
+    )
+    .await;
+    mount_list_parts(
+        &server,
+        "old-ok",
+        &format!(
+            r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for n in 2..=3 {
+        Mock::given(method("PUT"))
+            .and(path("/test-item/data.bin"))
+            .and(query_param("partNumber", n.to_string()))
+            .and(query_param("uploadId", "old-ok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "old-ok"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+/// A listing without `<Size>` is not held against the part; the md5 is
+/// the stronger check and it matches.
+#[tokio::test]
+async fn resume_with_a_missing_size_relies_on_the_md5() {
+    let server = MockServer::start().await;
+    mount_list_uploads(&server, &[("data.bin", "nosize-1")]).await;
+    mount_list_parts(
+        &server,
+        "nosize-1",
+        &format!(
+            r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    for n in 2..=3 {
+        Mock::given(method("PUT"))
+            .and(path("/test-item/data.bin"))
+            .and(query_param("partNumber", n.to_string()))
+            .and(query_param("uploadId", "nosize-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "nosize-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = upload_thirty(&server).await;
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    server.verify().await;
 }

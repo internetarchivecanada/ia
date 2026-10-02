@@ -677,8 +677,9 @@ pub async fn upload_file_multipart(
         });
     }
 
-    // Try to resume an existing upload
-    let (upload_id, existing_parts) = try_resume(client, &control_ctx).await?;
+    // Try to resume an existing upload whose parts match this file.
+    let (upload_id, existing_parts) =
+        try_resume(client, &control_ctx, file, file_size, part_size).await?;
 
     // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
     let extra_headers = {
@@ -993,26 +994,98 @@ async fn read_file_range(file: &Path, offset: u64, len: usize) -> Result<Vec<u8>
     Ok(buf)
 }
 
-/// Check for an existing in-progress upload for this key and return it.
+/// Find an in-progress upload for this key whose parts match the local file,
+/// and return it with those parts.
 ///
-/// If multiple uploads exist for the same key, returns the most recent one.
+/// Candidates are the item's unfinished uploads for `ctx.key`, newest first
+/// (S3 lists them in chronological order). Each candidate's parts are
+/// checked with [`validate_parts`] against the local file's size and the
+/// md5 of each local range; the first candidate that validates is resumed.
+/// One that does not is left in place (an abort would be #18's mistake
+/// again) and reported at warn with its upload ID, so `ia upload cleanup`
+/// can discard it. With no valid candidate, `None`: the caller initiates a
+/// fresh upload.
+///
+/// The local hashes come from one read of the file
+/// ([`super::checksum::hash_file_and_parts`]), done only when there is a
+/// candidate to check.
 async fn try_resume(
     client: &IaClient,
     ctx: &S3RetryCtx<'_>,
+    file: &Path,
+    file_size: u64,
+    part_size: u64,
 ) -> Result<(Option<String>, Vec<PartInfo>)> {
     let uploads = list_uploads_with_ctx(client, ctx).await?;
-
-    // Find uploads matching this key, take the most recent
-    // Take the last matching upload (most recent, S3 returns chronological order)
-    let matching = uploads.iter().rfind(|u| u.key == ctx.key);
-
-    match matching {
-        Some(info) => {
-            let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
-            Ok((Some(info.upload_id.clone()), parts))
-        }
-        None => Ok((None, Vec::new())),
+    let candidates: Vec<&MultipartUploadInfo> =
+        uploads.iter().rev().filter(|u| u.key == ctx.key).collect();
+    if candidates.is_empty() {
+        return Ok((None, Vec::new()));
     }
+
+    let hashes = super::checksum::hash_file_and_parts_async(file, part_size).await?;
+    for info in candidates {
+        let parts = list_parts_with_ctx(client, ctx, &info.upload_id).await?;
+        match validate_parts(&parts, file_size, part_size, &hashes.parts) {
+            Ok(()) => return Ok((Some(info.upload_id.clone()), parts)),
+            Err(reason) => tracing::warn!(
+                identifier = ctx.identifier,
+                key = ctx.key,
+                upload_id = %info.upload_id,
+                "not resuming multipart upload: {reason}; it is left on IA, \
+                 discard it with `ia upload cleanup`"
+            ),
+        }
+    }
+    Ok((None, Vec::new()))
+}
+
+/// Whether every part IA lists for an upload matches the local file.
+///
+/// For each part: its number must be within the file's part count at
+/// `part_size`; its size, when the listing gave one (0 means it did not),
+/// must be the expected size of that part (`part_size`, or what is left of
+/// the file for the last part); and its ETag, quotes stripped and case
+/// ignored, must equal the md5 of the local range (`local[n - 1]`). A part
+/// number listed twice is a mismatch. `Err` names the first offending part
+/// and why.
+fn validate_parts(
+    parts: &[PartInfo],
+    file_size: u64,
+    part_size: u64,
+    local: &[String],
+) -> std::result::Result<(), String> {
+    let part_count = file_size.div_ceil(part_size).max(1);
+    let mut seen = std::collections::HashSet::new();
+    for part in parts {
+        let n = part.part_number;
+        if n == 0 || u64::from(n) > part_count {
+            return Err(format!(
+                "part {n} is outside this file's {part_count} parts of {part_size} bytes"
+            ));
+        }
+        if !seen.insert(n) {
+            return Err(format!("part {n} is listed twice"));
+        }
+        let offset = u64::from(n - 1) * part_size;
+        let expected = part_size.min(file_size - offset);
+        if part.size != 0 && part.size != expected {
+            return Err(format!(
+                "part {n} is {} bytes on IA but {expected} bytes locally",
+                part.size
+            ));
+        }
+        let etag = part.etag.trim().trim_matches('"').to_ascii_lowercase();
+        match local.get((n - 1) as usize) {
+            Some(md5) if *md5 == etag => {}
+            _ => {
+                return Err(format!(
+                    "part {n} has md5 {etag} on IA but the local range hashes differently"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1302,5 +1375,76 @@ mod tests {
             kept(2, 2, 1, "f.bin").describe(spam),
             IaError::SpamDetected { .. }
         ));
+    }
+
+    // -- validate_parts: a listed part is reused only when it matches --
+
+    fn part(n: u32, etag: &str, size: u64) -> PartInfo {
+        PartInfo {
+            part_number: n,
+            etag: etag.to_string(),
+            size,
+        }
+    }
+
+    fn local() -> Vec<String> {
+        vec!["aa".repeat(16), "bb".repeat(16), "cc".repeat(16)]
+    }
+
+    #[test]
+    fn validate_parts_accepts_matching_parts() {
+        let parts = [
+            part(1, &format!("\"{}\"", "aa".repeat(16)), 10),
+            part(3, &"cc".repeat(16), 5),
+        ];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
+    }
+
+    #[test]
+    fn validate_parts_ignores_etag_quotes_and_case() {
+        let parts = [part(2, &format!("\"{}\"", "BB".repeat(16)), 10)];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_wrong_md5() {
+        let parts = [part(1, &"dd".repeat(16), 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(
+            reason.contains("part 1") && reason.contains("md5"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_wrong_size() {
+        let parts = [part(1, &"aa".repeat(16), 9)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(
+            reason.contains("part 1") && reason.contains("9 bytes"),
+            "{reason}"
+        );
+        // The last part is shorter; its expected size is what is left.
+        let parts = [part(3, &"cc".repeat(16), 10)];
+        assert!(validate_parts(&parts, 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_an_out_of_range_part_number() {
+        assert!(validate_parts(&[part(0, &"aa".repeat(16), 10)], 25, 10, &local()).is_err());
+        assert!(validate_parts(&[part(4, &"aa".repeat(16), 10)], 25, 10, &local()).is_err());
+    }
+
+    #[test]
+    fn validate_parts_rejects_a_duplicate_part_number() {
+        let parts = [part(1, &"aa".repeat(16), 10), part(1, &"aa".repeat(16), 10)];
+        let reason = validate_parts(&parts, 25, 10, &local()).unwrap_err();
+        assert!(reason.contains("twice"), "{reason}");
+    }
+
+    #[test]
+    fn validate_parts_treats_a_missing_size_as_not_given() {
+        let parts = [part(1, &"aa".repeat(16), 0)];
+        assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
     }
 }
