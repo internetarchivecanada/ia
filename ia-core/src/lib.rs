@@ -18,6 +18,7 @@ pub mod retry;
 pub mod scandata;
 pub mod search;
 pub mod spreadsheet;
+pub(crate) mod stall;
 pub mod tasks;
 pub mod types;
 pub mod update;

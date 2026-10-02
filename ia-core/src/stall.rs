@@ -1,17 +1,20 @@
-//! Stall detection for download streams (#11).
+//! Stall detection for byte streams: download bodies (#11) and upload body
+//! sends (#38).
 //!
-//! A datanode that keeps sending bytes, slowly, never trips the transport's
-//! read timeout (it resets on every chunk) and never errors the body
-//! stream, so nothing in the chunk loop would ever give up on it. The
-//! [`StallDetector`] answers one question for the loop: averaged over the
-//! last [`WINDOW`], is this stream below its floor? It is pure, taking the
-//! clock as an argument, so the rule is unit-tested without a runtime.
+//! A peer that keeps moving bytes, slowly, never trips a transport timeout
+//! and never errors the stream, so nothing in a chunk loop would ever give
+//! up on it; and the upload transport has no read timeout at all, so a
+//! server that stops reading a body hangs the send for good. The
+//! [`StallDetector`] answers one question for either loop: averaged over
+//! the last [`WINDOW`], is this stream below its floor? It is pure, taking
+//! the clock as an argument, so the rule is unit-tested without a runtime.
 //!
 //! The window and grace are fixed for users ([`policy`]). The drip-feed
-//! tests in the parent module shrink them through a `cfg(test)`-only
-//! override so a real-time test takes a second or two instead of a minute;
-//! tokio's paused clock is not an option there because its auto-advance
-//! runs the connect timeout out before a real TCP connect can complete.
+//! tests in the download and upload modules shrink them through a
+//! `cfg(test)`-only override so a real-time test takes a second or two
+//! instead of a minute; tokio's paused clock is not an option there because
+//! its auto-advance runs the connect timeout out before a real TCP connect
+//! can complete.
 
 use std::time::Duration;
 

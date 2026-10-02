@@ -1,4 +1,4 @@
-mod stall;
+use crate::stall;
 pub mod zip;
 
 use std::path::{Component, Path, PathBuf};
