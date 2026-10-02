@@ -22,7 +22,7 @@
 
 ## Review (2026-10-02), closed before the PR
 
-Important, fixed: the `--multipart` row in usage.md's option table still promised the post-completion confirmation; the `upload_file_multipart_flag_dispatches` test in `upload_single.rs` still mounted the metadata listing with the poll's comment (now `expect(0)` + `server.verify()`); the `--clobber --no-verify` test's doc comment still described the size-only check.
+Important, fixed: the `--multipart` row in usage.md's option table still promised the post-completion confirmation; the `upload_file_multipart_flag_dispatches` test in `upload_single.rs` still mounted the metadata listing with the poll's comment (now `expect(1)`, the skip check's one read before the upload, + `server.verify()`); the `--clobber --no-verify` test's doc comment still described the size-only check.
 
 Suggestions, taken: `upload_part` always puts the local md5 in the manifest instead of preferring an `ETag` header from IA (the whole check rests on IA comparing against what was sent; an echoed value would compare IA against itself; IA sends no header today, a differing one is logged at debug); the `clobber_opts` test helper is `no_skip_check_opts` (it turns the checksum compare off, not a clobber flag).
 

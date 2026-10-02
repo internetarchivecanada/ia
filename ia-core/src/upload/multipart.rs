@@ -312,6 +312,8 @@ pub(crate) async fn upload_part_with_retry(
     {
         if !server_etag.eq_ignore_ascii_case(&local_md5) {
             tracing::debug!(
+                identifier = ctx.identifier,
+                key = ctx.key,
                 part = part_number,
                 server_etag,
                 local_md5,
