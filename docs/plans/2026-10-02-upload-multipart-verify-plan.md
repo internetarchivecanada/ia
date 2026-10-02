@@ -48,3 +48,7 @@ Suggestions, taken: a `Retry-After` reaching past the deadline ends the poll wit
 ### Task 3: docs, verification, review
 
 - [x] Help on both structs (`--multipart`, `--delete-after-upload`), the `after_long_help` integrity block, usage.md "Verifying a multipart upload". [ ] `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-multipart-verify` only after a confirmed merge.
+
+### Reversed (2026-10-02, Part 2 PR 1)
+
+Task 2's post-completion poll, `UploadOpts.verify_timeout` and `UploadStatus::UploadedUnverified` were removed (plan `docs/plans/2026-10-02-multipart-complete-is-uploaded-plan.md`). The premise "a 200 on completion proves nothing" was wrong: the completion manifest carries every part's md5 as its ETag and IA checks each against the part it holds before answering 2xx, so the completion is the verification. The poll added a five-minute wait and a third outcome that the joblog had to record as `ok`. Task 1 (one read, the skip check for both paths) stands.

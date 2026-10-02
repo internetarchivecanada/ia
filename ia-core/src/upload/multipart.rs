@@ -219,13 +219,16 @@ pub(crate) async fn initiate_upload_with_retry(
     Ok((id, attempts))
 }
 
-/// Upload a single part. Returns the ETag for the completion manifest.
+/// Upload a single part. Returns the ETag for the completion manifest: the
+/// quoted hex MD5 of the body as sent.
 ///
 /// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
 ///
-/// IA's S3 does not return an `ETag` header on part PUTs; its completion
-/// check compares the manifest entry against the part's MD5. When the header
-/// is absent, the quoted hex MD5 of the body is used instead.
+/// IA's completion check compares each manifest entry against the part it
+/// holds, and an accepted completion is the upload's verification. That
+/// only means something when the manifest carries what was sent, so the
+/// local MD5 is always used; an `ETag` header IA might return is not echoed
+/// back (IA returns none today; one that differs is logged at debug).
 ///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
 /// need a configurable budget go through `upload_file_multipart`.
@@ -298,15 +301,27 @@ pub(crate) async fn upload_part_with_retry(
     })
     .await?;
 
-    // Prefer the server's ETag; IA omits it, so fall back to the local MD5.
-    let etag = sent
+    // The manifest carries the MD5 of what was sent, never a value IA gave
+    // back: IA's completion check compares the manifest against the part it
+    // holds, which proves nothing if the manifest echoes IA's own value.
+    if let Some(server_etag) = sent
         .response
         .headers()
         .get("etag")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or(local_md5);
-    Ok((etag, sent.attempts))
+    {
+        if !server_etag.eq_ignore_ascii_case(&local_md5) {
+            tracing::debug!(
+                identifier = ctx.identifier,
+                key = ctx.key,
+                part = part_number,
+                server_etag,
+                local_md5,
+                "part PUT returned an ETag that differs from the local md5"
+            );
+        }
+    }
+    Ok((local_md5, sent.attempts))
 }
 
 /// Complete a multipart upload by sending the manifest.
@@ -916,26 +931,8 @@ pub async fn upload_file_multipart(
     .await?;
     total_retries += completion_attempts.saturating_sub(1);
 
-    // IA assembles the object after completion; a 200 proves nothing about
-    // it. Ask the item until the file is listed with the expected size and
-    // md5 (#20). --no-verify checks the size only.
-    let expected_md5 = if opts.verify {
-        hashes.map(|h| h.md5.as_str())
-    } else {
-        None
-    };
-    if let Some(ref cb) = progress {
-        cb(UploadProgress {
-            identifier: identifier.into(),
-            key: key.into(),
-            bytes_sent: file_size,
-            total_bytes: file_size,
-            status: UploadProgressStatus::Verifying,
-        });
-    }
-    let verified = verify_assembled(client, identifier, key, file_size, expected_md5, opts).await?;
-
-    // Report completion
+    // IA compared every part's md5 from the manifest with the part it holds
+    // before answering 2xx, so the completion is the upload.
     if let Some(ref cb) = progress {
         cb(UploadProgress {
             identifier: identifier.into(),
@@ -946,122 +943,21 @@ pub async fn upload_file_multipart(
         });
     }
 
-    let status = match verified {
-        Assembled::Verified => {
-            // Delete the local file only once IA has the object.
-            if opts.delete_after_upload {
-                if let Err(e) = tokio::fs::remove_file(file).await {
-                    tracing::warn!("failed to delete {} after upload: {e}", file.display());
-                }
-            }
-            UploadStatus::Uploaded
+    if opts.delete_after_upload {
+        if let Err(e) = tokio::fs::remove_file(file).await {
+            tracing::warn!("failed to delete {} after upload: {e}", file.display());
         }
-        Assembled::NotYet => {
-            tracing::warn!(
-                identifier,
-                key,
-                "uploaded, not yet verified: IA has not listed the assembled file with the \
-                 expected size and md5 within {:?}; the local file is kept",
-                opts.verify_timeout
-            );
-            UploadStatus::UploadedUnverified
-        }
-    };
+    }
 
     Ok(UploadResult {
         identifier: identifier.into(),
         key: key.into(),
-        status,
+        status: UploadStatus::Uploaded,
         bytes: file_size,
         md5: hashes.map(|h| h.md5.clone()),
         elapsed_ms: start.elapsed().as_millis() as u64,
         retries: total_retries,
     })
-}
-
-/// What the item's metadata said about the assembled object by the deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Assembled {
-    /// Listed with the expected size and (when checked) md5.
-    Verified,
-    /// Not listed, or listed without a size or md5 to compare, until the
-    /// deadline passed.
-    NotYet,
-}
-
-/// Poll the item's metadata until `key` is listed with `size` and, when
-/// given, `md5`, or `opts.verify_timeout` passes.
-///
-/// IA assembles a multipart object asynchronously; for a while after
-/// completion the file is missing or a placeholder. Between polls the wait
-/// is the standard schedule from `opts` (random, up to a cap that doubles),
-/// never shorter than `retry_min_delay` so a `Retry-After: 0` cannot turn
-/// the poll into a tight loop; a `429`'s `Retry-After` is honored as
-/// given, and one that reaches past the deadline ends the poll without
-/// another request. A listing with the right size but a different md5 is a
-/// mismatch, not "not yet": the object on IA is wrong, and the file fails.
-/// A metadata fetch error other than a 429 counts as "not yet"; the
-/// deadline bounds it.
-async fn verify_assembled(
-    client: &IaClient,
-    identifier: &str,
-    key: &str,
-    size: u64,
-    md5: Option<&str>,
-    opts: &UploadOpts,
-) -> Result<Assembled> {
-    let deadline = Instant::now() + opts.verify_timeout;
-    // The poll budget is the deadline, not a count: a very large count
-    // keeps the schedule's waits capped at `retry_max_delay`.
-    let backoff =
-        crate::retry::backoff_policy(opts.retry_min_delay, opts.retry_max_delay, u32::MAX);
-    let mut polls: u32 = 0;
-    loop {
-        let mut retry_after = None;
-        match client.get_item(identifier).await {
-            Ok(item) => {
-                if let Some(entry) = item.files.iter().find(|f| f.name == key) {
-                    let size_ok = entry.size == Some(size);
-                    match (size_ok, md5, entry.md5.as_deref()) {
-                        (true, None, _) => return Ok(Assembled::Verified),
-                        (true, Some(want), Some(got)) if got.eq_ignore_ascii_case(want) => {
-                            return Ok(Assembled::Verified)
-                        }
-                        (true, Some(want), Some(got)) => {
-                            return Err(IaError::UploadFailed {
-                                identifier: identifier.into(),
-                                key: key.into(),
-                                message: format!(
-                                    "assembled file md5 {got} on IA does not match local md5 {want}"
-                                ),
-                                status: None,
-                            })
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                retry_after = e.retry_after().map(std::time::Duration::from_secs);
-                tracing::debug!(identifier, key, error = %e, "metadata not readable yet while verifying");
-            }
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(Assembled::NotYet);
-        }
-        let left = deadline - now;
-        // The server's Retry-After is honored as given: if it reaches past
-        // the deadline there is no poll left to make.
-        if retry_after.is_some_and(|ra| ra >= left) {
-            return Ok(Assembled::NotYet);
-        }
-        let wait = crate::retry::wait_before_retry(retry_after, &backoff, polls)
-            .max(opts.retry_min_delay)
-            .min(left);
-        polls = polls.saturating_add(1);
-        tokio::time::sleep(wait).await;
-    }
 }
 
 /// What the user needs to know when a part fails for good and the upload is

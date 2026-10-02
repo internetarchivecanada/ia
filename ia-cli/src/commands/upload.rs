@@ -81,10 +81,8 @@ fn build_skip_set(
          \n  <bold>--joblog FILE</bold>     Separate resume mechanism — skips files logged\
          \n                    as successful in previous runs. Works independently\
          \n                    of checksum/verify. Disable with --no-resume.\
-         \n  <bold>--multipart</bold>       Same skip check from the same single read. After\
-         \n                    completion, the assembled file is checked by size and\
-         \n                    md5 through the item's metadata for up to 5 minutes;\
-         \n                    not listed in time = \"uploaded, not yet verified\".\n\
+         \n  <bold>--multipart</bold>       Same skip check from the same single read; IA checks\
+         \n                    every part's md5 when the upload is completed.\n\
          \n<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Upload a file to an existing or new item</dim>\
          \n  <bold>$ ia upload my-item file.pdf -m mediatype:texts -m collection:opensource</bold>\
@@ -180,9 +178,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub clobber: bool,
 
-    /// Delete local file after verified upload (with --multipart, only once
-    /// IA lists the assembled file with the expected size and md5; a file
-    /// reported "not yet verified" is kept)
+    /// Delete local file after verified upload
     #[arg(long)]
     pub delete_after_upload: bool,
 
@@ -227,15 +223,9 @@ pub struct UploadArgs {
     ///
     /// The same read gives the md5 for the skip check, so a file the item
     /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway). IA assembles the object after completion, so the upload
-    /// then asks the item's metadata until the file appears with the
-    /// expected size and md5, for up to 5 minutes, waiting on the retry
-    /// schedule between polls. Listed with the right size but another md5:
-    /// the file fails. Not listed in time: "uploaded, not yet verified",
-    /// exit 0 with a warning; a rerun skips it once IA lists the md5, or
-    /// uploads it again if IA never does (with --joblog the file is logged
-    /// as ok, so add --no-resume for that rerun to check it). --no-verify
-    /// checks the size only; --clobber --no-verify also skips the read.
+    /// anyway; --clobber --no-verify also skips the read). Each part's md5
+    /// goes to IA with the completion request, and IA checks every part
+    /// against it before accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 
@@ -343,9 +333,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub clobber: bool,
 
-    /// Delete local file after verified upload (with --multipart, only once
-    /// IA lists the assembled file with the expected size and md5; a file
-    /// reported "not yet verified" is kept)
+    /// Delete local file after verified upload
     #[arg(long)]
     pub delete_after_upload: bool,
 
@@ -368,15 +356,9 @@ pub struct ImportArgs {
     ///
     /// The same read gives the md5 for the skip check, so a file the item
     /// already has is skipped as with a single PUT (--clobber uploads it
-    /// anyway). IA assembles the object after completion, so the upload
-    /// then asks the item's metadata until the file appears with the
-    /// expected size and md5, for up to 5 minutes, waiting on the retry
-    /// schedule between polls. Listed with the right size but another md5:
-    /// the file fails. Not listed in time: "uploaded, not yet verified",
-    /// exit 0 with a warning; a rerun skips it once IA lists the md5, or
-    /// uploads it again if IA never does (with --joblog the file is logged
-    /// as ok, so add --no-resume for that rerun to check it). --no-verify
-    /// checks the size only; --clobber --no-verify also skips the read.
+    /// anyway; --clobber --no-verify also skips the read). Each part's md5
+    /// goes to IA with the completion request, and IA checks every part
+    /// against it before accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
 
@@ -1428,12 +1410,7 @@ fn output_results(
 fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, usize, u64) {
     let uploaded = results
         .iter()
-        .filter(|r| {
-            matches!(
-                r.status,
-                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
-            )
-        })
+        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
         .count();
     let skipped = results
         .iter()
@@ -1449,12 +1426,7 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, usize, u
         .count();
     let total_bytes: u64 = results
         .iter()
-        .filter(|r| {
-            matches!(
-                r.status,
-                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
-            )
-        })
+        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
         .map(|r| r.bytes)
         .sum();
     (uploaded, skipped, resumed, failed, total_bytes)
@@ -1534,26 +1506,6 @@ fn print_result_line(r: &UploadResult) {
                 r.elapsed_ms as f64 / 1000.0,
             );
         }
-        UploadStatus::UploadedUnverified => {
-            // With --no-verify no md5 was computed, and only the size was
-            // awaited.
-            let expected = if r.md5.is_some() {
-                "expected size and md5"
-            } else {
-                "expected size"
-            };
-            eprintln!(
-                " {} {}/{} ({}, {:.1}s) uploaded, not yet verified: IA has not yet listed the \
-                 assembled file with the {expected}; rerun later to check (skipped once it \
-                 matches, uploaded again if it never does; with --joblog add --no-resume so the \
-                 check runs)",
-                style("!").yellow(),
-                r.identifier,
-                r.key,
-                crate::output::format_bytes(r.bytes),
-                r.elapsed_ms as f64 / 1000.0,
-            );
-        }
         UploadStatus::Skipped => {
             eprintln!(
                 " {} {}/{} (skipped, already exists)",
@@ -1589,11 +1541,7 @@ fn print_result_line(r: &UploadResult) {
 pub(crate) fn write_upload_result(jl: &JoblogWriter, r: &UploadResult) {
     let entry = JoblogEntry::new("upload", &r.identifier, &r.key);
     let entry = match &r.status {
-        // Unverified counts as ok: the parts landed and IA accepted the
-        // completion; a rerun's skip check settles it either way.
-        UploadStatus::Uploaded | UploadStatus::UploadedUnverified => {
-            entry.ok(r.bytes, r.elapsed_ms)
-        }
+        UploadStatus::Uploaded => entry.ok(r.bytes, r.elapsed_ms),
         UploadStatus::Skipped => entry.skipped(),
         UploadStatus::Resumed => return, // don't write resumed files to joblog
         UploadStatus::Failed(msg) => entry.error(msg, r.retries as usize),
@@ -1825,47 +1773,6 @@ mod tests {
             identifier: "test-item".into(),
             key: "file.pdf".into(),
             status: UploadStatus::Uploaded,
-            bytes: 1024,
-            md5: Some("abc123".into()),
-            elapsed_ms: 500,
-            retries: 0,
-        };
-        write_upload_result(&jl, &r);
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"op\":\"upload\""));
-        assert!(content.contains("\"item\":\"test-item\""));
-        assert!(content.contains("\"status\":\"ok\""));
-    }
-
-    #[test]
-    fn summarize_counts_an_unverified_upload_as_uploaded() {
-        let results = vec![UploadResult {
-            identifier: "test-item".into(),
-            key: "big.bin".into(),
-            status: UploadStatus::UploadedUnverified,
-            bytes: 2048,
-            md5: Some("abc".into()),
-            elapsed_ms: 5,
-            retries: 0,
-        }];
-        let (uploaded, skipped, resumed, failed, bytes) = summarize_results(&results);
-        assert_eq!(
-            (uploaded, skipped, resumed, failed, bytes),
-            (1, 0, 0, 0, 2048)
-        );
-    }
-
-    #[test]
-    fn write_upload_result_unverified_is_ok() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.jsonl");
-        let jl = JoblogWriter::open(&path).unwrap();
-
-        let r = UploadResult {
-            identifier: "test-item".into(),
-            key: "file.pdf".into(),
-            status: UploadStatus::UploadedUnverified,
             bytes: 1024,
             md5: Some("abc123".into()),
             elapsed_ms: 500,
