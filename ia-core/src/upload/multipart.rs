@@ -721,7 +721,7 @@ pub async fn upload_file_multipart(
             key: key.into(),
             status: UploadStatus::DryRun,
             bytes: file_size,
-            md5: None,
+            md5: hashes.map(|h| h.md5.clone()),
             elapsed_ms: start.elapsed().as_millis() as u64,
             retries: 0,
         });
@@ -990,10 +990,13 @@ enum Assembled {
 /// IA assembles a multipart object asynchronously; for a while after
 /// completion the file is missing or a placeholder. Between polls the wait
 /// is the standard schedule from `opts` (random, up to a cap that doubles),
-/// and a `429` is honored through its `Retry-After`. A listing with the
-/// right size but a different md5 is a mismatch, not "not yet": the object
-/// on IA is wrong, and the file fails. A metadata fetch error other than a
-/// 429 counts as "not yet"; the deadline bounds it.
+/// never shorter than `retry_min_delay` so a `Retry-After: 0` cannot turn
+/// the poll into a tight loop; a `429`'s `Retry-After` is honored as
+/// given, and one that reaches past the deadline ends the poll without
+/// another request. A listing with the right size but a different md5 is a
+/// mismatch, not "not yet": the object on IA is wrong, and the file fails.
+/// A metadata fetch error other than a 429 counts as "not yet"; the
+/// deadline bounds it.
 async fn verify_assembled(
     client: &IaClient,
     identifier: &str,
@@ -1042,8 +1045,15 @@ async fn verify_assembled(
         if now >= deadline {
             return Ok(Assembled::NotYet);
         }
-        let wait =
-            crate::retry::wait_before_retry(retry_after, &backoff, polls).min(deadline - now);
+        let left = deadline - now;
+        // The server's Retry-After is honored as given: if it reaches past
+        // the deadline there is no poll left to make.
+        if retry_after.is_some_and(|ra| ra >= left) {
+            return Ok(Assembled::NotYet);
+        }
+        let wait = crate::retry::wait_before_retry(retry_after, &backoff, polls)
+            .max(opts.retry_min_delay)
+            .min(left);
         polls = polls.saturating_add(1);
         tokio::time::sleep(wait).await;
     }

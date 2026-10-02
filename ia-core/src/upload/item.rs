@@ -494,7 +494,10 @@ async fn upload_one_file(
     .await
     {
         Ok(result) => {
-            let uploaded = matches!(result.status, UploadStatus::Uploaded);
+            let uploaded = matches!(
+                result.status,
+                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
+            );
             if let Some(ref cb) = on_result {
                 cb(&result);
             }

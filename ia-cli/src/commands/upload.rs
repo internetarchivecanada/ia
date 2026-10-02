@@ -224,8 +224,9 @@ pub struct UploadArgs {
     /// schedule between polls. Listed with the right size but another md5:
     /// the file fails. Not listed in time: "uploaded, not yet verified",
     /// exit 0 with a warning; a rerun skips it once IA lists the md5, or
-    /// uploads it again if IA never does. --no-verify checks the size
-    /// only; --clobber --no-verify also skips the read.
+    /// uploads it again if IA never does (with --joblog the file is logged
+    /// as ok, so add --no-resume for that rerun to check it). --no-verify
+    /// checks the size only; --clobber --no-verify also skips the read.
     #[arg(long)]
     pub multipart: bool,
 
@@ -354,8 +355,9 @@ pub struct ImportArgs {
     /// schedule between polls. Listed with the right size but another md5:
     /// the file fails. Not listed in time: "uploaded, not yet verified",
     /// exit 0 with a warning; a rerun skips it once IA lists the md5, or
-    /// uploads it again if IA never does. --no-verify checks the size
-    /// only; --clobber --no-verify also skips the read.
+    /// uploads it again if IA never does (with --joblog the file is logged
+    /// as ok, so add --no-resume for that rerun to check it). --no-verify
+    /// checks the size only; --clobber --no-verify also skips the read.
     #[arg(long)]
     pub multipart: bool,
 
@@ -1306,7 +1308,12 @@ fn output_results(
 fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, usize, u64) {
     let uploaded = results
         .iter()
-        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
+        .filter(|r| {
+            matches!(
+                r.status,
+                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
+            )
+        })
         .count();
     let skipped = results
         .iter()
@@ -1322,7 +1329,12 @@ fn summarize_results(results: &[UploadResult]) -> (usize, usize, usize, usize, u
         .count();
     let total_bytes: u64 = results
         .iter()
-        .filter(|r| matches!(r.status, UploadStatus::Uploaded))
+        .filter(|r| {
+            matches!(
+                r.status,
+                UploadStatus::Uploaded | UploadStatus::UploadedUnverified
+            )
+        })
         .map(|r| r.bytes)
         .sum();
     (uploaded, skipped, resumed, failed, total_bytes)
@@ -1403,10 +1415,18 @@ fn print_result_line(r: &UploadResult) {
             );
         }
         UploadStatus::UploadedUnverified => {
+            // With --no-verify no md5 was computed, and only the size was
+            // awaited.
+            let expected = if r.md5.is_some() {
+                "expected size and md5"
+            } else {
+                "expected size"
+            };
             eprintln!(
                 " {} {}/{} ({}, {:.1}s) uploaded, not yet verified: IA has not yet listed the \
-                 assembled file with the expected size and md5; rerun later to check (the file \
-                 is skipped once it matches, uploaded again if it never does)",
+                 assembled file with the {expected}; rerun later to check (skipped once it \
+                 matches, uploaded again if it never does; with --joblog add --no-resume so the \
+                 check runs)",
                 style("!").yellow(),
                 r.identifier,
                 r.key,
@@ -1696,6 +1716,24 @@ mod tests {
         assert!(content.contains("\"op\":\"upload\""));
         assert!(content.contains("\"item\":\"test-item\""));
         assert!(content.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn summarize_counts_an_unverified_upload_as_uploaded() {
+        let results = vec![UploadResult {
+            identifier: "test-item".into(),
+            key: "big.bin".into(),
+            status: UploadStatus::UploadedUnverified,
+            bytes: 2048,
+            md5: Some("abc".into()),
+            elapsed_ms: 5,
+            retries: 0,
+        }];
+        let (uploaded, skipped, resumed, failed, bytes) = summarize_results(&results);
+        assert_eq!(
+            (uploaded, skipped, resumed, failed, bytes),
+            (1, 0, 0, 0, 2048)
+        );
     }
 
     #[test]

@@ -2963,3 +2963,198 @@ async fn multipart_no_verify_checks_size_only() {
     assert_eq!(result.md5, None);
     server.verify().await;
 }
+
+// ── Verification corners from the review (#20) ──────────────────────────
+
+/// A 404 (item not yet in the metadata API), then a placeholder, then the
+/// real entry: the acceptance criterion's "placeholder or 404".
+#[tokio::test]
+async fn multipart_polls_through_a_404_before_the_object_appears() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": md5_hex(THIRTY), "source": "original"}]),
+    )
+    .await;
+    let (result, _f) = upload_thirty_via_upload_file(&server, clobber_opts()).await;
+    assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
+    server.verify().await;
+}
+
+/// A 429 on the metadata poll is waited out per its Retry-After.
+#[tokio::test]
+async fn multipart_verification_honors_retry_after_on_the_metadata_api() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_string("slow down"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_metadata_once(
+        &server,
+        serde_json::json!([{"name": "data.bin", "size": "30", "md5": md5_hex(THIRTY), "source": "original"}]),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let (result, _f) = upload_thirty_via_upload_file(&server, clobber_opts()).await;
+    assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "Retry-After: 1 was not waited for ({:?})",
+        started.elapsed()
+    );
+    server.verify().await;
+}
+
+/// A Retry-After longer than the time left is not cut short: no further
+/// poll is sent, the file is reported unverified.
+#[tokio::test]
+async fn multipart_verification_does_not_poll_past_a_retry_after_beyond_the_deadline() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "60")
+                .set_body_string("slow down"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let opts = UploadOpts {
+        verify_timeout: std::time::Duration::from_millis(300),
+        ..clobber_opts()
+    };
+    let started = std::time::Instant::now();
+    let (result, _f) = upload_thirty_via_upload_file(&server, opts).await;
+    assert!(matches!(
+        result.unwrap().status,
+        UploadStatus::UploadedUnverified
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    server.verify().await;
+}
+
+/// `Retry-After: 0` on every poll does not turn the poll into a tight loop:
+/// the wait is floored at the schedule's minimum.
+#[tokio::test]
+async fn multipart_verification_floors_the_wait_between_polls() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .set_body_string("slow down"),
+        )
+        .expect(1..=8)
+        .mount(&server)
+        .await;
+    let opts = UploadOpts {
+        verify_timeout: std::time::Duration::from_millis(300),
+        retry_min_delay: std::time::Duration::from_millis(50),
+        retry_max_delay: std::time::Duration::from_millis(50),
+        ..clobber_opts()
+    };
+    let (result, _f) = upload_thirty_via_upload_file(&server, opts).await;
+    assert!(matches!(
+        result.unwrap().status,
+        UploadStatus::UploadedUnverified
+    ));
+    server.verify().await;
+}
+
+/// A md5 supplied through `--checksums` is used as given: the skip check
+/// finds it listed and skips without reading the file.
+#[tokio::test]
+async fn multipart_uses_a_supplied_checksum_for_the_skip_check() {
+    let server = MockServer::start().await;
+    mount_metadata_with(&server, Some("00000000000000000000000000000001"), 30).await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let f = temp_file(THIRTY);
+    let mut checksums = std::collections::HashMap::new();
+    checksums.insert(
+        "data.bin".to_string(),
+        "00000000000000000000000000000001".to_string(),
+    );
+    let opts = UploadOpts {
+        multipart: true,
+        checksum_file: Some(checksums),
+        ..Default::default()
+    };
+    let result = ia_core::upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Skipped), "{result:?}");
+    assert_eq!(
+        result.md5.as_deref(),
+        Some("00000000000000000000000000000001")
+    );
+    server.verify().await;
+}
+
+/// A multipart dry run reports the md5 like a single-PUT dry run does.
+#[tokio::test]
+async fn multipart_dry_run_reports_the_md5() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(THIRTY);
+    let opts = UploadOpts {
+        multipart: true,
+        checksum: false,
+        dry_run: true,
+        ..Default::default()
+    };
+    let result = ia_core::upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::DryRun));
+    assert_eq!(result.md5.as_deref(), Some(md5_hex(THIRTY).as_str()));
+}
