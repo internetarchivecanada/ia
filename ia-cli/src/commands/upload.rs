@@ -97,7 +97,11 @@ fn build_skip_set(
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
          \n\n  <dim># Ride out a flaky link: 20 attempts per part; waits are random, up to a</dim>\
          \n  <dim># cap that doubles from 1 s to 60 s, or exactly what Retry-After says</dim>\
-         \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\n"
+         \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
+         \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
+         \n  <dim># the parts already there, or discard it</dim>\
+         \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
+         \n  <bold>$ ia upload cleanup my-item big.iso</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -195,6 +199,13 @@ pub struct UploadArgs {
     pub json: bool,
 
     /// Use multipart upload (recommended for files >5 GB)
+    ///
+    /// The file is sent in 100 MiB parts, each retried on its own. A part
+    /// that fails for good (IA refuses it, or its --retries run out) does
+    /// not abort the upload: the parts IA already holds stay there, the
+    /// error names its upload ID, and rerunning the same command resumes
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// discards a kept upload instead.
     #[arg(long)]
     pub multipart: bool,
 
@@ -302,6 +313,13 @@ pub struct ImportArgs {
     pub test_item: bool,
 
     /// Use multipart upload (recommended for files >5 GB)
+    ///
+    /// The file is sent in 100 MiB parts, each retried on its own. A part
+    /// that fails for good (IA refuses it, or its --retries run out) does
+    /// not abort the upload: the parts IA already holds stay there, the
+    /// error names its upload ID, and rerunning the same command resumes
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// discards a kept upload instead.
     #[arg(long)]
     pub multipart: bool,
 

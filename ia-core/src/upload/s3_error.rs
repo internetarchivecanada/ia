@@ -44,17 +44,23 @@ impl S3Error {
     /// RequestTimeout, RequestLimitExceeded, ThrottlingException
     /// Non-retryable: AccessDenied, InvalidAccessKeyId, BadDigest, MissingContentLength, etc.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.code.as_str(),
-            "SlowDown"
-                | "InternalError"
-                | "ServiceUnavailable"
-                | "OperationAborted"
-                | "RequestTimeout"
-                | "RequestLimitExceeded"
-                | "ThrottlingException"
-        )
+        is_retryable_code(&self.code)
     }
+}
+
+/// Whether an S3 error `<Code>` names a transient condition. The same list
+/// [`S3Error::is_retryable`] uses, for callers that have only the code.
+pub(crate) fn is_retryable_code(code: &str) -> bool {
+    matches!(
+        code,
+        "SlowDown"
+            | "InternalError"
+            | "ServiceUnavailable"
+            | "OperationAborted"
+            | "RequestTimeout"
+            | "RequestLimitExceeded"
+            | "ThrottlingException"
+    )
 }
 
 /// Whether an IA-S3 response should be retried.

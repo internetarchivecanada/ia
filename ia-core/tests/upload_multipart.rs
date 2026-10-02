@@ -670,14 +670,11 @@ async fn upload_file_multipart_part_429_retry_honors_retry_after() {
     server.verify().await;
 }
 
-#[tokio::test]
-async fn upload_file_multipart_aborts_on_permanent_error() {
-    let server = MockServer::start().await;
-    let client = test_client(&server);
+// ── A failed part leaves the upload on IA (#18) ─────────────────────────
 
-    let f = temp_file(b"data");
-
-    // List uploads (resume check): empty
+/// Two-part fixture: list_uploads empty, initiate → `mp-keep`, part 1 OK,
+/// and a `DELETE ?uploadId=` mock that must never be called.
+async fn mount_two_part_upload_with_no_abort(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/test-item"))
         .and(query_param("uploads", ""))
@@ -685,34 +682,252 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
             ResponseTemplate::new(200)
                 .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
         )
-        .mount(&server)
+        .mount(server)
         .await;
-
-    // Initiate
     Mock::given(method("POST"))
         .and(path("/test-item/data.bin"))
         .and(query_param("uploads", ""))
         .respond_with(ResponseTemplate::new(200).set_body_string(
-            "<InitiateMultipartUploadResult><UploadId>mp-789</UploadId></InitiateMultipartUploadResult>",
+            "<InitiateMultipartUploadResult><UploadId>mp-keep</UploadId></InitiateMultipartUploadResult>",
         ))
-        .mount(&server)
+        .mount(server)
         .await;
-
-    // Part 1: permanent 403
     Mock::given(method("PUT"))
         .and(path("/test-item/data.bin"))
         .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag1\""))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/test-item/data.bin"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+fn two_parts() -> NamedTempFile {
+    temp_file(&[7u8; 1500])
+}
+
+/// A part refused for good (AccessDenied) does not abort the upload: the
+/// parts IA holds stay, and the error names the upload ID and both ways
+/// forward. (Before #18 this test asserted the abort.)
+#[tokio::test]
+async fn part_permanent_refusal_leaves_the_upload_for_cleanup() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    mount_two_part_upload_with_no_abort(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
         .respond_with(ResponseTemplate::new(403).set_body_string(
             "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
         ))
+        .expect(1)
         .mount(&server)
         .await;
 
-    // Abort (should be called on permanent failure)
-    Mock::given(method("DELETE"))
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        ..Default::default()
+    };
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("AccessDenied on part 2 fails the upload");
+
+    let msg = err.to_string();
+    for needle in [
+        "part 2 of 2",
+        "refused",
+        "AccessDenied",
+        "mp-keep",
+        "kept with 1 part",
+        "rerun",
+        "ia upload cleanup",
+    ] {
+        assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+    }
+    assert!(
+        matches!(
+            err,
+            ia_core::IaError::UploadFailed {
+                status: Some(403),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    server.verify().await;
+}
+
+/// A part whose transient budget runs out does not abort either: the
+/// upload stays for a rerun to resume.
+#[tokio::test]
+async fn part_exhausted_budget_leaves_the_upload_for_resume() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    mount_two_part_upload_with_no_abort(&server).await;
+    Mock::given(method("PUT"))
         .and(path("/test-item/data.bin"))
-        .and(query_param("uploadId", "mp-789"))
-        .respond_with(ResponseTemplate::new(204))
+        .and(query_param("partNumber", "2"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "0")
+                .set_body_string("<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>"),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 2,
+        ..Default::default()
+    };
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a spent budget fails the upload");
+
+    let msg = err.to_string();
+    for needle in [
+        "part 2 of 2",
+        "after 3 attempts",
+        "SlowDown",
+        "mp-keep",
+        "kept with 1 part",
+        "rerun",
+        "ia upload cleanup",
+    ] {
+        assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+    }
+    assert!(
+        matches!(
+            err,
+            ia_core::IaError::UploadFailed {
+                status: Some(503),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    server.verify().await;
+}
+
+/// IA's spam rejection on a part is permanent and fatal for the whole item
+/// (the item loop stops on `SpamDetected`); it must pass through unchanged,
+/// not be reworded as a part failure that asks for a rerun. The upload is
+/// still not aborted.
+#[tokio::test]
+async fn spam_rejection_on_a_part_stays_fatal_and_does_not_abort() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    mount_two_part_upload_with_no_abort(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(
+            "Upload rejected: this item appears to be spam. Please contact info@archive.org.",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = UploadOpts {
+        verify: false,
+        retries: 3,
+        ..Default::default()
+    };
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("spam rejection fails the upload");
+    assert!(
+        matches!(err, ia_core::IaError::SpamDetected { .. }),
+        "got {err:?}"
+    );
+    server.verify().await;
+}
+
+/// The rerun after such a failure finds the upload and its part 1 on IA,
+/// sends only part 2, and completes.
+#[tokio::test]
+async fn rerun_after_part_failure_resumes_from_existing_parts() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult><Upload><Key>data.bin</Key><UploadId>mp-keep</UploadId>\
+             <Initiated>2026-10-02T00:00:00.000Z</Initiated></Upload></ListMultipartUploadsResult>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-keep"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"etag1\"</ETag><Size>1024</Size></Part></ListPartsResult>",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-keep"))
+        .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)
         .await;
@@ -721,7 +936,6 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
         verify: false,
         ..Default::default()
     };
-
     let result = multipart::upload_file_multipart(
         &client,
         "test-item",
@@ -734,9 +948,11 @@ async fn upload_file_multipart_aborts_on_permanent_error() {
         None,
         None,
     )
-    .await;
-
-    assert!(result.is_err());
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 0);
+    server.verify().await;
 }
 
 // ── Resume ──────────────────────────────────────────────────────────────

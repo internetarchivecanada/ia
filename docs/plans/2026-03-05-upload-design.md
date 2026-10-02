@@ -740,6 +740,8 @@ identifier,file,REMOTE_NAME,mediatype,collection,title,description,creator,date,
 
 `--multipart` flag. Off by default to avoid orphaned uploads on IA.
 
+> **2026-10-02 (#18):** a part that fails for good no longer aborts the upload; the parts IA holds are kept for a rerun to resume, and `ia upload cleanup` discards them. See `docs/plans/2026-10-02-upload-part-failure-plan.md`.
+
 ### When to Recommend
 
 - Files >5 GB (re-upload on failure is painful)

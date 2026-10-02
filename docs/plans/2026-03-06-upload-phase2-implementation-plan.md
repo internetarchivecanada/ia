@@ -1653,6 +1653,8 @@ Add upload_file_multipart() that orchestrates the full S3 multipart
 flow: initiate → split into parts → upload each part with retry →
 complete. On permanent part failure, aborts the upload for cleanup.
 
+> **2026-10-02 (#18):** reversed. A part that fails for good leaves the upload on IA for resume or `ia upload cleanup`; see `docs/plans/2026-10-02-upload-part-failure-plan.md`.
+
 Part of #214.
 ```
 
