@@ -2158,9 +2158,15 @@ struct CleanupFixture {
 }
 
 /// Two unfinished uploads on `my-item`: `a.bin` (u1, parts of 10 and 5
-/// bytes) and `b.bin` (u2, one part of 7 bytes). `deletes` says how many
-/// aborts each may receive.
+/// bytes) and `b.bin` (u2, one part of 7 bytes). `deletes_a` and
+/// `deletes_b` say how many aborts each may receive.
 fn cleanup_fixture(deletes_a: u64, deletes_b: u64) -> CleanupFixture {
+    cleanup_fixture_with(deletes_a, deletes_b, false)
+}
+
+/// As [`cleanup_fixture`]; with `b_abort_fails` the abort of `b.bin`
+/// answers 403 AccessDenied.
+fn cleanup_fixture_with(deletes_a: u64, deletes_b: u64, b_abort_fails: bool) -> CleanupFixture {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2200,10 +2206,17 @@ fn cleanup_fixture(deletes_a: u64, deletes_b: u64) -> CleanupFixture {
             .expect(deletes_a)
             .mount(&server)
             .await;
+        let b_response = if b_abort_fails {
+            ResponseTemplate::new(403).set_body_string(
+                "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            )
+        } else {
+            ResponseTemplate::new(204)
+        };
         Mock::given(method("DELETE"))
             .and(path("/my-item/b.bin"))
             .and(query_param("uploadId", "u2"))
-            .respond_with(ResponseTemplate::new(204))
+            .respond_with(b_response)
             .expect(deletes_b)
             .mount(&server)
             .await;
@@ -2239,8 +2252,9 @@ fn cleanup_with_file_lists_that_file_and_aborts_nothing() {
         .stderr(predicate::str::contains("15 B"))
         .stderr(predicate::str::contains("u2").not())
         .stderr(predicate::str::contains("aborted my-item").not())
-        .stderr(predicate::str::contains("Nothing aborted"))
-        .stderr(predicate::str::contains("--abort"));
+        .stderr(predicate::str::contains(
+            "Nothing aborted. Add --abort to abort this upload.",
+        ));
     fx.rt.block_on(fx.server.verify());
 }
 
@@ -2273,7 +2287,8 @@ fn cleanup_abort_and_abort_all_conflict() {
     cleanup_cmd(&fx, &["a.bin", "--abort", "--abort-all"])
         .assert()
         .failure()
-        .code(2);
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -2313,16 +2328,119 @@ fn cleanup_json_listing_has_parts_and_bytes() {
     let fx = cleanup_fixture(0, 0);
     let out = cleanup_cmd(&fx, &["--json"]).output().unwrap();
     assert!(out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let a = v
-        .as_array()
-        .unwrap()
+    // JSONL: one object per upload per line, as `ia list --json` does.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    let a = lines
         .iter()
         .find(|u| u["key"] == "a.bin")
         .expect("a.bin listed");
     assert_eq!(a["upload_id"], "u1");
     assert_eq!(a["parts"], 2);
     assert_eq!(a["bytes"], 15);
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_json_with_no_uploads_prints_nothing() {
+    let fx = cleanup_fixture(0, 0);
+    let out = cleanup_cmd(&fx, &["zzz.bin", "--json"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_file_with_no_uploads_says_so() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["zzz.bin"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "No incomplete uploads of 'zzz.bin'",
+        ));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_json_abort_reports_each_abort_as_a_line() {
+    let fx = cleanup_fixture(1, 0);
+    let out = cleanup_cmd(&fx, &["a.bin", "--abort", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(v["action"], "aborted");
+    assert_eq!(v["upload_id"], "u1");
+    assert_eq!(v["bytes"], 15);
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_abort_all_dry_run_lists_both_and_sends_nothing() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["--abort-all", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("would abort my-item/a.bin"))
+        .stderr(predicate::str::contains("would abort my-item/b.bin"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+#[test]
+fn cleanup_dry_run_alone_lists_and_sends_nothing() {
+    let fx = cleanup_fixture(0, 0);
+    cleanup_cmd(&fx, &["--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Nothing aborted"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+/// When the second of two aborts fails, the first stands and the error
+/// says so; the exit code is 1.
+#[test]
+fn cleanup_abort_all_failing_midway_reports_what_stands() {
+    let fx = cleanup_fixture_with(1, 1, true);
+    cleanup_cmd(&fx, &["--abort-all"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("aborted my-item/a.bin"))
+        .stderr(predicate::str::contains("AccessDenied"))
+        .stderr(predicate::str::contains("earlier aborts stand"));
+    fx.rt.block_on(fx.server.verify());
+}
+
+/// Under --json an error is the JSON error object on stderr, not plain text.
+#[test]
+fn cleanup_json_error_is_a_json_object_on_stderr() {
+    let fx = cleanup_fixture_with(1, 1, true);
+    let out = cleanup_cmd(&fx, &["--abort-all", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr.lines().last().unwrap_or("");
+    let v: serde_json::Value =
+        serde_json::from_str(last).unwrap_or_else(|_| panic!("stderr: {stderr}"));
+    assert!(v["error"]["code"].is_string(), "{stderr}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("AccessDenied"),
+        "{stderr}"
+    );
     fx.rt.block_on(fx.server.verify());
 }
 

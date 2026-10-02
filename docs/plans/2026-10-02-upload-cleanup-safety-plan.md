@@ -32,6 +32,10 @@
 - [x] **Step 2: Run**; two `describe` tests and the help test failed on the missing `--abort`.
 - [x] **Step 3: Implement.** The message, the warning, both `--multipart` doc comments, the help example, the three usage.md quotes, the cleanup section's table and examples, and a dated note in the #18 plan. Commit: `docs(upload): the way to discard a kept multipart upload is cleanup --abort`.
 
+### Review findings (2026-10-02), closed before the PR
+
+No Important findings. Taken: the JSON listing is JSONL (one object per upload per line, no lines when empty), as the "--json Output" design doc requires and as `ia list --json` does, instead of one array; under `--json` an error is the JSON error object on stderr (code from the `IaError` at the root, message with the context chain) and exit 1, as download does; a failed abort midway carries context ("N of M aborted; earlier aborts stand, the rest are left on IA; rerun to continue"); a failed parts listing says which upload; the FILE listing's trailer is specific ("Add --abort to abort this upload"); `--dry-run`'s help says that with neither abort flag it lists; tests for `--abort-all --dry-run`, FILE with no uploads, `--json` with no uploads, `--json --abort`, an abort failing midway, the JSON error shape, `--dry-run` alone, and the conflict error's text; dated notes on the two historical plans and the #19 plan that showed a bare `cleanup ITEM FILE` as the abort. Engineering call kept: one failed parts listing fails the whole command rather than showing an upload with unknown parts. Noted: clap errors exit 2 CLI-wide (pre-existing); the text listing goes to stderr (pre-existing, in the batch-interface audit).
+
 ### Task 3: verification and review
 
 - [ ] `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-cleanup-safety` only after a confirmed merge.

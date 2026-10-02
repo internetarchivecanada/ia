@@ -442,11 +442,12 @@ pub struct CleanupArgs {
     #[arg(long)]
     pub abort_all: bool,
 
-    /// Show what --abort or --abort-all would abort; abort nothing
+    /// Show what --abort or --abort-all would abort; abort nothing (with
+    /// neither, lists)
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Output as JSON (a listing is one array; aborts are one object per line)
+    /// Output as JSONL: one object per upload (listing) or per abort
     #[arg(long)]
     pub json: bool,
 }
@@ -1177,6 +1178,28 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
+    let json = args.json;
+    match run_cleanup_inner(client, args).await {
+        Ok(()) => Ok(()),
+        // Under --json the error is the JSON error object on stderr, not
+        // anyhow's plain text (AGENTS.md, "--json Output"). The code comes
+        // from the IaError at the root; the message keeps the context chain.
+        Err(e) if json => {
+            let code = e
+                .downcast_ref::<ia_core::IaError>()
+                .map(|ia| ia.to_json_error().error.code)
+                .unwrap_or_else(|| "error".to_string());
+            let err_json = serde_json::json!({
+                "error": {"code": code, "message": format!("{e:#}")}
+            });
+            eprintln!("{}", serde_json::to_string(&err_json).unwrap_or_default());
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_cleanup_inner(client: &IaClient, args: CleanupArgs) -> Result<()> {
     let uploads = ia_core::upload::multipart::list_uploads(client, &args.identifier).await?;
 
     // Narrow to one file when asked.
@@ -1186,9 +1209,8 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
     };
 
     if targets.is_empty() {
-        if args.json {
-            println!("[]");
-        } else {
+        // JSONL: nothing to list is no lines.
+        if !args.json {
             match &args.file {
                 Some(file) => eprintln!(
                     "{} No incomplete uploads of '{}' for {}",
@@ -1207,12 +1229,16 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
     }
 
     // What IA holds for each upload: the listing shows it, and an abort
-    // says what it discarded.
+    // says what it discarded. One failed listing fails the command: a
+    // partial answer here would hide the state the user came to see.
     let mut described = Vec::with_capacity(targets.len());
     for u in targets {
         let parts =
             ia_core::upload::multipart::list_parts(client, &args.identifier, &u.key, &u.upload_id)
-                .await?;
+                .await
+                .with_context(|| {
+                    format!("listing the parts of upload {} ({})", u.upload_id, u.key)
+                })?;
         let bytes: u64 = parts.iter().map(|p| p.size).sum();
         described.push((u, parts.len(), bytes));
     }
@@ -1220,19 +1246,16 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
     let aborting = args.abort || args.abort_all;
     if !aborting {
         if args.json {
-            let json: Vec<serde_json::Value> = described
-                .iter()
-                .map(|(u, parts, bytes)| {
-                    serde_json::json!({
-                        "key": u.key,
-                        "upload_id": u.upload_id,
-                        "initiated": u.initiated,
-                        "parts": parts,
-                        "bytes": bytes,
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string(&json)?);
+            for (u, parts, bytes) in &described {
+                let json = serde_json::json!({
+                    "key": u.key,
+                    "upload_id": u.upload_id,
+                    "initiated": u.initiated,
+                    "parts": parts,
+                    "bytes": bytes,
+                });
+                println!("{}", serde_json::to_string(&json)?);
+            }
         } else {
             eprintln!(
                 "{} {} incomplete multipart upload(s) for {}:",
@@ -1250,12 +1273,17 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
                     crate::output::format_bytes(*bytes),
                 );
             }
-            eprintln!("\nNothing aborted. Use --abort with FILE, or --abort-all, to abort.");
+            if args.file.is_some() {
+                eprintln!("\nNothing aborted. Add --abort to abort this upload.");
+            } else {
+                eprintln!("\nNothing aborted. Use --abort with FILE, or --abort-all, to abort.");
+            }
         }
         return Ok(());
     }
 
-    for (u, parts, bytes) in &described {
+    let total = described.len();
+    for (done, (u, parts, bytes)) in described.iter().enumerate() {
         if !args.dry_run {
             ia_core::upload::multipart::abort_upload(
                 client,
@@ -1263,7 +1291,14 @@ async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
                 &u.key,
                 &u.upload_id,
             )
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "aborting {}/{} ({}): {done} of {total} aborted; earlier aborts stand, the \
+                     rest are left on IA; rerun to continue",
+                    args.identifier, u.key, u.upload_id
+                )
+            })?;
         }
         let action = if args.dry_run {
             "would_abort"

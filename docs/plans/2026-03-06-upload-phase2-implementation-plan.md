@@ -2482,3 +2482,5 @@ Closes #214
 Closes #215
 Closes #216
 ```
+
+> **2026-10-02 (#24):** `ia upload cleanup ITEM FILE` lists; aborting needs `--abort` (one file) or `--abort-all`. Examples above that show a bare `cleanup ITEM FILE` as the abort are historical. See `docs/plans/2026-10-02-upload-cleanup-safety-plan.md`.

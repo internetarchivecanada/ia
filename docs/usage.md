@@ -621,8 +621,8 @@ Supports the same options as the bare command: `-m`, `--header`, `--checksums`, 
 | `[FILE]` | Only this file's incomplete uploads (lists them; add `--abort` to abort) |
 | `--abort` | Abort FILE's incomplete upload(s); requires FILE |
 | `--abort-all` | Abort every incomplete upload of the item |
-| `--dry-run` | Show what `--abort` or `--abort-all` would abort; abort nothing |
-| `--json` | Output as JSON: a listing is one array (`key`, `upload_id`, `initiated`, `parts`, `bytes`); each abort is one object per line with `"action": "aborted"` or `"would_abort"` |
+| `--dry-run` | Show what `--abort` or `--abort-all` would abort; abort nothing (with neither, lists) |
+| `--json` | Output as JSONL: one object per upload for a listing (`key`, `upload_id`, `initiated`, `parts`, `bytes`; no lines when there are none), one per abort with `"action": "aborted"` or `"would_abort"`; an error is `{"error": {"code", "message"}}` on stderr |
 
 #### Examples
 

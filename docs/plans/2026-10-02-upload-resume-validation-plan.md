@@ -62,3 +62,5 @@ Second batch (findings 6 to 11): the not-resuming warning now names the upload I
 ### Task 4: docs, verification, review
 
 - [ ] usage.md, help, the phase-2 plan's dated note; `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-resume-validation` only after a confirmed merge.
+
+> **2026-10-02 (#24):** `ia upload cleanup ITEM FILE` lists; aborting needs `--abort` (one file) or `--abort-all`. Examples above that show a bare `cleanup ITEM FILE` as the abort are historical. See `docs/plans/2026-10-02-upload-cleanup-safety-plan.md`.
