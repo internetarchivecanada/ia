@@ -767,18 +767,22 @@ mod tests {
             min_speed: 10 * 1024,
             ..Default::default()
         };
-        let err = upload_file(
-            &client,
-            "test-item",
-            f.path(),
-            "big.bin",
-            &opts,
-            true,
-            true,
-            None,
-            None,
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            upload_file(
+                &client,
+                "test-item",
+                f.path(),
+                "big.bin",
+                &opts,
+                true,
+                true,
+                None,
+                None,
+            ),
         )
         .await
+        .expect("the stalled sends must be judged within a minute")
         .expect_err("a stalled send must fail once the retries are spent");
         assert!(
             matches!(

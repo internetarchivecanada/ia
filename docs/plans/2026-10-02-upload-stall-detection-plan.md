@@ -47,6 +47,14 @@
 
 - [x] `--min-speed` help on both structs and the `--retries` help landed in Task 2 with their tests; this task adds the example (`--multipart --min-speed 1M`, asserted by `upload_help_shows_a_min_speed_example`, written with the example rather than before it: a doc example), the usage.md `--min-speed` row, the `--retries` row's stall clause, and the "Slow and stalled uploads" section. Commit: `docs(upload): --min-speed`.
 
+### Review findings (2026-10-02), closed before the PR
+
+The reviewer verified in hyper 1.9 and hyper-util 0.1.20 source that dropping the request future closes the connection and keeps it out of the pool, that an explicit `Content-Length` wins over chunked for a wrapped stream, and that hyper stops polling the body once the length is out. No blocking defect.
+
+Suggestions, taken: the detector's clock starts at the first body poll, not when the watch is built, so a slow connect and TLS handshake are neither a stall nor part of the window's divisor (with the help's own `--min-speed 1M` example, a 15 s connect on a 1.5 MiB/s link would have read 0.75 MiB/s at the first judgment and cost a 100 MiB re-send); test `the_clock_starts_at_the_first_body_poll`, red first. A stalled part's message carries the attempt count when it exceeds one (a 503 then a stall is "stalled 1 time, after 2 attempts"). The stalling test listener sets a 64 KiB receive buffer so the 16 MiB body cannot be handed over in full whatever the host's socket buffers are, and each stall test is wrapped in a 60 s timeout so the failure mode is a panic, not a 20-minute hang. The help texts and usage.md distinguish the single-PUT message from the multipart part's message, say the clock starts at the first byte, and say the consequence of judging only the send: a server that takes the whole body and never answers hangs until the connection dies; "Multipart part failures" gained the stall example. That unbounded wait is filed as #40 (a response timeout needs a measurement of IA's post-body latency before a default is chosen). A dangling comment in download.rs and the detector's "download stream" doc fixed. AGENTS.md's hermetic rule now allows a raw loopback listener where wiremock cannot produce the behavior.
+
+Noted, no change: `DEFAULT_MIN_SPEED` in `default_ctx` duplicates the `UploadOpts` default, in the same style as `DEFAULT_RETRIES`. Public API breaks for an exhaustive match on `IaError` and for an `UploadOpts` literal without `..Default::default()` are stated in the PR.
+
 ### Task 6: verification and review
 
 - [ ] `just ci`; code-reviewer pass; fix or record findings; PR; squash-merge after checks pass; `scripts/ia-cleanup upload-stall-detection` only after a confirmed merge.

@@ -217,12 +217,15 @@ pub struct UploadArgs {
     /// once a second. Below it, the request is abandoned (the connection is
     /// closed) and sent again at once, spending one of --retries; with
     /// --multipart that is the part, and the parts already on IA stay. When
-    /// the retries are gone the file fails with "upload of <item>/<key>
+    /// the retries are gone, a single PUT fails with "upload of <item>/<key>
     /// stalled N times: ..." (N counts every stall; in --json output the
-    /// file's error message is this text), and a multipart upload is kept
-    /// on IA for a rerun to resume. Only the body send is judged: once the
-    /// last byte is handed to the connection, waiting for IA's answer is
-    /// not a stall.
+    /// file's error message is this text); with --multipart the part's
+    /// message reads "part N of M stalled K times (...)" and the upload is
+    /// kept on IA for a rerun to resume. Only the body send is judged, from
+    /// its first byte (connecting is not counted): once the last byte is
+    /// handed to the connection, waiting for IA's answer is not a stall,
+    /// and nothing bounds that wait: a server that takes the whole body and
+    /// never answers hangs until the connection dies.
     ///
     /// RATE is bytes per second: a plain number, or a number followed by K,
     /// M, or G for powers of 1024 (10K is 10240 bytes per second). 0
@@ -424,12 +427,15 @@ pub struct ImportArgs {
     /// once a second. Below it, the request is abandoned (the connection is
     /// closed) and sent again at once, spending one of --retries; with
     /// --multipart that is the part, and the parts already on IA stay. When
-    /// the retries are gone the file fails with "upload of <item>/<key>
+    /// the retries are gone, a single PUT fails with "upload of <item>/<key>
     /// stalled N times: ..." (N counts every stall; in --json output the
-    /// file's error message is this text), and a multipart upload is kept
-    /// on IA for a rerun to resume. Only the body send is judged: once the
-    /// last byte is handed to the connection, waiting for IA's answer is
-    /// not a stall.
+    /// file's error message is this text); with --multipart the part's
+    /// message reads "part N of M stalled K times (...)" and the upload is
+    /// kept on IA for a rerun to resume. Only the body send is judged, from
+    /// its first byte (connecting is not counted): once the last byte is
+    /// handed to the connection, waiting for IA's answer is not a stall,
+    /// and nothing bounds that wait: a server that takes the whole body and
+    /// never answers hangs until the connection dies.
     ///
     /// RATE is bytes per second: a plain number, or a number followed by K,
     /// M, or G for powers of 1024 (10K is 10240 bytes per second). 0

@@ -11,10 +11,14 @@
 //! [`StallDetector`], and [`watch_send`] runs the request under a
 //! once-a-second ticker that asks the detector. A send judged below the
 //! floor is abandoned: the request future is dropped, which closes the
-//! connection, and the caller retries. Only the body send is judged: once
-//! the last chunk has been handed over, the wait for the server's response
-//! is not a stall (a part PUT's answer legitimately arrives seconds after
-//! the body, while IA hashes it).
+//! connection, and the caller retries. The clock starts at the first body
+//! poll, so a slow connect and TLS handshake are neither a stall nor part
+//! of the window's divisor (a connect that hangs is bounded by the connect
+//! timeout). Only the body send is judged: once the last chunk has been
+//! handed over, the wait for the server's response is not a stall (a part
+//! PUT's answer legitimately arrives seconds after the body, while IA
+//! hashes it), and nothing bounds that wait: a server that takes the whole
+//! body and never answers hangs until the connection dies.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,6 +36,7 @@ use crate::stall::{self, StallDetector};
 /// stream that feeds it and the ticker that asks it.
 #[derive(Debug, Clone)]
 pub(crate) struct BodyWatch {
+    /// Built at the first body poll, so the clock starts there.
     detector: Arc<Mutex<Option<StallDetector>>>,
     /// Set when the body has been handed over in full; from then on the
     /// send is not judged. With a `Content-Length` set, the transport stops
@@ -43,21 +48,24 @@ pub(crate) struct BodyWatch {
     expected: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
     min_speed: u64,
+    window: std::time::Duration,
+    grace: std::time::Duration,
 }
 
 impl BodyWatch {
     /// A watch with the given floor in bytes per second; 0 disables it.
-    /// The clock starts now, so connecting counts toward the grace.
+    /// The clock starts at the first body poll, not now: connecting is not
+    /// judged and does not dilute the window.
     pub(crate) fn new(min_speed: u64) -> Self {
         let (window, grace) = stall::policy();
-        let detector =
-            (min_speed > 0).then(|| StallDetector::new(min_speed, window, grace, Instant::now()));
         Self {
-            detector: Arc::new(Mutex::new(detector)),
+            detector: Arc::new(Mutex::new(None)),
             done: Arc::new(AtomicBool::new(false)),
             expected: Arc::new(AtomicU64::new(u64::MAX)),
             sent: Arc::new(AtomicU64::new(0)),
             min_speed,
+            window,
+            grace,
         }
     }
 
@@ -81,9 +89,13 @@ impl BodyWatch {
     }
 
     fn record(&self, bytes: u64) {
-        if let Ok(mut guard) = self.detector.lock() {
-            if let Some(d) = guard.as_mut() {
-                d.record(Instant::now(), bytes);
+        if self.min_speed > 0 {
+            if let Ok(mut guard) = self.detector.lock() {
+                let now = Instant::now();
+                let d = guard.get_or_insert_with(|| {
+                    StallDetector::new(self.min_speed, self.window, self.grace, now)
+                });
+                d.record(now, bytes);
             }
         }
         let sent = self.sent.fetch_add(bytes, Ordering::SeqCst) + bytes;
@@ -93,6 +105,8 @@ impl BodyWatch {
     }
 
     /// `Some((observed, window_secs))` when the send is below the floor.
+    /// `None` while nothing has been polled yet, within the grace, while
+    /// keeping up, and once the body is done.
     fn check(&self) -> Option<(u64, u64)> {
         if self.done.load(Ordering::SeqCst) {
             return None;
@@ -197,7 +211,13 @@ pub(crate) mod test_support {
     /// counter of accepted connections.
     pub(crate) async fn stalling_listener() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
         use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A small receive buffer, so the client's send blocks after a few
+        // hundred kilobytes whatever the host's socket buffer defaults are;
+        // the 16 MiB body then cannot be handed over in full.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = connections.clone();
@@ -260,15 +280,19 @@ mod tests {
         let watch = BodyWatch::new(10 * 1024);
         let body = watch.wrap(bytes_chunks(big_body()), 16 * 1024 * 1024);
         let started = std::time::Instant::now();
-        let end = watch_send(
-            &watch,
-            client
-                .put(format!("http://{addr}/item/part"))
-                .header("Content-Length", (16 * 1024 * 1024).to_string())
-                .body(reqwest::Body::wrap_stream(body))
-                .send(),
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            watch_send(
+                &watch,
+                client
+                    .put(format!("http://{addr}/item/part"))
+                    .header("Content-Length", (16 * 1024 * 1024).to_string())
+                    .body(reqwest::Body::wrap_stream(body))
+                    .send(),
+            ),
         )
-        .await;
+        .await
+        .expect("the stalled send must be judged within a minute");
         match end {
             SendEnd::Stalled {
                 observed,
@@ -376,6 +400,30 @@ mod tests {
         assert!(
             matches!(end, SendEnd::Done(Ok(_))),
             "a slow response after a finished body is not a stall: {end:?}"
+        );
+    }
+
+    /// The clock starts at the first body poll, not when the watch is
+    /// built: a slow connect and TLS handshake are not a stall, and must not
+    /// sit in the window's divisor either. Past the grace with nothing
+    /// polled yet, there is nothing to judge.
+    #[tokio::test]
+    async fn the_clock_starts_at_the_first_body_poll() {
+        let _policy = shrink_policy();
+        let watch = BodyWatch::new(10 * 1024);
+        let _body = watch.wrap(bytes_chunks(Bytes::from_static(b"x")), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            watch.check().is_none(),
+            "nothing was polled yet, so nothing is judged"
+        );
+        // The first poll starts the clock; the grace runs from here.
+        watch.record(0);
+        assert!(watch.check().is_none(), "within the grace");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(
+            watch.check().is_some(),
+            "past the grace with no bytes: a stall"
         );
     }
 

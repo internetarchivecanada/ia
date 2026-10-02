@@ -340,16 +340,20 @@ mod stall_tests {
         let client = reqwest_middleware::ClientBuilder::new(client).build();
         let body = big_body();
         let url = format!("http://{addr}/item/part.bin?partNumber=1&uploadId=u1");
-        let failure = send_with_retry(&ctx(1), "upload part 1", |watch| {
-            client
-                .put(&url)
-                .header("Content-Length", body.len().to_string())
-                .body(reqwest::Body::wrap_stream(
-                    watch.wrap(bytes_chunks(body.clone()), body.len() as u64),
-                ))
-                .send()
-        })
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            send_with_retry(&ctx(1), "upload part 1", |watch| {
+                client
+                    .put(&url)
+                    .header("Content-Length", body.len().to_string())
+                    .body(reqwest::Body::wrap_stream(
+                        watch.wrap(bytes_chunks(body.clone()), body.len() as u64),
+                    ))
+                    .send()
+            }),
+        )
         .await
+        .expect("the stalled sends must be judged within a minute")
         .expect_err("a stalled send must fail once the retries are spent");
         assert_eq!(failure.attempts, 2);
         assert!(failure.code.is_none());

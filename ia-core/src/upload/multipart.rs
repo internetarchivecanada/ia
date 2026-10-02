@@ -1113,14 +1113,21 @@ impl KeptUpload<'_> {
                 ..
             } => {
                 let kept = self.kept_sentence();
+                // Attempts can exceed stalls when an earlier attempt failed
+                // some other way; say so, as the UploadFailed arm does.
+                let attempts = if failure.attempts > 1 {
+                    format!(", after {} attempts", failure.attempts)
+                } else {
+                    String::new()
+                };
                 return IaError::UploadFailed {
                     identifier: self.identifier.into(),
                     key: self.key.into(),
                     message: format!(
                         "part {} of {} stalled {stalls} {} ({observed_bytes_per_sec} B/s over the \
                          last {window_secs} s is below the --min-speed floor of \
-                         {min_bytes_per_sec} B/s): multipart upload {} {kept}; rerun the same \
-                         command to resume, or discard it with: ia upload cleanup {} {} --abort",
+                         {min_bytes_per_sec} B/s{attempts}): multipart upload {} {kept}; rerun the \
+                         same command to resume, or discard it with: ia upload cleanup {} {} --abort",
                         self.part_num,
                         self.part_count,
                         if stalls == 1 { "time" } else { "times" },
@@ -1616,12 +1623,12 @@ mod tests {
                 stalls: 2,
             }),
             code: None,
-            attempts: 2,
+            attempts: 3,
         };
         let err = kept(2, 3, 1, "f.bin").describe(stalled);
         let msg = err.to_string();
         assert!(
-            msg.contains("part 2 of 3 stalled 2 times (512 B/s over the last 60 s is below the --min-speed floor of 10240 B/s): "),
+            msg.contains("part 2 of 3 stalled 2 times (512 B/s over the last 60 s is below the --min-speed floor of 10240 B/s, after 3 attempts): "),
             "{msg}"
         );
         assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin --abort"), "{msg}");

@@ -72,7 +72,7 @@ mod test_policy {
     }
 }
 
-/// Sliding-window throughput check for one download stream.
+/// Sliding-window throughput check for one stream.
 ///
 /// Bytes are credited to per-second buckets covering the last `window`.
 /// [`check`](Self::check) is `Some` when the stream is older than `grace`

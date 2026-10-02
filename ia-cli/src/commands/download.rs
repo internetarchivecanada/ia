@@ -1277,8 +1277,6 @@ fn print_json_item_result(result: &std::result::Result<ItemDownloadResult, (Stri
 
 #[cfg(test)]
 mod tests {
-    // -- --min-speed parsing (#11) --
-
     use super::*;
     use std::time::Duration;
 
