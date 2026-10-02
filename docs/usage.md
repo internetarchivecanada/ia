@@ -44,7 +44,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--exclude-source <TYPE>` | Exclude by source type |
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
-| `-C, --checksum` | Verify md5 checksums; without it the md5 is never checked (a local file is skipped on size and mtime, a download accepted on size). See "Checksum mismatches" |
+| `-C, --checksum` | Verify md5 checksums; without it the md5 is never checked (a local file is skipped on size and mtime, a download accepted on size; see "Checksum mismatches") |
 | `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
