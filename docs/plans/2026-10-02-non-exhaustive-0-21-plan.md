@@ -9,6 +9,6 @@
 **Release:** the version lives once, in the workspace `Cargo.toml`; `Cargo.lock` follows. Tagging and publishing are the release workflow's, not this PR's.
 
 ## Tasks
-- [ ] Red: `ia --version` prints `0.21.0` (fails at 0.20.1). The attribute's effect is a compile-time contract, pinned by the compiler on every outside site, not by a test; no new crate for compile-fail tests.
-- [ ] Green: version, four attributes, every outside site the compiler names, `Cargo.lock`.
+- [x] Red: `ia --version` prints `0.21.0` (failed at 0.20.1). The attribute's effect is a compile-time contract, pinned by the compiler on every outside site, not by a test; no new crate for compile-fail tests.
+- [x] Green: version, four attributes, every outside site the compiler named (two `UploadOpts` and one `DownloadOpts` built in ia-cli, four `UploadStatus` matches in ia-cli, 80 `UploadOpts` literals in the ia-core integration tests), `Cargo.lock`. Outside the crate a non-exhaustive struct cannot be built by a struct expression even with `..Default::default()`, so every site builds a default and assigns fields. The wildcard arms treat an unknown status as not a success: the joblog records an error (a later run must not skip the file), the summaries count it as failed, the result line prints its Debug form. 1968 tests pass.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup non-exhaustive-0-21` after a confirmed merge.

@@ -20,6 +20,7 @@ pub struct JsonErrorBody {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum IaError {
     #[error("item not found: {0}")]
     NotFound(String),

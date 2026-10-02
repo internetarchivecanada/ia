@@ -113,7 +113,11 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Options for downloading files.
+///
+/// Build one with `..Default::default()`; the struct is `#[non_exhaustive]`,
+/// so fields may be added without a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DownloadOpts {
     /// Destination directory.
     pub destdir: PathBuf,

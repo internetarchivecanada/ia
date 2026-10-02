@@ -38,14 +38,15 @@ async fn upload_item_single_file() {
     fs::write(&f, "hello world").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -88,14 +89,15 @@ async fn upload_item_multiple_files() {
     fs::write(&f2, "file b").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(
@@ -136,14 +138,15 @@ async fn upload_item_expands_directory() {
     fs::write(dir.path().join(".hidden"), "hidden").unwrap(); // should be skipped
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(
@@ -169,14 +172,15 @@ async fn upload_item_expands_directory() {
 async fn upload_item_empty_files_error() {
     let server = MockServer::start().await;
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let err = upload::upload_item(&client, "test-item", &[], &opts, None, None, None, 1, None)
@@ -220,12 +224,13 @@ async fn upload_item_test_item_injects_collection() {
     fs::write(&f, "content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        test_item: true,
-        no_collection_check: true,
-        metadata: vec![("mediatype".into(), "texts".into())],
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.test_item = true;
+        o.no_collection_check = true;
+        o.metadata = vec![("mediatype".into(), "texts".into())];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -254,15 +259,16 @@ async fn upload_item_with_remote_dir() {
     fs::write(&f, "content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        remote_dir: Some("scans".into()),
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.remote_dir = Some("scans".into());
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -284,15 +290,16 @@ async fn upload_item_dry_run() {
     fs::write(&f, "content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        dry_run: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.dry_run = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -315,10 +322,11 @@ async fn upload_item_missing_metadata_error() {
     fs::write(&f, "content").unwrap();
 
     // Has mediatype but missing collection
-    let opts = UploadOpts {
-        verify: false,
-        metadata: vec![("mediatype".into(), "texts".into())],
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.metadata = vec![("mediatype".into(), "texts".into())];
+        o
     };
 
     let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -349,11 +357,12 @@ async fn upload_item_no_collection_check_skips_validation() {
 
     let client = test_client(&server);
     // Missing collection, but no_collection_check=true should skip validation
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        metadata: vec![("mediatype".into(), "texts".into())],
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = vec![("mediatype".into(), "texts".into())];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -382,14 +391,15 @@ async fn upload_item_checks_collection_exists() {
     fs::write(&f, "hello").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: false,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = false;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "nonexistent-collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let err = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -427,14 +437,15 @@ async fn upload_item_collection_check_passes_when_exists() {
     fs::write(&f, "hello").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: false,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = false;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -462,9 +473,10 @@ async fn upload_item_empty_metadata_skips_validation() {
 
     let client = test_client(&server);
     // No metadata at all -- should not error on missing metadata
-    let opts = UploadOpts {
-        verify: false,
-        ..Default::default()
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -495,15 +507,16 @@ async fn upload_item_keep_directories_preserves_path() {
     fs::write(&f, "deep content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        keep_directories: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.keep_directories = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     // Pass the directory so expand_files walks it; keep_directories uses the full path
@@ -555,15 +568,16 @@ async fn upload_item_remote_name_changes_put_path() {
     fs::write(&f, "renamed content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        no_collection_check: true,
-        remote_name: Some("custom.txt".into()),
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.remote_name = Some("custom.txt".into());
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "test_collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)
@@ -594,15 +608,16 @@ async fn upload_item_test_item_replaces_existing_collection() {
     fs::write(&f, "content").unwrap();
 
     let client = test_client(&server);
-    let opts = UploadOpts {
-        verify: false,
-        test_item: true,
-        no_collection_check: true,
-        metadata: vec![
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.test_item = true;
+        o.no_collection_check = true;
+        o.metadata = vec![
             ("mediatype".into(), "texts".into()),
             ("collection".into(), "my-real-collection".into()),
-        ],
-        ..Default::default()
+        ];
+        o
     };
 
     let results = upload::upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None)

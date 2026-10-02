@@ -764,6 +764,10 @@ async fn run_dashboard_and_summarize(
                         ia_core::upload::UploadStatus::DryRun => {
                             total_skipped += 1;
                         }
+                        // #[non_exhaustive]: an unknown status is not a success.
+                        _ => {
+                            total_failed += 1;
+                        }
                     }
                 }
             }

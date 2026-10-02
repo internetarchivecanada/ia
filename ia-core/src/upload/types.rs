@@ -4,7 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Options for upload operations.
+///
+/// Build one with `..Default::default()` or [`UploadOptsBuilder`]; the
+/// struct is `#[non_exhaustive]`, so fields may be added without a
+/// breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UploadOpts {
     /// Metadata key-value pairs to set on the item.
     pub metadata: Vec<(String, String)>,
@@ -270,6 +275,7 @@ pub struct UploadResult {
 /// Upload outcome for a single file.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+#[non_exhaustive]
 pub enum UploadStatus {
     Uploaded,
     Skipped,

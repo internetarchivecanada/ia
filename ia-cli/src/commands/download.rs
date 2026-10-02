@@ -451,16 +451,18 @@ pub async fn run(
         bail!("{msg}");
     }
 
-    let make_opts = |destdir: PathBuf| DownloadOpts {
-        destdir,
-        no_directories: args.no_directories,
-        checksum: args.checksum,
-        retries: args.retries,
-        no_timestamps: args.no_timestamps,
-        dry_run: args.dry_run,
-        filter: filter.clone(),
-        count_views: args.count_views,
-        min_speed: args.min_speed,
+    let make_opts = |destdir: PathBuf| {
+        let mut o = DownloadOpts::default();
+        o.destdir = destdir;
+        o.no_directories = args.no_directories;
+        o.checksum = args.checksum;
+        o.retries = args.retries;
+        o.no_timestamps = args.no_timestamps;
+        o.dry_run = args.dry_run;
+        o.filter = filter.clone();
+        o.count_views = args.count_views;
+        o.min_speed = args.min_speed;
+        o
     };
 
     let opts = make_opts(base_destdir.clone());
