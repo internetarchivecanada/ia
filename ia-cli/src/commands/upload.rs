@@ -105,7 +105,7 @@ fn build_skip_set(
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
-         \n  <bold>$ ia upload cleanup my-item big.iso</bold>\n"
+         \n  <bold>$ ia upload cleanup my-item big.iso --abort</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -210,7 +210,7 @@ pub struct UploadArgs {
     /// that fails for good (IA refuses it, or its --retries run out) does
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is
@@ -262,17 +262,25 @@ pub enum UploadCommand {
     )]
     Template(TemplateArgs),
 
-    /// Clean up incomplete multipart uploads
+    /// List or abort incomplete multipart uploads
     #[command(
-        long_about = "List or abort incomplete multipart uploads for an item. \
-            Use this to clean up uploads that were interrupted or abandoned.",
+        long_about = "List or abort incomplete multipart uploads for an item. Lists by default, \
+            with or without FILE: each unfinished upload with its upload ID, when it started, \
+            and the parts IA holds (count and bytes). Nothing is aborted unless asked: --abort \
+            aborts FILE's upload(s), --abort-all aborts every upload of the item, and --dry-run \
+            shows what either would abort without aborting. There is no interactive prompt. An \
+            abort tells IA to delete every part already uploaded; a rerun of the upload resumes \
+            from those parts instead, so abort only what you mean to discard.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
-             \n  <dim># List all incomplete uploads for an item</dim>\
+             \n  <dim># List all incomplete uploads for an item, with parts and bytes</dim>\
              \n  <bold>$ ia upload cleanup my-item</bold>\
-             \n\n  <dim># Abort a specific file's upload</dim>\
+             \n\n  <dim># List only one file's incomplete uploads (aborts nothing)</dim>\
              \n  <bold>$ ia upload cleanup my-item file.zip</bold>\
-             \n\n  <dim># Abort all incomplete uploads</dim>\
+             \n\n  <dim># Abort one file's incomplete upload</dim>\
+             \n  <bold>$ ia upload cleanup my-item file.zip --abort</bold>\
+             \n\n  <dim># See what --abort-all would discard, then do it</dim>\
+             \n  <bold>$ ia upload cleanup my-item --abort-all --dry-run</bold>\
              \n  <bold>$ ia upload cleanup my-item --abort-all</bold>\n"
         ),
     )]
@@ -341,7 +349,7 @@ pub struct ImportArgs {
     /// that fails for good (IA refuses it, or its --retries run out) does
     /// not abort the upload: the parts IA already holds stay there, the
     /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE'
+    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
     /// discards a kept upload instead. A rerun resumes only when every
     /// part IA holds matches the local file by size and md5 (one read of
     /// the file); otherwise a fresh upload starts and the stale one is
@@ -422,15 +430,24 @@ pub struct CleanupArgs {
     #[arg()]
     pub identifier: String,
 
-    /// Specific file to clean up
+    /// Only this file's incomplete uploads (lists them; add --abort to abort)
     #[arg()]
     pub file: Option<String>,
 
-    /// Abort all incomplete uploads without confirmation
+    /// Abort FILE's incomplete upload(s); requires FILE
+    #[arg(long, requires = "file", conflicts_with = "abort_all")]
+    pub abort: bool,
+
+    /// Abort every incomplete upload of the item
     #[arg(long)]
     pub abort_all: bool,
 
-    /// Output as JSON
+    /// Show what --abort or --abort-all would abort; abort nothing (with
+    /// neither, lists)
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output as JSONL: one object per upload (listing) or per abort
     #[arg(long)]
     pub json: bool,
 }
@@ -1161,85 +1178,175 @@ fn run_template(args: TemplateArgs) -> Result<()> {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 async fn run_cleanup(client: &IaClient, args: CleanupArgs) -> Result<()> {
+    let json = args.json;
+    match run_cleanup_inner(client, args).await {
+        Ok(()) => Ok(()),
+        // Under --json the error is the JSON error object on stderr, not
+        // anyhow's plain text (AGENTS.md, "--json Output"). The code comes
+        // from the IaError at the root; the message keeps the context chain.
+        Err(e) if json => {
+            let code = e
+                .downcast_ref::<ia_core::IaError>()
+                .map(|ia| ia.to_json_error().error.code)
+                .unwrap_or_else(|| "error".to_string());
+            let err_json = serde_json::json!({
+                "error": {"code": code, "message": format!("{e:#}")}
+            });
+            eprintln!("{}", serde_json::to_string(&err_json).unwrap_or_default());
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_cleanup_inner(client: &IaClient, args: CleanupArgs) -> Result<()> {
     let uploads = ia_core::upload::multipart::list_uploads(client, &args.identifier).await?;
 
-    if uploads.is_empty() {
-        if args.json {
-            println!("[]");
-        } else {
-            eprintln!(
-                "{} No incomplete multipart uploads for {}",
-                style("✓").green(),
-                args.identifier,
-            );
-        }
-        return Ok(());
-    }
-
-    // Filter by file if specified
-    let targets: Vec<_> = if let Some(ref file) = args.file {
-        uploads.into_iter().filter(|u| u.key == *file).collect()
-    } else {
-        uploads
+    // Narrow to one file when asked.
+    let targets: Vec<_> = match &args.file {
+        Some(file) => uploads.into_iter().filter(|u| u.key == *file).collect(),
+        None => uploads,
     };
 
     if targets.is_empty() {
-        if args.json {
-            println!("[]");
-        } else {
-            eprintln!(
-                "{} No incomplete uploads matching '{}' for {}",
-                style("✓").green(),
-                args.file.as_deref().unwrap_or(""),
-                args.identifier,
-            );
+        // JSONL: nothing to list is no lines.
+        if !args.json {
+            match &args.file {
+                Some(file) => eprintln!(
+                    "{} No incomplete uploads of '{}' for {}",
+                    style("✓").green(),
+                    file,
+                    args.identifier,
+                ),
+                None => eprintln!(
+                    "{} No incomplete multipart uploads for {}",
+                    style("✓").green(),
+                    args.identifier,
+                ),
+            }
         }
         return Ok(());
     }
 
-    // List mode: no file and no --abort-all → just list
-    if args.file.is_none() && !args.abort_all {
+    // What IA holds for each upload: the listing shows it, and an abort
+    // says what it discarded. One failed listing fails the command: a
+    // partial answer here would hide the state the user came to see.
+    let mut described = Vec::with_capacity(targets.len());
+    for u in targets {
+        let parts =
+            ia_core::upload::multipart::list_parts(client, &args.identifier, &u.key, &u.upload_id)
+                .await
+                .with_context(|| {
+                    format!("listing the parts of upload {} ({})", u.upload_id, u.key)
+                })?;
+        let bytes: u64 = parts.iter().map(|p| p.size).sum();
+        described.push((u, parts.len(), bytes));
+    }
+
+    let aborting = args.abort || args.abort_all;
+    if !aborting {
         if args.json {
-            let json = serde_json::to_string(&targets)?;
-            println!("{json}");
+            for (u, parts, bytes) in &described {
+                let json = serde_json::json!({
+                    "key": u.key,
+                    "upload_id": u.upload_id,
+                    "initiated": u.initiated,
+                    "parts": parts,
+                    "bytes": bytes,
+                });
+                println!("{}", serde_json::to_string(&json)?);
+            }
         } else {
             eprintln!(
                 "{} {} incomplete multipart upload(s) for {}:",
                 style("▸").cyan(),
-                targets.len(),
+                described.len(),
                 args.identifier,
             );
-            for u in &targets {
-                eprintln!("  {} {} (initiated: {})", u.upload_id, u.key, u.initiated,);
+            for (u, parts, bytes) in &described {
+                eprintln!(
+                    "  {} {} (initiated: {}, {}, {})",
+                    u.upload_id,
+                    u.key,
+                    u.initiated,
+                    plural(*parts, "part"),
+                    crate::output::format_bytes(*bytes),
+                );
             }
-            eprintln!("\nUse --abort-all or specify a file to abort.");
+            if args.file.is_some() {
+                eprintln!("\nNothing aborted. Add --abort to abort this upload.");
+            } else {
+                eprintln!("\nNothing aborted. Use --abort with FILE, or --abort-all, to abort.");
+            }
         }
         return Ok(());
     }
 
-    // Abort mode
-    for u in &targets {
-        ia_core::upload::multipart::abort_upload(client, &args.identifier, &u.key, &u.upload_id)
-            .await?;
+    let total = described.len();
+    for (done, (u, parts, bytes)) in described.iter().enumerate() {
+        if !args.dry_run {
+            ia_core::upload::multipart::abort_upload(
+                client,
+                &args.identifier,
+                &u.key,
+                &u.upload_id,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "aborting {}/{} ({}): {done} of {total} aborted; earlier aborts stand, the \
+                     rest are left on IA; rerun to continue",
+                    args.identifier, u.key, u.upload_id
+                )
+            })?;
+        }
+        let action = if args.dry_run {
+            "would_abort"
+        } else {
+            "aborted"
+        };
         if args.json {
             let json = serde_json::json!({
-                "action": "aborted",
+                "action": action,
                 "identifier": args.identifier,
                 "key": u.key,
                 "upload_id": u.upload_id,
+                "parts": parts,
+                "bytes": bytes,
             });
             println!("{}", serde_json::to_string(&json)?);
         } else {
             eprintln!(
-                " {} aborted {}/{}",
-                style("✓").green(),
+                " {} {} {}/{} ({}, {}, {})",
+                if args.dry_run {
+                    style("⊘").dim()
+                } else {
+                    style("✓").green()
+                },
+                if args.dry_run {
+                    "would abort"
+                } else {
+                    "aborted"
+                },
                 args.identifier,
                 u.key,
+                u.upload_id,
+                plural(*parts, "part"),
+                crate::output::format_bytes(*bytes),
             );
         }
     }
 
     Ok(())
+}
+
+/// "1 part" / "2 parts".
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

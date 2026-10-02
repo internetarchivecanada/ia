@@ -917,3 +917,5 @@ Can be developed in parallel with Phase 1 once progress callback API is stable.
 - Metadata schema: https://archive.org/developers/metadata-schema
 - Items documentation: https://archive.org/developers/items.html
 - Error simulation: `curl s3.us.archive.org -H 'x-archive-simulate-error:help'`
+
+> **2026-10-02 (#24):** `ia upload cleanup ITEM FILE` lists; aborting needs `--abort` (one file) or `--abort-all`. Examples above that show a bare `cleanup ITEM FILE` as the abort are historical. See `docs/plans/2026-10-02-upload-cleanup-safety-plan.md`.

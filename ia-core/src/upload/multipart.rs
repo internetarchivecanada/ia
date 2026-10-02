@@ -1076,7 +1076,7 @@ impl KeptUpload<'_> {
     /// a permanent refusal (`AccessDenied`, `InvalidAccessKeyId`,
     /// `BadDigest`, ...) says "refused by IA" and asks the user to fix the
     /// cause before rerunning; a spent budget says how many attempts were
-    /// made. Both carry the upload ID and name `ia upload cleanup`.
+    /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
     /// Only an `UploadFailed` is reworded. Anything else the part request
     /// produced, in practice IA's spam rejection (`SpamDetected`), is fatal
@@ -1123,7 +1123,7 @@ impl KeptUpload<'_> {
             key: self.key.into(),
             message: format!(
                 "{what}: multipart upload {} {kept}; {fix}rerun the same command to resume, \
-                 or discard it with: ia upload cleanup {} {}",
+                 or discard it with: ia upload cleanup {} {} --abort",
                 self.upload_id,
                 self.identifier,
                 shell_word(self.key)
@@ -1228,7 +1228,7 @@ async fn try_resume(
                 key = ctx.key,
                 upload_id = %info.upload_id,
                 "not resuming multipart upload {}: {reason}; it is left on IA, discard it \
-                 with: ia upload cleanup {} {}",
+                 with: ia upload cleanup {} {} --abort",
                 info.upload_id,
                 ctx.identifier,
                 shell_word(ctx.key)
@@ -1497,7 +1497,7 @@ mod tests {
             msg.contains("part 2 of 3 failed after 3 attempts (connection reset by peer): "),
             "{msg}"
         );
-        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin"), "{msg}");
+        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA; rerun the same command to resume, or discard it with: ia upload cleanup item f.bin --abort"), "{msg}");
         assert!(!msg.contains("fix the cause"), "{msg}");
     }
 
@@ -1548,7 +1548,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.ends_with("ia upload cleanup item 'dir/my file.bin'"),
+            msg.ends_with("ia upload cleanup item 'dir/my file.bin' --abort"),
             "{msg}"
         );
         assert!(matches!(
