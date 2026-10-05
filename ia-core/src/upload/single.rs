@@ -199,8 +199,8 @@ pub async fn upload_file(
     let mut stalls: usize = 0;
     let mut unanswered: usize = 0;
     let mut last_was_stall = false;
-    let window_secs = crate::stall::policy().0.as_secs();
-    let response_secs = crate::stall::response_wait().as_secs();
+    let mut window_secs = crate::stall::policy().0.as_secs();
+    let mut response_secs = crate::stall::response_wait().as_secs();
     loop {
         // On retry: after a 503, wait out any Retry-After and then poll
         // check_limit until the rate limit clears; after a stall, re-send
@@ -352,16 +352,21 @@ pub async fn upload_file(
         )
         .await
         {
-            SendEnd::Done(response) => response,
-            dead @ (SendEnd::Stalled { .. } | SendEnd::Unanswered { .. }) => {
+            SendEnd::Done(response) => Ok(response),
+            SendEnd::Stalled { window_secs: w } => {
+                window_secs = w;
+                Err("body send moved no bytes for the whole window")
+            }
+            SendEnd::Unanswered { wait_secs } => {
+                response_secs = wait_secs;
+                unanswered += 1;
+                Err("no answer came within the response wait of the body")
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(what) => {
                 stalls += 1;
-                let what = match dead {
-                    SendEnd::Unanswered { .. } => {
-                        unanswered += 1;
-                        "no answer came within the response wait of the body"
-                    }
-                    _ => "body send moved no bytes for the whole window",
-                };
                 tracing::warn!(
                     identifier,
                     key,

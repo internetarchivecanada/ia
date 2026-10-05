@@ -116,8 +116,10 @@ where
     let mut attempt: u32 = 0;
     let mut stalls: usize = 0;
     let mut unanswered: usize = 0;
-    let window_secs = crate::stall::policy().0.as_secs();
-    let response_secs = crate::stall::response_wait().as_secs();
+    // The window and wait the final error reports; each verdict carries its
+    // own value, these cover the rule that never fired.
+    let mut window_secs = crate::stall::policy().0.as_secs();
+    let mut response_secs = crate::stall::response_wait().as_secs();
     loop {
         attempt += 1;
 
@@ -125,16 +127,21 @@ where
         // connection and gets a full window before it can be judged dead.
         let watch = BodyWatch::new();
         let sent = match watch_send(&watch, send(&watch)).await {
-            SendEnd::Done(result) => result,
-            dead @ (SendEnd::Stalled { .. } | SendEnd::Unanswered { .. }) => {
+            SendEnd::Done(result) => Ok(result),
+            SendEnd::Stalled { window_secs: w } => {
+                window_secs = w;
+                Err("body send moved no bytes for the whole window")
+            }
+            SendEnd::Unanswered { wait_secs } => {
+                response_secs = wait_secs;
+                unanswered += 1;
+                Err("no answer came within the response wait of the body")
+            }
+        };
+        let sent = match sent {
+            Ok(result) => result,
+            Err(what) => {
                 stalls += 1;
-                let what = match dead {
-                    SendEnd::Unanswered { .. } => {
-                        unanswered += 1;
-                        "no answer came within the response wait of the body"
-                    }
-                    _ => "body send moved no bytes for the whole window",
-                };
                 tracing::warn!(
                     identifier = ctx.identifier,
                     key = ctx.key,
