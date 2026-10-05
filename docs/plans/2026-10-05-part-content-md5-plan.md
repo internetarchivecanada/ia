@@ -12,3 +12,9 @@
 - [x] Red (`ia-core/tests/upload_multipart.rs`): `upload_part` sends `Content-MD5` equal to the base64 md5 of the body; through `upload_file` the part carries it by default; with `verify: false` no part PUT carries it. Run: the first two failed, the third passed already (it pins the `--no-verify` case).
 - [x] Green: the header (`upload_part_with_retry` takes `content_md5: bool`; `upload_part` passes true, the part loop `opts.verify`), `base64_encode` crate-visible, the doc comment; `--no-verify` help and usage.md say the header is skipped on parts too; "Completing a multipart upload" says each part is checked on receipt.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup part-content-md5` after a confirmed merge.
+
+## Review (2026-10-05), closed before merge
+
+No Important findings. Verified by the reviewer: the header is the same string the single PUT sends for the same bytes (both test constants recomputed); it is computed once and present on every re-send (the closure is rebuilt per attempt); nothing in reqwest or hyper alters it; the `--no-verify` test genuinely pins the case (a header-carrying part would hit the `expect(0)` mock first); the dated statements in the 2026-10-02 plan that IA returns no ETag stay as a record, corrected by the note appended there.
+
+Recommendation for Jake, not changed here: make `BadDigest` retryable within the existing budget for both paths. On a part the digest is of the exact in-memory bytes streamed, so a `BadDigest` can only be transit corruption or an IA fault, and today's message ("refused by IA (BadDigest ...): fix the cause and rerun") names a cause the user cannot fix. On the single PUT it can also mean the file changed between the md5 read and the send, which a retry will not fix, but the budget bounds that and the final error still names `BadDigest`. One classifier (`s3_error::is_retryable_code`) serves both paths, which argues for one answer.
