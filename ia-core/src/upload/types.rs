@@ -9,6 +9,15 @@ use std::time::Duration;
 /// breaking change. Outside this crate that rules out struct expressions,
 /// `..Default::default()` included: start from [`UploadOpts::default()`]
 /// and assign the fields to change, or use [`UploadOptsBuilder`].
+///
+/// ```compile_fail,E0639
+/// let opts = ia_core::upload::UploadOpts { retries: 3, ..Default::default() };
+/// ```
+///
+/// ```
+/// let mut opts = ia_core::upload::UploadOpts::default();
+/// opts.retries = 3;
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UploadOpts {
@@ -274,6 +283,40 @@ pub struct UploadResult {
 }
 
 /// Upload outcome for a single file.
+///
+/// The enum is `#[non_exhaustive]`: a `match` outside this crate needs a
+/// wildcard arm, and a status it does not know should not be counted as
+/// a success. The first test names every variant with a wildcard and
+/// compiles; the second, without the wildcard, does not, which is the
+/// attribute at work. Add a line to both when adding a variant (see
+/// [`crate::IaError`]).
+///
+/// ```
+/// use ia_core::upload::UploadStatus;
+/// fn is_done(s: &UploadStatus) -> bool {
+///     match s {
+///         UploadStatus::Uploaded => true,
+///         UploadStatus::Skipped => true,
+///         UploadStatus::Resumed => true,
+///         UploadStatus::Failed(_) => false,
+///         UploadStatus::DryRun => false,
+///         _ => false,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0004
+/// use ia_core::upload::UploadStatus;
+/// fn is_done(s: &UploadStatus) -> bool {
+///     match s {
+///         UploadStatus::Uploaded => true,
+///         UploadStatus::Skipped => true,
+///         UploadStatus::Resumed => true,
+///         UploadStatus::Failed(_) => false,
+///         UploadStatus::DryRun => false,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status", content = "detail")]
 #[non_exhaustive]

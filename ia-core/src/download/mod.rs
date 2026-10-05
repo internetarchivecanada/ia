@@ -118,6 +118,15 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// breaking change. Outside this crate that rules out struct expressions,
 /// `..Default::default()` included: start from [`DownloadOpts::default()`]
 /// and assign the fields to change.
+///
+/// ```compile_fail,E0639
+/// let opts = ia_core::download::DownloadOpts { retries: 3, ..Default::default() };
+/// ```
+///
+/// ```
+/// let mut opts = ia_core::download::DownloadOpts::default();
+/// opts.retries = 3;
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DownloadOpts {
@@ -4543,8 +4552,9 @@ mod tests {
         use crate::types::{ItemMetadata, MetadataFields, MetadataValue};
         let _policy = shrink_policy();
         let body = stall_body();
-        // The outer loop's first retry delay is 2 s; a wrongful retry would
-        // connect again within the 3 s quiet period.
+        // The outer loop's first retry wait is random, up to 1 s (the
+        // standard schedule, see crate::retry); a wrongful retry would
+        // connect again well within the 3 s quiet period.
         let (client, server) = spawn_script_server(
             vec![dripping(body.clone(), DRIP), dripping(body.clone(), DRIP)],
             Duration::from_secs(3),

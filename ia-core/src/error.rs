@@ -19,6 +19,121 @@ pub struct JsonErrorBody {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// The error type behind this crate's [`Result`].
+///
+/// The enum is `#[non_exhaustive]`: variants may be added without a
+/// breaking change, so a `match` outside this crate needs a wildcard arm.
+/// The first test below names every variant with a wildcard and compiles,
+/// which proves the list is current; the second names the same variants
+/// without the wildcard and does not compile, which is the attribute at
+/// work. Add a line to both when adding a variant.
+///
+/// ```
+/// use ia_core::IaError;
+/// fn classify(e: &IaError) {
+///     match e {
+///         IaError::NotFound(_) => (),
+///         IaError::Http { .. } => (),
+///         IaError::RateLimited { .. } => (),
+///         IaError::ChecksumMismatch { .. } => (),
+///         IaError::SourceChecksumMismatch { .. } => (),
+///         IaError::DiskFull { .. } => (),
+///         IaError::NoDiskSpace { .. } => (),
+///         IaError::ResumeFailed { .. } => (),
+///         IaError::Config(_) => (),
+///         IaError::Auth(_) => (),
+///         IaError::MetadataWrite { .. } => (),
+///         IaError::NoChanges { .. } => (),
+///         IaError::LlmApi { .. } => (),
+///         IaError::UpdateNoAsset { .. } => (),
+///         IaError::UpdateApiError { .. } => (),
+///         IaError::UpdateVerifyFailed { .. } => (),
+///         IaError::UpdateBelowMinimum { .. } => (),
+///         IaError::UpdateVersionNotFound { .. } => (),
+///         IaError::PathTraversal { .. } => (),
+///         IaError::DownloadTooLarge { .. } => (),
+///         IaError::DownloadSizeMismatch { .. } => (),
+///         IaError::ServerSizeMismatch { .. } => (),
+///         IaError::DownloadStalled { .. } => (),
+///         IaError::UploadStalled { .. } => (),
+///         IaError::UploadFailed { .. } => (),
+///         IaError::SpamDetected { .. } => (),
+///         IaError::CollectionNotFound { .. } => (),
+///         IaError::InvalidIdentifier { .. } => (),
+///         IaError::InvalidArgument(_) => (),
+///         IaError::Csv(_) => (),
+///         IaError::MissingRequiredMetadata { .. } => (),
+///         IaError::CheckLimitFailed { .. } => (),
+///         IaError::FileTooLarge { .. } => (),
+///         IaError::EmptyUpload => (),
+///         IaError::SymlinkSkipped { .. } => (),
+///         IaError::MultipartAborted { .. } => (),
+///         IaError::MultipartIncomplete { .. } => (),
+///         IaError::SchemaFieldNotFound { .. } => (),
+///         IaError::TaskSubmitFailed { .. } => (),
+///         IaError::TaskRerunFailed { .. } => (),
+///         IaError::TaskNotFound { .. } => (),
+///         IaError::TaskTimeout { .. } => (),
+///         IaError::Network(_) => (),
+///         IaError::Io(_) => (),
+///         IaError::Json(_) => (),
+///         _ => (),
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0004
+/// use ia_core::IaError;
+/// fn classify(e: &IaError) {
+///     match e {
+///         IaError::NotFound(_) => (),
+///         IaError::Http { .. } => (),
+///         IaError::RateLimited { .. } => (),
+///         IaError::ChecksumMismatch { .. } => (),
+///         IaError::SourceChecksumMismatch { .. } => (),
+///         IaError::DiskFull { .. } => (),
+///         IaError::NoDiskSpace { .. } => (),
+///         IaError::ResumeFailed { .. } => (),
+///         IaError::Config(_) => (),
+///         IaError::Auth(_) => (),
+///         IaError::MetadataWrite { .. } => (),
+///         IaError::NoChanges { .. } => (),
+///         IaError::LlmApi { .. } => (),
+///         IaError::UpdateNoAsset { .. } => (),
+///         IaError::UpdateApiError { .. } => (),
+///         IaError::UpdateVerifyFailed { .. } => (),
+///         IaError::UpdateBelowMinimum { .. } => (),
+///         IaError::UpdateVersionNotFound { .. } => (),
+///         IaError::PathTraversal { .. } => (),
+///         IaError::DownloadTooLarge { .. } => (),
+///         IaError::DownloadSizeMismatch { .. } => (),
+///         IaError::ServerSizeMismatch { .. } => (),
+///         IaError::DownloadStalled { .. } => (),
+///         IaError::UploadStalled { .. } => (),
+///         IaError::UploadFailed { .. } => (),
+///         IaError::SpamDetected { .. } => (),
+///         IaError::CollectionNotFound { .. } => (),
+///         IaError::InvalidIdentifier { .. } => (),
+///         IaError::InvalidArgument(_) => (),
+///         IaError::Csv(_) => (),
+///         IaError::MissingRequiredMetadata { .. } => (),
+///         IaError::CheckLimitFailed { .. } => (),
+///         IaError::FileTooLarge { .. } => (),
+///         IaError::EmptyUpload => (),
+///         IaError::SymlinkSkipped { .. } => (),
+///         IaError::MultipartAborted { .. } => (),
+///         IaError::MultipartIncomplete { .. } => (),
+///         IaError::SchemaFieldNotFound { .. } => (),
+///         IaError::TaskSubmitFailed { .. } => (),
+///         IaError::TaskRerunFailed { .. } => (),
+///         IaError::TaskNotFound { .. } => (),
+///         IaError::TaskTimeout { .. } => (),
+///         IaError::Network(_) => (),
+///         IaError::Io(_) => (),
+///         IaError::Json(_) => (),
+///     }
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum IaError {
