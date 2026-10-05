@@ -161,7 +161,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub clobber: bool,
 
-    /// Delete local file after verified upload
+    /// Delete the local file once IA has accepted the upload with its md5 (refused with --no-verify)
     #[arg(long)]
     pub delete_after_upload: bool,
 
@@ -315,7 +315,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub clobber: bool,
 
-    /// Delete local file after verified upload
+    /// Delete the local file once IA has accepted the upload with its md5 (refused with --no-verify)
     #[arg(long)]
     pub delete_after_upload: bool,
 

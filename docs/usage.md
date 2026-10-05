@@ -62,7 +62,7 @@ Killing `ia download`, or losing the connection, leaves each unfinished file as 
 
 #### Retries
 
-A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5). The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carried a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. In `--json` output an `http_error` that carried the header shows it as `retry_after`.
+A file whose attempt fails with a retryable error (a dropped connection, a `429`, a `5xx`, a size mismatch that left a resumable `.part`, a checksum mismatch) is tried again up to `--retries` times (default 5), waiting between attempts on the standard schedule, or what the failed response's `Retry-After` header says (see "Retry waits"). In `--json` output an `http_error` that carried the header shows it as `retry_after`.
 
 ```bash
 # Ride out a flaky link: 20 retries per file
@@ -75,13 +75,13 @@ Each file streams to `<name>.part` and is renamed into place only when the numbe
 
 If the server answers a `Range` request with a `Content-Range` total that differs from the metadata size, nothing from that response is written and the file fails with `server reports N bytes for <name> but item metadata says M bytes`. Retrying cannot fix that, so the command moves on to the next file.
 
-If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree and the `.part` file is exactly that long, it already holds the whole file: nothing more is downloaded, the md5 is compared when `--checksum` is on, and the `.part` file is renamed into place. When the two agree but the `.part` file is longer, it is deleted and the file is reported as `download resume failed for <name>: the server answered 416 to a resume from byte M of its N-byte copy; the .part file is longer than the file, so the .part file was removed` (`--json` code `resume_failed`), which is retried from the beginning.
+If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree and the `.part` file is exactly that long, it already holds the whole file: nothing more is downloaded, the md5 is compared when `--checksum` is on, and the `.part` file is renamed into place. When the two agree but the `.part` file is longer, it is deleted and the file is reported as `download resume failed for <name>: the server answered 416 to a resume from byte M of its N-byte copy; the .part file is longer than the file, so the .part file was removed` (in `--json` output the error code is `download_failed` and this text is the message), which is retried from the beginning.
 
 Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final. The one exception is a 416 on a resume: with no metadata size to compare against, the server's length is taken as the file's, so the `.part` file is removed and the download restarts, even when the `.part` file is already that long; the message then says the item metadata has no size that can confirm it.
 
 #### Slow and stalled downloads
 
-A connection that drops is resumed: the bytes already in the `.part` file stay, and the file is re-requested with a `Range` header from that offset. A connection that keeps sending bytes too slowly gets the same treatment. Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
+A connection that keeps sending bytes too slowly is treated like one that dropped (the re-request rule is at the end of this section). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
@@ -153,7 +153,7 @@ ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
-Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting what the server's `Retry-After` header says (seconds or an HTTP date, as given) or else a random wait up to a cap that doubles from 1 s to 60 s; past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
+Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting as the standard schedule or the server's `Retry-After` header says (see "Retry waits"); past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
 
 #### Shared flags (all backends)
 
@@ -362,7 +362,7 @@ ia metadata --itemlist items.txt -m "subject:archived"
 
 #### `ia metadata export`
 
-Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc.
+Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2), and grows by one after as many consecutive successes as it currently allows, up to 200; `--jobs N` pins it.
 
 | Flag | Description |
 |------|-------------|
@@ -554,7 +554,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--keep-directories` | Preserve relative path structure |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
-| `--delete-after-upload` | Delete local file after verified upload |
+| `--delete-after-upload` | Delete the local file once IA has accepted the upload with its md5 (refused with `--no-verify`) |
 | `--no-verify` | Skip the Content-MD5 header (on the single PUT, and on each part with `--multipart`) |
 | `--no-derive` | Skip derivative generation |
 | `--no-backup` | Don't keep old file versions |
@@ -571,7 +571,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 
 #### Retries
 
-Every IA-S3 request in an upload (the single PUT, or each multipart request: initiate, part, complete, abort, listings) gets `--retries` attempts after the first (default 10). Transient failures retry: connect errors, timeouts, resets, 5xx responses, `429`, IA's `503 SlowDown`, and `BadDigest` (IA's md5 of the body it received differs from the `Content-MD5` sent, which over https means a body IA did not receive whole, so the body is sent again); refusals such as `AccessDenied` do not. The wait before each retry is random, up to a cap that doubles from 1 s to 60 s (full jitter, so retries from many clients do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` re-sends at once. After a `503` on the single PUT, the upload also polls IA's `check_limit` endpoint on the same schedule until the rate limit clears, up to `--retries` polls.
+Every IA-S3 request in an upload (the single PUT, or each multipart request: initiate, part, complete, abort, listings) gets `--retries` attempts after the first (default 10). Transient failures retry: connect errors, timeouts, resets, 5xx responses, `429`, IA's `503 SlowDown`, and `BadDigest` (IA's md5 of the body it received differs from the `Content-MD5` sent, which over https means a body IA did not receive whole, so the body is sent again); refusals such as `AccessDenied` do not. The wait before each retry is the standard schedule's, or what the failed response's `Retry-After` header says (see "Retry waits"). After a `503` on the single PUT, the upload also polls IA's `check_limit` endpoint on the same schedule until the rate limit clears, up to `--retries` polls.
 
 ```bash
 # Ride out a flaky link: 20 attempts per part
@@ -671,7 +671,7 @@ ia upload my-item ./files/ --dashboard
 
 #### Resuming uploads
 
-Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished, so the same command can be rerun after an interruption; `--no-resume` turns that off.
+Two things can resume, and they are different. A plain upload sends each file in one PUT: if it is interrupted, the rerun sends that file again from byte 0 (the skip check spares files the item already lists with the same md5). With `--multipart`, the rerun resumes a file from the parts IA already holds, after checking them against the local file (see "Resuming a multipart upload" above). On top of either, `--joblog` skips whole files a previous run finished, so the same command can be rerun after an interruption; `--no-resume` turns that off. A file the joblog skips is reported as resumed: `(resumed, already uploaded)` on the console, `"status": "resumed"` in `--json`, and its own count in the summary line; it is not written to the joblog again.
 
 ```sh
 # First run — uploads all files, logs results
@@ -1046,7 +1046,7 @@ curl -H "$(ia config print-auth)" https://s3.us.archive.org/...
 
 Check for updates, list available versions, or install a specific version. This command is only available in standalone release builds (feature-gated behind `self-update`). If you installed via `cargo install`, use cargo to update instead.
 
-Requests to GitHub's release API are retried up to three times on a `5xx`, a `429` or a connection failure. The wait before each retry is random, up to a cap that doubles from 1 s to 30 s; a `Retry-After` header on the failed response sets the wait instead, as given.
+Requests to GitHub's release API are retried up to three times on a `5xx`, a `429` or a connection failure, on the standard schedule with its cap at 30 s instead of 60 s (see "Retry waits").
 
 ```sh
 ia update [OPTIONS]
@@ -1096,7 +1096,7 @@ ia update install 0.5.1
 
 AI tooling for Internet Archive metadata. **Experimental** — only available in builds with the `alpha` feature.
 
-LLM requests that fail with a `429`, a `5xx` or a connection failure are retried up to five times. The wait before each retry is random, up to a cap that doubles from 1 s to 60 s; a `Retry-After` header on the failed response (seconds or an HTTP date) sets the wait instead, as given.
+LLM requests that fail with a `429`, a `5xx` or a connection failure are retried up to five times on the standard schedule (see "Retry waits").
 
 ```sh
 ia ai qa <IDENTIFIER>... [OPTIONS]
@@ -1211,7 +1211,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (omit for adaptive concurrency; commands without it use 8) |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
@@ -1238,6 +1238,12 @@ ia --config-file ~/my-ia.ini download nasa
 ```
 
 ## Advanced features
+
+### Retry waits
+
+The retries that answer a failed request wait on one schedule: the per-file download retries, every IA-S3 request in an upload, a search page answered with `429`, the HTTP layer's own retries of a `5xx`, the LLM client, and the self-updater. The wait is random, up to a cap that doubles with each attempt from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. `ia update` is on the schedule with its cap at 30 s. How many retries each command makes, and what it retries, is in that command's section.
+
+Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit` and `ia metadata` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`).
 
 ### Job logging
 

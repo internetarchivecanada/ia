@@ -35,7 +35,8 @@ pub struct UploadOpts {
     pub checksum: bool,
     /// Pre-computed MD5 checksums keyed by filename.
     pub checksum_file: Option<HashMap<String, String>>,
-    /// Delete local file after verified upload.
+    /// Delete the local file once IA has accepted the upload. The library
+    /// does not gate this on `verify`; the CLI refuses the pair.
     pub delete_after_upload: bool,
     /// Skip derivative generation (x-archive-queue-derive: 0 on all files).
     pub no_derive: bool,
