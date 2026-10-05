@@ -444,14 +444,15 @@ pub async fn upload_file(
                         }
                     }
 
-                    // Rate limited: retry with check_limit polling
+                    // Rate limited: retry with check_limit polling. A spent
+                    // budget counts attempts, as every other branch does.
                     if retries >= opts.retries {
                         return Err(IaError::UploadFailed {
                             identifier: identifier.to_string(),
                             key: key.to_string(),
-                            message: format!(
-                                "503 after {retries} retries: {}",
-                                strip_xml(&body_text)
+                            message: super::retry::describe_attempts(
+                                &format!("HTTP 503: {}", strip_xml(&body_text)),
+                                retries + 1,
                             ),
                             status: Some(503),
                         });

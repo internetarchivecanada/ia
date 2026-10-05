@@ -32,9 +32,13 @@ PR #49 gave the single PUT's spent budget on an S3 error the
 "(after N attempts)" suffix through `describe_attempts`. The transport
 branch (a reset, a connection closed before the response) still returns
 the bare error chain (single.rs:507-512). The part path says "failed after
-N attempts" for the same failure.
+N attempts" for the same failure. The reviewer added the third branch:
+the spent 503 budget said "503 after N retries", counting retries where
+every other message counts attempts.
 
-Fix: `describe_attempts(&full_message, retries + 1)`.
+Fix: `describe_attempts(&full_message, retries + 1)` on the transport
+branch; `describe_attempts("HTTP 503: <body>", retries + 1)` on the 503
+branch. `upload_503_retries_exhausted` now pins "after 3 attempts".
 
 Test: `upload_exhausted_transport_error_names_the_attempt_count`: a
 loopback listener that accepts each connection and closes it, `retries =
@@ -60,4 +64,13 @@ ia-cli/tests/cli.rs, on a fixture listing two uploads of one key.
 
 ## Review record
 
-Filled in after the code-reviewer pass.
+Code-reviewer pass 2026-10-05: no Important or Minor findings. Verified
+the one caller of the poll, that no other `WaitingRateLimit` event has an
+empty key, that `retries + 1` is the attempt count on every branch, that
+the loopback test is hermetic, deterministic (the listener reads before it
+closes; hyper's client does not wait for a 100 Continue; each attempt
+dials fresh, so three accepts) and bounded, and that no doc or help quotes
+the changed texts. Nits, all taken: the listener's accepted counter was a
+tautology and a shortfall would have hung the join, so the join is now
+under a 5 s timeout; the 503 branch's "after N retries" wording (above);
+this record.

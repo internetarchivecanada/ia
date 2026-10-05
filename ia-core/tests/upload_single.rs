@@ -1252,6 +1252,10 @@ async fn upload_503_retries_exhausted() {
         err.to_string().contains("503"),
         "expected error to contain '503', got: {err}"
     );
+    assert!(
+        err.to_string().contains("after 3 attempts"),
+        "the spent 503 budget must count attempts like every other branch: {err}"
+    );
 }
 
 // -- no_auto_make_bucket omits header --
@@ -2013,16 +2017,14 @@ async fn upload_exhausted_transport_error_names_the_attempt_count() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
-        let mut accepted = 0usize;
-        // Three attempts: the first try and two retries.
+        // Three attempts: the first try and two retries. Fewer would leave
+        // this task waiting on accept, so the caller bounds the join.
         for _ in 0..3 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf).await;
             drop(stream);
-            accepted += 1;
         }
-        accepted
     });
 
     let mut config = IaConfig::default();
@@ -2051,5 +2053,8 @@ async fn upload_exhausted_transport_error_names_the_attempt_count() {
         msg.contains("after 3 attempts"),
         "the spent transport budget must name the attempt count: {msg}"
     );
-    assert_eq!(server.await.unwrap(), 3, "one connection per attempt");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("one connection per attempt: the listener saw fewer than three")
+        .unwrap();
 }
