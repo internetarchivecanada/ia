@@ -194,9 +194,13 @@ pub async fn upload_file(
     let mut retries = 0u32;
     let mut last_was_503 = false;
     let mut retry_after: Option<std::time::Duration> = None;
-    // Stalled sends (#38): re-sent at once, counted for the final error.
+    // Stalled sends (#38) and unanswered bodies (#40): re-sent at once,
+    // counted for the final error.
     let mut stalls: usize = 0;
+    let mut unanswered: usize = 0;
     let mut last_was_stall = false;
+    let mut window_secs = crate::stall::policy().0.as_secs();
+    let mut response_secs = crate::stall::response_wait().as_secs();
     loop {
         // On retry: after a 503, wait out any Retry-After and then poll
         // check_limit until the rate limit clears; after a stall, re-send
@@ -348,15 +352,28 @@ pub async fn upload_file(
         )
         .await
         {
-            SendEnd::Done(response) => response,
-            SendEnd::Stalled { window_secs } => {
+            SendEnd::Done(response) => Ok(response),
+            SendEnd::Stalled { window_secs: w } => {
+                window_secs = w;
+                Err("body send moved no bytes for the whole window")
+            }
+            SendEnd::Unanswered { wait_secs } => {
+                response_secs = wait_secs;
+                unanswered += 1;
+                Err("no answer came within the response wait after the body was sent")
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(what) => {
                 stalls += 1;
                 tracing::warn!(
                     identifier,
                     key,
                     retry = retries + 1,
                     window_secs,
-                    "body send moved no bytes for the whole window, {}",
+                    response_secs,
+                    "{what}, {}",
                     if retries < opts.retries {
                         "re-sending"
                     } else {
@@ -384,6 +401,8 @@ pub async fn upload_file(
                     key: key.to_string(),
                     window_secs,
                     stalls,
+                    response_secs,
+                    unanswered,
                 });
             }
         };
@@ -741,7 +760,9 @@ mod tests {
 
     // -- Stall detection on the body send (#38) --
 
-    use crate::upload::stall_watch::test_support::{shrink_policy, stalling_listener};
+    use crate::upload::stall_watch::test_support::{
+        shrink_policy, silent_listener, stalling_listener,
+    };
 
     fn stalling_client(addr: std::net::SocketAddr) -> crate::IaClient {
         let mut config = crate::IaConfig::default();
@@ -801,6 +822,60 @@ mod tests {
                 IaError::UploadStalled {
                     stalls: 2,
                     window_secs: 2,
+                    unanswered: 0,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A single-file PUT the server reads in full and never answers is
+    /// abandoned after the response wait and re-sent; when the retries are
+    /// spent the file fails as stalled, every stall an unanswered body (#40).
+    #[tokio::test]
+    async fn unanswered_single_put_is_retried_then_fails_as_stalled() {
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = stalling_client(addr);
+        let f = {
+            use std::io::Write;
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(&[9u8; 200 * 1024]).unwrap();
+            f.flush().unwrap();
+            f
+        };
+        let opts = UploadOpts {
+            verify: false,
+            checksum: false,
+            retries: 1,
+            ..Default::default()
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            upload_file(
+                &client,
+                "test-item",
+                f.path(),
+                "small.bin",
+                &opts,
+                true,
+                true,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the unanswered sends must be judged within the wait")
+        .expect_err("an unanswered body must fail once the retries are spent");
+        assert!(
+            matches!(
+                err,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 2,
+                    response_secs: 4,
                     ..
                 }
             ),

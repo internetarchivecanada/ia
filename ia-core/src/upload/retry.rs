@@ -96,7 +96,8 @@ impl From<S3Failure> for IaError {
 /// with a body worth watching wraps its stream with it, the others ignore
 /// it.
 ///
-/// A body send that moves no bytes for a minute (see [`BodyWatch`]) is
+/// A body send that moves no bytes for a minute, or a body handed over in
+/// full that gets no answer for two minutes (see [`BodyWatch`]), is
 /// abandoned and re-sent at once while the budget lasts; past it the
 /// failure is [`IaError::UploadStalled`].
 ///
@@ -114,6 +115,11 @@ where
 {
     let mut attempt: u32 = 0;
     let mut stalls: usize = 0;
+    let mut unanswered: usize = 0;
+    // The window and wait the final error reports; each verdict carries its
+    // own value, these cover the rule that never fired.
+    let mut window_secs = crate::stall::policy().0.as_secs();
+    let mut response_secs = crate::stall::response_wait().as_secs();
     loop {
         attempt += 1;
 
@@ -121,15 +127,28 @@ where
         // connection and gets a full window before it can be judged dead.
         let watch = BodyWatch::new();
         let sent = match watch_send(&watch, send(&watch)).await {
-            SendEnd::Done(result) => result,
-            SendEnd::Stalled { window_secs } => {
+            SendEnd::Done(result) => Ok(result),
+            SendEnd::Stalled { window_secs: w } => {
+                window_secs = w;
+                Err("body send moved no bytes for the whole window")
+            }
+            SendEnd::Unanswered { wait_secs } => {
+                response_secs = wait_secs;
+                unanswered += 1;
+                Err("no answer came within the response wait after the body was sent")
+            }
+        };
+        let sent = match sent {
+            Ok(result) => result,
+            Err(what) => {
                 stalls += 1;
                 tracing::warn!(
                     identifier = ctx.identifier,
                     key = ctx.key,
                     attempt,
                     window_secs,
-                    "body send moved no bytes for the whole window, {}",
+                    response_secs,
+                    "{what}, {}",
                     if attempt <= ctx.retries {
                         "re-sending"
                     } else {
@@ -147,6 +166,8 @@ where
                         key: ctx.key.into(),
                         window_secs,
                         stalls,
+                        response_secs,
+                        unanswered,
                     }),
                     code: None,
                     attempts: attempt,
@@ -293,7 +314,9 @@ fn report_backoff(ctx: &S3RetryCtx<'_>, status: UploadProgressStatus) {
 mod stall_tests {
     use super::*;
     use crate::upload::stall_watch::bytes_chunks;
-    use crate::upload::stall_watch::test_support::{big_body, shrink_policy, stalling_listener};
+    use crate::upload::stall_watch::test_support::{
+        big_body, shrink_policy, silent_listener, stalling_listener,
+    };
 
     fn ctx<'a>(retries: u32) -> S3RetryCtx<'a> {
         S3RetryCtx {
@@ -351,6 +374,58 @@ mod stall_tests {
                 IaError::UploadStalled {
                     stalls: 2,
                     window_secs: 2,
+                    unanswered: 0,
+                    ..
+                }
+            ),
+            "got {:?}",
+            failure.error
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A part PUT the server reads in full and never answers is abandoned
+    /// after the response wait and re-sent; when the budget is spent the
+    /// failure is UploadStalled with every stall an unanswered body, and
+    /// the peer saw one connection per attempt (#40).
+    #[tokio::test]
+    async fn unanswered_part_is_retried_then_fails_as_stalled() {
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = crate::client::configure_transport(
+            reqwest::Client::builder(),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .build()
+        .unwrap();
+        let client = reqwest_middleware::ClientBuilder::new(client).build();
+        let body = bytes::Bytes::from(vec![3u8; 200 * 1024]);
+        let url = format!("http://{addr}/item/part.bin?partNumber=1&uploadId=u1");
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send_with_retry(&ctx(1), "upload part 1", |watch| {
+                client
+                    .put(&url)
+                    .header("Content-Length", body.len().to_string())
+                    .body(reqwest::Body::wrap_stream(
+                        watch.wrap(bytes_chunks(body.clone()), body.len() as u64),
+                    ))
+                    .send()
+            }),
+        )
+        .await
+        .expect("the unanswered sends must be judged within the wait")
+        .expect_err("an unanswered body must fail once the retries are spent");
+        assert_eq!(failure.attempts, 2);
+        assert!(failure.code.is_none());
+        assert!(
+            matches!(
+                *failure.error,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 2,
+                    response_secs: 4,
                     ..
                 }
             ),
