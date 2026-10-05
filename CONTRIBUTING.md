@@ -124,17 +124,16 @@ Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
 This bumps the workspace version, commits, tags, and pushes. The GitHub Actions
 release workflow then builds binaries and creates the GitHub Release.
 
-The three binaries are built from the dependency cache that every push to main
-keeps warm (the `Release build` job in `ci.yml` runs the same builds, from the
-same workflow file, under the same cache key). The build starts when the tag
-is pushed and does not wait for the release workflow's own check and test
-jobs. Those still run on every tag, but a failing macOS or Windows test no
-longer stops the release; main's CI tests on Linux only. Let the commit's CI
-run on main finish before tagging, so the cache it keeps is the one the
-release restores. A release builds cold when the stable toolchain has moved
-(the rustc version is in the cache key) or when nothing has touched the cache
-for seven days (GitHub evicts it); a dependency change restores the rest of
-the cache and rebuilds only what changed.
+The release workflow builds the three binaries and runs the checks and the
+tests on ubuntu, macOS and Windows at the same time; the release is published
+only when all of them pass. Builds and tests restore the dependency caches
+that every push to main keeps warm (the `Release build` and `Release platform
+tests` jobs in `ci.yml` run the same workflow files under the same cache
+keys). Let the commit's CI run on main finish before tagging, so the caches
+it keeps are the ones the release restores. A release builds cold when the
+stable toolchain has moved (the rustc version is in the cache key) or when
+nothing has touched a cache for seven days (GitHub evicts it); a dependency
+change restores the rest of the cache and rebuilds only what changed.
 
 To preview without making changes:
 
