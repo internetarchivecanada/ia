@@ -9,7 +9,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Run CI checks first — release only proceeds if all pass
+  # The checks and tests run on every tag for the record. They gate neither
+  # the build nor the release: the Linux checks run on main for the same
+  # commit, and the macOS and Windows tests run only here. Their caches are
+  # not saved: a cache saved under a tag ref is never read again.
   check:
     name: CI Check
     runs-on: ubuntu-latest
@@ -19,6 +22,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p ia-core -p ia-cli -- -D warnings
       - run: cargo doc --no-deps -p ia-core -p ia-cli
@@ -37,45 +42,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
+          save-if: false
       - run: cargo test -p ia-core -p ia-cli
 
+  # The three release builds, restored from the cache that every push to main
+  # saves under the same key (the "Release build" job in ci.yml).
   build:
-    name: Build (${{ matrix.target }})
-    needs: [check, test]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            binary: ia-cli
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            binary: ia-cli
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            binary: ia-cli.exe
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Build release binary
-        run: cargo build -p ia-cli --release --target ${{ matrix.target }} --features self-update
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ia-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+    name: Build
+    uses: ./.github/workflows/build.yml
 
   release:
     name: Release
