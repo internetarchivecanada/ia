@@ -555,7 +555,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
 | `--delete-after-upload` | Delete local file after verified upload |
-| `--no-verify` | Skip Content-MD5 verification |
+| `--no-verify` | Skip the Content-MD5 header (on the single PUT, and on each part with `--multipart`) |
 | `--no-derive` | Skip derivative generation |
 | `--no-backup` | Don't keep old file versions |
 | `--no-auto-make-bucket` | Error if item doesn't already exist |
@@ -588,7 +588,7 @@ Before sending any part, `--multipart` asks IA for unfinished multipart uploads 
 
 #### Completing a multipart upload
 
-The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). Each part's md5 is sent to IA in the completion request, and IA compares it with the part it holds before accepting the completion. An accepted completion is the upload: the file is reported `uploaded`, `--delete-after-upload` deletes the local file then, and nothing is polled afterwards. IA assembles the object in the background, so the file may take a minute to appear in the item's listing. The result's `md5` is the local md5, as for a single PUT.
+The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). Each part is sent with `Content-MD5`, as a single PUT is, so a part whose bytes arrive changed is refused on receipt (`BadDigest`); `--no-verify` skips the header on parts too. Each part's md5 is also sent to IA in the completion request, and IA compares it with the part it holds before accepting the completion. An accepted completion is the upload: the file is reported `uploaded`, `--delete-after-upload` deletes the local file then, and nothing is polled afterwards. IA assembles the object in the background, so the file may take a minute to appear in the item's listing. The result's `md5` is the local md5, as for a single PUT.
 
 #### Multipart part failures
 

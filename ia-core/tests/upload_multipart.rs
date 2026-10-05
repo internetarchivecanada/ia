@@ -5,7 +5,7 @@ use ia_core::upload::{UploadOpts, UploadStatus};
 use ia_core::{IaClient, IaConfig};
 use std::io::Write;
 use tempfile::NamedTempFile;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Helper to create a temp file with given content.
@@ -2936,4 +2936,78 @@ async fn multipart_dry_run_reports_the_md5() {
     .unwrap();
     assert!(matches!(result.status, UploadStatus::DryRun));
     assert_eq!(result.md5.as_deref(), Some(md5_hex(THIRTY).as_str()));
+}
+
+// ── Content-MD5 on part PUTs ─────────────────────────────────────────────
+//
+// IA checks Content-MD5 on a part PUT (a wrong one gets 400 BadDigest), so
+// every part carries the base64 of its md5 unless verify is off, as the
+// single PUT does.
+
+/// The header is the base64 of the body's md5 ("hello world" →
+/// 5eb63bbbe01eeed093cb22bb8f5acdc3 → XrY7u+Ae7tCTyyK7j1rNww==).
+#[tokio::test]
+async fn upload_part_sends_content_md5() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.zip"))
+        .and(query_param("partNumber", "1"))
+        .and(header("Content-MD5", "XrY7u+Ae7tCTyyK7j1rNww=="))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    multipart::upload_part(
+        &client,
+        "test-item",
+        "file.zip",
+        "upload-123",
+        1,
+        b"hello world".to_vec(),
+    )
+    .await
+    .expect("the PUT with Content-MD5 matches the mock");
+    server.verify().await;
+}
+
+/// Through `upload_file`: the part carries the header by default.
+#[tokio::test]
+async fn multipart_part_carries_content_md5_by_default() {
+    let server = MockServer::start().await;
+    mount_fresh_single_part_upload(&server).await;
+    let (result, _f) = upload_thirty_via_upload_file(&server, no_skip_check_opts()).await;
+    assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
+    let requests = server.received_requests().await.unwrap();
+    let part_put = requests
+        .iter()
+        .find(|r| r.method == "PUT" && r.url.query().unwrap_or("").contains("partNumber=1"))
+        .expect("the part PUT was received");
+    let got = part_put
+        .headers
+        .get("content-md5")
+        .and_then(|v| v.to_str().ok())
+        .expect("the part PUT carries Content-MD5");
+    // base64 of md5(THIRTY)
+    assert_eq!(got, "q/H+Z+cjNjNx5j1TChfPjA==");
+    server.verify().await;
+}
+
+/// `--no-verify` skips the header on parts as on a single PUT.
+#[tokio::test]
+async fn multipart_no_verify_sends_no_content_md5() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(header_exists("content-md5"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(0)
+        .mount(&server)
+        .await;
+    mount_fresh_single_part_upload(&server).await;
+    let mut opts = no_skip_check_opts();
+    opts.verify = false;
+    let (result, _f) = upload_thirty_via_upload_file(&server, opts).await;
+    assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
+    server.verify().await;
 }

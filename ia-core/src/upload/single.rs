@@ -585,9 +585,9 @@ async fn poll_check_limit(
 
 /// Encode bytes as base64 (standard alphabet, with padding).
 ///
-/// Used for Content-MD5 header value. Avoids adding the `base64` crate
-/// for a single call site.
-fn base64_encode(data: &[u8]) -> String {
+/// Used for the Content-MD5 header value on the single PUT and on each
+/// multipart part. Avoids adding the `base64` crate for two call sites.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
