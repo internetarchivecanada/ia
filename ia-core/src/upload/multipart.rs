@@ -994,8 +994,8 @@ struct KeptUpload<'a> {
 impl KeptUpload<'_> {
     /// The error for a part failure. Two wordings, chosen on the S3 code:
     /// a permanent refusal (`AccessDenied`, `InvalidAccessKeyId`,
-    /// `BadDigest`, ...) says "refused by IA" and asks the user to fix the
-    /// cause before rerunning; a spent budget says how many attempts were
+    /// `MissingContentLength`, ...) says "refused by IA" and asks the user to
+    /// fix the cause before rerunning; a spent budget says how many attempts were
     /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
     /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38) as

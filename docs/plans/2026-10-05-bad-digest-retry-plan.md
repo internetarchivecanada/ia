@@ -9,6 +9,6 @@
 **Not changed:** the single PUT does not re-hash the file per attempt (a separate question; a changed file is a user action, and the final error still says what IA saw).
 
 ## Tasks
-- [ ] Red: `upload_400_bad_digest_is_not_retried` (upload_single.rs) becomes `upload_400_bad_digest_is_retried` (a BadDigest then a 200 → Uploaded, two PUTs); the two `s3_error.rs` tests pinning it non-retryable flip; a part-PUT test: part 1 BadDigest once, then 200, upload completes. Run; fail.
-- [ ] Green: the classifier; the doc list on `S3Error::is_retryable`; the `KeptUpload::describe` comment's example code; usage.md.
+- [x] Red: `upload_400_bad_digest_is_not_retried` (upload_single.rs) becomes `upload_400_bad_digest_is_retried` (a BadDigest then a 200 → Uploaded, two PUTs); the two `s3_error.rs` tests pinning it non-retryable flip; a part-PUT test: part 1 BadDigest once, then 200, upload completes. Run: all four failed.
+- [x] Green: the classifier; the doc list on `S3Error::is_retryable`; the `KeptUpload::describe` comment's example code; usage.md.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup bad-digest-retry` after a confirmed merge.

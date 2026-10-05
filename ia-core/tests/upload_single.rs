@@ -772,14 +772,22 @@ async fn upload_403_is_not_retried() {
 }
 
 #[tokio::test]
-async fn upload_400_bad_digest_is_not_retried() {
+async fn upload_400_bad_digest_is_retried() {
+    // IA's md5 of the body it received differs from Content-MD5: over https
+    // that means a body IA did not receive whole, or an IA-side fault, and
+    // a re-send fixes it. One BadDigest, then a 200.
     let server = MockServer::start().await;
-
     Mock::given(method("PUT"))
         .respond_with(ResponseTemplate::new(400).set_body_string(
             "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match.</Message></Error>",
         ))
-        .expect(1) // exactly 1 request — no retries
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -787,7 +795,8 @@ async fn upload_400_bad_digest_is_not_retried() {
     let client = test_client(&server);
     let opts = {
         let mut o = UploadOpts::default();
-        o.verify = false;
+        o.verify = true;
+        o.checksum = false;
         o.retries = 3;
         o.retry_min_delay = std::time::Duration::from_millis(1);
         o.retry_max_delay = std::time::Duration::from_millis(2);
@@ -805,9 +814,11 @@ async fn upload_400_bad_digest_is_not_retried() {
         None,
         None,
     )
-    .await;
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("BadDigest"));
+    .await
+    .expect("a BadDigest is retried and the second PUT succeeds");
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    server.verify().await;
 }
 
 // -- Checksum skip --
