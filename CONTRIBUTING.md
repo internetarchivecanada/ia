@@ -124,6 +124,13 @@ Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
 This bumps the workspace version, commits, tags, and pushes. The GitHub Actions
 release workflow then builds binaries and creates the GitHub Release.
 
+The three binaries are built from the dependency cache that every push to main
+saves (the `Release build` job in `ci.yml` runs the same builds, from the same
+workflow file, under the same cache key), and the build does not wait for the
+release workflow's own check and test jobs, which run on main for the same
+commit. The first release after a stable toolchain update or a dependency
+change builds cold once; the next push to main saves a fresh cache.
+
 To preview without making changes:
 
     cargo release <version> --dry-run

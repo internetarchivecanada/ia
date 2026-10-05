@@ -58,3 +58,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo install cargo-audit
       - run: cargo audit
+
+  # Warm the release build cache: the same three builds release.yml runs,
+  # saved under the key a tag's run restores. A tag's run can read caches
+  # saved on main but never another tag's, so without this every release
+  # build is cold. Pushes to main only; artifacts are not kept.
+  release-build:
+    name: Release build
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/build.yml
+    with:
+      upload-artifacts: false

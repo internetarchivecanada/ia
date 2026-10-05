@@ -1,0 +1,62 @@
+name: Build release binaries
+
+# Called by release.yml (on a tag) and by ci.yml (on every push to main).
+# One definition, not two copies: Swatinem/rust-cache hashes the job's rustc
+# version, its CARGO*/RUST* environment and the lockfiles into the cache key,
+# so two hand-kept copies could drift apart and miss the cache with no error
+# to show for it. A called workflow runs the same steps from both callers.
+on:
+  workflow_call:
+    inputs:
+      upload-artifacts:
+        description: Upload each binary as a run artifact (the release job needs them; the warm-up on main does not)
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            binary: ia-cli
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: ia-cli
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: ia-cli.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The same key from main and from a tag. A workflow run can read
+          # caches saved by its own ref and by the default branch, so the
+          # push to main saves what the tag's run restores.
+          shared-key: release-${{ matrix.target }}
+          # A cache saved under a tag ref is never read again (no later tag
+          # shares its scope), so only runs on main save.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build -p ia-cli --release --target ${{ matrix.target }} --features self-update
+
+      - name: Upload artifact
+        if: inputs.upload-artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ia-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
