@@ -9,10 +9,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The checks and tests run on every tag for the record. They gate neither
-  # the build nor the release: the Linux checks run on main for the same
-  # commit, and the macOS and Windows tests run only here. Their caches are
-  # not saved: a cache saved under a tag ref is never read again.
+  # The release waits for the checks and for the tests on all three
+  # platforms (the release job's `needs`). The builds start at once, in
+  # parallel with them. The check job's cache is not saved: a cache saved
+  # under a tag ref is never read again.
   check:
     name: CI Check
     runs-on: ubuntu-latest
@@ -30,20 +30,11 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  # The tests on ubuntu, macOS and Windows, restored from the cache that
+  # every push to main keeps warm (the "Release platform tests" job in ci.yml).
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: test-${{ matrix.os }}
-          save-if: false
-      - run: cargo test -p ia-core -p ia-cli
+    name: Test
+    uses: ./.github/workflows/test.yml
 
   # The three release builds, restored from the cache that every push to main
   # saves under the same key (the "Release build" job in ci.yml).
@@ -53,7 +44,7 @@ jobs:
 
   release:
     name: Release
-    needs: build
+    needs: [build, check, test]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

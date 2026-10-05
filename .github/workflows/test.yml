@@ -1,0 +1,27 @@
+name: Test release platforms
+
+# Called by release.yml (on a tag, where the release waits for it) and by
+# ci.yml (on every push to main, to keep the cache warm). One definition
+# for the same reason as build.yml: the cache key hashes the job's
+# environment, and two copies could drift and miss the cache silently.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test -p ia-core -p ia-cli

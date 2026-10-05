@@ -69,3 +69,11 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       upload-artifacts: false
+
+  # Keep the release test caches warm the same way: the tests release.yml
+  # waits for, on all three platforms, saved under the key a tag's run
+  # restores. Pushes to main only.
+  release-tests:
+    name: Release platform tests
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/test.yml
