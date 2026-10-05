@@ -2894,3 +2894,57 @@ fn version_is_0_21_0() {
         .success()
         .stdout(predicate::str::contains("0.21.0"));
 }
+
+/// Two unfinished uploads of one file (`a.bin`: u1 and u3). `--abort` would
+/// abort both, so the listing's closing line must not say "this upload".
+fn cleanup_fixture_two_uploads_of_a() -> CleanupFixture {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/my-item"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<ListMultipartUploadsResult>\
+                 <Upload><Key>a.bin</Key><UploadId>u1</UploadId><Initiated>2026-10-02T01:00:00.000Z</Initiated></Upload>\
+                 <Upload><Key>a.bin</Key><UploadId>u3</UploadId><Initiated>2026-10-02T03:00:00.000Z</Initiated></Upload>\
+                 </ListMultipartUploadsResult>",
+            ))
+            .mount(&server)
+            .await;
+        for id in ["u1", "u3"] {
+            Mock::given(method("GET"))
+                .and(path("/my-item/a.bin"))
+                .and(query_param("uploadId", id))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>"e1"</ETag><Size>10</Size></Part></ListPartsResult>"#,
+                ))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    CleanupFixture { rt, server, host }
+}
+
+#[test]
+fn cleanup_with_file_and_two_uploads_says_these_uploads() {
+    let fx = cleanup_fixture_two_uploads_of_a();
+    cleanup_cmd(&fx, &["a.bin"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("u1"))
+        .stderr(predicate::str::contains("u3"))
+        .stderr(predicate::str::contains(
+            "Nothing aborted. Add --abort to abort these uploads.",
+        ))
+        .stderr(predicate::str::contains("this upload").not());
+    fx.rt.block_on(fx.server.verify());
+}
