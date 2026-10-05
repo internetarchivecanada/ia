@@ -285,9 +285,25 @@ pub struct UploadResult {
 /// Upload outcome for a single file.
 ///
 /// The enum is `#[non_exhaustive]`: a `match` outside this crate needs a
-/// wildcard arm, and a status it does not know must not count as a
-/// success. The test names every variant and still does not compile.
-/// (Keep the list complete when adding a variant; see [`crate::IaError`].)
+/// wildcard arm, and a status it does not know should not be counted as
+/// a success. The first test names every variant with a wildcard and
+/// compiles; the second, without the wildcard, does not, which is the
+/// attribute at work. Add a line to both when adding a variant (see
+/// [`crate::IaError`]).
+///
+/// ```
+/// use ia_core::upload::UploadStatus;
+/// fn is_done(s: &UploadStatus) -> bool {
+///     match s {
+///         UploadStatus::Uploaded => true,
+///         UploadStatus::Skipped => true,
+///         UploadStatus::Resumed => true,
+///         UploadStatus::Failed(_) => false,
+///         UploadStatus::DryRun => false,
+///         _ => false,
+///     }
+/// }
+/// ```
 ///
 /// ```compile_fail,E0004
 /// use ia_core::upload::UploadStatus;

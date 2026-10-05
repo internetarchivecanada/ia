@@ -14,12 +14,16 @@ crate it has no effect, and the repo has no compile-fail harness.
 Fix: a `compile_fail` doctest on each type. Doctests compile as an external
 crate, so the attribute is in force there. For the two structs the test is
 a struct expression, which is exactly what the attribute forbids
-(`E0639`). For the two enums it is a `match` that names every variant and
-has no wildcard; the only reason it cannot compile is the attribute
-(`E0004`). The enum tests must list every variant: a variant added later
-without a line in the test still fails to compile (a missing arm is
-`E0004` too), so the test keeps passing but no longer proves the
-attribute. The doc comment says so, and it is the one maintenance cost.
+(`E0639`), beside a positive test that builds one from `Default` and
+assigns a field. For the two enums it is a pair: a `match` naming every
+variant plus a wildcard, which compiles only while the list is current,
+and the same `match` without the wildcard, which cannot compile only
+because of the attribute (`E0004`). The pair is needed because stable
+rustdoc ignores the error code after `compile_fail` (the reviewer
+checked: a bogus code and a misspelled arm both pass on stable, and CI
+runs stable), so the positive twin is what keeps the arm list honest.
+Add a line to both when adding a variant; that is the one maintenance
+cost, and the doc comments say so.
 
 No new crate: `trybuild` would do the same with a dependency.
 
@@ -61,4 +65,15 @@ a half. Comment corrected; the test is unchanged.
 
 ## Review record
 
-Filled in after the code-reviewer pass.
+Code-reviewer pass 2026-10-05. Minor, taken: on stable the `compile_fail`
+error code is not enforced, so each enum block gained a positive twin
+(above). Nits, taken: `o.checksum = false` in the new multipart test was
+inert (the multipart path reads `verify`, which must stay on for
+Content-MD5), removed; "Every error this crate returns" overstated (two
+`files.rs` helpers return `String` errors), now "the error type behind
+this crate's `Result`"; "must not count as a success" softened to
+"should not be counted". Verified by the reviewer: 45 arms against 45
+variants, by name, order and shape; the BadDigest test's wording, status
+and attempt count against `KeptUpload::describe` and the retry loop; the
+corrected comment against the schedule (first wait is 1 s times a
+uniform factor below 1).

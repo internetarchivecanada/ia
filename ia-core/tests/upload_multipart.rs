@@ -3063,9 +3063,9 @@ async fn part_exhausted_bad_digest_budget_is_a_kept_upload() {
         .mount(&server)
         .await;
 
+    // verify stays on: Content-MD5 on the part is what BadDigest answers.
     let opts = {
         let mut o = UploadOpts::default();
-        o.checksum = false;
         o.retries = 2;
         o.retry_min_delay = std::time::Duration::from_millis(1);
         o.retry_max_delay = std::time::Duration::from_millis(2);
