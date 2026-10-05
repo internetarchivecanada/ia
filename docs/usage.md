@@ -362,7 +362,7 @@ ia metadata --itemlist items.txt -m "subject:archived"
 
 #### `ia metadata export`
 
-Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2) and grows by one per success up to 200; `--jobs N` pins it.
+Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2), and grows by one after as many consecutive successes as it currently allows, up to 200; `--jobs N` pins it.
 
 | Flag | Description |
 |------|-------------|
