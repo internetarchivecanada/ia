@@ -224,14 +224,18 @@ pub(crate) async fn initiate_upload_with_retry(
 ///
 /// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
 ///
-/// IA's completion check compares each manifest entry against the part it
-/// holds, and an accepted completion is the upload's verification. That
-/// only means something when the manifest carries what was sent, so the
-/// local MD5 is always used; an `ETag` header IA might return is not echoed
-/// back (IA returns none today; one that differs is logged at debug).
+/// The part carries `Content-MD5`, which IA checks on receipt: a part whose
+/// bytes arrive changed is refused with `BadDigest` instead of being found
+/// at completion. IA's completion check then compares each manifest entry
+/// against the part it holds, and an accepted completion is the upload's
+/// verification. That only means something when the manifest carries what
+/// was sent, so the local MD5 is always used; the `ETag` header IA returns
+/// (the part's md5, observed 2026-10-05) is not echoed back, and one that
+/// differs is logged at debug.
 ///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
-/// need a configurable budget go through `upload_file_multipart`.
+/// need a configurable budget, or no `Content-MD5` (`--no-verify`), go
+/// through `upload_file_multipart`.
 pub async fn upload_part(
     client: &IaClient,
     identifier: &str,
@@ -245,7 +249,7 @@ pub async fn upload_part(
         total_bytes: body.len() as u64,
         ..default_ctx(identifier, key)
     };
-    upload_part_with_retry(client, &ctx, upload_id, part_number, body)
+    upload_part_with_retry(client, &ctx, upload_id, part_number, body, true)
         .await
         .map(|(etag, _attempts)| etag)
         .map_err(IaError::from)
@@ -259,6 +263,10 @@ pub async fn upload_part(
 /// every attempt, including the common single-attempt case, and the caller
 /// already has the buffer in hand.
 ///
+/// `content_md5` sends the part's md5 as `Content-MD5` so IA checks the
+/// bytes on receipt; the part loop passes `opts.verify`, so `--no-verify`
+/// skips the header here as on a single PUT.
+///
 /// Returns the [`S3Failure`] rather than a flattened error so the part loop
 /// can tell a permanent refusal (the S3 code) from a spent budget (the
 /// attempt count) and word its message accordingly.
@@ -268,6 +276,7 @@ pub(crate) async fn upload_part_with_retry(
     upload_id: &str,
     part_number: u32,
     body: Bytes,
+    content_md5: bool,
 ) -> std::result::Result<(String, u32), S3Failure> {
     let (access, secret) = client.require_auth().map_err(|e| S3Failure {
         error: Box::new(e),
@@ -281,23 +290,27 @@ pub(crate) async fn upload_part_with_retry(
         upload_id,
     );
     let content_length = body.len();
-    let local_md5 = {
+    let digest = {
         use md5::{Digest, Md5};
-        format!("\"{:x}\"", Md5::digest(&body))
+        Md5::digest(&body)
     };
+    let local_md5 = format!("\"{digest:x}\"");
+    let md5_b64 = content_md5.then(|| super::single::base64_encode(&digest));
 
     // The part goes out as a watched stream of 64 KiB slices (no copy), so a
     // server that stops reading is caught by the stall detector. The
     // explicit Content-Length keeps the transfer unchunked, as IA requires.
     let sent = send_with_retry(ctx, &format!("upload part {part_number}"), |watch| {
         let stream = watch.wrap(bytes_chunks(body.clone()), content_length as u64);
-        client
+        let mut req = client
             .upload_http()
             .put(&url)
             .header("Authorization", format!("LOW {access}:{secret}"))
-            .header("Content-Length", content_length.to_string())
-            .body(reqwest::Body::wrap_stream(stream))
-            .send()
+            .header("Content-Length", content_length.to_string());
+        if let Some(b64) = &md5_b64 {
+            req = req.header("Content-MD5", b64.as_str());
+        }
+        req.body(reqwest::Body::wrap_stream(stream)).send()
     })
     .await?;
 
@@ -870,40 +883,46 @@ pub async fn upload_file_multipart(
             total_bytes: file_size,
             progress: progress.clone(),
         };
-        let etag =
-            match upload_part_with_retry(client, &ctx, &upload_id, part_num, Bytes::from(data))
-                .await
-            {
-                Ok((etag, attempts)) => {
-                    // attempts counts the first try, so retries is one fewer.
-                    total_retries += attempts.saturating_sub(1);
-                    tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
-                    etag
-                }
-                Err(failure) => {
-                    // Not aborted: an abort would delete every part IA holds,
-                    // which is what multipart exists to avoid. The error says
-                    // where the upload stands and both ways forward (#18).
-                    let kept = KeptUpload {
-                        identifier,
-                        key,
-                        upload_id: &upload_id,
-                        part_num,
-                        part_count,
-                        parts_on_ia: completed_parts.len(),
-                    };
-                    let err = kept.describe(failure);
-                    tracing::warn!(
-                        identifier,
-                        key,
-                        %upload_id,
-                        part = part_num,
-                        parts_on_ia = completed_parts.len(),
-                        "multipart part failed; upload kept on IA for resume or cleanup"
-                    );
-                    return Err(err);
-                }
-            };
+        let etag = match upload_part_with_retry(
+            client,
+            &ctx,
+            &upload_id,
+            part_num,
+            Bytes::from(data),
+            opts.verify,
+        )
+        .await
+        {
+            Ok((etag, attempts)) => {
+                // attempts counts the first try, so retries is one fewer.
+                total_retries += attempts.saturating_sub(1);
+                tracing::debug!(identifier, key, part = part_num, %etag, "part uploaded");
+                etag
+            }
+            Err(failure) => {
+                // Not aborted: an abort would delete every part IA holds,
+                // which is what multipart exists to avoid. The error says
+                // where the upload stands and both ways forward (#18).
+                let kept = KeptUpload {
+                    identifier,
+                    key,
+                    upload_id: &upload_id,
+                    part_num,
+                    part_count,
+                    parts_on_ia: completed_parts.len(),
+                };
+                let err = kept.describe(failure);
+                tracing::warn!(
+                    identifier,
+                    key,
+                    %upload_id,
+                    part = part_num,
+                    parts_on_ia = completed_parts.len(),
+                    "multipart part failed; upload kept on IA for resume or cleanup"
+                );
+                return Err(err);
+            }
+        };
 
         completed_parts.push((part_num, etag));
     }

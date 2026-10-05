@@ -27,3 +27,5 @@ Important, fixed: the `--multipart` row in usage.md's option table still promise
 Suggestions, taken: `upload_part` always puts the local md5 in the manifest instead of preferring an `ETag` header from IA (the whole check rests on IA comparing against what was sent; an echoed value would compare IA against itself; IA sends no header today, a differing one is logged at debug); the `clobber_opts` test helper is `no_skip_check_opts` (it turns the checksum compare off, not a clobber flag).
 
 Noted: a resumed part's manifest ETag comes from IA's listing, and #19's `validate_parts` already requires it to equal the local range's md5; the removed second `Verifying` event was a no-op for the TUI's counting; 26 clippy lints under `--all-targets` are pre-existing in test files and outside the CI recipe.
+
+Correction (2026-10-05): IA does return an `ETag` header on a part PUT (the part's md5), and it checks `Content-MD5` on part PUTs; Jake's live probe showed both. The manifest still carries the local md5, which is what makes the completion check meaningful. Content-MD5 on parts: `docs/plans/2026-10-05-part-content-md5-plan.md`.

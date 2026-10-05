@@ -141,7 +141,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub no_auto_make_bucket: bool,
 
-    /// Skip Content-MD5 verification
+    /// Skip the Content-MD5 header (on the single PUT, and on each part with --multipart)
     #[arg(long)]
     pub no_verify: bool,
 
@@ -299,7 +299,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub no_auto_make_bucket: bool,
 
-    /// Skip Content-MD5 verification
+    /// Skip the Content-MD5 header (on the single PUT, and on each part with --multipart)
     #[arg(long)]
     pub no_verify: bool,
 
