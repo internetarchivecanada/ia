@@ -456,7 +456,10 @@ mod tests {
             SendEnd::Unanswered { wait_secs } => assert_eq!(wait_secs, 2),
             other => panic!("expected an unanswered body, got {other:?}"),
         }
-        assert!(watch.done.load(Ordering::SeqCst), "the body was handed over");
+        assert!(
+            watch.done.load(Ordering::SeqCst),
+            "the body was handed over"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "judged in {:?}",

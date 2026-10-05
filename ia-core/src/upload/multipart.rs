@@ -1576,7 +1576,10 @@ mod tests {
             ),
             "{msg}"
         );
-        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA"), "{msg}");
+        assert!(
+            msg.contains("multipart upload mp-1 is kept with 1 part on IA"),
+            "{msg}"
+        );
     }
 
     #[test]
