@@ -41,8 +41,11 @@ impl S3Error {
     /// Whether this S3 error code indicates a retryable condition.
     ///
     /// Retryable: SlowDown, InternalError, ServiceUnavailable, OperationAborted,
-    /// RequestTimeout, RequestLimitExceeded, ThrottlingException
-    /// Non-retryable: AccessDenied, InvalidAccessKeyId, BadDigest, MissingContentLength, etc.
+    /// RequestTimeout, RequestLimitExceeded, ThrottlingException, and BadDigest
+    /// (IA's md5 of the body it received differs from the Content-MD5 sent;
+    /// over https that is a body IA did not receive whole, or an IA-side
+    /// fault, and a re-send fixes it).
+    /// Non-retryable: AccessDenied, InvalidAccessKeyId, MissingContentLength, etc.
     pub fn is_retryable(&self) -> bool {
         is_retryable_code(&self.code)
     }
@@ -60,6 +63,7 @@ pub(crate) fn is_retryable_code(code: &str) -> bool {
             | "RequestTimeout"
             | "RequestLimitExceeded"
             | "ThrottlingException"
+            | "BadDigest"
     )
 }
 
@@ -190,7 +194,8 @@ mod tests {
         let xml = "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match.</Message></Error>";
         let err = parse_s3_error(xml).unwrap();
         assert_eq!(err.code, "BadDigest");
-        assert!(!err.is_retryable());
+        // IA hashed a body it did not receive whole; a re-send fixes it.
+        assert!(err.is_retryable());
     }
 
     #[test]
@@ -303,6 +308,7 @@ mod tests {
             "RequestTimeout",
             "RequestLimitExceeded",
             "ThrottlingException",
+            "BadDigest",
         ];
         for code in retryable {
             let err = S3Error {
@@ -318,7 +324,6 @@ mod tests {
         let non_retryable = [
             "AccessDenied",
             "InvalidAccessKeyId",
-            "BadDigest",
             "MissingContentLength",
             "NoSuchBucket",
             "InvalidArgument",

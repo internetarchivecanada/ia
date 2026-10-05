@@ -3011,3 +3011,35 @@ async fn multipart_no_verify_sends_no_content_md5() {
     assert!(matches!(result.unwrap().status, UploadStatus::Uploaded));
     server.verify().await;
 }
+
+/// A part refused with BadDigest is re-sent: IA hashed a body it did not
+/// receive whole, and the same bytes go again. One BadDigest, then a 200,
+/// and the upload completes.
+#[tokio::test]
+async fn multipart_part_bad_digest_is_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match what we received.</Message></Error>",
+        ))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_fresh_single_part_upload(&server).await;
+    let (result, _f) = upload_thirty_via_upload_file(&server, no_skip_check_opts()).await;
+    let result = result.expect("a BadDigest on a part is retried");
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    let puts = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "PUT")
+        .count();
+    assert_eq!(puts, 2, "the part was sent twice");
+    server.verify().await;
+}
