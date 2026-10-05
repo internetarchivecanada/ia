@@ -69,7 +69,7 @@ Flags and their behavior are documented in `--help` at every level, so there is 
 
 ## Install
 
-Download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases):
+Download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 
 | Platform | Asset |
 |----------|-------|
