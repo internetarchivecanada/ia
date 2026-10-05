@@ -178,7 +178,7 @@ pub struct UploadArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart); a send
-    /// dead for 60 s, or no answer within 120 s of the body, spends one
+    /// dead for 60 s, or no answer within 120 s after the body was sent, spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
@@ -348,7 +348,7 @@ pub struct ImportArgs {
     pub dry_run: bool,
 
     /// Retry attempts per IA-S3 request (per part with --multipart); a send
-    /// dead for 60 s, or no answer within 120 s of the body, spends one
+    /// dead for 60 s, or no answer within 120 s after the body was sent, spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,

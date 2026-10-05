@@ -2818,7 +2818,7 @@ fn upload_help_keeps_the_dead_send_rule_out_except_what_retries_counts() {
         .stdout(predicate::str::contains("--min-speed").not())
         .stdout(predicate::str::contains("moves no bytes").not())
         .stdout(predicate::str::contains(
-            "a send dead for 60 s, or no answer within 120 s of the body, spends one",
+            "a send dead for 60 s, or no answer within 120 s after the body was sent, spends one",
         ));
 }
 

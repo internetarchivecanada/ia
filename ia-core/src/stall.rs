@@ -38,12 +38,12 @@ pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const RESPONSE_WAIT: Duration = Duration::from_secs(120);
 
 /// The response wait in force: [`RESPONSE_WAIT`], except under `cfg(test)`
-/// while a [`PolicyOverride`] is alive on this thread, when it is that
-/// override's window.
+/// while a [`PolicyOverride`] built with a response wait is alive on this
+/// thread.
 pub(crate) fn response_wait() -> Duration {
     #[cfg(test)]
-    if let Some((window, _grace)) = test_policy::OVERRIDE.with(|cell| cell.get()) {
-        return window;
+    if let Some(wait) = test_policy::RESPONSE_OVERRIDE.with(|cell| cell.get()) {
+        return wait;
     }
     RESPONSE_WAIT
 }
@@ -68,11 +68,14 @@ mod test_policy {
 
     thread_local! {
         pub(super) static OVERRIDE: Cell<Option<(Duration, Duration)>> = const { Cell::new(None) };
+        pub(super) static RESPONSE_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
     }
 
-    /// Shrinks the window and grace for the rest of the test that holds it.
-    /// Works for the single-threaded `#[tokio::test]` runtime, where the
-    /// download code runs on the test's own thread.
+    /// Shrinks the window and grace, and with
+    /// [`with_response_wait`](Self::with_response_wait) the upload response
+    /// wait, for the rest of the test that holds it. Works for the
+    /// single-threaded `#[tokio::test]` runtime, where the download and
+    /// upload code runs on the test's own thread.
     pub(crate) struct PolicyOverride;
 
     impl PolicyOverride {
@@ -80,11 +83,24 @@ mod test_policy {
             OVERRIDE.with(|cell| cell.set(Some((window, grace))));
             PolicyOverride
         }
+
+        /// The window and grace, plus the upload response wait, which
+        /// should differ from the window so a test can tell the two rules
+        /// apart.
+        pub(crate) fn with_response_wait(
+            window: Duration,
+            grace: Duration,
+            response_wait: Duration,
+        ) -> Self {
+            RESPONSE_OVERRIDE.with(|cell| cell.set(Some(response_wait)));
+            Self::new(window, grace)
+        }
     }
 
     impl Drop for PolicyOverride {
         fn drop(&mut self) {
             OVERRIDE.with(|cell| cell.set(None));
+            RESPONSE_OVERRIDE.with(|cell| cell.set(None));
         }
     }
 }
@@ -314,8 +330,18 @@ mod tests {
         assert_eq!(policy(), (WINDOW, GRACE));
         assert_eq!(response_wait(), RESPONSE_WAIT);
         {
+            let _o = PolicyOverride::with_response_wait(
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Duration::from_secs(4),
+            );
+            assert_eq!(policy(), (Duration::from_secs(2), Duration::from_secs(1)));
+            assert_eq!(response_wait(), Duration::from_secs(4));
+        }
+        assert_eq!(response_wait(), RESPONSE_WAIT);
+        {
             let _o = PolicyOverride::new(Duration::from_secs(2), Duration::from_secs(1));
-            assert_eq!(response_wait(), Duration::from_secs(2));
+            assert_eq!(response_wait(), RESPONSE_WAIT);
             assert_eq!(policy(), (Duration::from_secs(2), Duration::from_secs(1)));
         }
         assert_eq!(policy(), (WINDOW, GRACE));

@@ -423,10 +423,10 @@ pub(crate) fn stall_detail(
     if unanswered == 0 {
         format!("no bytes were sent for {window_secs} s")
     } else if dead_sends == 0 {
-        format!("no answer came within {response_secs} s of the body")
+        format!("no answer came within {response_secs} s after the body was sent")
     } else {
         format!(
-            "{dead_sends} {} moved no bytes for {window_secs} s and {unanswered} {} not come within {response_secs} s of the body",
+            "{dead_sends} {} moved no bytes for {window_secs} s and {unanswered} {} not come within {response_secs} s after the body was sent",
             if dead_sends == 1 { "send" } else { "sends" },
             if unanswered == 1 { "answer did" } else { "answers did" }
         )
@@ -2030,19 +2030,19 @@ mod tests {
     fn upload_stalled_names_the_unanswered_body() {
         assert_eq!(
             upload_stalled_with(3, 3).to_string(),
-            "upload of item/big.iso stalled 3 times: no answer came within 120 s of the body"
+            "upload of item/big.iso stalled 3 times: no answer came within 120 s after the body was sent"
         );
         assert_eq!(
             upload_stalled_with(3, 1).to_string(),
-            "upload of item/big.iso stalled 3 times: 2 sends moved no bytes for 60 s and 1 answer did not come within 120 s of the body"
+            "upload of item/big.iso stalled 3 times: 2 sends moved no bytes for 60 s and 1 answer did not come within 120 s after the body was sent"
         );
         assert_eq!(
             upload_stalled_with(3, 2).to_string(),
-            "upload of item/big.iso stalled 3 times: 1 send moved no bytes for 60 s and 2 answers did not come within 120 s of the body"
+            "upload of item/big.iso stalled 3 times: 1 send moved no bytes for 60 s and 2 answers did not come within 120 s after the body was sent"
         );
         assert_eq!(
             upload_stalled_with(1, 1).to_string(),
-            "upload of item/big.iso stalled 1 time: no answer came within 120 s of the body"
+            "upload of item/big.iso stalled 1 time: no answer came within 120 s after the body was sent"
         );
     }
 

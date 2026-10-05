@@ -220,7 +220,7 @@ pub(crate) async fn initiate_upload_with_retry(
 }
 
 /// Upload a single part. Returns the ETag for the completion manifest: the
-/// quoted hex MD5 of the body as sent.
+/// quoted hex MD5 after the body was sent as sent.
 ///
 /// `PUT /{identifier}/{key}?partNumber={N}&uploadId={ID}`
 ///
@@ -1000,7 +1000,7 @@ impl KeptUpload<'_> {
     ///
     /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38,
     /// #40) as "part N of M stalled K times (no bytes were sent for W s)"
-    /// or "(no answer came within R s of the body)". Anything
+    /// or "(no answer came within R s after the body was sent)". Anything
     /// else the part request produced, in practice IA's spam rejection
     /// (`SpamDetected`), is fatal for the whole item and passes through
     /// unchanged so the item loop still stops on it.
@@ -1572,7 +1572,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains(
-                "part 2 of 3 stalled 11 times (no answer came within 120 s of the body, after 11 attempts): "
+                "part 2 of 3 stalled 11 times (no answer came within 120 s after the body was sent, after 11 attempts): "
             ),
             "{msg}"
         );

@@ -360,7 +360,7 @@ pub async fn upload_file(
             SendEnd::Unanswered { wait_secs } => {
                 response_secs = wait_secs;
                 unanswered += 1;
-                Err("no answer came within the response wait of the body")
+                Err("no answer came within the response wait after the body was sent")
             }
         };
         let response = match response {
@@ -875,7 +875,7 @@ mod tests {
                 IaError::UploadStalled {
                     stalls: 2,
                     unanswered: 2,
-                    response_secs: 2,
+                    response_secs: 4,
                     ..
                 }
             ),
