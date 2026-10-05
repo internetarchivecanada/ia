@@ -81,7 +81,7 @@ Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml
 
 #### Slow and stalled downloads
 
-A connection that keeps sending bytes too slowly is treated like one that dropped: abandoned, and resumed with `Range` from the bytes on disk (see "After an interruption"). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
+A connection that keeps sending bytes too slowly is treated like one that dropped (the re-request rule is at the end of this section). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
@@ -362,7 +362,7 @@ ia metadata --itemlist items.txt -m "subject:archived"
 
 #### `ia metadata export`
 
-Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc.
+Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2) and grows by one per success up to 200; `--jobs N` pins it.
 
 | Flag | Description |
 |------|-------------|
@@ -1211,7 +1211,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata` adapts to the server when it is omitted) |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
@@ -1241,7 +1241,9 @@ ia --config-file ~/my-ia.ini download nasa
 
 ### Retry waits
 
-Every retry in `ia` waits the same way, whichever request failed: the per-file download retries, every IA-S3 request in an upload, a search page answered with `429`, the LLM client, and the self-updater. The wait is random, up to a cap that doubles with each attempt from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. The one exception is `ia update`, whose cap is 30 s. How many retries each command makes, and what it retries, is in that command's section.
+The retries that answer a failed request wait on one schedule: the per-file download retries, every IA-S3 request in an upload, a search page answered with `429`, the HTTP layer's own retries of a `5xx`, the LLM client, and the self-updater. The wait is random, up to a cap that doubles with each attempt from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. `ia update` is on the schedule with its cap at 30 s. How many retries each command makes, and what it retries, is in that command's section.
+
+Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit` and `ia metadata` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`).
 
 ### Job logging
 

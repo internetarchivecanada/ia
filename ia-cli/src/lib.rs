@@ -88,7 +88,7 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations (default 8; ia metadata adapts to the server when omitted)
+    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify uses 2)
     #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 
