@@ -1252,7 +1252,13 @@ async fn run_cleanup_inner(client: &IaClient, args: CleanupArgs) -> Result<()> {
                 );
             }
             if args.file.is_some() {
-                eprintln!("\nNothing aborted. Add --abort to abort this upload.");
+                // --abort takes every upload of FILE, so say how many.
+                let these = if described.len() == 1 {
+                    "this upload"
+                } else {
+                    "these uploads"
+                };
+                eprintln!("\nNothing aborted. Add --abort to abort {these}.");
             } else {
                 eprintln!("\nNothing aborted. Use --abort with FILE, or --abort-all, to abort.");
             }
