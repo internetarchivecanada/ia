@@ -29,7 +29,7 @@
 - [x] actionlint on the three workflows; `just ci` (green).
 - [x] Dispatch release.yml on the branch (37377561458): the three Build jobs started 6 s after the run, in parallel with the checks.
 - [x] code-reviewer pass (above). PR #54; `gh pr update-branch`, `gh pr checks --watch --fail-fast`, `gh pr merge --squash`; `scripts/ia-cleanup release-cache` after `gh pr view --json state` says MERGED.
-- [ ] After the merge: the main push's `Release build` jobs save the caches; dispatch release.yml on main and read the Build jobs for a restored cache and the build step's time. Record before/after below.
+- [x] After the merge (PR #54, 65092bb): the main push's `Release build` jobs (run 37378485983) saved the three caches under `v0-rust-release-<target>-<OS>-<arch>-<env>-<lock>`, the same env and lockfile hashes the v0.21.0 tag run had computed. release.yml dispatched on main (run 37379374780): every Build job logged `Restored from cache key ... full match: true`.
 
 ## Review (2026-10-05), closed before merge
 
@@ -43,4 +43,6 @@ Verified correct by the reviewer: both callers produce the same key (dtolnay/rus
 
 Before (v0.21.0, tag 21:13:06 UTC to release 21:34:49 UTC): 21 min 43 s. Build jobs started at 21:27:16 after the Windows test job; build steps 3 min 08 s / 4 min 46 s / 1 min 46 s; the macOS build job waited 5 min for a runner.
 
-After: recorded when measured.
+Cold with the gate removed (dispatch on the branch, run 37377561458, no cache on a non-main ref): last binary 7 min 00 s after the run started; build steps 2 min 41 s (musl), 6 min 18 s (Windows), 4 min 40 s (macOS).
+
+Warm (dispatch on main after the merge, run 37379374780): last binary 3 min 14 s after the run started; the Release job added 11 s in the v0.21.0 run, so a warm tag release is about 3 min 30 s. Build steps 44 s (musl), 54 s (macOS), 2 min 09 s (Windows); cache restores 6 s, 5 s and 17 s. Windows is the critical path: the workspace crates themselves and the link take two minutes there even with every dependency cached. The runner queue is outside this change; the macOS build job queued 5 min in the v0.21.0 run and 8 s here.
