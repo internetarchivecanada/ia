@@ -9,8 +9,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The checks and tests run on main for the same commit before it is tagged.
-  # They run again here for the record; the build does not wait for them.
+  # The checks and tests run on every tag for the record. They gate neither
+  # the build nor the release: the Linux checks run on main for the same
+  # commit, and the macOS and Windows tests run only here. Their caches are
+  # not saved: a cache saved under a tag ref is never read again.
   check:
     name: CI Check
     runs-on: ubuntu-latest
@@ -20,6 +22,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p ia-core -p ia-cli -- -D warnings
       - run: cargo doc --no-deps -p ia-core -p ia-cli
@@ -38,6 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.os }}
+          save-if: false
       - run: cargo test -p ia-core -p ia-cli
 
   # The three release builds, restored from the cache that every push to main
