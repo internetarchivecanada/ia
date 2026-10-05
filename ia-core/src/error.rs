@@ -277,19 +277,24 @@ pub enum IaError {
         stalls: usize,
     },
 
-    /// The body send of an upload kept dying (no bytes sent for
-    /// `window_secs`) until the retries were spent (#38). `stalls` counts
-    /// every stall, so it is one more than the retries when every attempt
-    /// stalled.
+    /// An upload's connection kept dying until the retries were spent: the
+    /// body send moved no bytes for `window_secs` (#38), or the body was
+    /// handed over in full and no answer came for `response_secs` (#40).
+    /// `stalls` counts every stall, so it is one more than the retries
+    /// when every attempt stalled; `unanswered` counts the stalls that
+    /// were an unanswered body.
     #[error(
-        "upload of {identifier}/{key} stalled {stalls} {}: no bytes were sent for {window_secs} s",
-        if *.stalls == 1 { "time" } else { "times" }
+        "upload of {identifier}/{key} stalled {stalls} {}: {}",
+        if *.stalls == 1 { "time" } else { "times" },
+        stall_detail(*.stalls, *.unanswered, *.window_secs, *.response_secs)
     )]
     UploadStalled {
         identifier: String,
         key: String,
         window_secs: u64,
         stalls: usize,
+        response_secs: u64,
+        unanswered: usize,
     },
 
     #[error("upload failed for {identifier}/{key}: {message}")]
@@ -403,6 +408,29 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     chain
+}
+
+/// Why an upload stalled, for [`IaError::UploadStalled`] and the multipart
+/// part message: the dead-send rule, the unanswered-body rule, or both with
+/// their counts.
+pub(crate) fn stall_detail(
+    stalls: usize,
+    unanswered: usize,
+    window_secs: u64,
+    response_secs: u64,
+) -> String {
+    let dead_sends = stalls.saturating_sub(unanswered);
+    if unanswered == 0 {
+        format!("no bytes were sent for {window_secs} s")
+    } else if dead_sends == 0 {
+        format!("no answer came within {response_secs} s of the body")
+    } else {
+        format!(
+            "{dead_sends} {} moved no bytes for {window_secs} s and {unanswered} {} not come within {response_secs} s of the body",
+            if dead_sends == 1 { "send" } else { "sends" },
+            if unanswered == 1 { "answer did" } else { "answers did" }
+        )
+    }
 }
 
 impl IaError {
@@ -687,11 +715,15 @@ impl IaError {
                 key,
                 window_secs,
                 stalls,
+                response_secs,
+                unanswered,
             } => {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("key".into(), key.clone().into());
                 extra.insert("window_secs".into(), (*window_secs).into());
                 extra.insert("stalls".into(), (*stalls).into());
+                extra.insert("response_secs".into(), (*response_secs).into());
+                extra.insert("unanswered".into(), (*unanswered).into());
                 "upload_stalled"
             }
             IaError::UploadFailed {
@@ -1969,11 +2001,17 @@ mod tests {
     // -- UploadStalled (#38, fixed rule after #41) --
 
     fn upload_stalled(stalls: usize) -> IaError {
+        upload_stalled_with(stalls, 0)
+    }
+
+    fn upload_stalled_with(stalls: usize, unanswered: usize) -> IaError {
         IaError::UploadStalled {
             identifier: "item".into(),
             key: "big.iso".into(),
             window_secs: 60,
             stalls,
+            response_secs: 120,
+            unanswered,
         }
     }
 
@@ -1983,6 +2021,28 @@ mod tests {
         assert_eq!(
             msg,
             "upload of item/big.iso stalled 5 times: no bytes were sent for 60 s"
+        );
+    }
+
+    /// #40: every stall an unanswered body names the response wait; a mix
+    /// names both rules with their counts.
+    #[test]
+    fn upload_stalled_names_the_unanswered_body() {
+        assert_eq!(
+            upload_stalled_with(3, 3).to_string(),
+            "upload of item/big.iso stalled 3 times: no answer came within 120 s of the body"
+        );
+        assert_eq!(
+            upload_stalled_with(3, 1).to_string(),
+            "upload of item/big.iso stalled 3 times: 2 sends moved no bytes for 60 s and 1 answer did not come within 120 s of the body"
+        );
+        assert_eq!(
+            upload_stalled_with(3, 2).to_string(),
+            "upload of item/big.iso stalled 3 times: 1 send moved no bytes for 60 s and 2 answers did not come within 120 s of the body"
+        );
+        assert_eq!(
+            upload_stalled_with(1, 1).to_string(),
+            "upload of item/big.iso stalled 1 time: no answer came within 120 s of the body"
         );
     }
 
@@ -2006,6 +2066,8 @@ mod tests {
         assert_eq!(v["error"]["key"], "big.iso");
         assert_eq!(v["error"]["window_secs"], 60);
         assert_eq!(v["error"]["stalls"], 2);
+        assert_eq!(v["error"]["response_secs"], 120);
+        assert_eq!(v["error"]["unanswered"], 0);
         assert!(v["error"].get("min_bytes_per_sec").is_none());
     }
 

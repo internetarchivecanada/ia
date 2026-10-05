@@ -998,8 +998,9 @@ impl KeptUpload<'_> {
     /// fix the cause before rerunning; a spent budget says how many attempts were
     /// made. Both carry the upload ID and name `ia upload cleanup ... --abort`.
     ///
-    /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38) as
-    /// "part N of M stalled K times (no bytes sent for W s)". Anything
+    /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38,
+    /// #40) as "part N of M stalled K times (no bytes were sent for W s)"
+    /// or "(no answer came within R s of the body)". Anything
     /// else the part request produced, in practice IA's spam rejection
     /// (`SpamDetected`), is fatal for the whole item and passes through
     /// unchanged so the item loop still stops on it.
@@ -1018,9 +1019,13 @@ impl KeptUpload<'_> {
             IaError::UploadStalled {
                 window_secs,
                 stalls,
+                response_secs,
+                unanswered,
                 ..
             } => {
                 let kept = self.kept_sentence();
+                let detail =
+                    crate::error::stall_detail(stalls, unanswered, window_secs, response_secs);
                 // Attempts can exceed stalls when an earlier attempt failed
                 // some other way; say so, as the UploadFailed arm does.
                 let attempts = if failure.attempts > 1 {
@@ -1032,7 +1037,7 @@ impl KeptUpload<'_> {
                     identifier: self.identifier.into(),
                     key: self.key.into(),
                     message: format!(
-                        "part {} of {} stalled {stalls} {} (no bytes sent for {window_secs} s{attempts}): \
+                        "part {} of {} stalled {stalls} {} ({detail}{attempts}): \
                          multipart upload {} {kept}; rerun the same command to resume, or discard it \
                          with: ia upload cleanup {} {} --abort",
                         self.part_num,
@@ -1526,6 +1531,8 @@ mod tests {
                 key: "f.bin".into(),
                 window_secs: 60,
                 stalls: 2,
+                response_secs: 120,
+                unanswered: 0,
             }),
             code: None,
             attempts: 3,
@@ -1534,7 +1541,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains(
-                "part 2 of 3 stalled 2 times (no bytes sent for 60 s, after 3 attempts): "
+                "part 2 of 3 stalled 2 times (no bytes were sent for 60 s, after 3 attempts): "
             ),
             "{msg}"
         );
@@ -1543,6 +1550,33 @@ mod tests {
             matches!(err, IaError::UploadFailed { status: None, .. }),
             "{err:?}"
         );
+    }
+
+    /// A part whose body IA read but never answered (#40) is a stalled
+    /// part with the response-wait detail.
+    #[test]
+    fn describe_unanswered_part_is_a_kept_upload() {
+        let unanswered = S3Failure {
+            error: Box::new(IaError::UploadStalled {
+                identifier: "item".into(),
+                key: "f.bin".into(),
+                window_secs: 60,
+                stalls: 11,
+                response_secs: 120,
+                unanswered: 11,
+            }),
+            code: None,
+            attempts: 11,
+        };
+        let err = kept(2, 3, 1, "f.bin").describe(unanswered);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "part 2 of 3 stalled 11 times (no answer came within 120 s of the body, after 11 attempts): "
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("multipart upload mp-1 is kept with 1 part on IA"), "{msg}");
     }
 
     #[test]

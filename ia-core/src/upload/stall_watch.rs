@@ -16,13 +16,17 @@
 //! floor to tune, unlike download's `--min-speed`: a re-send goes to the
 //! same endpoint, so "slow" is not a signal of anything fixable, only
 //! "dead" is. The clock starts at the first body poll, so a slow connect
-//! is not counted. Only the body send is judged: once the last chunk has
-//! been handed over, the wait for the server's response is not a stall (a
-//! part PUT's answer legitimately arrives seconds after the body, while IA
-//! hashes it), and nothing bounds that wait (#40). In practice "no bytes"
-//! means no 64 KiB chunk was handed to the transport in the last 59 whole
-//! seconds, checked once a second; a link draining under about 1 KiB/s for
-//! a minute is judged dead too.
+//! is not counted. In practice "no bytes" means no 64 KiB chunk was handed
+//! to the transport in the last 59 whole seconds, checked once a second; a
+//! link draining under about 1 KiB/s for a minute is judged dead too.
+//!
+//! Once the last chunk has been handed over, the send is no longer judged
+//! (a part PUT's answer legitimately arrives seconds after the body, while
+//! IA hashes it), but the wait for the answer is bounded (#40): an answer
+//! that has not arrived [`stall::RESPONSE_WAIT`] (120 s) after the body is
+//! treated the same way, the request is dropped and the caller re-sends.
+//! A request with no body stream to wrap, or a zero-length body, has no
+//! clock here.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -48,10 +52,22 @@ pub(crate) struct BodyWatch {
     /// its end, so the flag is set by the byte count reaching the length
     /// given to [`wrap`](Self::wrap), and also on the stream's end.
     done: Arc<AtomicBool>,
+    /// When `done` was set; the response wait runs from here.
+    done_at: Arc<Mutex<Option<Instant>>>,
     /// The body length given to `wrap`.
     expected: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
     window: std::time::Duration,
+    response_wait: std::time::Duration,
+}
+
+/// What a check found dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dead {
+    /// The body send moved no bytes for `window_secs`.
+    Send { window_secs: u64 },
+    /// The body was handed over in full and no answer came for `wait_secs`.
+    Unanswered { wait_secs: u64 },
 }
 
 impl BodyWatch {
@@ -62,9 +78,22 @@ impl BodyWatch {
         Self {
             detector: Arc::new(Mutex::new(None)),
             done: Arc::new(AtomicBool::new(false)),
+            done_at: Arc::new(Mutex::new(None)),
             expected: Arc::new(AtomicU64::new(u64::MAX)),
             sent: Arc::new(AtomicU64::new(0)),
             window,
+            response_wait: stall::response_wait(),
+        }
+    }
+
+    /// The body has been handed over in full; the response wait starts
+    /// now. The first call wins, so a stream end after the byte count
+    /// already reached the length does not restart the clock.
+    fn finish(&self) {
+        if !self.done.swap(true, Ordering::SeqCst) {
+            if let Ok(mut at) = self.done_at.lock() {
+                *at = Some(Instant::now());
+            }
         }
     }
 
@@ -74,7 +103,7 @@ impl BodyWatch {
     pub(crate) fn wrap<S>(&self, inner: S, body_len: u64) -> WatchedBody<S> {
         self.expected.store(body_len, Ordering::SeqCst);
         if body_len == 0 {
-            self.done.store(true, Ordering::SeqCst);
+            self.finish();
         }
         WatchedBody {
             inner,
@@ -93,20 +122,27 @@ impl BodyWatch {
         }
         let sent = self.sent.fetch_add(bytes, Ordering::SeqCst) + bytes;
         if sent >= self.expected.load(Ordering::SeqCst) {
-            self.done.store(true, Ordering::SeqCst);
+            self.finish();
         }
     }
 
-    /// `Some(window_secs)` when the send is dead: nothing moved over the
-    /// window. `None` while nothing has been polled yet, within the first
-    /// window, while bytes keep moving, and once the body is done.
-    fn check(&self) -> Option<u64> {
+    /// `Some(Dead::Send)` when the send is dead: nothing moved over the
+    /// window. `Some(Dead::Unanswered)` when the body is done and the
+    /// response wait has passed with no answer. `None` while nothing has
+    /// been polled yet, within the first window, while bytes keep moving,
+    /// and while a finished body waits within the response wait.
+    fn check(&self) -> Option<Dead> {
         if self.done.load(Ordering::SeqCst) {
-            return None;
+            let at = (*self.done_at.lock().ok()?)?;
+            return (at.elapsed() >= self.response_wait).then_some(Dead::Unanswered {
+                wait_secs: self.response_wait.as_secs(),
+            });
         }
         let mut guard = self.detector.lock().ok()?;
         let d = guard.as_mut()?;
-        d.check(Instant::now()).map(|_observed| d.window_secs())
+        d.check(Instant::now()).map(|_observed| Dead::Send {
+            window_secs: d.window_secs(),
+        })
     }
 }
 
@@ -130,7 +166,7 @@ where
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(None) => {
-                this.watch.done.store(true, Ordering::SeqCst);
+                this.watch.finish();
                 Poll::Ready(None)
             }
             other => other,
@@ -146,10 +182,13 @@ pub(crate) enum SendEnd<T> {
     /// The body send moved no bytes for `window_secs`; the request was
     /// dropped, closing the connection.
     Stalled { window_secs: u64 },
+    /// The body was handed over in full and no answer came for `wait_secs`;
+    /// the request was dropped, closing the connection.
+    Unanswered { wait_secs: u64 },
 }
 
 /// Run `send` under `watch`: the future races a once-a-second check of the
-/// detector, and a dead send drops the future.
+/// detector, and a dead send or an unanswered body drops the future.
 pub(crate) async fn watch_send<F, T>(watch: &BodyWatch, send: F) -> SendEnd<T>
 where
     F: Future<Output = T>,
@@ -161,8 +200,10 @@ where
         tokio::select! {
             result = &mut send => return SendEnd::Done(result),
             _ = ticker.tick() => {
-                if let Some(window_secs) = watch.check() {
-                    return SendEnd::Stalled { window_secs };
+                match watch.check() {
+                    Some(Dead::Send { window_secs }) => return SendEnd::Stalled { window_secs },
+                    Some(Dead::Unanswered { wait_secs }) => return SendEnd::Unanswered { wait_secs },
+                    None => {}
                 }
             }
         }
@@ -226,6 +267,34 @@ pub(crate) mod test_support {
         (addr, connections)
     }
 
+    /// A server that accepts, reads everything it is sent, and never
+    /// answers. Returns its address and a counter of accepted connections.
+    pub(crate) async fn silent_listener() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64 * 1024];
+                    // Read until the client gives up; never write.
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, connections)
+    }
+
     /// 16 MiB: larger than the loopback socket buffers, so the send really
     /// stops when the server stops reading.
     pub(crate) fn big_body() -> bytes::Bytes {
@@ -282,7 +351,7 @@ mod tests {
         .expect("the stalled send must be judged within a minute");
         match end {
             SendEnd::Stalled { window_secs } => assert_eq!(window_secs, 2),
-            SendEnd::Done(r) => panic!("expected a stall, got {r:?}"),
+            other => panic!("expected a stall, got {other:?}"),
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(15),
@@ -326,8 +395,9 @@ mod tests {
         server.verify().await;
     }
 
-    /// Once the body has been handed over, waiting for the response is not
-    /// judged: a slow server that has read everything is not a stall.
+    /// Once the body has been handed over, the send is not judged: a slow
+    /// server that has read everything and answers within the response
+    /// wait (2 s here) is not a stall.
     #[tokio::test]
     async fn a_finished_body_is_not_judged_while_waiting_for_the_response() {
         let _policy = shrink_policy();
@@ -335,7 +405,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_delay(std::time::Duration::from_millis(3500)),
+                    .set_delay(std::time::Duration::from_millis(1500)),
             )
             .mount(&server)
             .await;
@@ -355,6 +425,44 @@ mod tests {
             matches!(end, SendEnd::Done(Ok(_))),
             "a slow response after a finished body is not a stall: {end:?}"
         );
+    }
+
+    /// A server that reads the whole body and never answers: the request
+    /// is abandoned once the response wait (2 s here) has passed since the
+    /// body was done, not held until the connection dies (#40).
+    #[tokio::test]
+    async fn an_unanswered_request_is_abandoned_after_the_wait() {
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = plain_client();
+        let watch = BodyWatch::new();
+        let payload = Bytes::from(vec![7u8; 200 * 1024]);
+        let body = watch.wrap(bytes_chunks(payload), 200 * 1024);
+        let started = std::time::Instant::now();
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            watch_send(
+                &watch,
+                client
+                    .put(format!("http://{addr}/item/part"))
+                    .header("Content-Length", (200 * 1024).to_string())
+                    .body(reqwest::Body::wrap_stream(body))
+                    .send(),
+            ),
+        )
+        .await
+        .expect("the unanswered request must be judged within the wait");
+        match end {
+            SendEnd::Unanswered { wait_secs } => assert_eq!(wait_secs, 2),
+            other => panic!("expected an unanswered body, got {other:?}"),
+        }
+        assert!(watch.done.load(Ordering::SeqCst), "the body was handed over");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "judged in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
     /// The clock starts at the first body poll, not when the watch is

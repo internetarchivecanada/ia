@@ -31,6 +31,23 @@ pub(crate) const GRACE: Duration = Duration::from_secs(30);
 /// nothing at all is judged on time.
 pub(crate) const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long an upload waits for IA's answer once its body has been handed
+/// over in full (#40). The Python `internetarchive` library's upload
+/// timeout; measured on 2026-10-05, IA answered a 1 KiB part PUT 1.8 to
+/// 6.2 s after the last body byte.
+pub(crate) const RESPONSE_WAIT: Duration = Duration::from_secs(120);
+
+/// The response wait in force: [`RESPONSE_WAIT`], except under `cfg(test)`
+/// while a [`PolicyOverride`] is alive on this thread, when it is that
+/// override's window.
+pub(crate) fn response_wait() -> Duration {
+    #[cfg(test)]
+    if let Some((window, _grace)) = test_policy::OVERRIDE.with(|cell| cell.get()) {
+        return window;
+    }
+    RESPONSE_WAIT
+}
+
 /// The window and grace in force: the fixed constants, except under
 /// `cfg(test)` while a [`PolicyOverride`] is alive on this thread.
 pub(crate) fn policy() -> (Duration, Duration) {
@@ -295,8 +312,10 @@ mod tests {
     #[test]
     fn policy_is_the_fixed_constants_unless_overridden() {
         assert_eq!(policy(), (WINDOW, GRACE));
+        assert_eq!(response_wait(), RESPONSE_WAIT);
         {
             let _o = PolicyOverride::new(Duration::from_secs(2), Duration::from_secs(1));
+            assert_eq!(response_wait(), Duration::from_secs(2));
             assert_eq!(policy(), (Duration::from_secs(2), Duration::from_secs(1)));
         }
         assert_eq!(policy(), (WINDOW, GRACE));
