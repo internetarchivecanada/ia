@@ -480,10 +480,12 @@ pub async fn upload_file(
                         continue;
                     }
 
+                    // A spent budget says so, as the part path's message does;
+                    // a first-try refusal keeps the bare S3 text.
                     return Err(IaError::UploadFailed {
                         identifier: identifier.to_string(),
                         key: key.to_string(),
-                        message: err_msg,
+                        message: super::retry::describe_attempts(&err_msg, retries + 1),
                         status: Some(status.as_u16()),
                     });
                 }

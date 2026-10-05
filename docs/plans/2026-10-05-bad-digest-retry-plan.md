@@ -12,3 +12,9 @@
 - [x] Red: `upload_400_bad_digest_is_not_retried` (upload_single.rs) becomes `upload_400_bad_digest_is_retried` (a BadDigest then a 200 → Uploaded, two PUTs); the two `s3_error.rs` tests pinning it non-retryable flip; a part-PUT test: part 1 BadDigest once, then 200, upload completes. Run: all four failed.
 - [x] Green: the classifier; the doc list on `S3Error::is_retryable`; the `KeptUpload::describe` comment's example code; usage.md.
 - [ ] `just ci`; code-reviewer pass; PR; merge after checks; `scripts/ia-cleanup bad-digest-retry` after a confirmed merge.
+
+## Review (2026-10-05), closed before merge
+
+Suggestion, taken: on the single PUT a spent budget on a non-503 retryable code returned the bare S3 text ("BadDigest: ..."), so eleven sends read like a first-try refusal; the message now carries "(after N attempts)" through the shared `describe_attempts`, pinned by `upload_exhausted_bad_digest_names_the_attempt_count`. The usage.md sentence says "the body is sent again" (the single PUT re-reads the file; a part re-sends the same bytes).
+
+Noted, no change: `S3Error::is_retryable` is public, so the classification is observable to external consumers (in the PR body); a 503 carrying `<Code>BadDigest</Code>` would now poll check_limit, theoretical since IA sends it as 400; the cost of the change is up to ten extra sends before the same error in the one case a retry cannot fix; the 2026-03-05 design doc's "400 BadDigest | No" row is a dated record.

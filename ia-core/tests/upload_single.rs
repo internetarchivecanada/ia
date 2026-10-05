@@ -821,6 +821,49 @@ async fn upload_400_bad_digest_is_retried() {
     server.verify().await;
 }
 
+/// Every send gets BadDigest: the budget is spent and the error says how
+/// many attempts were made, as the part path's message does.
+#[tokio::test]
+async fn upload_exhausted_bad_digest_names_the_attempt_count() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match.</Message></Error>",
+        ))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = false;
+        o.retries = 2;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
+    };
+
+    let err = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("every attempt was refused");
+    let msg = err.to_string();
+    assert!(msg.contains("BadDigest"), "{msg}");
+    assert!(msg.contains("after 3 attempts"), "{msg}");
+    server.verify().await;
+}
+
 // -- Checksum skip --
 
 #[tokio::test]

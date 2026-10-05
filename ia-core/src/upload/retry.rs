@@ -267,7 +267,7 @@ where
 /// Append the attempt count to a final error message when there was more
 /// than one attempt, so the user can tell a first-try failure from an
 /// exhausted budget.
-fn describe_attempts(message: &str, attempts: u32) -> String {
+pub(crate) fn describe_attempts(message: &str, attempts: u32) -> String {
     if attempts > 1 {
         format!("{message} (after {attempts} attempts)")
     } else {
