@@ -226,7 +226,16 @@ pub async fn upload_file(
                     }
                     tokio::time::sleep(wait).await;
                 }
-                poll_check_limit(client, identifier, opts, &backoff, progress.clone()).await?;
+                poll_check_limit(
+                    client,
+                    identifier,
+                    key,
+                    file_size,
+                    opts,
+                    &backoff,
+                    progress.clone(),
+                )
+                .await?;
             } else {
                 // Report retrying status for non-503 errors
                 if let Some(ref cb) = progress {
@@ -435,14 +444,15 @@ pub async fn upload_file(
                         }
                     }
 
-                    // Rate limited: retry with check_limit polling
+                    // Rate limited: retry with check_limit polling. A spent
+                    // budget counts attempts, as every other branch does.
                     if retries >= opts.retries {
                         return Err(IaError::UploadFailed {
                             identifier: identifier.to_string(),
                             key: key.to_string(),
-                            message: format!(
-                                "503 after {retries} retries: {}",
-                                strip_xml(&body_text)
+                            message: super::retry::describe_attempts(
+                                &format!("HTTP 503: {}", strip_xml(&body_text)),
+                                retries + 1,
                             ),
                             status: Some(503),
                         });
@@ -509,10 +519,12 @@ pub async fn upload_file(
                     key,
                     "upload failed after {retries} retries: {full_message}"
                 );
+                // A spent budget says so here too, as on an S3 error above
+                // and as the part path's message does.
                 return Err(IaError::UploadFailed {
                     identifier: identifier.to_string(),
                     key: key.to_string(),
-                    message: full_message,
+                    message: super::retry::describe_attempts(&full_message, retries + 1),
                     status: None,
                 });
             }
@@ -526,12 +538,17 @@ use super::build_s3_url;
 ///
 /// Polls up to `opts.retries` times, waiting between polls on the same
 /// backoff schedule as the retries. There is no wait after the last poll:
-/// nothing follows it but the error.
+/// nothing follows it but the error. The limit is per item, but the
+/// `WaitingRateLimit` event each poll emits is addressed to the file being
+/// uploaded (`key`, `file_size`), since the UIs keep their rows per file
+/// and the file's row is what must show the wait.
 /// Returns `Ok(())` when the rate limit has cleared.
 /// Returns `Err(CheckLimitFailed)` if all retries are exhausted.
 async fn poll_check_limit(
     client: &IaClient,
     identifier: &str,
+    key: &str,
+    file_size: u64,
     opts: &UploadOpts,
     backoff: &reqwest_retry::policies::ExponentialBackoff,
     progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
@@ -552,9 +569,9 @@ async fn poll_check_limit(
         if let Some(ref cb) = progress {
             cb(UploadProgress {
                 identifier: identifier.to_string(),
-                key: String::new(),
+                key: key.to_string(),
                 bytes_sent: 0,
-                total_bytes: 0,
+                total_bytes: file_size,
                 status: UploadProgressStatus::WaitingRateLimit,
             });
         }

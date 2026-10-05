@@ -19,7 +19,7 @@ const STYLES: clap::builder::Styles = clap::builder::Styles::styled()
 fn parse_jobs(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
     if n == 0 {
-        return Err("must be at least 1 (omit --jobs for adaptive concurrency)".to_string());
+        return Err("must be at least 1 (omit --jobs for the default)".to_string());
     }
     Ok(n)
 }
@@ -88,7 +88,7 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations (omit for adaptive concurrency)
+    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify uses 2)
     #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 

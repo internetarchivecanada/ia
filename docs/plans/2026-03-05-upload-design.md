@@ -662,6 +662,8 @@ MultipartIncomplete { identifier: String, key: String, upload_id: String },
 | IO error (local disk) | No |
 | check_limit unreachable | Yes — treat as overloaded, sleep and retry |
 
+> Superseded 2026-10-05 (PR #49): `400 BadDigest` is retried within the budget on both paths. Over https it means a body IA did not receive whole, or an IA-side fault, and a re-send fixes it; the one unfixable case, a file edited after hashing on a single PUT, spends the budget and ends with the same error.
+
 ### S3 XML Error Parsing
 
 IA S3 returns errors as XML:
