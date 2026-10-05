@@ -1,0 +1,22 @@
+# An upload answer that never comes is a stall (#40)
+
+**Decision (Jake, 2026-10-05, "so fix it"):** once an upload's body has been handed over in full, IA's answer must arrive within 120 s; otherwise the request is dropped (closing the connection) and sent again at once, spending one of `--retries`, exactly as a dead send does. No flag.
+
+**The measurement.** Jake ran the probe (`upload-response-latency-probe.fish`, 2026-10-05) against `s3.us.archive.org`: five part PUTs of 1 KiB on a fresh `test_collection` item, each with `Content-MD5`, timed from the last body byte to the first response line: 6240, 3890, 1850, 4335, 1786 ms (median 3.9 s, max 6.2 s). The variance on a kilobyte says the wait is IA's backend, not hashing.
+
+**Why 120 s.** The Python `internetarchive` library, which has carried multi-GB single PUTs to IA for years, sets `timeout=120` on `upload_file` (requests' timeout, so 120 s to the response headers after the body); `ia-core` keeps that number. It is twenty times the largest wait measured on a part, and leaves room for IA's post-body work on a large single PUT. A knob would need a reason a user could act on; there is none (the answer comes from the same endpoint whatever the client does), so it is a fixed rule like the 60 s dead-send rule.
+
+**Where.** `BodyWatch` already knows the moment the body is done (the `done` flag, set when the byte count reaches the body length or the stream ends). It records that instant; `check` then has two verdicts, a send that moved no bytes for the window (as before) and an answer that has not arrived `RESPONSE_WAIT` after the body; `watch_send` returns `SendEnd::Unanswered { wait_secs }` for the second. The two call sites (`retry::send_with_retry` for every multipart request, `single::upload_file` for the single PUT) treat it as a stall: re-send at once while the budget lasts, past it `IaError::UploadStalled`. The transport keeps no read timeout (its clock is not reset by body writes).
+
+**Not judged:** a request with no body stream to watch (initiate, complete, abort, listings never call `wrap`; nothing starts their clock), and a zero-length body (done at `wrap`, before the connect; the 30 s connect timeout bounds that case). #40's scope is the wait after a body.
+
+**The error.** `UploadStalled` gains `response_secs: u64` and `unanswered: usize`; `stalls` still counts every stall, `unanswered` the ones that were an unanswered body. The text keeps its shape, "upload of <item>/<key> stalled N times: <detail>", with the detail from `stall_detail`: "no bytes were sent for 60 s" (no unanswered), "no answer came within 120 s of the body" (all unanswered), or "2 sends moved no bytes for 60 s and 1 answer did not come within 120 s of the body" (mixed). The multipart part message uses the same detail: "part N of M stalled K times (<detail>, after A attempts): multipart upload <id> is kept ...". `--json`'s `upload_stalled` carries both new fields. Adding fields to a `#[non_exhaustive]` enum's variant is not a break for external matchers (`..`), and construction outside the crate was already impossible.
+
+**Test seam.** `stall::response_wait()` returns `RESPONSE_WAIT` (120 s), or the window of the live `PolicyOverride` under `cfg(test)`, so `shrink_policy()` (window 2 s) shrinks the wait to 2 s too. A new fixture, `silent_listener`, reads every byte it is sent and never answers.
+
+## Tasks
+- [ ] Plan committed first.
+- [ ] Red: `error.rs` (three wordings, singular, JSON fields); `stall_watch.rs` (`an_unanswered_request_is_abandoned_after_the_wait`; the existing 3.5 s-delay test becomes 1.5 s, within the wait); `retry.rs` (`unanswered_part_is_retried_then_fails_as_stalled`: retries 1, attempts 2, stalls 2, unanswered 2, two connections); `single.rs` (`unanswered_single_put_is_retried_then_fails_as_stalled`); `multipart.rs` (`describe_unanswered_part_is_a_kept_upload`).
+- [ ] Green: `stall::RESPONSE_WAIT` and `response_wait()`; `BodyWatch` done instant and the two verdicts; `SendEnd::Unanswered`; both call sites; `UploadStalled` fields, `stall_detail`, Display, JSON; `KeptUpload::describe`.
+- [ ] Docs: usage.md "Stalled uploads" and the `--retries` row; `--retries` help on both upload structs; `IaError` size stays under 104.
+- [ ] `just ci`; code-reviewer pass; PR; `gh pr update-branch`, `gh pr checks --watch --fail-fast`, `gh pr merge --squash`; `scripts/ia-cleanup upload-response-wait` after `gh pr view --json state` says MERGED; close #40 with the PR and commit.
