@@ -1695,9 +1695,9 @@ fn fast_opts(retries: u32) -> UploadOpts {
 
 /// While the upload sleeps out a Retry-After before polling check_limit,
 /// the UI must already show "waiting for rate limit", not stay on
-/// "uploading". The poll emits that status itself, but only after the
-/// sleep and with an empty key (it is item-level); the event for the file
-/// itself, with the file's key, is the one emitted before the sleep.
+/// "uploading". The poll emits that status itself, but only once it
+/// starts, after the sleep; the event emitted before the sleep is what
+/// covers the wait.
 #[tokio::test]
 async fn upload_503_retry_after_reports_waiting_before_the_sleep() {
     let server = MockServer::start().await;
@@ -1930,4 +1930,126 @@ async fn check_limit_exhaustion_does_not_sleep_after_the_last_poll() {
         started.elapsed()
     );
     server.verify().await;
+}
+
+// -- Series review (2026-10-05): message and progress gaps --
+
+/// A 503 with no `Retry-After` goes straight to the check_limit poll. The
+/// poll's `WaitingRateLimit` event is then the only one the file gets, so
+/// it must carry the file's key and size, or the per-file row sits on
+/// "uploading" for the whole poll.
+#[tokio::test]
+async fn check_limit_poll_reports_waiting_for_the_file() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("Please reduce your request rate."),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/file.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = temp_file(b"data");
+    let client = test_client(&server);
+    let (cb, events) = collect_progress();
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "file.txt",
+        &fast_opts(3),
+        true,
+        true,
+        None,
+        Some(cb),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+
+    let events = events.lock().unwrap();
+    let waiting: Vec<(&str, u64)> = events
+        .iter()
+        .filter(|p| matches!(p.status, upload::UploadProgressStatus::WaitingRateLimit))
+        .map(|p| (p.key.as_str(), p.total_bytes))
+        .collect();
+    assert!(
+        !waiting.is_empty(),
+        "no WaitingRateLimit event at all during the check_limit poll"
+    );
+    assert!(
+        waiting
+            .iter()
+            .all(|(key, total)| *key == "file.txt" && *total == 4),
+        "every WaitingRateLimit event must name the file and its size; got {waiting:?}"
+    );
+    server.verify().await;
+}
+
+/// Every connection is closed before a response: the budget is spent on
+/// transport errors and the message says how many attempts were made, as
+/// it does for a spent budget on an S3 error and as the part path does.
+#[tokio::test]
+async fn upload_exhausted_transport_error_names_the_attempt_count() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        // Three attempts: the first try and two retries.
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            drop(stream);
+            accepted += 1;
+        }
+        accepted
+    });
+
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = format!("127.0.0.1:{port}");
+    config.general.secure = false;
+    let client = IaClient::from_config_no_retry(config).unwrap();
+
+    let f = temp_file(b"hello");
+    let err = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &fast_opts(2),
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect_err("every connection was closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("after 3 attempts"),
+        "the spent transport budget must name the attempt count: {msg}"
+    );
+    assert_eq!(server.await.unwrap(), 3, "one connection per attempt");
 }
