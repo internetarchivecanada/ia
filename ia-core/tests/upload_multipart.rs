@@ -3043,3 +3043,74 @@ async fn multipart_part_bad_digest_is_retried() {
     assert_eq!(puts, 2, "the part was sent twice");
     server.verify().await;
 }
+
+/// Every send of a part gets BadDigest: the budget is spent on a code that
+/// is retryable since #49, so the message counts the attempts ("failed
+/// after"), not "refused by IA", and the upload is kept for a rerun.
+#[tokio::test]
+async fn part_exhausted_bad_digest_budget_is_a_kept_upload() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = two_parts();
+    mount_two_part_upload_with_no_abort(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "<Error><Code>BadDigest</Code><Message>The Content-MD5 you specified did not match what we received.</Message></Error>",
+        ))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = false;
+        o.retries = 2;
+        o.retry_min_delay = std::time::Duration::from_millis(1);
+        o.retry_max_delay = std::time::Duration::from_millis(2);
+        o
+    };
+    let err = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        1024,
+        true,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a spent BadDigest budget fails the upload");
+
+    let msg = err.to_string();
+    for needle in [
+        "part 2 of 2 failed after 3 attempts",
+        "BadDigest",
+        "mp-keep",
+        "kept with 1 part",
+        "rerun the same command to resume",
+        "ia upload cleanup",
+    ] {
+        assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+    }
+    assert!(
+        !msg.contains("refused by IA"),
+        "BadDigest is not a refusal: {msg}"
+    );
+    assert!(
+        matches!(
+            err,
+            ia_core::IaError::UploadFailed {
+                status: Some(400),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    server.verify().await;
+}
