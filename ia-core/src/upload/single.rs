@@ -372,7 +372,7 @@ pub async fn upload_file(
             Ok(response) => response,
             Err(what) => {
                 stalls += 1;
-                let falls_back = retries < opts.retries && file_size > MULTIPART_FALLBACK_MIN_SIZE;
+                let falls_back = falls_back(retries, opts, file_size);
                 if !falls_back {
                     tracing::warn!(
                         identifier,
@@ -549,7 +549,16 @@ pub async fn upload_file(
                 retry_after = None;
                 let full_message = format_error_chain(&e);
                 if retries < opts.retries {
-                    if file_size > MULTIPART_FALLBACK_MIN_SIZE {
+                    if falls_back(retries, opts, file_size) {
+                        if let Some(ref cb) = progress {
+                            cb(UploadProgress {
+                                identifier: identifier.to_string(),
+                                key: key.to_string(),
+                                bytes_sent: 0,
+                                total_bytes: file_size,
+                                status: UploadProgressStatus::Retrying,
+                            });
+                        }
                         return continue_as_multipart(
                             client,
                             identifier,
@@ -596,6 +605,14 @@ pub async fn upload_file(
 }
 
 use super::build_s3_url;
+
+/// Whether a single PUT that just died continues as a multipart upload
+/// (#21): a retry is left (which also keeps `opts.retries - attempts` from
+/// underflowing in [`continue_as_multipart`]) and the file is larger than
+/// [`MULTIPART_FALLBACK_MIN_SIZE`].
+fn falls_back(retries: u32, opts: &UploadOpts, file_size: u64) -> bool {
+    retries < opts.retries && file_size > MULTIPART_FALLBACK_MIN_SIZE
+}
 
 /// Continue a file whose single PUT died as a multipart upload (#21).
 ///

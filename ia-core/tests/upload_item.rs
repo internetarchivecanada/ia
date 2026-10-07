@@ -7,6 +7,11 @@ use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
+use ia_core::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE;
+use wiremock::matchers::{query_param, query_param_is_missing};
+
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
 fn test_client(server: &MockServer) -> IaClient {
     let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
@@ -628,11 +633,6 @@ async fn upload_item_test_item_replaces_existing_collection() {
 }
 
 // -- Falling back to multipart across a run (#21) --
-
-mod support;
-
-use ia_core::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE;
-use wiremock::matchers::{query_param, query_param_is_missing};
 
 fn client_at(addr: std::net::SocketAddr) -> IaClient {
     let mut config = IaConfig::default();

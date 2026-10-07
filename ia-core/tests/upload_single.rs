@@ -9,6 +9,11 @@ use tempfile::NamedTempFile;
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
+use ia_core::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE;
+use wiremock::matchers::{query_param, query_param_is_missing};
+
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
 fn test_client(server: &MockServer) -> IaClient {
     let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
@@ -2061,11 +2066,6 @@ async fn upload_exhausted_transport_error_names_the_attempt_count() {
 
 // -- Falling back to multipart on an unreliable path (#21) --
 
-mod support;
-
-use ia_core::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE;
-use wiremock::matchers::{query_param, query_param_is_missing};
-
 /// A client whose IA host is `addr` (a loopback proxy in these tests).
 fn client_at(addr: std::net::SocketAddr) -> IaClient {
     let mut config = IaConfig::default();
@@ -2358,6 +2358,10 @@ async fn the_switched_file_keeps_only_the_remaining_budget() {
     let text = err.to_string();
     assert!(text.contains("after 2 attempts"), "{text}");
     assert!(text.contains("fb-2"), "{text}");
+    assert!(
+        text.contains("rerun the same command with --multipart to resume"),
+        "{text}"
+    );
     server.verify().await;
 }
 

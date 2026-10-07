@@ -68,7 +68,7 @@ fn build_skip_set(
         resumes from the parts already on IA after checking them against the local file. A single PUT of a \
         file larger than 2 MiB that dies on the way (not one IA refused or throttled) continues as a \
         multipart upload with the retries it has left, and every later file larger than 2 MiB in the run \
-        is sent as multipart from the start, so an interrupted run resumes those files from their parts. \
+        is sent as multipart from the start; a rerun given --multipart resumes such a file from its parts. \
         --joblog adds a layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
@@ -200,7 +200,8 @@ pub struct UploadArgs {
     ///
     /// Without the flag, a file larger than 2 MiB whose single PUT dies on
     /// the way continues as a multipart upload, and every later file larger
-    /// than 2 MiB in the run is sent as multipart from the start.
+    /// than 2 MiB in the run is sent as multipart from the start. Only a
+    /// rerun with the flag looks for the parts such a file left on IA.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -336,7 +337,8 @@ pub struct ImportArgs {
     ///
     /// Without the flag, a file larger than 2 MiB whose single PUT dies on
     /// the way continues as a multipart upload, and every later file larger
-    /// than 2 MiB in the run is sent as multipart from the start.
+    /// than 2 MiB in the run is sent as multipart from the start. Only a
+    /// rerun with the flag looks for the parts such a file left on IA.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does

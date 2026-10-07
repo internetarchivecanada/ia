@@ -31,6 +31,7 @@ impl MultipartFallback {
         self.0.load(Ordering::SeqCst)
     }
 
+    /// Record that a single PUT in this run has died.
     pub(crate) fn turn_on(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -258,6 +259,13 @@ impl UploadOptsBuilder {
     /// Set whether to use multipart upload.
     pub fn multipart(mut self, multipart: bool) -> Self {
         self.opts.multipart = multipart;
+        self
+    }
+
+    /// Share a run's [`MultipartFallback`] handle with these options, so
+    /// options built separately for the files of one run switch together.
+    pub fn multipart_fallback(mut self, handle: MultipartFallback) -> Self {
+        self.opts.multipart_fallback = handle;
         self
     }
 
@@ -574,6 +582,10 @@ mod tests {
         assert!(opts.multipart_fallback.is_on());
         assert!(!UploadOptsBuilder::new().build().multipart_fallback.is_on());
         assert!(!UploadOpts::default().multipart_fallback.is_on());
+        let built = UploadOptsBuilder::new()
+            .multipart_fallback(opts.multipart_fallback.clone())
+            .build();
+        assert!(built.multipart_fallback.is_on());
     }
 
     #[test]
