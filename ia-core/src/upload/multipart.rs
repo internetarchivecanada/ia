@@ -915,7 +915,7 @@ pub async fn upload_file_multipart(
                     part_num,
                     part_count,
                     parts_on_ia: completed_parts.len(),
-                    by_fallback: !opts.multipart,
+                    by_fallback: !opts.multipart && opts.multipart_fallback.is_on(),
                 };
                 let err = kept.describe(failure);
                 tracing::warn!(
@@ -995,8 +995,9 @@ struct KeptUpload<'a> {
     part_num: u32,
     part_count: u32,
     parts_on_ia: usize,
-    /// The file reached the multipart path by the fallback (#21), not by
-    /// `--multipart`; a rerun finds its parts only with the flag.
+    /// The file reached the multipart path by the fallback (#21): the run
+    /// did not ask for multipart and its handle is on. A rerun finds the
+    /// parts only with `--multipart`.
     by_fallback: bool,
 }
 
