@@ -9,6 +9,11 @@ use tempfile::NamedTempFile;
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod support;
+
+use ia_core::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE;
+use wiremock::matchers::{query_param, query_param_is_missing};
+
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.
 fn test_client(server: &MockServer) -> IaClient {
     let host_port = server.uri().strip_prefix("http://").unwrap().to_string();
@@ -2057,4 +2062,364 @@ async fn upload_exhausted_transport_error_names_the_attempt_count() {
         .await
         .expect("one connection per attempt: the listener saw fewer than three")
         .unwrap();
+}
+
+// -- Falling back to multipart on an unreliable path (#21) --
+
+/// A client whose IA host is `addr` (a loopback proxy in these tests).
+fn client_at(addr: std::net::SocketAddr) -> IaClient {
+    let mut config = IaConfig::default();
+    config.s3_access = Some("test-access".into());
+    config.s3_secret = Some("test-secret".into());
+    config.general.host = addr.to_string();
+    config.general.secure = false;
+    IaClient::from_config_no_retry(config).unwrap()
+}
+
+/// A file one mebibyte above the fallback threshold.
+fn large_file() -> NamedTempFile {
+    temp_file(&vec![
+        0x42u8;
+        (MULTIPART_FALLBACK_MIN_SIZE + 1024 * 1024) as usize
+    ])
+}
+
+/// A file one mebibyte below the fallback threshold.
+fn small_file() -> NamedTempFile {
+    temp_file(&vec![
+        0x42u8;
+        (MULTIPART_FALLBACK_MIN_SIZE - 1024 * 1024) as usize
+    ])
+}
+
+/// The multipart requests for a one-part upload of `/test-item/<key>`:
+/// the resume listing (empty), initiate, part 1, complete.
+async fn mount_one_part_multipart(server: &MockServer, key: &str, upload_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/test-item/{key}")))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<InitiateMultipartUploadResult><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        )))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/test-item/{key}")))
+        .and(query_param("partNumber", "1"))
+        .and(query_param("uploadId", upload_id))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/test-item/{key}")))
+        .and(query_param("uploadId", upload_id))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// An initiate that must never be sent.
+async fn mount_no_initiate(server: &MockServer, key: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/test-item/{key}")))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// The single PUT of `/test-item/<key>`, expected `times` times.
+async fn mount_single_put(server: &MockServer, key: &str, status: u16, times: u64) {
+    Mock::given(method("PUT"))
+        .and(path(format!("/test-item/{key}")))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(ResponseTemplate::new(status))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+async fn upload_big(
+    client: &IaClient,
+    f: &NamedTempFile,
+    opts: &UploadOpts,
+) -> ia_core::Result<upload::UploadResult> {
+    upload::upload_file(
+        client,
+        "test-item",
+        f.path(),
+        "big.bin",
+        opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+}
+
+/// A single PUT of a file above the threshold that ends in a transport
+/// error continues as a multipart upload: no single PUT reaches the server,
+/// the one-part upload completes, the result counts the spent attempt, and
+/// the run's handle is on for the files that follow.
+#[tokio::test]
+async fn a_dead_single_put_of_a_large_file_switches_to_multipart() {
+    let server = MockServer::start().await;
+    mount_one_part_multipart(&server, "big.bin", "fb-1").await;
+    mount_single_put(&server, "big.bin", 200, 0).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+
+    let opts = fast_opts(3);
+    assert!(!opts.multipart_fallback.is_on());
+    let f = large_file();
+    let result = upload_big(&client_at(proxy), &f, &opts).await.unwrap();
+
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.retries, 1);
+    assert!(opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A file at or below the threshold is re-sent as a single PUT after a
+/// transport error, and the handle stays off.
+#[tokio::test]
+async fn a_small_file_is_re_sent_as_a_single_put() {
+    let server = MockServer::start().await;
+    mount_single_put(&server, "big.bin", 200, 1).await;
+    mount_no_initiate(&server, "big.bin").await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+
+    let opts = fast_opts(3);
+    let f = small_file();
+    let result = upload_big(&client_at(proxy), &f, &opts).await.unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.retries, 1);
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A 503 throttle is IA's load, not the path: the file stays a single PUT.
+#[tokio::test]
+async fn a_throttled_large_file_does_not_switch() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/big.bin"))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "0")
+                .set_body_string("<Error><Code>SlowDown</Code><Message>slow</Message></Error>"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_single_put(&server, "big.bin", 200, 1).await;
+    Mock::given(method("GET"))
+        .and(query_param("check_limit", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"bucket":"test-item","over_limit":0}"#),
+        )
+        .mount(&server)
+        .await;
+    mount_no_initiate(&server, "big.bin").await;
+
+    let opts = fast_opts(3);
+    let f = large_file();
+    let result = upload_big(&test_client(&server), &f, &opts).await.unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A refusal is the request's fault, not the path's: no switch.
+#[tokio::test]
+async fn a_refused_large_file_does_not_switch() {
+    let server = MockServer::start().await;
+    mount_single_put(&server, "big.bin", 403, 1).await;
+    mount_no_initiate(&server, "big.bin").await;
+
+    let opts = fast_opts(3);
+    let f = large_file();
+    let err = upload_big(&test_client(&server), &f, &opts)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ia_core::IaError::UploadFailed { .. }),
+        "{err:?}"
+    );
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A spam rejection stays fatal for the item: no switch.
+#[tokio::test]
+async fn a_spam_rejected_large_file_does_not_switch() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/big.bin"))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Your upload appears to be spam."))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_no_initiate(&server, "big.bin").await;
+
+    let opts = fast_opts(3);
+    let f = large_file();
+    let err = upload_big(&test_client(&server), &f, &opts)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ia_core::IaError::SpamDetected { .. }),
+        "{err:?}"
+    );
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// With no retry left there is nothing to continue with: the file fails as
+/// it always did.
+#[tokio::test]
+async fn a_dead_single_put_on_the_last_attempt_does_not_switch() {
+    let server = MockServer::start().await;
+    mount_no_initiate(&server, "big.bin").await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+
+    let opts = fast_opts(0);
+    let f = large_file();
+    let err = upload_big(&client_at(proxy), &f, &opts).await.unwrap_err();
+
+    assert!(
+        matches!(err, ia_core::IaError::UploadFailed { .. }),
+        "{err:?}"
+    );
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// The multipart requests get the retries the single PUT did not spend:
+/// with `retries` 2 and one attempt gone, each request has one retry left,
+/// so a part that always fails is tried exactly twice.
+#[tokio::test]
+async fn the_switched_file_keeps_only_the_remaining_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/big.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>fb-2</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/big.bin"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+
+    let opts = fast_opts(2);
+    let f = large_file();
+    let err = upload_big(&client_at(proxy), &f, &opts).await.unwrap_err();
+
+    let text = err.to_string();
+    assert!(text.contains("after 2 attempts"), "{text}");
+    assert!(text.contains("fb-2"), "{text}");
+    assert!(
+        text.contains("rerun the same command with --multipart to resume"),
+        "{text}"
+    );
+    server.verify().await;
+}
+
+/// Once the handle is on, a file above the threshold takes the multipart
+/// path from the start: the skip check runs as usual and no single PUT is
+/// attempted.
+#[tokio::test]
+async fn a_large_file_after_the_switch_is_multipart_from_the_start() {
+    let server = MockServer::start().await;
+    mount_one_part_multipart(&server, "big.bin", "fb-3").await;
+    mount_single_put(&server, "big.bin", 200, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut opts = fast_opts(3);
+    opts.verify = true;
+    opts.checksum = true;
+    // The handle has no public setter: it is turned on the way a run turns
+    // it on, by an earlier file whose single PUT dies. A clone shares it.
+    {
+        let earlier = MockServer::start().await;
+        mount_one_part_multipart(&earlier, "earlier.bin", "earlier-1").await;
+        let proxy = support::dropping_proxy(support::mock_addr(&earlier), 1).await;
+        let f = large_file();
+        // No skip check on this run, so the dropped connection is the PUT.
+        let mut shared = opts.clone();
+        shared.checksum = false;
+        shared.verify = false;
+        upload::upload_file(
+            &client_at(proxy),
+            "test-item",
+            f.path(),
+            "earlier.bin",
+            &shared,
+            true,
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(opts.multipart_fallback.is_on());
+
+    let f = large_file();
+    let result = upload_big(&test_client(&server), &f, &opts).await.unwrap();
+
+    assert!(
+        matches!(result.status, UploadStatus::Uploaded),
+        "{result:?}"
+    );
+    assert_eq!(result.retries, 0);
+    server.verify().await;
 }

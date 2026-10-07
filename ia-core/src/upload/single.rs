@@ -2,6 +2,9 @@ use crate::error::{format_error_chain, IaError, Result};
 use crate::upload::check_limit::{is_spam_response, parse_check_limit_response};
 use crate::upload::checksum::{compute_file_md5_async, hash_file_and_parts_async, FileHashes};
 use crate::upload::headers::encode_metadata_headers;
+use crate::upload::multipart::{
+    upload_file_multipart, DEFAULT_PART_SIZE, MULTIPART_FALLBACK_MIN_SIZE,
+};
 use crate::upload::s3_error::{describe_parsed, parse_s3_error, strip_xml};
 use crate::upload::stall_watch::{watch_send, BodyWatch, SendEnd};
 use crate::upload::types::*;
@@ -49,6 +52,12 @@ pub async fn upload_file(
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
+    // The path is decided once per file: multipart when asked for, or when
+    // an earlier single PUT in this run died and the file is above the
+    // fallback threshold (#21).
+    let multipart = opts.multipart
+        || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE);
+
     // One read of the file when either the skip check or verification
     // needs its md5 (`--clobber --no-verify` reads nothing). For a
     // multipart upload the same pass yields every part's md5, which a
@@ -73,11 +82,8 @@ pub async fn upload_file(
                     status: UploadProgressStatus::Verifying,
                 });
             }
-            if opts.multipart {
-                Some(
-                    hash_file_and_parts_async(file, crate::upload::multipart::DEFAULT_PART_SIZE)
-                        .await?,
-                )
+            if multipart {
+                Some(hash_file_and_parts_async(file, DEFAULT_PART_SIZE).await?)
             } else {
                 Some(FileHashes {
                     md5: compute_file_md5_async(file).await?,
@@ -132,16 +138,15 @@ pub async fn upload_file(
         }
     }
 
-    // Dry run: validate everything but don't upload
     // Multipart from here: the skip check above applies to both paths.
-    if opts.multipart {
-        return crate::upload::multipart::upload_file_multipart(
+    if multipart {
+        return upload_file_multipart(
             client,
             identifier,
             file,
             key,
             opts,
-            crate::upload::multipart::DEFAULT_PART_SIZE,
+            DEFAULT_PART_SIZE,
             is_first_file,
             is_last_file,
             size_hint,
@@ -367,19 +372,22 @@ pub async fn upload_file(
             Ok(response) => response,
             Err(what) => {
                 stalls += 1;
-                tracing::warn!(
-                    identifier,
-                    key,
-                    retry = retries + 1,
-                    window_secs,
-                    response_secs,
-                    "{what}, {}",
-                    if retries < opts.retries {
-                        "re-sending"
-                    } else {
-                        "giving up"
-                    }
-                );
+                let falls_back = falls_back(retries, opts, file_size);
+                if !falls_back {
+                    tracing::warn!(
+                        identifier,
+                        key,
+                        retry = retries + 1,
+                        window_secs,
+                        response_secs,
+                        "{what}, {}",
+                        if retries < opts.retries {
+                            "re-sending"
+                        } else {
+                            "giving up"
+                        }
+                    );
+                }
                 if retries < opts.retries {
                     if let Some(ref cb) = progress {
                         cb(UploadProgress {
@@ -389,6 +397,24 @@ pub async fn upload_file(
                             total_bytes: file_size,
                             status: UploadProgressStatus::Retrying,
                         });
+                    }
+                    if falls_back {
+                        return continue_as_multipart(
+                            client,
+                            identifier,
+                            file,
+                            key,
+                            opts,
+                            retries + 1,
+                            what,
+                            is_first_file,
+                            is_last_file,
+                            size_hint,
+                            progress,
+                            hashes.as_ref(),
+                            start,
+                        )
+                        .await;
                     }
                     last_was_503 = false;
                     last_was_stall = true;
@@ -523,6 +549,33 @@ pub async fn upload_file(
                 retry_after = None;
                 let full_message = format_error_chain(&e);
                 if retries < opts.retries {
+                    if falls_back(retries, opts, file_size) {
+                        if let Some(ref cb) = progress {
+                            cb(UploadProgress {
+                                identifier: identifier.to_string(),
+                                key: key.to_string(),
+                                bytes_sent: 0,
+                                total_bytes: file_size,
+                                status: UploadProgressStatus::Retrying,
+                            });
+                        }
+                        return continue_as_multipart(
+                            client,
+                            identifier,
+                            file,
+                            key,
+                            opts,
+                            retries + 1,
+                            &full_message,
+                            is_first_file,
+                            is_last_file,
+                            size_hint,
+                            progress,
+                            hashes.as_ref(),
+                            start,
+                        )
+                        .await;
+                    }
                     tracing::debug!(
                         identifier,
                         key,
@@ -552,6 +605,69 @@ pub async fn upload_file(
 }
 
 use super::build_s3_url;
+
+/// Whether a single PUT that just died continues as a multipart upload
+/// (#21): a retry is left (which also keeps `opts.retries - attempts` from
+/// underflowing in [`continue_as_multipart`]) and the file is larger than
+/// [`MULTIPART_FALLBACK_MIN_SIZE`].
+fn falls_back(retries: u32, opts: &UploadOpts, file_size: u64) -> bool {
+    retries < opts.retries && file_size > MULTIPART_FALLBACK_MIN_SIZE
+}
+
+/// Continue a file whose single PUT died as a multipart upload (#21).
+///
+/// Turns the run's [`MultipartFallback`] handle on, so every later file
+/// larger than [`MULTIPART_FALLBACK_MIN_SIZE`] takes the multipart path
+/// from the start, and sends this file with the retries the single PUT did
+/// not spend: `attempts` were made of the `opts.retries + 1` allowed, so
+/// each multipart request gets `opts.retries - attempts` retries. The
+/// caller has checked that at least one is left. The result counts the
+/// single PUT's attempts among its retries and is timed from `start`.
+#[allow(clippy::too_many_arguments)]
+async fn continue_as_multipart(
+    client: &IaClient,
+    identifier: &str,
+    file: &Path,
+    key: &str,
+    opts: &UploadOpts,
+    attempts: u32,
+    what: &str,
+    is_first_file: bool,
+    is_last_file: bool,
+    size_hint: Option<u64>,
+    progress: Option<Arc<dyn Fn(UploadProgress) + Send + Sync>>,
+    hashes: Option<&FileHashes>,
+    start: Instant,
+) -> Result<UploadResult> {
+    opts.multipart_fallback.turn_on();
+    tracing::warn!(
+        identifier,
+        key,
+        attempts,
+        "single PUT of {identifier}/{key} failed ({what}); the file continues as a multipart \
+         upload, as does every later file larger than {} MiB in this run",
+        MULTIPART_FALLBACK_MIN_SIZE / (1024 * 1024)
+    );
+    let mut remaining = opts.clone();
+    remaining.retries = opts.retries - attempts;
+    let mut result = upload_file_multipart(
+        client,
+        identifier,
+        file,
+        key,
+        &remaining,
+        DEFAULT_PART_SIZE,
+        is_first_file,
+        is_last_file,
+        size_hint,
+        progress,
+        hashes,
+    )
+    .await?;
+    result.retries += attempts;
+    result.elapsed_ms = start.elapsed().as_millis() as u64;
+    Ok(result)
+}
 
 /// Poll the check_limit endpoint until the rate limit clears.
 ///
@@ -784,11 +900,100 @@ mod tests {
         f
     }
 
-    /// A single-file PUT whose body send stalls is abandoned and re-sent;
-    /// when the retries are spent the file fails as stalled, with one stall
-    /// per attempt.
+    /// A single PUT of a file above the fallback threshold whose send dies
+    /// continues as a multipart upload (#21): the proxy stalls the first
+    /// connection and forwards the rest to a server that completes a
+    /// one-part upload.
     #[tokio::test]
-    async fn stalled_single_put_is_retried_then_fails_as_stalled() {
+    async fn a_dead_send_of_a_large_file_continues_as_multipart() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _policy = shrink_policy();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/test-item"))
+            .and(query_param("uploads", ""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/test-item/big.bin"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>dead-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/test-item/big.bin"))
+            .and(query_param("partNumber", "1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/test-item/big.bin"))
+            .and(query_param("uploadId", "dead-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target: std::net::SocketAddr = server
+            .uri()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let proxy =
+            crate::upload::stall_watch::test_support::stalling_then_forwarding_proxy(target).await;
+
+        let client = stalling_client(proxy);
+        let f = big_temp_file();
+        let opts = UploadOpts {
+            verify: false,
+            checksum: false,
+            retries: 2,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            upload_file(
+                &client,
+                "test-item",
+                f.path(),
+                "big.bin",
+                &opts,
+                true,
+                true,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the dead send must be judged within the shrunk window")
+        .expect("the file must complete as a multipart upload");
+
+        assert!(
+            matches!(result.status, UploadStatus::Uploaded),
+            "{result:?}"
+        );
+        assert_eq!(result.retries, 1);
+        assert!(opts.multipart_fallback.is_on());
+        server.verify().await;
+    }
+
+    /// A single-file PUT whose body send stalls with no retry left fails as
+    /// stalled after one connection. (With a retry left, a file this size
+    /// continues as a multipart upload instead; see
+    /// `a_dead_send_of_a_large_file_continues_as_multipart`.)
+    #[tokio::test]
+    async fn stalled_single_put_with_no_retry_left_fails_as_stalled() {
         let _policy = shrink_policy();
         let (addr, connections) = stalling_listener().await;
         let client = stalling_client(addr);
@@ -796,7 +1001,7 @@ mod tests {
         let opts = UploadOpts {
             verify: false,
             checksum: false,
-            retries: 1,
+            retries: 0,
             ..Default::default()
         };
         let err = tokio::time::timeout(
@@ -814,13 +1019,13 @@ mod tests {
             ),
         )
         .await
-        .expect("the stalled sends must be judged within a minute")
+        .expect("the stalled send must be judged within a minute")
         .expect_err("a stalled send must fail once the retries are spent");
         assert!(
             matches!(
                 err,
                 IaError::UploadStalled {
-                    stalls: 2,
+                    stalls: 1,
                     window_secs: 2,
                     unanswered: 0,
                     ..
@@ -828,7 +1033,7 @@ mod tests {
             ),
             "got {err:?}"
         );
-        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A single-file PUT the server reads in full and never answers is

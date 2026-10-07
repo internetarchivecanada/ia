@@ -21,6 +21,11 @@ use bytes::Bytes;
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Files strictly larger than this fall back to multipart once the run's
+/// [`MultipartFallback`](crate::upload::MultipartFallback) handle is on;
+/// files of this size or less are always sent as a single PUT. 2 MiB.
+pub const MULTIPART_FALLBACK_MIN_SIZE: u64 = 2 * 1024 * 1024;
+
 // ── XML parsing helpers ─────────────────────────────────────────────────────
 //
 // S3 returns XML for multipart operations. We use simple string matching
@@ -910,6 +915,7 @@ pub async fn upload_file_multipart(
                     part_num,
                     part_count,
                     parts_on_ia: completed_parts.len(),
+                    by_fallback: !opts.multipart && opts.multipart_fallback.is_on(),
                 };
                 let err = kept.describe(failure);
                 tracing::warn!(
@@ -989,6 +995,10 @@ struct KeptUpload<'a> {
     part_num: u32,
     part_count: u32,
     parts_on_ia: usize,
+    /// The file reached the multipart path by the fallback (#21): the run
+    /// did not ask for multipart and its handle is on. A rerun finds the
+    /// parts only with `--multipart`.
+    by_fallback: bool,
 }
 
 impl KeptUpload<'_> {
@@ -1038,12 +1048,13 @@ impl KeptUpload<'_> {
                     key: self.key.into(),
                     message: format!(
                         "part {} of {} stalled {stalls} {} ({detail}{attempts}): \
-                         multipart upload {} {kept}; rerun the same command to resume, or discard it \
+                         multipart upload {} {kept}; rerun the same command{} to resume, or discard it \
                          with: ia upload cleanup {} {} --abort",
                         self.part_num,
                         self.part_count,
                         if stalls == 1 { "time" } else { "times" },
                         self.upload_id,
+                        self.rerun_flag(),
                         self.identifier,
                         shell_word(self.key)
                     ),
@@ -1074,13 +1085,25 @@ impl KeptUpload<'_> {
             identifier: self.identifier.into(),
             key: self.key.into(),
             message: format!(
-                "{what}: multipart upload {} {kept}; {fix}rerun the same command to resume, \
+                "{what}: multipart upload {} {kept}; {fix}rerun the same command{} to resume, \
                  or discard it with: ia upload cleanup {} {} --abort",
                 self.upload_id,
+                self.rerun_flag(),
                 self.identifier,
                 shell_word(self.key)
             ),
             status,
+        }
+    }
+
+    /// " with --multipart" when the file reached this path by the fallback:
+    /// without the flag a rerun sends the file as a single PUT and never
+    /// looks for the parts. Empty when the run asked for multipart.
+    fn rerun_flag(&self) -> &'static str {
+        if self.by_fallback {
+            " with --multipart"
+        } else {
+            ""
         }
     }
 
@@ -1429,7 +1452,47 @@ mod tests {
             part_num,
             part_count,
             parts_on_ia,
+            by_fallback: false,
         }
+    }
+
+    /// A kept upload reached by the fallback asks for --multipart on the
+    /// rerun, in both wordings.
+    #[test]
+    fn describe_by_fallback_asks_for_the_flag_on_the_rerun() {
+        let mut k = kept(2, 3, 1, "f.bin");
+        k.by_fallback = true;
+        let msg = k
+            .describe(failure("HTTP 500", Some(500), None, 2))
+            .to_string();
+        assert!(
+            msg.contains("rerun the same command with --multipart to resume, or discard it with: ia upload cleanup item f.bin --abort"),
+            "{msg}"
+        );
+        let stalled = S3Failure {
+            error: Box::new(IaError::UploadStalled {
+                identifier: "item".into(),
+                key: "f.bin".into(),
+                window_secs: 60,
+                stalls: 2,
+                response_secs: 120,
+                unanswered: 0,
+            }),
+            code: None,
+            attempts: 2,
+        };
+        let msg = k.describe(stalled).to_string();
+        assert!(
+            msg.contains("rerun the same command with --multipart to resume"),
+            "{msg}"
+        );
+        let plain = kept(2, 3, 1, "f.bin")
+            .describe(failure("HTTP 500", Some(500), None, 2))
+            .to_string();
+        assert!(
+            plain.contains("rerun the same command to resume"),
+            "{plain}"
+        );
     }
 
     fn failure(message: &str, status: Option<u16>, code: Option<&str>, attempts: u32) -> S3Failure {

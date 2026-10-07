@@ -65,8 +65,11 @@ fn build_skip_set(
         Each file is sent in one PUT unless --multipart is given. If an upload is interrupted (the process \
         is killed, the network drops past the retries), a single-PUT file is sent again from byte 0 on the \
         rerun, except that a file the item already lists with the same md5 is skipped; a --multipart file \
-        resumes from the parts already on IA after checking them against the local file. --joblog adds a \
-        layer on top of either: files a previous run finished are skipped without a request.",
+        resumes from the parts already on IA after checking them against the local file. A single PUT of a \
+        file larger than 2 MiB that dies on the way (not one IA refused or throttled) continues as a \
+        multipart upload with the retries it has left, and every later file larger than 2 MiB in the run \
+        is sent as multipart from the start; a rerun given --multipart resumes such a file from its parts. \
+        --joblog adds a layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Upload a file to an existing or new item</dim>\
@@ -183,7 +186,9 @@ pub struct UploadArgs {
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// dead send or an unanswered body is re-sent at once.
+    /// dead send or an unanswered body is re-sent at once. A file that
+    /// continues as multipart after its single PUT died carries the attempts
+    /// it has left over to each of its multipart requests.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -191,7 +196,12 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Use multipart upload (for large files or unreliable connections)
+    /// Use multipart upload for every file (for large files or unreliable connections)
+    ///
+    /// Without the flag, a file larger than 2 MiB whose single PUT dies on
+    /// the way continues as a multipart upload, and every later file larger
+    /// than 2 MiB in the run is sent as multipart from the start. Only a
+    /// rerun with the flag looks for the parts such a file left on IA.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -323,7 +333,12 @@ pub struct ImportArgs {
     #[arg(long)]
     pub test_item: bool,
 
-    /// Use multipart upload (for large files or unreliable connections)
+    /// Use multipart upload for every file (for large files or unreliable connections)
+    ///
+    /// Without the flag, a file larger than 2 MiB whose single PUT dies on
+    /// the way continues as a multipart upload, and every later file larger
+    /// than 2 MiB in the run is sent as multipart from the start. Only a
+    /// rerun with the flag looks for the parts such a file left on IA.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -353,7 +368,9 @@ pub struct ImportArgs {
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// dead send or an unanswered body is re-sent at once.
+    /// dead send or an unanswered body is re-sent at once. A file that
+    /// continues as multipart after its single PUT died carries the attempts
+    /// it has left over to each of its multipart requests.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
