@@ -2131,6 +2131,20 @@ fn cleanup_help_says_unfinished_uploads_may_be_cleaned_up() {
         ));
 }
 
+// -- a single PUT that dies continues as multipart (#21) --
+
+#[test]
+fn upload_help_describes_the_multipart_fallback() {
+    ia().args(["upload", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("larger than 2 MiB"))
+        .stdout(predicate::str::contains("continues as a multipart upload"))
+        .stdout(predicate::str::contains(
+            "every later file larger than 2 MiB",
+        ));
+}
+
 // -- upload retries back off; --retry-sleep is gone --
 
 #[test]

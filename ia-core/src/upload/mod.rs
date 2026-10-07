@@ -19,8 +19,8 @@ pub use item::upload_item;
 pub use single::upload_file;
 pub use template::{generate_template, write_template_csv, TemplateOpts, TemplateRow};
 pub use types::{
-    MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts, UploadOptsBuilder, UploadProgress,
-    UploadProgressStatus, UploadResult, UploadStatus,
+    MultipartFallback, MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts,
+    UploadOptsBuilder, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 
 use crate::IaClient;

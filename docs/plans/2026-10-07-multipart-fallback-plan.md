@@ -50,10 +50,14 @@ Hermetic. A transport error is produced by a loopback proxy in `ia-core/tests/su
 - `docs/usage.md`: the `--multipart` row; a "Falling back to multipart" section under the upload stall and multipart sections stating the rule, the trigger, the non-triggers, the carried budget, the warning text, and that `--multipart` still forces it; the "Resuming uploads" paragraph notes that a switched file resumes like a `--multipart` file.
 - `README.md`: the upload row.
 
+## Finding during implementation: requests without a body have no answer bound
+
+The multipart control requests (initiate, complete, abort, the two listings) carry no body, so neither the dead-send rule nor the 120 s answer bound from #40 applies to them, and the upload transport has no read timeout. Against a server that accepts a connection and then goes silent, a single PUT was abandoned after 60 s; with the fallback, the same file now continues with an initiate request to the same server, and that request waits indefinitely. Before this change the behavior was reachable only with `--multipart`; the fallback reaches it on the default path. The pre-existing crate test that sent a 16 MiB file to such a server with one retry, and expected the file to fail as stalled after two sends, hung for this reason; it now covers the no-retry case, and the retry case is covered by the fallback test. The bound for bodiless requests is a separate change (an answer clock on every IA-S3 request, not only after a body) and is filed as its own issue.
+
 ## Tasks
 
-- [ ] Plan committed first.
-- [ ] Red: the tests above.
-- [ ] Green: `MULTIPART_FALLBACK_MIN_SIZE`, `MultipartFallback`, the `UploadOpts` field, the decision in `upload_file`, the switch in the two arms, the warning.
-- [ ] Docs: help text on both structs, `usage.md`, `README.md`.
-- [ ] `just ci`; code-reviewer pass; findings closed and recorded below; PR; squash-merge after green checks; `scripts/ia-cleanup multipart-fallback` after the merge is confirmed; close #21 naming the PR and commit.
+- [x] Plan committed first.
+- [x] Red: the tests above.
+- [x] Green: `MULTIPART_FALLBACK_MIN_SIZE`, `MultipartFallback`, the `UploadOpts` field, the decision in `upload_file`, the switch in the two arms, the warning.
+- [x] Docs: help text on both structs, `usage.md`, `README.md`.
+- [ ] `just ci`; code-reviewer pass; findings closed and recorded below; PR; squash-merge after green checks; `scripts/ia-cleanup multipart-fallback` after the merge is confirmed; close #21 naming the PR and commit; file the bodiless-request issue.

@@ -299,6 +299,45 @@ pub(crate) mod test_support {
         (addr, connections)
     }
 
+    /// A proxy whose first connection stalls (it reads the first kilobyte
+    /// and then stops reading without closing) and whose later connections
+    /// are forwarded byte for byte to `target`. Returns its address.
+    pub(crate) async fn stalling_then_forwarding_proxy(
+        target: std::net::SocketAddr,
+    ) -> std::net::SocketAddr {
+        use tokio::io::AsyncReadExt;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut accepted = 0usize;
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted += 1;
+                if accepted == 1 {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        let _ = inbound.read_exact(&mut buf).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                        drop(inbound);
+                    });
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        addr
+    }
+
     /// 16 MiB: larger than the loopback socket buffers, so the send really
     /// stops when the server stops reading.
     pub(crate) fn big_body() -> bytes::Bytes {
