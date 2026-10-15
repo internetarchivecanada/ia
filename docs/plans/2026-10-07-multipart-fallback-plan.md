@@ -18,7 +18,7 @@
 - The warning, at `warn` level (shown by default on the console): `single PUT of <identifier>/<key> failed (<what happened>); the file continues as a multipart upload, as does every later file larger than 2 MiB in this run`.
 - A failure on the last allowed attempt does not switch; the file fails as it does today.
 - `MultipartFallback` also records, per item, the file names for which IA holds an unfinished multipart upload: `record_unfinished(identifier, keys)` (crate-private) and `has_unfinished(identifier, key)`. `upload_item` fills it from one listing per item before any file starts; `upload_file` reads it in the path decision: `opts.multipart || opts.multipart_fallback.has_unfinished(identifier, key) || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE)`.
-- The listing uses the run's retry budget like every other IA-S3 request. A brand-new item (`NoSuchBucket`) has nothing to resume. Any other failure of the listing does not fail the item: the run warns, `could not list the unfinished multipart uploads of <item> (<error>); a file that left parts on IA in an earlier run is sent again as a single PUT`, and continues as a run without the listing would, which is the behavior before this revision. The listing exists to find kept uploads; when it cannot, the uploads themselves are still worth sending.
+- The listing uses the run's retry budget like every other IA-S3 request, and is given the response wait (120 s, `stall::response_wait`) over all its attempts: it carries no body, so nothing in the stall rules bounds its answer (#60), and a run must not hang before its first file on a server that accepts the connection and goes silent. Past the wait it counts as a failed listing. A brand-new item (`NoSuchBucket`) has nothing to resume. Any other failure of the listing does not fail the item: the run warns, `could not list the unfinished multipart uploads of <item> (<error>); a file that left parts on IA in an earlier run is sent again as a single PUT`, and continues as a run without the listing would, which is the behavior before this revision. The listing exists to find kept uploads; when it cannot, the uploads themselves are still worth sending.
 - The part-failure message no longer varies with how the file reached the multipart path: `rerun the same command to resume` in both wordings. `KeptUpload.by_fallback` and `rerun_flag` are removed.
 
 ## Public API
@@ -52,6 +52,7 @@ Hermetic. A transport error is produced by a loopback proxy in `ia-core/tests/su
 - the same for a file of 1 MiB, below the fallback threshold;
 - a listing that fails (a 500 on every attempt of the budget) leaves the run on single PUTs, which complete, with the warning;
 - a brand-new item (`NoSuchBucket`) sends single PUTs with no warning;
+- (crate test in `item.rs`, with the shrunk stall policy) a listing to a server that accepts the connection and never answers is abandoned at the response wait and the run sends its single PUT;
 - under `dry_run` no listing is sent (the existing dry-run tests reach a client with no server);
 - the two fallback tests above now see the listing as the first connection: the proxy forwards it and drops the next connection, the single PUT (the listing answer carries `Connection: close`, so the PUT opens a new connection).
 
@@ -65,7 +66,7 @@ Hermetic. A transport error is produced by a loopback proxy in `ia-core/tests/su
 
 ## Finding during implementation: requests without a body have no answer bound
 
-The multipart control requests (initiate, complete, abort, the two listings) carry no body, so neither the dead-send rule nor the 120 s answer bound from #40 applies to them, and the upload transport has no read timeout. Against a server that accepts a connection and then goes silent, a single PUT was abandoned after 60 s; with the fallback, the same file now continues with an initiate request to the same server, and that request waits indefinitely. Before this change the behavior was reachable only with `--multipart`; the fallback reaches it on the default path. The pre-existing crate test that sent a 16 MiB file to such a server with one retry, and expected the file to fail as stalled after two sends, hung for this reason; it now covers the no-retry case, and the retry case is covered by the fallback test. The bound for bodiless requests is a separate change (an answer clock on every IA-S3 request, not only after a body), filed as #60.
+The multipart control requests (initiate, complete, abort, the two listings) carry no body, so neither the dead-send rule nor the 120 s answer bound from #40 applies to them, and the upload transport has no read timeout. Against a server that accepts a connection and then goes silent, a single PUT was abandoned after 60 s; with the fallback, the same file now continues with an initiate request to the same server, and that request waits indefinitely. Before this change the behavior was reachable only with `--multipart`; the fallback reaches it on the default path. The listing per item added by the revision of 2026-10-14 is on the default path of every run, so it is bounded on its own, by the response wait over all its attempts (see the design above); the other bodiless requests remain for #60. The pre-existing crate test that sent a 16 MiB file to such a server with one retry, and expected the file to fail as stalled after two sends, hung for this reason; it now covers the no-retry case, and the retry case is covered by the fallback test. The bound for bodiless requests is a separate change (an answer clock on every IA-S3 request, not only after a body), filed as #60.
 
 ## Tasks
 
@@ -91,3 +92,13 @@ Noted, no change: the `tracing::warn!` names the identifier and key in both the 
 ## Revision (2026-10-14): a rerun resumes a switched file without `--multipart`
 
 Decided: the open question on #21 is answered with the listing. The cost of one listing request per item per run is accepted so that a kept upload is resumed by the same command that created it, without the user having to know that the file switched. The design, tests and documentation above are revised in place; the review of this revision is recorded below.
+
+### Review of the revision (2026-10-14), closed before the push
+
+Important, taken: the listing is a bodiless request on the default path of every run, and nothing bounded its answer (#60); against a server that accepts and goes silent, a plain `ia upload` would have hung before its first file. The listing is now given the response wait over all its attempts and counts as failed past it; the crate test above pins it; the plan's finding paragraph is corrected.
+
+Minor, taken: an `info` line says the item is being checked, so a listing whose retries back off is not silent; the warning quotes the listing's own message rather than the `upload failed for <item>/:` prefix an empty key renders.
+
+Minor, recorded: listing keys are not XML-unescaped (`extract_xml_field` returns the raw text, so a name with `&` never matches), which is pre-existing and affects `--multipart` resume the same way; filed as its own issue. `has_unfinished` builds two `String`s per call, once per file; left as is.
+
+Verified correct by the reviewer: the listing runs after the `test_item` clone and before both the sequential and the concurrent path, and every caller (`upload_batch` per item, both TUI call sites, the stdin path) goes through `upload_item`; the skip conditions and their tests; warn-and-continue; the `Mutex` is never held across an await; a different local file with the same name is rejected by the multipart path's own check and starts fresh; the tests fail without the change; the `Connection: close` answer makes the two fallback tests deterministic over plain HTTP/1.1; the help, `usage.md`, README and plan agree with the code.

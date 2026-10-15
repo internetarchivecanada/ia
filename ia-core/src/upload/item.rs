@@ -420,10 +420,13 @@ pub async fn upload_item(
 
 /// Ask IA once for the item's unfinished multipart uploads and record their
 /// names on the run's [`MultipartFallback`] handle, with the run's retry
-/// budget. A brand-new item has nothing to list. Any other failure does not
-/// fail the item: the run warns and goes on as a run without the listing
-/// would, sending every file as a single PUT, which is the behavior the
-/// listing improves on, not one it replaces.
+/// budget and, over all attempts, the response wait (120 s): the listing
+/// carries no body, so nothing else bounds its answer (#60), and a run must
+/// not hang before its first file on a server that accepts and goes silent.
+/// A brand-new item has nothing to list. Any other failure does not fail
+/// the item: the run warns and goes on as a run without the listing would,
+/// sending every file as a single PUT, which is the behavior the listing
+/// improves on, not one it replaces.
 async fn record_unfinished_uploads(client: &IaClient, identifier: &str, opts: &UploadOpts) {
     let ctx = S3RetryCtx {
         identifier,
@@ -434,8 +437,14 @@ async fn record_unfinished_uploads(client: &IaClient, identifier: &str, opts: &U
         total_bytes: 0,
         progress: None,
     };
-    match list_uploads_with_ctx(client, &ctx).await {
-        Ok(uploads) => {
+    tracing::info!(
+        identifier,
+        "checking {identifier} for unfinished multipart uploads"
+    );
+    let wait = crate::stall::response_wait();
+    let listed = tokio::time::timeout(wait, list_uploads_with_ctx(client, &ctx)).await;
+    let why = match listed {
+        Ok(Ok(uploads)) => {
             if !uploads.is_empty() {
                 tracing::info!(
                     identifier,
@@ -445,14 +454,18 @@ async fn record_unfinished_uploads(client: &IaClient, identifier: &str, opts: &U
             }
             opts.multipart_fallback
                 .record_unfinished(identifier, uploads.into_iter().map(|u| u.key));
+            return;
         }
-        Err(e) => tracing::warn!(
-            identifier,
-            error = %e,
-            "could not list the unfinished multipart uploads of {identifier} ({e}); a file that \
-             left parts on IA in an earlier run is sent again as a single PUT"
-        ),
-    }
+        // The listing's own error already names the item.
+        Ok(Err(IaError::UploadFailed { message, .. })) => message,
+        Ok(Err(e)) => e.to_string(),
+        Err(_elapsed) => format!("no answer within {} s", wait.as_secs()),
+    };
+    tracing::warn!(
+        identifier,
+        "could not list the unfinished multipart uploads of {identifier} ({why}); a file that \
+         left parts on IA in an earlier run is sent again as a single PUT"
+    );
 }
 
 /// Upload a single file within an item, handling skip-set checks, error
@@ -722,6 +735,69 @@ mod tests {
     }
 
     // -- upload_item resume (skip_set) tests --
+
+    /// The listing has no body, so nothing in the stall rules bounds its
+    /// answer (#60); a server that accepts the connection and goes silent
+    /// must not hang the run before its first file. The listing is given
+    /// the response wait in all, then the run warns and sends single PUTs.
+    #[tokio::test]
+    async fn a_listing_that_is_never_answered_is_abandoned_and_the_run_goes_on() {
+        use crate::upload::stall_watch::test_support::{
+            shrink_policy, stalling_then_forwarding_proxy,
+        };
+        use wiremock::matchers::{method, path, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _policy = shrink_policy();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/test-item/a.bin"))
+            .and(query_param_is_missing("partNumber"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target: std::net::SocketAddr = server
+            .uri()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let proxy = stalling_then_forwarding_proxy(target).await;
+
+        let mut config = crate::IaConfig::default();
+        config.s3_access = Some("test-access".into());
+        config.s3_secret = Some("test-secret".into());
+        config.general.host = proxy.to_string();
+        config.general.secure = false;
+        let client = crate::IaClient::from_config_no_retry(config).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("a.bin");
+        std::fs::write(&f, vec![0x42u8; 1024]).unwrap();
+        let opts = UploadOpts {
+            verify: false,
+            checksum: false,
+            no_collection_check: true,
+            retries: 1,
+            ..Default::default()
+        };
+
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            upload_item(&client, "test-item", &[f], &opts, None, None, None, 1, None),
+        )
+        .await
+        .expect("the silent listing must be abandoned within the shrunk response wait")
+        .unwrap();
+
+        assert!(
+            matches!(results[0].status, UploadStatus::Uploaded),
+            "{results:?}"
+        );
+        assert!(!opts.multipart_fallback.has_unfinished("test-item", "a.bin"));
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn upload_item_skips_resumed_files() {
