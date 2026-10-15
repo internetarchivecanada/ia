@@ -46,6 +46,17 @@ impl wiremock::Match for NoHeader {
     }
 }
 
+/// Matches a request that carries the named header exactly once, with
+/// this value: a second value would not be seen by `header()`.
+struct HeaderOnce(&'static str, &'static str);
+
+impl wiremock::Match for HeaderOnce {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let values: Vec<_> = request.headers.get_all(self.0).iter().collect();
+        values.len() == 1 && values[0] == self.1
+    }
+}
+
 // ── Initiate ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -582,6 +593,58 @@ async fn no_derive_and_no_backup_reach_the_completion_request() {
         &opts,
         10,
         false,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+/// A custom Content-Type describes the object, so it goes on the initiate
+/// request as before; the completion request's body is the manifest, and
+/// its Content-Type stays application/xml alone (review finding, #62).
+#[tokio::test]
+async fn a_custom_content_type_does_not_reach_the_completion_request() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+    mount_one_part_upload(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .and(HeaderOnce("content-type", "video/mp4"))
+        .respond_with(initiate_ok())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-1"))
+        .and(HeaderOnce("content-type", "application/xml"))
+        .and(header("x-archive-queue-derive", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.headers = vec![("Content-Type".into(), "video/mp4".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
         true,
         None,
         None,

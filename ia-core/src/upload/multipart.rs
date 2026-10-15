@@ -350,7 +350,9 @@ pub(crate) async fn upload_part_with_retry(
 /// creates the task that writes the object, and that is where IA reads
 /// `x-archive-queue-derive` and `x-archive-keep-old-version`; a completion
 /// without `x-archive-queue-derive: 0` queues a derive whatever the initiate
-/// request said (#62).
+/// request said (#62). A `Content-Type` or `Content-Length` in the list is
+/// left out here: they describe the object, and this request's body is the
+/// manifest.
 ///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
 /// need a configurable budget go through `upload_file_multipart`.
@@ -411,6 +413,12 @@ pub(crate) async fn complete_upload_with_retry(
             .header("Content-Type", "application/xml")
             .header("Content-Length", manifest.len().to_string());
         for (k, v) in extra_headers {
+            // The body here is the manifest, not the object. A custom
+            // Content-Type or Content-Length describes the object and would
+            // be appended as a second value next to the manifest's own.
+            if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
             req = req.header(k.as_str(), v.as_str());
         }
         req.body(manifest.clone()).send()
