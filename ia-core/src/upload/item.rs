@@ -9,6 +9,8 @@ use futures::stream::{self, StreamExt};
 use crate::error::{IaError, Result};
 use crate::fs_util::expand_files;
 use crate::identifier::validate_identifier;
+use crate::upload::multipart::list_uploads_with_ctx;
+use crate::upload::retry::S3RetryCtx;
 use crate::upload::single::upload_file;
 use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
@@ -106,6 +108,15 @@ pub async fn upload_item(
 
     // 7. Compute remote keys
     let keys = compute_keys(&expanded, &opts)?;
+
+    // 7b. One listing of the item's unfinished multipart uploads, so that a
+    //     file which switched to multipart in an earlier run (#21), or was
+    //     uploaded with `multipart` and left parts on IA, resumes from them
+    //     instead of being sent again as a single PUT. Not with `multipart`
+    //     (every file lists for itself) and not on a dry run (no request).
+    if !opts.multipart && !opts.dry_run {
+        record_unfinished_uploads(client, identifier, &opts).await;
+    }
 
     // 8. Compute total bytes (always needed for progress display).
     //    Do a single stat pass here; conditionally set size_hint based on no_size_hint.
@@ -405,6 +416,43 @@ pub async fn upload_item(
     }
 
     Ok(results)
+}
+
+/// Ask IA once for the item's unfinished multipart uploads and record their
+/// names on the run's [`MultipartFallback`] handle, with the run's retry
+/// budget. A brand-new item has nothing to list. Any other failure does not
+/// fail the item: the run warns and goes on as a run without the listing
+/// would, sending every file as a single PUT, which is the behavior the
+/// listing improves on, not one it replaces.
+async fn record_unfinished_uploads(client: &IaClient, identifier: &str, opts: &UploadOpts) {
+    let ctx = S3RetryCtx {
+        identifier,
+        key: "",
+        retries: opts.retries,
+        backoff: opts.backoff(),
+        bytes_sent: 0,
+        total_bytes: 0,
+        progress: None,
+    };
+    match list_uploads_with_ctx(client, &ctx).await {
+        Ok(uploads) => {
+            if !uploads.is_empty() {
+                tracing::info!(
+                    identifier,
+                    unfinished = uploads.len(),
+                    "IA holds unfinished multipart uploads for this item; those files resume as multipart"
+                );
+            }
+            opts.multipart_fallback
+                .record_unfinished(identifier, uploads.into_iter().map(|u| u.key));
+        }
+        Err(e) => tracing::warn!(
+            identifier,
+            error = %e,
+            "could not list the unfinished multipart uploads of {identifier} ({e}); a file that \
+             left parts on IA in an earlier run is sent again as a single PUT"
+        ),
+    }
 }
 
 /// Upload a single file within an item, handling skip-set checks, error

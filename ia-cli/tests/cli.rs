@@ -2142,7 +2142,11 @@ fn upload_help_describes_the_multipart_fallback() {
         .stdout(predicate::str::contains("continues as a multipart upload"))
         .stdout(predicate::str::contains(
             "every later file larger than 2 MiB",
-        ));
+        ))
+        .stdout(predicate::str::contains(
+            "a rerun resumes such a file from its parts",
+        ))
+        .stdout(predicate::str::contains("Only a rerun with the flag").not());
 }
 
 // -- upload retries back off; --retry-sleep is gone --

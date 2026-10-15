@@ -52,10 +52,13 @@ pub async fn upload_file(
     let start = Instant::now();
     let file_size = tokio::fs::metadata(file).await?.len();
 
-    // The path is decided once per file: multipart when asked for, or when
-    // an earlier single PUT in this run died and the file is above the
-    // fallback threshold (#21).
+    // The path is decided once per file: multipart when asked for, when IA
+    // holds an unfinished multipart upload of this file (found by the
+    // listing `upload_item` takes at the start of the run, so a file that
+    // switched in an earlier run resumes), or when an earlier single PUT in
+    // this run died and the file is above the fallback threshold (#21).
     let multipart = opts.multipart
+        || opts.multipart_fallback.has_unfinished(identifier, key)
         || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE);
 
     // One read of the file when either the skip check or verification

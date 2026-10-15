@@ -6,11 +6,16 @@ use std::net::SocketAddr;
 
 use tokio::net::{TcpListener, TcpStream};
 
-/// A loopback proxy in front of a mock server. Its first `drop_first`
-/// connections are accepted and closed at once, so the request on each of
-/// them ends in a transport error; every later connection is forwarded byte
-/// for byte to `target`. Returns the proxy's address.
-pub async fn dropping_proxy(target: SocketAddr, drop_first: usize) -> SocketAddr {
+/// A loopback proxy in front of a mock server. Its first `forward_first`
+/// connections are forwarded byte for byte to `target`; the next
+/// `drop_next` connections are accepted and closed at once, so the request
+/// on each of them ends in a transport error; every later connection is
+/// forwarded. Returns the proxy's address.
+pub async fn dropping_proxy(
+    target: SocketAddr,
+    forward_first: usize,
+    drop_next: usize,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -20,7 +25,7 @@ pub async fn dropping_proxy(target: SocketAddr, drop_first: usize) -> SocketAddr
                 break;
             };
             accepted += 1;
-            if accepted <= drop_first {
+            if accepted > forward_first && accepted <= forward_first + drop_next {
                 drop(inbound);
                 continue;
             }

@@ -2180,7 +2180,7 @@ async fn a_dead_single_put_of_a_large_file_switches_to_multipart() {
     let server = MockServer::start().await;
     mount_one_part_multipart(&server, "big.bin", "fb-1").await;
     mount_single_put(&server, "big.bin", 200, 0).await;
-    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 1).await;
 
     let opts = fast_opts(3);
     assert!(!opts.multipart_fallback.is_on());
@@ -2203,7 +2203,7 @@ async fn a_small_file_is_re_sent_as_a_single_put() {
     let server = MockServer::start().await;
     mount_single_put(&server, "big.bin", 200, 1).await;
     mount_no_initiate(&server, "big.bin").await;
-    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 1).await;
 
     let opts = fast_opts(3);
     let f = small_file();
@@ -2304,7 +2304,7 @@ async fn a_spam_rejected_large_file_does_not_switch() {
 async fn a_dead_single_put_on_the_last_attempt_does_not_switch() {
     let server = MockServer::start().await;
     mount_no_initiate(&server, "big.bin").await;
-    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 1).await;
 
     let opts = fast_opts(0);
     let f = large_file();
@@ -2349,7 +2349,7 @@ async fn the_switched_file_keeps_only_the_remaining_budget() {
         .expect(2)
         .mount(&server)
         .await;
-    let proxy = support::dropping_proxy(support::mock_addr(&server), 1).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 1).await;
 
     let opts = fast_opts(2);
     let f = large_file();
@@ -2358,10 +2358,7 @@ async fn the_switched_file_keeps_only_the_remaining_budget() {
     let text = err.to_string();
     assert!(text.contains("after 2 attempts"), "{text}");
     assert!(text.contains("fb-2"), "{text}");
-    assert!(
-        text.contains("rerun the same command with --multipart to resume"),
-        "{text}"
-    );
+    assert!(text.contains("rerun the same command to resume"), "{text}");
     server.verify().await;
 }
 
@@ -2391,7 +2388,7 @@ async fn a_large_file_after_the_switch_is_multipart_from_the_start() {
     {
         let earlier = MockServer::start().await;
         mount_one_part_multipart(&earlier, "earlier.bin", "earlier-1").await;
-        let proxy = support::dropping_proxy(support::mock_addr(&earlier), 1).await;
+        let proxy = support::dropping_proxy(support::mock_addr(&earlier), 0, 1).await;
         let f = large_file();
         // No skip check on this run, so the dropped connection is the PUT.
         let mut shared = opts.clone();

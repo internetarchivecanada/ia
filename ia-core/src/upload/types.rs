@@ -1,25 +1,38 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// The run-level switch from single PUT to multipart.
+/// The run's multipart state for files that were not asked to be multipart.
 ///
-/// Off in a fresh [`UploadOpts`]. It is turned on by the first single PUT
-/// of a file larger than
-/// [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE)
-/// that ends in a dead send, an unanswered body or a transport error with a
-/// retry left; from then on every file larger than that in the same run is
-/// sent as a multipart upload. Clones share the state, so every clone of
-/// the options made during a run (per item in a batch, per file in a
-/// concurrent item) sees the same switch, while `Default` gives a fresh one.
-/// Nothing turns it off.
+/// Two facts, both discovered during the run and shared by every clone of
+/// the [`UploadOpts`] made during it (per item in a batch, per file in a
+/// concurrent item), while `Default` gives a fresh one:
+///
+/// - The switch. Off in a fresh [`UploadOpts`]. It is turned on by the
+///   first single PUT of a file larger than
+///   [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE)
+///   that ends in a dead send, an unanswered body or a transport error with
+///   a retry left; from then on every file larger than that in the same run
+///   is sent as a multipart upload. Nothing turns it off.
+/// - The files IA holds an unfinished multipart upload for, by item and
+///   name, from one listing per item that `upload_item` takes at the start
+///   of the run. Such a file is sent as a multipart upload, whatever its
+///   size, and resumes from the parts IA holds; that is how a rerun resumes
+///   a file that switched in an earlier run without being told to.
 #[derive(Debug, Clone, Default)]
-pub struct MultipartFallback(Arc<AtomicBool>);
+pub struct MultipartFallback(Arc<FallbackState>);
+
+#[derive(Debug, Default)]
+struct FallbackState {
+    on: AtomicBool,
+    /// `(identifier, key)` pairs with an unfinished multipart upload on IA.
+    unfinished: Mutex<HashSet<(String, String)>>,
+}
 
 impl MultipartFallback {
-    /// A handle that is off.
+    /// A handle that is off, with no unfinished uploads recorded.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -28,12 +41,39 @@ impl MultipartFallback {
     /// Whether a single PUT in this run has already died.
     #[must_use]
     pub fn is_on(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.on.load(Ordering::SeqCst)
     }
 
     /// Record that a single PUT in this run has died.
     pub(crate) fn turn_on(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.on.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the run found an unfinished multipart upload of `key` in
+    /// `identifier` on IA at its start.
+    #[must_use]
+    pub fn has_unfinished(&self, identifier: &str, key: &str) -> bool {
+        self.unfinished()
+            .contains(&(identifier.to_string(), key.to_string()))
+    }
+
+    /// Record the names IA listed as unfinished multipart uploads in
+    /// `identifier`.
+    pub(crate) fn record_unfinished(
+        &self,
+        identifier: &str,
+        keys: impl IntoIterator<Item = String>,
+    ) {
+        self.unfinished()
+            .extend(keys.into_iter().map(|key| (identifier.to_string(), key)));
+    }
+
+    /// The set, recovered from a poisoned lock: the writers only insert.
+    fn unfinished(&self) -> std::sync::MutexGuard<'_, HashSet<(String, String)>> {
+        self.0
+            .unfinished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -86,9 +126,10 @@ pub struct UploadOpts {
     pub test_item: bool,
     /// Send every file as a multipart upload.
     pub multipart: bool,
-    /// The run's switch to multipart for files larger than
+    /// The run's multipart state: the switch for files larger than
     /// [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE),
-    /// turned on by the first single PUT that dies. Shared by clones.
+    /// turned on by the first single PUT that dies, and the files found
+    /// with an unfinished multipart upload on IA. Shared by clones.
     pub multipart_fallback: MultipartFallback,
     /// Maximum retry attempts on transient failure.
     pub retries: u32,
@@ -586,6 +627,24 @@ mod tests {
             .multipart_fallback(opts.multipart_fallback.clone())
             .build();
         assert!(built.multipart_fallback.is_on());
+    }
+
+    #[test]
+    fn a_recorded_unfinished_upload_is_seen_by_every_clone_for_its_item_and_name() {
+        let opts = UploadOpts::default();
+        let clone = opts.clone();
+        assert!(!opts.multipart_fallback.has_unfinished("item", "a.bin"));
+        clone
+            .multipart_fallback
+            .record_unfinished("item", ["a.bin".to_string(), "b.bin".to_string()]);
+        assert!(opts.multipart_fallback.has_unfinished("item", "a.bin"));
+        assert!(opts.multipart_fallback.has_unfinished("item", "b.bin"));
+        assert!(!opts.multipart_fallback.has_unfinished("item", "c.bin"));
+        assert!(!opts.multipart_fallback.has_unfinished("other", "a.bin"));
+        assert!(!opts.multipart_fallback.is_on());
+        assert!(!UploadOpts::default()
+            .multipart_fallback
+            .has_unfinished("item", "a.bin"));
     }
 
     #[test]
