@@ -1,0 +1,14 @@
+# Item-level headers on the multipart completion request
+
+**Issue:** #62. `ia upload <item> <file> --multipart --no-derive` (0.21.0) queued a derive: the `s3-put-complete-multipart` task on IA carried `next_cmd: derive`, and the derive task that followed blocked the item's queue. Reported by IA staff.
+
+**Cause:** the single PUT sends every item-level header on its one request (`x-archive-queue-derive`, `x-archive-keep-old-version`, `x-archive-auto-make-bucket`, `x-archive-size-hint`, the `x-archive-meta*` headers, the `--header` values; `ia-core/src/upload/single.rs`). The multipart path splits them: the initiate request (`POST ?uploads`) carries all but `x-archive-keep-old-version`, and the completion request (`POST ?uploadId=`) carries only `x-archive-keep-old-version` (`complete_upload_with_retry`, `ia-core/src/upload/multipart.rs`). The completion request creates the task that writes the object and queues the derive; the `0` on the initiate request did not reach it.
+
+**Change:** `upload_file_multipart` builds the item-level header list once per file, now including `x-archive-keep-old-version` under the single PUT's rule (`1` unless `--no-backup`), and sends the same list on the initiate request and on the completion request. A header reaches IA on whichever of the two requests reads it, so the client does not need to know which that is per header, and the two multipart requests together carry exactly what the single PUT carries. `multipart::complete_upload` takes `extra_headers: &[(String, String)]`, as `initiate_upload` does, in place of `keep_old_version: bool` (public API change in `ia-core`; a consumer that passed `true` passes `[("x-archive-keep-old-version", "1")]`). `complete_upload_with_retry` takes the same.
+
+**Docs:** `docs/usage.md` "Completing a multipart upload" says the completion request carries the same item-level headers as the single PUT, so `--no-derive` and `--no-backup` apply to a multipart upload as they do to a single PUT.
+
+## Tasks
+- [ ] Red (`ia-core/tests/upload_multipart.rs`): through `upload_file_multipart`, the completion request carries `x-archive-queue-derive: 1`, `x-archive-keep-old-version: 1`, `x-archive-auto-make-bucket: 1`, `x-archive-size-hint`, a metadata header and a `--header` value on the first and last file; carries `x-archive-queue-derive: 0` and no `x-archive-keep-old-version`, `x-archive-auto-make-bucket` or metadata header with `no_derive`, `no_backup` and not the first file; carries `x-archive-queue-derive: 0` on a file that is not the last. The same assertions on the initiate request. The two `complete_upload` tests pass header lists.
+- [ ] Green: one `item_headers` list in `upload_file_multipart`, sent on both requests; `complete_upload` and `complete_upload_with_retry` take `extra_headers`; doc comments.
+- [ ] `docs/usage.md`; `just ci`; code-reviewer pass; PR against main, merged before PR #59 (which makes multipart reachable on the default path).
