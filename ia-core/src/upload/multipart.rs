@@ -21,6 +21,11 @@ use bytes::Bytes;
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Files strictly larger than this fall back to multipart once the run's
+/// [`MultipartFallback`](crate::upload::MultipartFallback) handle is on;
+/// files of this size or less are always sent as a single PUT. 2 MiB.
+pub const MULTIPART_FALLBACK_MIN_SIZE: u64 = 2 * 1024 * 1024;
+
 // ── XML parsing helpers ─────────────────────────────────────────────────────
 //
 // S3 returns XML for multipart operations. We use simple string matching
