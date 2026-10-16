@@ -74,9 +74,11 @@ pub fn parse_key_value(s: &str) -> Result<(String, String)> {
 /// the modified copy. The caller then diffs source vs destination to
 /// compute the JSON Patch.
 ///
-/// `Set` is applied to the whole change list at once (see [`apply_set`]);
-/// the other operations are applied one `(key, value)` pair at a time, in
-/// order, each against the running result.
+/// `Set` is applied to the whole change list at once: a field named once is
+/// written exactly as given; a field named more than once becomes one list
+/// of every value, each kept once; and `field[N]` overwrites position `N`
+/// of the field's current list. The other operations are applied one
+/// `(key, value)` pair at a time, in order, each against the running result.
 pub fn prepare_metadata(
     source: &serde_json::Value,
     changes: &[(String, serde_json::Value)],
