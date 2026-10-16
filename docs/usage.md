@@ -305,6 +305,8 @@ Metadata writes use subcommands. Each takes `-m/--metadata <FIELD:VALUE>` pairs 
 
 Passing `-m` on the bare command (`ia metadata <ID> -m <K:V>`) is shorthand for `ia metadata modify`.
 
+Repeating `-m` for one field under `modify` sets that field to the list of values: `-m subject:a -m subject:b` writes `["a", "b"]`. `field[N]:value` replaces position N of the field's current list and keeps the other positions; `REMOVE_TAG` at a position deletes it. Deleting the last `collection` value is refused.
+
 Chain multiple operations with `+` to apply them in a single request. Valid operations after `+`: `modify`, `append`, `append-list`, `insert`, `remove`. Shared options (`--target`, `--dry-run`, `--json`, etc.) go before the first `+`.
 
 | Write option | Description |
@@ -328,6 +330,12 @@ ia metadata myitem -m "description:Updated description"
 
 # Set multiple fields at once
 ia metadata modify myitem -m "title:New Title" -m "subject:science"
+
+# Set a multi-value field (repeat -m for the same field)
+ia metadata modify myitem -m "subject:physics" -m "subject:space"
+
+# Replace one position of a list and keep the rest
+ia metadata modify myitem -m "collection[0]:featured"
 
 # Append to a string field
 ia metadata append myitem -m "description: (updated 2026)"
