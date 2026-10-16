@@ -2890,11 +2890,11 @@ fn search_help_names_no_json_code_in_prose() {
 // -- 0.21.0: the series' public API changes ship under one version --
 
 #[test]
-fn version_is_0_21_0() {
+fn version_is_0_21_1() {
     ia().arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.21.0"));
+        .stdout(predicate::str::contains("0.21.1"));
 }
 
 /// Two unfinished uploads of one file (`a.bin`: u1 and u3). `--abort` would
