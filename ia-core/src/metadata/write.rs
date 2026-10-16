@@ -8,6 +8,10 @@ use std::collections::HashMap;
 pub enum MetadataOp {
     /// Set field to value (replace if exists, add if new).
     /// To delete a field, set its value to "REMOVE_TAG".
+    ///
+    /// A field named more than once in one change list becomes a list of
+    /// every value; `field[N]` overwrites position N of the field's current
+    /// list (see [`prepare_metadata`]). Emptying `collection` is refused.
     Set,
     /// Append string to existing string field (space-separated).
     /// Errors if target field is a list.
@@ -45,7 +49,9 @@ pub struct ModifyResponse {
 }
 
 /// The REMOVE_TAG sentinel value. Setting a field to this string
-/// signals that the field should be deleted entirely.
+/// signals that the field should be deleted entirely; at a list position
+/// (`field[N]`) it deletes that element. Deleting the last `collection`
+/// value is refused.
 pub const REMOVE_TAG: &str = "REMOVE_TAG";
 
 /// Fields that cannot be modified by users.
@@ -129,21 +135,32 @@ pub fn prepare_metadata(
 ///    one list: array values contribute their elements, each value is kept
 ///    once, `REMOVE_TAG` entries are dropped, and a single survivor is
 ///    written as a scalar. A group with nothing left deletes the field.
-/// 2. Indexed keys (`field[N]`), in order. Position `N` of the field's
-///    current list (an array as is, a scalar wrapped, a missing field empty)
-///    is overwritten, or marked for deletion on `REMOVE_TAG`; the list is
-///    padded to reach `N`. Deleted and padding slots are dropped at the end,
-///    and a list left empty deletes the field.
+/// 2. Indexed keys (`field[N]`), applied per field in index order (a
+///    position named twice takes its later value). The field's current list
+///    is the starting point (an array as is, a scalar wrapped, a missing
+///    field empty). A position inside the list is overwritten, or marked for
+///    deletion on `REMOVE_TAG`; a position past the end appends, so the list
+///    is never padded and no index can allocate or overflow. Marked slots
+///    are dropped at the end, and a list left empty deletes the field.
 ///
-/// A bare key followed by an indexed key for the same field applies in that
-/// order, so `collection:a` then `collection[1]:b` gives `["a", "b"]`.
-/// Deleting the last `collection` value is refused, as `Remove` refuses it.
+/// Pass 1 feeds pass 2, so `collection:a` then `collection[1]:b` gives
+/// `["a", "b"]`. (The Python client seeds its indexed pass from the item's
+/// current list and discards the bare value; this is a deliberate
+/// difference, since the bare value was given and should not vanish.)
+///
+/// Deleting the last `collection` value is refused, as `Remove` refuses it:
+/// if the item had a collection before this batch and would have none after
+/// it, the whole batch errors. An item that had no `collection` field (a
+/// file-level target, for instance) is not affected.
 fn apply_set(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     changes: &[(String, serde_json::Value)],
     identifier: &str,
 ) -> Result<()> {
     let remove_tag = serde_json::Value::String(REMOVE_TAG.to_string());
+    let had_collection = obj
+        .get("collection")
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
 
     // Pass 1: bare keys. Collect every value given for a key, in order.
     let mut grouped: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
@@ -183,51 +200,58 @@ fn apply_set(
             }
         };
         if merged == remove_tag {
-            if key == "collection" {
-                return Err(last_collection_error(identifier));
-            }
             obj.remove(&key);
         } else {
             obj.insert(key, merged);
         }
     }
 
-    // Pass 2: indexed keys.
-    let mut touched: Vec<String> = Vec::new();
+    // Pass 2: indexed keys, grouped per field in order of first appearance.
+    let mut indexed: Vec<(String, Vec<(usize, &serde_json::Value)>)> = Vec::new();
     for (key, value) in changes {
         let Some((field, idx)) = parse_indexed_key(key) else {
             continue;
         };
+        match indexed.iter_mut().find(|(f, _)| *f == field) {
+            Some((_, positions)) => positions.push((idx, value)),
+            None => indexed.push((field, vec![(idx, value)])),
+        }
+    }
+    for (field, mut positions) in indexed {
         let mut list = match obj.remove(&field) {
             Some(serde_json::Value::Array(items)) => items,
             Some(serde_json::Value::Null) | None => Vec::new(),
             Some(scalar) => vec![scalar],
         };
-        if list.len() <= idx {
-            list.resize(idx + 1, serde_json::Value::Null);
-        }
-        list[idx] = if *value == remove_tag {
-            serde_json::Value::Null
-        } else {
-            value.clone()
-        };
-        obj.insert(field.clone(), serde_json::Value::Array(list));
-        if !touched.contains(&field) {
-            touched.push(field);
-        }
-    }
-    for field in touched {
-        let Some(serde_json::Value::Array(list)) = obj.remove(&field) else {
-            continue;
-        };
-        let kept: Vec<serde_json::Value> = list.into_iter().filter(|v| !v.is_null()).collect();
-        if kept.is_empty() {
-            if field == "collection" {
-                return Err(last_collection_error(identifier));
+        // Stable, so a position named twice keeps the later value.
+        positions.sort_by_key(|(idx, _)| *idx);
+        for (idx, value) in positions {
+            let value = if *value == remove_tag {
+                serde_json::Value::Null
+            } else {
+                value.clone()
+            };
+            match list.get_mut(idx) {
+                Some(slot) => *slot = value,
+                None => {
+                    if !value.is_null() {
+                        list.push(value);
+                    }
+                }
             }
-        } else {
+        }
+        let kept: Vec<serde_json::Value> = list.into_iter().filter(|v| !v.is_null()).collect();
+        if !kept.is_empty() {
             obj.insert(field, serde_json::Value::Array(kept));
         }
+    }
+
+    if had_collection
+        && obj
+            .get("collection")
+            .is_none_or(|v| v.is_null() || v.as_array().is_some_and(|a| a.is_empty()))
+    {
+        return Err(last_collection_error(identifier));
     }
 
     Ok(())
@@ -651,15 +675,14 @@ pub fn extract_target_metadata(
 }
 
 /// Parse an indexed key like `collection[0]` into `("collection", 0)`.
-/// Returns None if the key doesn't contain brackets.
+///
+/// Returns `None` unless the key ends with `[N]` where `N` is a non-negative
+/// integer: `collection[1]zzz` and `collection[]` are not indexed keys.
 pub fn parse_indexed_key(key: &str) -> Option<(String, usize)> {
-    let bracket_start = key.find('[')?;
-    let bracket_end = key.find(']')?;
-    if bracket_end <= bracket_start + 1 {
-        return None;
-    }
-    let field = key[..bracket_start].to_string();
-    let index: usize = key[bracket_start + 1..bracket_end].parse().ok()?;
+    let inner = key.strip_suffix(']')?;
+    let bracket_start = inner.find('[')?;
+    let field = inner[..bracket_start].to_string();
+    let index: usize = inner[bracket_start + 1..].parse().ok()?;
     Some((field, index))
 }
 
@@ -716,6 +739,14 @@ mod tests {
         let (field, index) = parse_indexed_key("subject[42]").unwrap();
         assert_eq!(field, "subject");
         assert_eq!(index, 42);
+    }
+
+    #[test]
+    fn parse_indexed_key_rejects_trailing_text_and_empty_index() {
+        assert!(parse_indexed_key("subject[1]zzz").is_none());
+        assert!(parse_indexed_key("subject[]").is_none());
+        assert!(parse_indexed_key("subject[x]").is_none());
+        assert!(parse_indexed_key("subject]1[").is_none());
     }
 
     #[test]
@@ -989,6 +1020,67 @@ mod tests {
         ];
         let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert_eq!(dest["collection"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn prepare_set_huge_index_appends_without_panicking() {
+        let source = serde_json::json!({"subject": ["a"]});
+        let key = format!("subject[{}]", usize::MAX);
+        let changes = vec![(key, serde_json::json!("z"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["a", "z"]));
+    }
+
+    #[test]
+    fn prepare_set_out_of_order_indexed_keys_keep_index_order() {
+        let source = serde_json::json!({"subject": ["a"]});
+        let changes = vec![
+            ("subject[5]".to_string(), serde_json::json!("x")),
+            ("subject[3]".to_string(), serde_json::json!("y")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["a", "y", "x"]));
+    }
+
+    #[test]
+    fn prepare_set_same_index_twice_takes_the_later_value() {
+        let source = serde_json::json!({"subject": ["a", "b"]});
+        let changes = vec![
+            ("subject[0]".to_string(), serde_json::json!("first")),
+            ("subject[0]".to_string(), serde_json::json!("second")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["second", "b"]));
+    }
+
+    #[test]
+    fn prepare_set_past_end_remove_tag_is_a_noop() {
+        let source = serde_json::json!({"subject": ["a"]});
+        let changes = vec![("subject[7]".to_string(), serde_json::json!(REMOVE_TAG))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["a"]));
+    }
+
+    #[test]
+    fn prepare_set_collection_remove_tag_then_indexed_value_succeeds() {
+        let source = serde_json::json!({"collection": ["a", "b"]});
+        let changes = vec![
+            ("collection".to_string(), serde_json::json!(REMOVE_TAG)),
+            ("collection[0]".to_string(), serde_json::json!("x")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["x"]));
+    }
+
+    #[test]
+    fn prepare_set_collection_guard_ignores_an_item_without_collection() {
+        let source = serde_json::json!({"name": "foo.txt", "size": "10"});
+        let changes = vec![("collection".to_string(), serde_json::json!(REMOVE_TAG))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert!(dest.get("collection").is_none());
+        let changes = vec![("collection[0]".to_string(), serde_json::json!(REMOVE_TAG))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert!(dest.get("collection").is_none());
     }
 
     #[test]

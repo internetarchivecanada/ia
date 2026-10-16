@@ -3245,3 +3245,34 @@ fn metadata_modify_repeated_key_posts_a_list_patch() {
         "patch: {ops:?}"
     );
 }
+
+#[test]
+fn metadata_modify_remove_tag_on_collection_is_refused() {
+    let (_rt, _server, host) = multi_value_item_server();
+    for key in ["collection", "collection[0]"] {
+        let output = ia()
+            .args([
+                "--insecure",
+                "--host",
+                &host,
+                "metadata",
+                "mv-item",
+                "-m",
+                &format!("{key}:REMOVE_TAG"),
+                "-m",
+                "collection[1]:REMOVE_TAG",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{key}: expected failure, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("cannot remove last collection"),
+            "{key}: stderr was: {stderr}"
+        );
+    }
+}
