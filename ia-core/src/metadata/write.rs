@@ -73,6 +73,10 @@ pub fn parse_key_value(s: &str) -> Result<(String, String)> {
 /// apply the desired changes according to the operation mode, and return
 /// the modified copy. The caller then diffs source vs destination to
 /// compute the JSON Patch.
+///
+/// `Set` is applied to the whole change list at once (see [`apply_set`]);
+/// the other operations are applied one `(key, value)` pair at a time, in
+/// order, each against the running result.
 pub fn prepare_metadata(
     source: &serde_json::Value,
     changes: &[(String, serde_json::Value)],
@@ -84,122 +88,277 @@ pub fn prepare_metadata(
         .as_object_mut()
         .ok_or_else(|| IaError::Config("metadata must be a JSON object".into()))?;
 
-    for (key, value) in changes {
-        match op {
-            MetadataOp::Set => {
-                if value.as_str() == Some(REMOVE_TAG) {
-                    obj.remove(key);
-                } else {
-                    obj.insert(key.clone(), value.clone());
-                }
+    match op {
+        MetadataOp::Set => apply_set(obj, changes, identifier)?,
+        MetadataOp::Append => {
+            for (key, value) in changes {
+                apply_append(obj, key, value)?;
             }
-            MetadataOp::Append => {
-                let current = obj.get(key);
-                match current {
-                    Some(serde_json::Value::Array(_)) => {
-                        return Err(IaError::Config(format!(
-                            "cannot append to list field {key:?} — use --append-list instead"
-                        )));
-                    }
-                    Some(serde_json::Value::String(existing)) => {
-                        let new_val = format!(
-                            "{} {}",
-                            existing,
-                            value.as_str().unwrap_or(&value.to_string())
-                        );
-                        obj.insert(key.clone(), serde_json::Value::String(new_val));
-                    }
-                    Some(_) | None => {
-                        obj.insert(key.clone(), value.clone());
-                    }
-                }
+        }
+        MetadataOp::AppendList => {
+            for (key, value) in changes {
+                apply_append_list(obj, key, value);
             }
-            MetadataOp::AppendList => {
-                let current = obj.get(key).cloned();
-                match current {
-                    Some(serde_json::Value::Array(mut arr)) => {
-                        arr.push(value.clone());
-                        obj.insert(key.clone(), serde_json::Value::Array(arr));
-                    }
-                    Some(serde_json::Value::String(s)) => {
-                        obj.insert(
-                            key.clone(),
-                            serde_json::Value::Array(vec![
-                                serde_json::Value::String(s),
-                                value.clone(),
-                            ]),
-                        );
-                    }
-                    _ => {
-                        obj.insert(key.clone(), serde_json::Value::Array(vec![value.clone()]));
-                    }
-                }
+        }
+        MetadataOp::Insert(index) => {
+            for (key, value) in changes {
+                apply_insert(obj, key, value, *index);
             }
-            MetadataOp::Insert(index) => {
-                let current = obj.get(key).cloned();
-                let mut arr = match current {
-                    Some(serde_json::Value::Array(a)) => a,
-                    Some(serde_json::Value::String(s)) => {
-                        vec![serde_json::Value::String(s)]
-                    }
-                    _ => vec![],
-                };
-                // Deduplicate: remove existing occurrence
-                arr.retain(|v| v != value);
-                // Insert at index (clamped to bounds)
-                let idx = (*index).min(arr.len());
-                arr.insert(idx, value.clone());
-                obj.insert(key.clone(), serde_json::Value::Array(arr));
-            }
-            MetadataOp::Remove => {
-                let current = obj.get(key).cloned();
-                match current {
-                    Some(serde_json::Value::Array(arr)) => {
-                        let filtered: Vec<serde_json::Value> =
-                            arr.into_iter().filter(|v| v != value).collect();
-                        if filtered.is_empty() {
-                            if key == "collection" {
-                                return Err(IaError::MetadataWrite {
-                                    identifier: identifier.to_string(),
-                                    message: "cannot remove last collection".into(),
-                                });
-                            }
-                            obj.remove(key);
-                        } else {
-                            obj.insert(key.clone(), serde_json::Value::Array(filtered));
-                        }
-                    }
-                    Some(serde_json::Value::String(s)) => {
-                        let value_str = value.as_str().unwrap_or("");
-                        // Handle semicolon-delimited subjects
-                        if key == "subject" && s.contains(';') {
-                            let parts: Vec<&str> =
-                                s.split(';').filter(|p| p.trim() != value_str).collect();
-                            if parts.is_empty() {
-                                obj.remove(key);
-                            } else {
-                                obj.insert(key.clone(), serde_json::Value::String(parts.join(";")));
-                            }
-                        } else if s == value_str {
-                            if key == "collection" {
-                                return Err(IaError::MetadataWrite {
-                                    identifier: identifier.to_string(),
-                                    message: "cannot remove last collection".into(),
-                                });
-                            }
-                            obj.remove(key);
-                        }
-                        // If no match, leave unchanged (no-op)
-                    }
-                    _ => {
-                        // Field doesn't exist — nothing to remove
-                    }
-                }
+        }
+        MetadataOp::Remove => {
+            for (key, value) in changes {
+                apply_remove(obj, key, value, identifier)?;
             }
         }
     }
 
     Ok(dest)
+}
+
+/// Apply a batch of `Set` changes.
+///
+/// The whole list is handled together so that a field named more than once
+/// ends up with every value, the way the Python client's CLI builds a list
+/// from repeated `-m field:value` arguments (#65). Two passes:
+///
+/// 1. Bare keys, grouped in order of first appearance. A key named once is
+///    written exactly as given (a scalar, or a caller's array as is;
+///    `REMOVE_TAG` deletes the field). A key named more than once becomes
+///    one list: array values contribute their elements, each value is kept
+///    once, `REMOVE_TAG` entries are dropped, and a single survivor is
+///    written as a scalar. A group with nothing left deletes the field.
+/// 2. Indexed keys (`field[N]`), in order. Position `N` of the field's
+///    current list (an array as is, a scalar wrapped, a missing field empty)
+///    is overwritten, or marked for deletion on `REMOVE_TAG`; the list is
+///    padded to reach `N`. Deleted and padding slots are dropped at the end,
+///    and a list left empty deletes the field.
+///
+/// A bare key followed by an indexed key for the same field applies in that
+/// order, so `collection:a` then `collection[1]:b` gives `["a", "b"]`.
+/// Deleting the last `collection` value is refused, as `Remove` refuses it.
+fn apply_set(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    changes: &[(String, serde_json::Value)],
+    identifier: &str,
+) -> Result<()> {
+    let remove_tag = serde_json::Value::String(REMOVE_TAG.to_string());
+
+    // Pass 1: bare keys. Collect every value given for a key, in order.
+    let mut grouped: Vec<(String, Vec<&serde_json::Value>)> = Vec::new();
+    for (key, value) in changes {
+        if parse_indexed_key(key).is_some() {
+            continue;
+        }
+        match grouped.iter_mut().find(|(k, _)| k == key) {
+            Some((_, values)) => values.push(value),
+            None => grouped.push((key.clone(), vec![value])),
+        }
+    }
+    for (key, values) in grouped {
+        let merged = if let [single] = values.as_slice() {
+            // Named once: the value is written exactly as given, so a library
+            // caller's array (duplicates and all) survives untouched.
+            (**single).clone()
+        } else {
+            // Named more than once: the values become one list, each kept
+            // once, with REMOVE_TAG entries dropped.
+            let mut kept: Vec<serde_json::Value> = Vec::new();
+            for value in values {
+                let items: Vec<&serde_json::Value> = match value {
+                    serde_json::Value::Array(items) => items.iter().collect(),
+                    other => vec![other],
+                };
+                for item in items {
+                    if *item != remove_tag && !kept.contains(item) {
+                        kept.push(item.clone());
+                    }
+                }
+            }
+            match kept.len() {
+                0 => remove_tag.clone(),
+                1 => kept.swap_remove(0),
+                _ => serde_json::Value::Array(kept),
+            }
+        };
+        if merged == remove_tag {
+            if key == "collection" {
+                return Err(last_collection_error(identifier));
+            }
+            obj.remove(&key);
+        } else {
+            obj.insert(key, merged);
+        }
+    }
+
+    // Pass 2: indexed keys.
+    let mut touched: Vec<String> = Vec::new();
+    for (key, value) in changes {
+        let Some((field, idx)) = parse_indexed_key(key) else {
+            continue;
+        };
+        let mut list = match obj.remove(&field) {
+            Some(serde_json::Value::Array(items)) => items,
+            Some(serde_json::Value::Null) | None => Vec::new(),
+            Some(scalar) => vec![scalar],
+        };
+        if list.len() <= idx {
+            list.resize(idx + 1, serde_json::Value::Null);
+        }
+        list[idx] = if *value == remove_tag {
+            serde_json::Value::Null
+        } else {
+            value.clone()
+        };
+        obj.insert(field.clone(), serde_json::Value::Array(list));
+        if !touched.contains(&field) {
+            touched.push(field);
+        }
+    }
+    for field in touched {
+        let Some(serde_json::Value::Array(list)) = obj.remove(&field) else {
+            continue;
+        };
+        let kept: Vec<serde_json::Value> = list.into_iter().filter(|v| !v.is_null()).collect();
+        if kept.is_empty() {
+            if field == "collection" {
+                return Err(last_collection_error(identifier));
+            }
+        } else {
+            obj.insert(field, serde_json::Value::Array(kept));
+        }
+    }
+
+    Ok(())
+}
+
+fn last_collection_error(identifier: &str) -> IaError {
+    IaError::MetadataWrite {
+        identifier: identifier.to_string(),
+        message: "cannot remove last collection".into(),
+    }
+}
+
+/// Append a string to a string field (space-separated). Errors on a list.
+fn apply_append(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<()> {
+    let current = obj.get(key);
+    match current {
+        Some(serde_json::Value::Array(_)) => {
+            return Err(IaError::Config(format!(
+                "cannot append to list field {key:?} — use --append-list instead"
+            )));
+        }
+        Some(serde_json::Value::String(existing)) => {
+            let new_val = format!(
+                "{} {}",
+                existing,
+                value.as_str().unwrap_or(&value.to_string())
+            );
+            obj.insert(key.to_string(), serde_json::Value::String(new_val));
+        }
+        Some(_) | None => {
+            obj.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Append a value to a list field, converting a scalar to a list first.
+fn apply_append_list(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    let current = obj.get(key).cloned();
+    match current {
+        Some(serde_json::Value::Array(mut arr)) => {
+            arr.push(value.clone());
+            obj.insert(key.to_string(), serde_json::Value::Array(arr));
+        }
+        Some(serde_json::Value::String(s)) => {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(s), value.clone()]),
+            );
+        }
+        _ => {
+            obj.insert(
+                key.to_string(),
+                serde_json::Value::Array(vec![value.clone()]),
+            );
+        }
+    }
+}
+
+/// Insert a value at `index` of a list field, dropping an existing copy first.
+fn apply_insert(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+    index: usize,
+) {
+    let current = obj.get(key).cloned();
+    let mut arr = match current {
+        Some(serde_json::Value::Array(a)) => a,
+        Some(serde_json::Value::String(s)) => {
+            vec![serde_json::Value::String(s)]
+        }
+        _ => vec![],
+    };
+    // Deduplicate: remove existing occurrence
+    arr.retain(|v| v != value);
+    // Insert at index (clamped to bounds)
+    let idx = index.min(arr.len());
+    arr.insert(idx, value.clone());
+    obj.insert(key.to_string(), serde_json::Value::Array(arr));
+}
+
+/// Remove one value from a field; the field goes when its last value does.
+fn apply_remove(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+    identifier: &str,
+) -> Result<()> {
+    let current = obj.get(key).cloned();
+    match current {
+        Some(serde_json::Value::Array(arr)) => {
+            let filtered: Vec<serde_json::Value> = arr.into_iter().filter(|v| v != value).collect();
+            if filtered.is_empty() {
+                if key == "collection" {
+                    return Err(last_collection_error(identifier));
+                }
+                obj.remove(key);
+            } else {
+                obj.insert(key.to_string(), serde_json::Value::Array(filtered));
+            }
+        }
+        Some(serde_json::Value::String(s)) => {
+            let value_str = value.as_str().unwrap_or("");
+            // Handle semicolon-delimited subjects
+            if key == "subject" && s.contains(';') {
+                let parts: Vec<&str> = s.split(';').filter(|p| p.trim() != value_str).collect();
+                if parts.is_empty() {
+                    obj.remove(key);
+                } else {
+                    obj.insert(key.to_string(), serde_json::Value::String(parts.join(";")));
+                }
+            } else if s == value_str {
+                if key == "collection" {
+                    return Err(last_collection_error(identifier));
+                }
+                obj.remove(key);
+            }
+            // If no match, leave unchanged (no-op)
+        }
+        _ => {
+            // Field doesn't exist — nothing to remove
+        }
+    }
+    Ok(())
 }
 
 /// Compute a JSON Patch (RFC 6902) from desired metadata changes.
@@ -649,6 +808,218 @@ mod tests {
         let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
         assert_eq!(dest["title"], serde_json::json!("New"));
         assert_eq!(dest["date"], serde_json::json!("2024"));
+    }
+
+    // --- prepare_metadata: Set with repeated and indexed keys (#65) ---
+
+    #[test]
+    fn prepare_set_repeated_key_builds_list() {
+        let source = serde_json::json!({"collection": ["old"]});
+        let changes = vec![
+            ("collection".to_string(), serde_json::json!("a")),
+            ("collection".to_string(), serde_json::json!("b")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn prepare_set_repeated_key_keeps_each_value_once() {
+        let source = serde_json::json!({});
+        let changes = vec![
+            ("subject".to_string(), serde_json::json!("a")),
+            ("subject".to_string(), serde_json::json!("b")),
+            ("subject".to_string(), serde_json::json!("a")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn prepare_set_repeated_key_skips_remove_tag_among_values() {
+        let source = serde_json::json!({"subject": "old"});
+        let changes = vec![
+            ("subject".to_string(), serde_json::json!("a")),
+            ("subject".to_string(), serde_json::json!(REMOVE_TAG)),
+            ("subject".to_string(), serde_json::json!("b")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn prepare_set_array_value_is_written_as_is() {
+        let source = serde_json::json!({"subject": "old"});
+        let changes = vec![("subject".to_string(), serde_json::json!(["x", "y"]))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["x", "y"]));
+    }
+
+    #[test]
+    fn prepare_set_lone_array_value_keeps_duplicates() {
+        let source = serde_json::json!({"subject": ["history", "history", "archive"]});
+        let changes = vec![(
+            "subject".to_string(),
+            serde_json::json!(["history", "history", "archive", "history"]),
+        )];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(
+            dest["subject"],
+            serde_json::json!(["history", "history", "archive", "history"])
+        );
+    }
+
+    #[test]
+    fn prepare_set_array_and_scalar_for_one_key_flatten() {
+        let source = serde_json::json!({});
+        let changes = vec![
+            ("subject".to_string(), serde_json::json!(["x", "y"])),
+            ("subject".to_string(), serde_json::json!("z")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["x", "y", "z"]));
+    }
+
+    #[test]
+    fn prepare_set_scalar_replaces_existing_list() {
+        let source = serde_json::json!({"collection": ["a", "b"]});
+        let changes = vec![("collection".to_string(), serde_json::json!("x"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!("x"));
+    }
+
+    #[test]
+    fn prepare_set_repeated_keys_leave_other_fields_alone() {
+        let source = serde_json::json!({"title": "Old", "date": "2020", "creator": "Me"});
+        let changes = vec![
+            ("title".to_string(), serde_json::json!("New")),
+            ("subject".to_string(), serde_json::json!("a")),
+            ("date".to_string(), serde_json::json!("2024")),
+            ("subject".to_string(), serde_json::json!("b")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["title"], serde_json::json!("New"));
+        assert_eq!(dest["date"], serde_json::json!("2024"));
+        assert_eq!(dest["subject"], serde_json::json!(["a", "b"]));
+        assert_eq!(dest["creator"], serde_json::json!("Me"));
+    }
+
+    #[test]
+    fn prepare_set_indexed_key_overwrites_position() {
+        let source = serde_json::json!({"collection": ["a", "b", "c"]});
+        let changes = vec![("collection[1]".to_string(), serde_json::json!("B"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["a", "B", "c"]));
+        assert!(dest.get("collection[1]").is_none());
+    }
+
+    #[test]
+    fn prepare_set_indexed_key_extends_past_end() {
+        let source = serde_json::json!({"collection": ["a"]});
+        let changes = vec![("collection[2]".to_string(), serde_json::json!("c"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["a", "c"]));
+    }
+
+    #[test]
+    fn prepare_set_indexed_keys_create_list_from_nothing() {
+        let source = serde_json::json!({});
+        let changes = vec![
+            ("subject[0]".to_string(), serde_json::json!("x")),
+            ("subject[1]".to_string(), serde_json::json!("y")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["x", "y"]));
+        assert!(dest.get("subject[0]").is_none());
+        assert!(dest.get("subject[1]").is_none());
+    }
+
+    #[test]
+    fn prepare_set_indexed_key_wraps_existing_scalar() {
+        let source = serde_json::json!({"subject": "x"});
+        let changes = vec![("subject[1]".to_string(), serde_json::json!("y"))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["subject"], serde_json::json!(["x", "y"]));
+    }
+
+    #[test]
+    fn prepare_set_indexed_remove_tag_deletes_element() {
+        let source = serde_json::json!({"collection": ["a", "b", "c"]});
+        let changes = vec![("collection[1]".to_string(), serde_json::json!(REMOVE_TAG))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["a", "c"]));
+    }
+
+    #[test]
+    fn prepare_set_indexed_remove_tag_emptying_field_deletes_it() {
+        let source = serde_json::json!({"subject": "a", "title": "T"});
+        let changes = vec![("subject[0]".to_string(), serde_json::json!(REMOVE_TAG))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert!(dest.get("subject").is_none());
+        assert_eq!(dest["title"], serde_json::json!("T"));
+    }
+
+    #[test]
+    fn prepare_set_indexed_remove_tag_on_last_collection_errors() {
+        let source = serde_json::json!({"collection": ["only"]});
+        let changes = vec![("collection[0]".to_string(), serde_json::json!(REMOVE_TAG))];
+        let err = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot remove last collection"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prepare_set_remove_tag_on_collection_errors() {
+        let source = serde_json::json!({"collection": ["a", "b"]});
+        let changes = vec![("collection".to_string(), serde_json::json!(REMOVE_TAG))];
+        let err = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap_err();
+        assert!(err.to_string().contains("cannot remove last collection"));
+    }
+
+    #[test]
+    fn prepare_set_bare_then_indexed_same_field() {
+        let source = serde_json::json!({"collection": ["old1", "old2", "old3"]});
+        let changes = vec![
+            ("collection".to_string(), serde_json::json!("a")),
+            ("collection[1]".to_string(), serde_json::json!("b")),
+        ];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Set, "test").unwrap();
+        assert_eq!(dest["collection"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn compute_patch_for_repeated_key_yields_the_list() {
+        let source = serde_json::json!({"collection": ["old"], "title": "T"});
+        let changes = vec![
+            ("collection".to_string(), serde_json::json!("a")),
+            ("collection".to_string(), serde_json::json!("b")),
+        ];
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
+        assert!(
+            patch
+                .iter()
+                .all(|p| p["path"].as_str().unwrap_or("").starts_with("/collection")),
+            "unexpected paths: {patch:?}"
+        );
+        let mut applied = source.clone();
+        let patch: json_patch::Patch =
+            serde_json::from_value(serde_json::Value::Array(patch)).unwrap();
+        json_patch::patch(&mut applied, &patch).unwrap();
+        assert_eq!(applied["collection"], serde_json::json!(["a", "b"]));
+        assert_eq!(applied["title"], serde_json::json!("T"));
+    }
+
+    #[test]
+    fn compute_patch_for_indexed_key_targets_the_list_position() {
+        let source = serde_json::json!({"collection": ["a", "b"]});
+        let changes = vec![("collection[1]".to_string(), serde_json::json!("c"))];
+        let patch = compute_patch(&source, &changes, &MetadataOp::Set, None, "test").unwrap();
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0]["op"], "replace");
+        assert_eq!(patch[0]["path"], "/collection/1");
+        assert_eq!(patch[0]["value"], "c");
     }
 
     // --- prepare_metadata: Append operation ---
