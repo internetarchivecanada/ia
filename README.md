@@ -79,10 +79,14 @@ Download a prebuilt binary from [Releases](https://github.com/internetarchivecan
 
 ```sh
 # Example: Linux
-curl -L -o ia-cli https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
-chmod +x ia-cli
-sudo mv ia-cli /usr/local/bin/
+curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
+curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+chmod +x ia-x86_64-unknown-linux-musl
+sudo mv ia-x86_64-unknown-linux-musl /usr/local/bin/ia-cli
 ```
+
+Every release ships `SHA256SUMS` and a build provenance attestation. `gh attestation verify ia-x86_64-unknown-linux-musl --repo internetarchivecanada/ia` confirms the asset was built by this repository's release workflow.
 
 The binary is `ia-cli`, not `ia`, because the Python [`internetarchive`](https://github.com/jjjake/internetarchive) client already provides `ia`. Examples in these docs use `ia`; alias it with `alias ia=ia-cli`, and `ia-cli completions zsh --rename ia` generates matching completions. `ia-cli` may shorten to `ia` later, but that isn't promised.
 
