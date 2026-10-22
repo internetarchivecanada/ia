@@ -13,6 +13,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,11 +36,12 @@ jobs:
             os: windows-latest
             binary: ia-cli.exe
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The same key from main and from a tag. A workflow run can read
           # caches saved by its own ref and by the default branch, so the
@@ -52,11 +56,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build release binary
-        run: cargo build -p ia-cli --release --target ${{ matrix.target }}
+        run: cargo build --locked -p ia-cli --release --target ${{ matrix.target }}
 
       - name: Upload artifact
         if: inputs.upload-artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ia-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
