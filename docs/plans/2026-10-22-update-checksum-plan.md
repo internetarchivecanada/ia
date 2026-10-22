@@ -25,8 +25,9 @@ The doc-test lists of variants in `error.rs` gain both.
 **User-visible text.** The `update` help gains one sentence: "Assets are checked against the release's SHA256SUMS before they are installed." `docs/usage.md` under `ia update` gains the same sentence plus the two error codes, and names the pre-sums warning. README already documents verifying a manual download.
 
 ## Tasks
-- [ ] Plan committed first.
-- [ ] Red: unit tests for `parse_sha256sums` (two-space and asterisk separators, blank lines, a line for a different asset); wiremock tests through `install_version` for a matching sum (installs), a mismatching sum (error, temp file gone, target untouched), a post-sums release with no `SHA256SUMS` asset (`UpdateChecksumMissing`), a post-sums release whose file lacks this asset's line (`UpdateChecksumMissing`), and a pre-sums release without the file (installs); `error.rs` tests for display, JSON code and non-retryability of both variants.
-- [ ] Green: `aws-lc-rs` dependency, `parse_sha256sums`, `expected_checksum_for`, `download_asset_checked`, the two variants, the `MIN_CHECKSUMMED_VERSION` constant.
-- [ ] Docs: `update` help, `docs/usage.md`.
-- [ ] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`; code-reviewer pass; PR.
+- [x] Plan committed first.
+- [x] Red: unit tests for `parse_sha256sums` (two-space and asterisk separators, blank lines, a line for a different asset); wiremock tests through `install_version` for a matching sum (installs), a mismatching sum (error, temp file gone, target untouched), a post-sums release with no `SHA256SUMS` asset (`UpdateChecksumMissing`), a post-sums release whose file lacks this asset's line (`UpdateChecksumMissing`), and a pre-sums release without the file (installs); `error.rs` tests for display, JSON code and non-retryability of both variants.
+- [x] Green: `aws-lc-rs` dependency, `parse_sha256sums`, `expected_checksum_for`, `download_asset_checked`, the two variants, the `MIN_CHECKSUMMED_VERSION` constant.
+- [x] Docs: `update` help, `docs/usage.md`.
+- [x] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
+- [ ] Code-reviewer pass; PR.

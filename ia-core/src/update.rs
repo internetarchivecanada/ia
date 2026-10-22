@@ -112,6 +112,15 @@ pub struct ReleaseInfo {
 /// self-update support, so installing them would strand the user.
 pub const MIN_INSTALLABLE_VERSION: &str = "0.6.0";
 
+/// First release whose assets come with a `SHA256SUMS` file. From this
+/// version on, a release without the file, or without a line for this
+/// platform's asset, refuses to install; older releases were published
+/// without it and install with a warning.
+pub const MIN_CHECKSUMMED_VERSION: &str = "0.23.0";
+
+/// Name of the checksum file attached to each release.
+pub const SHA256SUMS_ASSET: &str = "SHA256SUMS";
+
 /// Returns `true` if `version` is at or above [`MIN_INSTALLABLE_VERSION`].
 ///
 /// Returns `false` for unparseable version strings.
@@ -334,8 +343,56 @@ pub async fn check_for_update(current_version: &str, api_base: &str) -> crate::R
     })
 }
 
-/// Download a release asset to a local file path.
+/// Download a release asset to a local file path without a checksum check.
+///
+/// Kept for library callers; `ia update` itself goes through
+/// [`download_asset_checked`].
 pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> crate::Result<()> {
+    download_asset_checked(url, dest, current_version, None).await
+}
+
+/// The SHA-256 a release's `SHA256SUMS` lists for one asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedSha256 {
+    pub asset: String,
+    /// 64 hex digits, any case.
+    pub hex: String,
+}
+
+/// Download a release asset to `dest`, refusing it if its SHA-256 does not
+/// match `expected`.
+///
+/// The body is hashed in memory before anything is written, so a bad
+/// download never reaches disk. `None` skips the check.
+pub async fn download_asset_checked(
+    url: &str,
+    dest: &Path,
+    current_version: &str,
+    expected: Option<&ExpectedSha256>,
+) -> crate::Result<()> {
+    let bytes = fetch_bytes(url, current_version, "download").await?;
+
+    if let Some(expected) = expected {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(&expected.hex) {
+            return Err(IaError::UpdateChecksumMismatch {
+                asset: expected.asset.clone(),
+                expected: expected.hex.to_ascii_lowercase(),
+                actual,
+            });
+        }
+    }
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+
+    Ok(())
+}
+
+/// GET `url` through the GitHub client and return the body. `what` names
+/// the request in error messages.
+async fn fetch_bytes(url: &str, current_version: &str, what: &str) -> crate::Result<bytes::Bytes> {
     let client = github_client(current_version)?;
     let response = client
         .get(url)
@@ -343,29 +400,109 @@ pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> cr
         .await
         .map_err(|e| IaError::UpdateApiError {
             status: 0,
-            message: format!("download failed: {e}"),
+            message: format!("{what} failed: {e}"),
         })?;
 
     if !response.status().is_success() {
         return Err(IaError::UpdateApiError {
             status: response.status().as_u16(),
-            message: format!("download returned {}", response.status()),
+            message: format!("{what} returned {}", response.status()),
         });
     }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| IaError::UpdateApiError {
-            status: 0,
-            message: format!("failed to read download body: {e}"),
-        })?;
+    response.bytes().await.map_err(|e| IaError::UpdateApiError {
+        status: 0,
+        message: format!("failed to read {what} body: {e}"),
+    })
+}
 
-    let mut file = tokio::fs::File::create(dest).await?;
-    file.write_all(&bytes).await?;
-    file.flush().await?;
+/// Lowercase hex SHA-256 of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
+    digest
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
 
-    Ok(())
+/// Parse the `sha256sum` output format: one `<hex>  <name>` line per file.
+///
+/// Accepts the two-space separator and the ` *` binary-mode marker, trims
+/// surrounding whitespace, and skips blank lines and lines without both
+/// parts. Returns `(hex, name)` pairs in file order.
+pub fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (hex, name) = line.trim().split_once(' ')?;
+            let name = name.trim_start_matches([' ', '*']);
+            if hex.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some((hex.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// The SHA-256 the release's `SHA256SUMS` lists for `asset_name`.
+///
+/// `Ok(None)` for a release older than [`MIN_CHECKSUMMED_VERSION`] that
+/// has no `SHA256SUMS`: it was published without one, and a warning is
+/// logged. A release that has the file is always checked against it.
+/// From [`MIN_CHECKSUMMED_VERSION`] on, a missing file or a missing line
+/// is [`IaError::UpdateChecksumMissing`].
+pub async fn expected_checksum_for(
+    release: &GitHubRelease,
+    asset_name: &str,
+    current_version: &str,
+) -> crate::Result<Option<ExpectedSha256>> {
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name)
+        .to_string();
+    // An unparseable tag is treated as new: fail closed.
+    let must_have_sums = match (
+        parse_version(&version),
+        parse_version(MIN_CHECKSUMMED_VERSION),
+    ) {
+        (Some(v), Some(min)) => v >= min,
+        _ => true,
+    };
+    let missing = || IaError::UpdateChecksumMissing {
+        version: version.clone(),
+    };
+
+    let Some(sums_asset) = release.assets.iter().find(|a| a.name == SHA256SUMS_ASSET) else {
+        if must_have_sums {
+            return Err(missing());
+        }
+        tracing::warn!(
+            "release v{version} predates SHA256SUMS; installing without checksum verification"
+        );
+        return Ok(None);
+    };
+
+    let body = fetch_bytes(
+        &sums_asset.browser_download_url,
+        current_version,
+        "SHA256SUMS download",
+    )
+    .await?;
+    let text = String::from_utf8_lossy(&body);
+    match parse_sha256sums(&text)
+        .into_iter()
+        .find(|(_, name)| name == asset_name)
+    {
+        Some((hex, _)) => Ok(Some(ExpectedSha256 {
+            asset: asset_name.to_string(),
+            hex,
+        })),
+        None => Err(missing()),
+    }
 }
 
 /// Atomically replace the binary at `target` with the file at `source`.
@@ -414,16 +551,28 @@ pub struct UpdateResult {
 ///
 /// This is the shared implementation for both `install_version` and `perform_update`.
 async fn download_and_replace(
+    release: &GitHubRelease,
     asset: &GitHubAsset,
     current_exe: &Path,
     current_version: &str,
     expected_version: &str,
     skip_verify: bool,
 ) -> crate::Result<()> {
+    // Look the checksum up before downloading: a release that should have
+    // one and does not is refused without fetching the asset at all.
+    let expected = expected_checksum_for(release, &asset.name, current_version).await?;
+
     let temp_path = current_exe.with_extension("update-tmp");
     let _ = std::fs::remove_file(&temp_path);
 
-    if let Err(e) = download_asset(&asset.browser_download_url, &temp_path, current_version).await {
+    if let Err(e) = download_asset_checked(
+        &asset.browser_download_url,
+        &temp_path,
+        current_version,
+        expected.as_ref(),
+    )
+    .await
+    {
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
@@ -500,6 +649,7 @@ pub async fn install_version(
         })?;
 
     download_and_replace(
+        &release,
         asset,
         current_exe,
         current_version,
@@ -541,6 +691,7 @@ pub async fn perform_update(
         })?;
 
     download_and_replace(
+        release,
         asset,
         current_exe,
         current_version,
@@ -790,25 +941,27 @@ mod tests {
         let fake_binary = b"new-binary-content";
 
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(&format!("/repos/{GITHUB_REPO}/releases/latest")))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
-                    "tag_name": "v99.0.0",
-                    "assets": [{
-                        "name": "ia-test-target",
-                        "browser_download_url": format!("{}/download/ia-test-target", mock_server.uri()),
-                        "size": fake_binary.len()
-                    }]
-                }),
-            ))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/latest"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(release_json(
+                    &mock_server.uri(),
+                    "v99.0.0",
+                    fake_binary.len(),
+                    true,
+                )),
+            )
             .mount(&mock_server)
             .await;
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/download/ia-test-target"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()))
-            .mount(&mock_server)
-            .await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_BINARY_CONTENT_SHA256}  ia-test-target\n").as_bytes(),
+        )
+        .await;
 
         let dir = tempfile::tempdir().unwrap();
         let exe_path = dir.path().join("ia");
@@ -1062,21 +1215,14 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         let fake_binary = b"new-version-binary";
 
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path(&format!(
-                "/repos/{GITHUB_REPO}/releases/tags/v99.0.0"
-            )))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"tag_name": "v99.0.0", "assets": [{"name": "ia-test-target", "browser_download_url": format!("{}/download/ia-test-target", mock_server.uri()), "size": fake_binary.len()}]}),
-            ))
-            .mount(&mock_server)
-            .await;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/download/ia-test-target"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(fake_binary.to_vec()))
-            .mount(&mock_server)
-            .await;
+        mount_release_by_tag(&mock_server, "v99.0.0", fake_binary.len(), true).await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_VERSION_BINARY_SHA256}  ia-test-target\n").as_bytes(),
+        )
+        .await;
 
         let dir = tempfile::tempdir().unwrap();
         let exe_path = dir.path().join("ia");
@@ -1095,6 +1241,290 @@ mod tests {
         assert_eq!(result.new_version, "99.0.0");
         assert_eq!(result.current_version, "0.5.0");
         assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    // SHA-256 of the fixtures above, computed with `shasum -a 256`.
+    const NEW_BINARY_CONTENT_SHA256: &str =
+        "14e726e382bdd84e4915710951640438c2960ce6eec4acdf0fdb0958ad5b7035";
+    const NEW_VERSION_BINARY_SHA256: &str =
+        "314a972e8bec759671a3a2585ecad004202b803fc64a32394d950f8936517f7d";
+
+    /// A release JSON body with the `ia-test-target` asset and, when
+    /// `with_sums` is set, a `SHA256SUMS` asset, both served by `base`.
+    fn release_json(base: &str, tag: &str, size: usize, with_sums: bool) -> serde_json::Value {
+        let mut assets = vec![serde_json::json!({
+            "name": "ia-test-target",
+            "browser_download_url": format!("{base}/download/ia-test-target"),
+            "size": size
+        })];
+        if with_sums {
+            assets.push(serde_json::json!({
+                "name": "SHA256SUMS",
+                "browser_download_url": format!("{base}/download/SHA256SUMS"),
+                "size": 0
+            }));
+        }
+        serde_json::json!({ "tag_name": tag, "assets": assets })
+    }
+
+    async fn mount_release_by_tag(
+        server: &wiremock::MockServer,
+        tag: &str,
+        size: usize,
+        with_sums: bool,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(&format!(
+                "/repos/{GITHUB_REPO}/releases/tags/{tag}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(release_json(
+                    &server.uri(),
+                    tag,
+                    size,
+                    with_sums,
+                )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_asset(server: &wiremock::MockServer, path: &str, body: &[u8]) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_two_space_and_asterisk_forms() {
+        let text = "aaaa  ia-x86_64-unknown-linux-musl\nbbbb *ia-aarch64-apple-darwin\n\n  cccc  ia-cli-man.tar.gz  \n";
+        assert_eq!(
+            parse_sha256sums(text),
+            vec![
+                (
+                    "aaaa".to_string(),
+                    "ia-x86_64-unknown-linux-musl".to_string()
+                ),
+                ("bbbb".to_string(), "ia-aarch64-apple-darwin".to_string()),
+                ("cccc".to_string(), "ia-cli-man.tar.gz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_skips_lines_without_both_parts() {
+        assert_eq!(parse_sha256sums("justahash\n   \n"), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_mismatching_checksum_and_leaves_the_binary_alone() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v99.0.0", fake_binary.len(), true).await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_BINARY_CONTENT_SHA256}  ia-test-target\n").as_bytes(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let err = install_version(
+            "99.0.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            IaError::UpdateChecksumMismatch {
+                asset,
+                expected,
+                actual,
+            } => {
+                assert_eq!(asset, "ia-test-target");
+                assert_eq!(expected, NEW_BINARY_CONTENT_SHA256);
+                assert_eq!(actual, NEW_VERSION_BINARY_SHA256);
+            }
+            other => panic!("expected UpdateChecksumMismatch, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
+        assert!(!exe_path.with_extension("update-tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn install_accepts_an_uppercase_checksum() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v99.0.0", fake_binary.len(), true).await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!(
+                "{}  ia-test-target\n",
+                NEW_VERSION_BINARY_SHA256.to_ascii_uppercase()
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        install_version(
+            "99.0.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_new_release_without_sha256sums() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v99.0.0", fake_binary.len(), false).await;
+        // No asset mock: the install must stop before downloading.
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let err = install_version(
+            "99.0.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IaError::UpdateChecksumMissing { ref version } if version == "99.0.0"),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_new_release_whose_sha256sums_lacks_this_asset() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v99.0.0", fake_binary.len(), true).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_VERSION_BINARY_SHA256}  ia-other-target\n").as_bytes(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let err = install_version(
+            "99.0.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IaError::UpdateChecksumMissing { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
+    }
+
+    #[tokio::test]
+    async fn install_accepts_a_pre_sums_release_without_sha256sums() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        // 0.7.0 is installable (>= 0.6.0) and predates SHA256SUMS (< 0.23.0).
+        mount_release_by_tag(&mock_server, "v0.7.0", fake_binary.len(), false).await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let result = install_version(
+            "0.7.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.new_version, "0.7.0");
+        assert_eq!(std::fs::read(&exe_path).unwrap(), fake_binary);
+    }
+
+    #[tokio::test]
+    async fn install_checks_a_pre_sums_release_that_does_have_sha256sums() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v0.7.0", fake_binary.len(), true).await;
+        mount_asset(&mock_server, "/download/ia-test-target", fake_binary).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_BINARY_CONTENT_SHA256}  ia-test-target\n").as_bytes(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let err = install_version(
+            "0.7.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, IaError::UpdateChecksumMismatch { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
     }
 
     #[tokio::test]

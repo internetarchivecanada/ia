@@ -35,7 +35,10 @@ csv = "1"
 rust_xlsxwriter = "0.101"
 indexmap = { version = "2", features = ["serde"] }
 base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# SHA-256 for checking update assets against SHA256SUMS. Already compiled
+# in as rustls's crypto provider, so this adds no code to the binary.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+image ={ version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 wiremock = "0.6"
