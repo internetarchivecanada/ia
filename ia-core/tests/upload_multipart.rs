@@ -704,6 +704,75 @@ async fn a_file_that_is_not_the_last_does_not_queue_a_derive_at_completion() {
     assert!(matches!(result.status, UploadStatus::Uploaded));
 }
 
+/// A rerun that resumes an unfinished upload sends no initiate request, so
+/// the completion request is the only one that can carry the item-level
+/// headers; it carries the rerun's list (#62).
+#[tokio::test]
+async fn a_resumed_upload_sends_the_item_headers_on_its_completion_request() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    // 20 bytes, part size 10: part 1 is on IA already, part 2 is sent.
+    let content = b"aaaaabbbbbcccccddddd";
+    let f = temp_file(content);
+    mount_list_uploads(&server, &[("data.bin", "resume-123")]).await;
+    mount_list_parts(
+        &server,
+        "resume-123",
+        &format!(
+            r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // No initiate request mounted: a POST ?uploads would fail the test.
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "resume-123"))
+        .and(header("x-archive-queue-derive", "0"))
+        .and(header("x-archive-keep-old-version", "1"))
+        .and(header("x-archive-size-hint", "20"))
+        .and(header("x-archive-ignore-preexisting-bucket", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_derive = true;
+        o.headers = vec![("x-archive-ignore-preexisting-bucket".into(), "1".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        true,
+        Some(20),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 20);
+}
+
 #[tokio::test]
 async fn upload_file_multipart_part_retry_on_503() {
     let server = MockServer::start().await;

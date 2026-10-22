@@ -12,6 +12,7 @@
 - [x] Red (`ia-core/tests/upload_multipart.rs`): through `upload_file_multipart`, the completion request carries `x-archive-queue-derive: 1`, `x-archive-keep-old-version: 1`, `x-archive-auto-make-bucket: 1`, `x-archive-size-hint`, a metadata header and a `--header` value on the first and last file; carries `x-archive-queue-derive: 0` and no `x-archive-keep-old-version`, `x-archive-auto-make-bucket` or metadata header with `no_derive`, `no_backup` and not the first file; carries `x-archive-queue-derive: 0` on a file that is not the last. The same assertions on the initiate request. The two `complete_upload` tests pass header lists.
 - [x] Green: one `item_headers` list in `upload_file_multipart`, sent on both requests; `complete_upload` and `complete_upload_with_retry` take `extra_headers`; doc comments.
 - [x] `docs/usage.md`; `just ci`; code-reviewer pass; PR against main, merged before PR #59 (which makes multipart reachable on the default path).
+- [x] Added 2026-10-22: a resumed upload sends no initiate request, so `a_resumed_upload_sends_the_item_headers_on_its_completion_request` pins `x-archive-queue-derive`, `x-archive-keep-old-version`, `x-archive-size-hint` and a `--header` value on the completion request of a resumed upload.
 
 ## Review (2026-10-14), closed before the PR
 
