@@ -241,8 +241,8 @@ pub enum IaError {
 
     /// A release that should carry `SHA256SUMS` has none, or has no line
     /// for this platform's asset. Nothing was installed.
-    #[error("release v{version} has no SHA256SUMS entry for this asset")]
-    UpdateChecksumMissing { version: String },
+    #[error("release v{version} has no SHA256SUMS line for {asset}")]
+    UpdateChecksumMissing { version: String, asset: String },
 
     #[error("path traversal blocked: {path} escapes destination directory {dest_dir}")]
     PathTraversal { path: String, dest_dir: String },
@@ -688,8 +688,9 @@ impl IaError {
                 extra.insert("actual".into(), actual.clone().into());
                 "update_checksum_mismatch"
             }
-            IaError::UpdateChecksumMissing { version } => {
+            IaError::UpdateChecksumMissing { version, asset } => {
                 extra.insert("version".into(), version.clone().into());
+                extra.insert("asset".into(), asset.clone().into());
                 "update_checksum_missing"
             }
             IaError::PathTraversal { path, dest_dir } => {
@@ -1621,21 +1622,26 @@ mod tests {
     }
 
     #[test]
-    fn update_checksum_missing_displays_version() {
+    fn update_checksum_missing_displays_version_and_asset() {
         let err = IaError::UpdateChecksumMissing {
             version: "0.23.0".into(),
+            asset: "ia-x86_64-unknown-linux-musl".into(),
         };
-        assert!(err.to_string().contains("v0.23.0"));
+        let text = err.to_string();
+        assert!(text.contains("v0.23.0"));
+        assert!(text.contains("ia-x86_64-unknown-linux-musl"));
     }
 
     #[test]
     fn json_update_checksum_missing() {
         let err = IaError::UpdateChecksumMissing {
             version: "0.23.0".into(),
+            asset: "ia-x86_64-unknown-linux-musl".into(),
         };
         let v = parse_json_error(&err);
         assert_eq!(v["error"]["code"], "update_checksum_missing");
         assert_eq!(v["error"]["version"], "0.23.0");
+        assert_eq!(v["error"]["asset"], "ia-x86_64-unknown-linux-musl");
     }
 
     #[test]
@@ -1648,6 +1654,7 @@ mod tests {
         .is_retryable());
         assert!(!IaError::UpdateChecksumMissing {
             version: "0.23.0".into(),
+            asset: "a".into(),
         }
         .is_retryable());
     }

@@ -353,10 +353,21 @@ pub async fn download_asset(url: &str, dest: &Path, current_version: &str) -> cr
 
 /// The SHA-256 a release's `SHA256SUMS` lists for one asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExpectedSha256 {
     pub asset: String,
     /// 64 hex digits, any case.
     pub hex: String,
+}
+
+impl ExpectedSha256 {
+    /// An expectation that `asset` hashes to `hex`.
+    pub fn new(asset: impl Into<String>, hex: impl Into<String>) -> Self {
+        Self {
+            asset: asset.into(),
+            hex: hex.into(),
+        }
+    }
 }
 
 /// Download a release asset to `dest`, refusing it if its SHA-256 does not
@@ -418,28 +429,24 @@ async fn fetch_bytes(url: &str, current_version: &str, what: &str) -> crate::Res
 
 /// Lowercase hex SHA-256 of `data`.
 fn sha256_hex(data: &[u8]) -> String {
-    use std::fmt::Write as _;
     let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
-    digest
-        .as_ref()
-        .iter()
-        .fold(String::with_capacity(64), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse the `sha256sum` output format: one `<hex>  <name>` line per file.
 ///
 /// Accepts the two-space separator and the ` *` binary-mode marker, trims
-/// surrounding whitespace, and skips blank lines and lines without both
-/// parts. Returns `(hex, name)` pairs in file order.
+/// surrounding whitespace (so CRLF files parse), and skips blank lines,
+/// lines without both parts, and lines whose digest is not 64 hex digits,
+/// so a corrupt file reads as "no entry" rather than as a mismatch against
+/// garbage. Returns `(hex, name)` pairs in file order.
 pub fn parse_sha256sums(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
             let (hex, name) = line.trim().split_once(' ')?;
             let name = name.trim_start_matches([' ', '*']);
-            if hex.is_empty() || name.is_empty() {
+            let is_sha256 = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+            if !is_sha256 || name.is_empty() {
                 return None;
             }
             Some((hex.to_string(), name.to_string()))
@@ -474,6 +481,7 @@ pub async fn expected_checksum_for(
     };
     let missing = || IaError::UpdateChecksumMissing {
         version: version.clone(),
+        asset: asset_name.to_string(),
     };
 
     let Some(sums_asset) = release.assets.iter().find(|a| a.name == SHA256SUMS_ASSET) else {
@@ -497,10 +505,7 @@ pub async fn expected_checksum_for(
         .into_iter()
         .find(|(_, name)| name == asset_name)
     {
-        Some((hex, _)) => Ok(Some(ExpectedSha256 {
-            asset: asset_name.to_string(),
-            hex,
-        })),
+        Some((hex, _)) => Ok(Some(ExpectedSha256::new(asset_name, hex))),
         None => Err(missing()),
     }
 }
@@ -1307,23 +1312,82 @@ mod tests {
 
     #[test]
     fn parse_sha256sums_two_space_and_asterisk_forms() {
-        let text = "aaaa  ia-x86_64-unknown-linux-musl\nbbbb *ia-aarch64-apple-darwin\n\n  cccc  ia-cli-man.tar.gz  \n";
+        let a = NEW_BINARY_CONTENT_SHA256;
+        let b = NEW_VERSION_BINARY_SHA256;
+        let c = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let text = format!(
+            "{a}  ia-x86_64-unknown-linux-musl\n{b} *ia-aarch64-apple-darwin\n\n  {c}  ia-cli-man.tar.gz  \n"
+        );
         assert_eq!(
-            parse_sha256sums(text),
+            parse_sha256sums(&text),
             vec![
-                (
-                    "aaaa".to_string(),
-                    "ia-x86_64-unknown-linux-musl".to_string()
-                ),
-                ("bbbb".to_string(), "ia-aarch64-apple-darwin".to_string()),
-                ("cccc".to_string(), "ia-cli-man.tar.gz".to_string()),
+                (a.to_string(), "ia-x86_64-unknown-linux-musl".to_string()),
+                (b.to_string(), "ia-aarch64-apple-darwin".to_string()),
+                (c.to_string(), "ia-cli-man.tar.gz".to_string()),
             ]
         );
     }
 
     #[test]
     fn parse_sha256sums_skips_lines_without_both_parts() {
-        assert_eq!(parse_sha256sums("justahash\n   \n"), Vec::new());
+        assert_eq!(
+            parse_sha256sums(&format!("{NEW_BINARY_CONTENT_SHA256}\n   \n")),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_skips_a_digest_that_is_not_64_hex_digits() {
+        let text = format!(
+            "notahash  ia-x\n{NEW_BINARY_CONTENT_SHA256}0  ia-y\nzz{}  ia-z\n",
+            &NEW_BINARY_CONTENT_SHA256[2..]
+        );
+        assert_eq!(parse_sha256sums(&text), Vec::new());
+    }
+
+    #[test]
+    fn parse_sha256sums_handles_crlf_line_endings() {
+        let text =
+            format!("{NEW_BINARY_CONTENT_SHA256}  ia-x\r\n{NEW_VERSION_BINARY_SHA256}  ia-y\r\n");
+        assert_eq!(
+            parse_sha256sums(&text),
+            vec![
+                (NEW_BINARY_CONTENT_SHA256.to_string(), "ia-x".to_string()),
+                (NEW_VERSION_BINARY_SHA256.to_string(), "ia-y".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sha256sums_keeps_spaces_inside_a_name() {
+        let text = format!("{NEW_BINARY_CONTENT_SHA256}  ia cli man.tar.gz\n");
+        assert_eq!(
+            parse_sha256sums(&text),
+            vec![(
+                NEW_BINARY_CONTENT_SHA256.to_string(),
+                "ia cli man.tar.gz".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn expected_checksum_for_fails_closed_on_an_unparseable_tag() {
+        // No assets, so nothing is fetched: the decision alone is under test.
+        let release = GitHubRelease {
+            tag_name: "nightly".into(),
+            assets: vec![],
+        };
+        let err = expected_checksum_for(&release, "ia-test-target", "0.5.0")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IaError::UpdateChecksumMissing { ref version, ref asset }
+                    if version == "nightly" && asset == "ia-test-target"
+            ),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1427,7 +1491,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, IaError::UpdateChecksumMissing { ref version } if version == "99.0.0"),
+            matches!(
+                err,
+                IaError::UpdateChecksumMissing { ref version, ref asset }
+                    if version == "99.0.0" && asset == "ia-test-target"
+            ),
             "got {err:?}"
         );
         assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
@@ -1522,6 +1590,39 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, IaError::UpdateChecksumMismatch { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");
+    }
+
+    #[tokio::test]
+    async fn install_refuses_a_pre_sums_release_whose_sha256sums_lacks_this_asset() {
+        let mock_server = wiremock::MockServer::start().await;
+        let fake_binary = b"new-version-binary";
+        mount_release_by_tag(&mock_server, "v0.7.0", fake_binary.len(), true).await;
+        mount_asset(
+            &mock_server,
+            "/download/SHA256SUMS",
+            format!("{NEW_VERSION_BINARY_SHA256}  ia-other-target\n").as_bytes(),
+        )
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("ia");
+        std::fs::write(&exe_path, b"old-binary").unwrap();
+
+        let err = install_version(
+            "0.7.0",
+            "0.5.0",
+            "test-target",
+            &exe_path,
+            &mock_server.uri(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, IaError::UpdateChecksumMissing { .. }),
             "got {err:?}"
         );
         assert_eq!(std::fs::read(&exe_path).unwrap(), b"old-binary");

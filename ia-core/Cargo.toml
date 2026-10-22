@@ -38,7 +38,7 @@ base64 = "0.22"
 # SHA-256 for checking update assets against SHA256SUMS. Already compiled
 # in as rustls's crypto provider, so this adds no code to the binary.
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
-image ={ version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 wiremock = "0.6"
