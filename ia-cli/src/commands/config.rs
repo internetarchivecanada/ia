@@ -241,7 +241,7 @@ pub async fn run(
                                  Use -u/--username and -p/--password for non-interactive login."
                             );
                         }
-                        rpassword::prompt_password_stderr("Password: ")?
+                        rpassword::prompt_password("Password: ")?
                     }
                 };
                 (email, password)
