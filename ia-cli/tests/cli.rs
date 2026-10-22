@@ -2036,7 +2036,6 @@ fn download_help_describes_md5_mismatch_handling() {
 
 // -- update: GitHub requests honor Retry-After --
 
-#[cfg(feature = "self-update")]
 #[test]
 fn update_help_describes_retries() {
     ia().args(["update", "--help"])

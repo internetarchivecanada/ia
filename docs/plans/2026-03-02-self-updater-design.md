@@ -1,7 +1,7 @@
 # Self-Updater Design (`ia update`)
 
 **Date:** 2026-03-02
-**Status:** Approved
+**Status:** Approved. Superseded 2026-10-22: the `self-update` feature gate was removed and `ia update` is built into every binary.
 
 ## Overview
 

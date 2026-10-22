@@ -154,7 +154,6 @@ enum Commands {
     Config(commands::config::ConfigArgs),
     // No doc comment here: clap would turn it into `about` and clear the
     // `long_about` set on UpdateArgs. Both live on the struct.
-    #[cfg(feature = "self-update")]
     Update(commands::update::UpdateArgs),
 }
 
@@ -231,7 +230,6 @@ pub async fn run() -> Result<()> {
             let cmd = Cli::command();
             return commands::man::run(args, &cmd);
         }
-        #[cfg(feature = "self-update")]
         Commands::Update(args) => {
             return commands::update::run(args).await;
         }
@@ -341,7 +339,6 @@ pub async fn run() -> Result<()> {
         Commands::Completions(_) => unreachable!("handled above"),
         Commands::Man(_) => unreachable!("handled above"),
         Commands::Config(_) => unreachable!("handled above"),
-        #[cfg(feature = "self-update")]
         Commands::Update(_) => unreachable!("handled above"),
     }
 

@@ -37,7 +37,6 @@ indexmap = "2"
 [features]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:open"]
-self-update = []
 alpha = ["ai-qa"]
 ai-qa = []
 ai-analyze = []
