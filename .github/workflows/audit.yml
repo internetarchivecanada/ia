@@ -1,0 +1,37 @@
+name: Audit
+
+# Scan Cargo.lock against the RustSec advisory database. Runs on every
+# push and pull request like the other checks (the "Audit" job is a
+# required status check on main), and once a week so an advisory
+# published between pushes is still noticed. Warnings for unsound or
+# unmaintained crates are reported but do not fail the job; only a
+# vulnerability does.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # 2026-10-16
+        with:
+          toolchain: stable
+      # rust-cache keeps ~/.cargo/bin, so the pinned install below is a
+      # no-op after the first run.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo install cargo-audit --locked --version 0.22.1
+      - run: cargo audit

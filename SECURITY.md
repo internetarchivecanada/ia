@@ -20,7 +20,7 @@ This project implements several security measures:
 - **Path traversal prevention:** Download paths are validated and sanitized (CVE-2025-58438 equivalent caught before public release)
 - **Upload validation:** Symlink detection, identifier sanitization, dotfile skipping
 - **Mock-only write tests:** Live archive.org is never modified in automated tests
-- **Dependency auditing:** `cargo audit` runs as a CI job on every pull request
+- **Dependency auditing:** `cargo audit` runs as a CI job on every pull request and on a weekly schedule; workflow actions are pinned to commit SHAs and builds use `--locked`
 
 ## Supported Versions
 
