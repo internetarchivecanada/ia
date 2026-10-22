@@ -1058,7 +1058,7 @@ curl -H "$(ia config print-auth)" https://s3.us.archive.org/...
 
 ### `ia update`
 
-Check for updates, list available versions, or install a specific version. This command is only available in standalone release builds (feature-gated behind `self-update`). If you installed via `cargo install`, use cargo to update instead.
+Check for updates, list available versions, or install a specific version. The new binary replaces the one that is running, wherever it is installed. If `ia` came from a package manager, update it with that tool instead.
 
 Requests to GitHub's release API are retried up to three times on a `5xx`, a `429` or a connection failure, on the standard schedule with its cap at 30 s instead of 60 s (see "Retry waits").
 

@@ -10,8 +10,8 @@ use console::style;
         Requests to GitHub are retried up to three times on a 5xx, a 429 or a connection failure, \
         waiting a random time up to a cap that doubles from 1 s to 30 s, or what a Retry-After \
         header says.\n\n\
-        This command is only available in standalone release builds. If you installed ia via \
-        cargo install or a package manager, use that tool to update instead.",
+        The new binary replaces the one that is running. If ia came from a package manager, \
+        update it with that tool instead.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Update to the latest version</dim>\n  <bold>$ ia update</bold>\
