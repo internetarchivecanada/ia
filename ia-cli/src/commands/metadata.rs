@@ -173,6 +173,9 @@ pub enum MetadataCommand {
     #[command(
         long_about = "Set metadata fields to new values. Replaces existing values. \
             Use -m/--metadata to specify field:value pairs.\n\n\
+            Repeat -m for one field to set it to a list of values. \
+            field[N]:value replaces position N of the field's current list and keeps \
+            the other positions; REMOVE_TAG at a position deletes it.\n\n\
             Chain multiple operations with + to apply them in a single request:\n  \
             ia metadata modify ID -m field:val + remove -m field:val\n\n\
             Valid operations after +: modify, append, append-list, insert, remove.\n\
@@ -181,6 +184,8 @@ pub enum MetadataCommand {
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Set title</dim>\n  <bold>$ ia metadata modify myitem -m \"title:New Title\"</bold>\
              \n\n  <dim># Set multiple fields</dim>\n  <bold>$ ia metadata modify myitem -m \"title:X\" -m \"date:2024\"</bold>\
+             \n\n  <dim># Set a multi-value field (repeat -m for the same field)</dim>\n  <bold>$ ia metadata modify myitem -m \"subject:physics\" -m \"subject:space\"</bold>\
+             \n\n  <dim># Replace one position of a list and keep the rest</dim>\n  <bold>$ ia metadata modify myitem -m \"collection[0]:featured\"</bold>\
              \n\n  <dim># Batch modify via search</dim>\n  <bold>$ ia metadata modify --search \"collection:test\" -m \"subject:updated\"</bold>\
              \n\n  <dim># Compound: set title and remove a subject in one request</dim>\
              \n  <bold>$ ia metadata modify myitem -m \"title:New\" + remove -m \"subject:old-tag\"</bold>\
@@ -437,6 +442,7 @@ pub struct AuditArgs {
          \n  <dim># Modify metadata (shorthand for 'ia metadata modify')</dim>\
          \n  <bold>$ ia metadata nasa -m \"title:New Title\"</bold>\
          \n  <bold>$ ia metadata nasa -m \"subject:rockets\" --dry-run</bold>\
+         \n  <bold>$ ia metadata nasa -m \"subject:rockets\" -m \"subject:apollo\"</bold>\
          \n\
          \n  <dim># Batch modify</dim>\
          \n  <bold>$ ia metadata --search \"collection:test\" -m \"subject:updated\"</bold>\
