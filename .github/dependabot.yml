@@ -1,0 +1,19 @@
+# Weekly dependency updates. Cargo minor and patch bumps arrive as one
+# grouped pull request; a major bump gets its own. Action pins (full
+# commit SHAs in the workflows) are kept current the same way.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
