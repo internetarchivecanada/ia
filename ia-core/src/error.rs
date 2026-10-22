@@ -50,6 +50,8 @@ pub struct JsonErrorBody {
 ///         IaError::UpdateVerifyFailed { .. } => (),
 ///         IaError::UpdateBelowMinimum { .. } => (),
 ///         IaError::UpdateVersionNotFound { .. } => (),
+///         IaError::UpdateChecksumMismatch { .. } => (),
+///         IaError::UpdateChecksumMissing { .. } => (),
 ///         IaError::PathTraversal { .. } => (),
 ///         IaError::DownloadTooLarge { .. } => (),
 ///         IaError::DownloadSizeMismatch { .. } => (),
@@ -104,6 +106,8 @@ pub struct JsonErrorBody {
 ///         IaError::UpdateVerifyFailed { .. } => (),
 ///         IaError::UpdateBelowMinimum { .. } => (),
 ///         IaError::UpdateVersionNotFound { .. } => (),
+///         IaError::UpdateChecksumMismatch { .. } => (),
+///         IaError::UpdateChecksumMissing { .. } => (),
 ///         IaError::PathTraversal { .. } => (),
 ///         IaError::DownloadTooLarge { .. } => (),
 ///         IaError::DownloadSizeMismatch { .. } => (),
@@ -225,6 +229,20 @@ pub enum IaError {
 
     #[error("version {version} not found")]
     UpdateVersionNotFound { version: String },
+
+    /// The downloaded update asset does not hash to the value in the
+    /// release's `SHA256SUMS`. Nothing was installed.
+    #[error("checksum mismatch for {asset}: expected {expected}, got {actual}")]
+    UpdateChecksumMismatch {
+        asset: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// A release that should carry `SHA256SUMS` has none, or has no line
+    /// for this platform's asset. Nothing was installed.
+    #[error("release v{version} has no SHA256SUMS line for {asset}")]
+    UpdateChecksumMissing { version: String, asset: String },
 
     #[error("path traversal blocked: {path} escapes destination directory {dest_dir}")]
     PathTraversal { path: String, dest_dir: String },
@@ -499,6 +517,8 @@ impl IaError {
             IaError::UpdateVerifyFailed { .. } => false,
             IaError::UpdateBelowMinimum { .. } => false,
             IaError::UpdateVersionNotFound { .. } => false,
+            IaError::UpdateChecksumMismatch { .. } => false,
+            IaError::UpdateChecksumMissing { .. } => false,
             // Security — never retry
             IaError::PathTraversal { .. } => false,
             IaError::DownloadTooLarge { .. } => false,
@@ -657,6 +677,21 @@ impl IaError {
             IaError::UpdateVersionNotFound { version } => {
                 extra.insert("version".into(), version.clone().into());
                 "update_version_not_found"
+            }
+            IaError::UpdateChecksumMismatch {
+                asset,
+                expected,
+                actual,
+            } => {
+                extra.insert("asset".into(), asset.clone().into());
+                extra.insert("expected".into(), expected.clone().into());
+                extra.insert("actual".into(), actual.clone().into());
+                "update_checksum_mismatch"
+            }
+            IaError::UpdateChecksumMissing { version, asset } => {
+                extra.insert("version".into(), version.clone().into());
+                extra.insert("asset".into(), asset.clone().into());
+                "update_checksum_missing"
             }
             IaError::PathTraversal { path, dest_dir } => {
                 extra.insert("path".into(), path.clone().into());
@@ -1557,6 +1592,71 @@ mod tests {
             version: "99.99.99".into(),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn update_checksum_mismatch_displays_asset_and_digests() {
+        let err = IaError::UpdateChecksumMismatch {
+            asset: "ia-x86_64-unknown-linux-musl".into(),
+            expected: "aaaa".into(),
+            actual: "bbbb".into(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("ia-x86_64-unknown-linux-musl"));
+        assert!(text.contains("aaaa"));
+        assert!(text.contains("bbbb"));
+    }
+
+    #[test]
+    fn json_update_checksum_mismatch() {
+        let err = IaError::UpdateChecksumMismatch {
+            asset: "ia-x86_64-unknown-linux-musl".into(),
+            expected: "aaaa".into(),
+            actual: "bbbb".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_checksum_mismatch");
+        assert_eq!(v["error"]["asset"], "ia-x86_64-unknown-linux-musl");
+        assert_eq!(v["error"]["expected"], "aaaa");
+        assert_eq!(v["error"]["actual"], "bbbb");
+    }
+
+    #[test]
+    fn update_checksum_missing_displays_version_and_asset() {
+        let err = IaError::UpdateChecksumMissing {
+            version: "0.23.0".into(),
+            asset: "ia-x86_64-unknown-linux-musl".into(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("v0.23.0"));
+        assert!(text.contains("ia-x86_64-unknown-linux-musl"));
+    }
+
+    #[test]
+    fn json_update_checksum_missing() {
+        let err = IaError::UpdateChecksumMissing {
+            version: "0.23.0".into(),
+            asset: "ia-x86_64-unknown-linux-musl".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "update_checksum_missing");
+        assert_eq!(v["error"]["version"], "0.23.0");
+        assert_eq!(v["error"]["asset"], "ia-x86_64-unknown-linux-musl");
+    }
+
+    #[test]
+    fn update_checksum_errors_are_not_retryable() {
+        assert!(!IaError::UpdateChecksumMismatch {
+            asset: "a".into(),
+            expected: "b".into(),
+            actual: "c".into(),
+        }
+        .is_retryable());
+        assert!(!IaError::UpdateChecksumMissing {
+            version: "0.23.0".into(),
+            asset: "a".into(),
+        }
+        .is_retryable());
     }
 
     // -- Upload error tests --

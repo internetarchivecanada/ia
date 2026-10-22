@@ -11,7 +11,9 @@ use console::style;
         waiting a random time up to a cap that doubles from 1 s to 30 s, or what a Retry-After \
         header says.\n\n\
         The new binary replaces the one that is running. If ia came from a package manager, \
-        update it with that tool instead.",
+        update it with that tool instead.\n\n\
+        Assets are checked against the release's SHA256SUMS before they are installed. \
+        Releases older than 0.23.0 have no SHA256SUMS and install with a warning.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Update to the latest version</dim>\n  <bold>$ ia update</bold>\

@@ -1316,6 +1316,7 @@ version = "0.22.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "bytes",
  "calamine",

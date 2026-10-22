@@ -1062,6 +1062,8 @@ Check for updates, list available versions, or install a specific version. The n
 
 Requests to GitHub's release API are retried up to three times on a `5xx`, a `429` or a connection failure, on the standard schedule with its cap at 30 s instead of 60 s (see "Retry waits").
 
+Assets are checked against the release's `SHA256SUMS` before they are installed. A download whose SHA-256 does not match is refused with error code `update_checksum_mismatch` and the running binary is left untouched; a release from 0.23.0 on that has no `SHA256SUMS`, or none for this platform's asset, is refused with `update_checksum_missing`. Releases older than 0.23.0 were published without the file and install with a warning on stderr.
+
 ```sh
 ia update [OPTIONS]
 ia update list [OPTIONS]
