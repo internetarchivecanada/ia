@@ -37,6 +37,26 @@ fn test_client(server: &MockServer) -> IaClient {
     IaClient::from_config(config).unwrap()
 }
 
+/// Matches a request that does not carry the named header.
+struct NoHeader(&'static str);
+
+impl wiremock::Match for NoHeader {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !request.headers.contains_key(self.0)
+    }
+}
+
+/// Matches a request that carries the named header exactly once, with
+/// this value: a second value would not be seen by `header()`.
+struct HeaderOnce(&'static str, &'static str);
+
+impl wiremock::Match for HeaderOnce {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let values: Vec<_> = request.headers.get_all(self.0).iter().collect();
+        values.len() == 1 && values[0] == self.1
+    }
+}
+
 // ── Initiate ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -201,9 +221,16 @@ async fn complete_upload_success() {
 
     let client = test_client(&server);
     let parts = vec![(1, "\"etag1\"".to_string()), (2, "\"etag2\"".to_string())];
-    let result =
-        multipart::complete_upload(&client, "test-item", "file.zip", "upload-123", &parts, true)
-            .await;
+    let headers = vec![("x-archive-keep-old-version".to_string(), "1".to_string())];
+    let result = multipart::complete_upload(
+        &client,
+        "test-item",
+        "file.zip",
+        "upload-123",
+        &parts,
+        &headers,
+    )
+    .await;
     assert!(result.is_ok());
 }
 
@@ -215,21 +242,16 @@ async fn complete_upload_without_backup() {
     Mock::given(method("POST"))
         .and(path("/test-item/file.zip"))
         .and(query_param("uploadId", "upload-123"))
+        .and(NoHeader("x-archive-keep-old-version"))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
 
     let client = test_client(&server);
     let parts = vec![(1, "\"etag1\"".to_string())];
-    let result = multipart::complete_upload(
-        &client,
-        "test-item",
-        "file.zip",
-        "upload-123",
-        &parts,
-        false,
-    )
-    .await;
+    let result =
+        multipart::complete_upload(&client, "test-item", "file.zip", "upload-123", &parts, &[])
+            .await;
     assert!(result.is_ok());
 }
 
@@ -432,6 +454,323 @@ async fn upload_file_multipart_success() {
     assert_eq!(result.bytes, 15);
     assert_eq!(result.identifier, "test-item");
     assert_eq!(result.key, "data.bin");
+}
+
+// ── Item-level headers on the initiate and completion requests (#62) ────
+//
+// The single PUT sends every item-level header on its one request. A
+// multipart upload sends the same list on both the initiate request and the
+// completion request, so a header reaches IA on whichever of the two reads
+// it; IA takes the derive decision from the completion request.
+
+/// Mount the resume listing (empty) and a one-part upload under `mp-1`;
+/// the initiate and completion mocks are the caller's, with their headers.
+async fn mount_one_part_upload(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "1"))
+        .and(query_param("uploadId", "mp-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+fn initiate_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_string(
+        "<InitiateMultipartUploadResult><UploadId>mp-1</UploadId></InitiateMultipartUploadResult>",
+    )
+}
+
+#[tokio::test]
+async fn first_and_last_file_sends_every_item_header_on_initiate_and_completion() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+    mount_one_part_upload(&server).await;
+
+    for (m, q, resp) in [
+        (method("POST"), query_param("uploads", ""), initiate_ok()),
+        (
+            method("POST"),
+            query_param("uploadId", "mp-1"),
+            ResponseTemplate::new(200),
+        ),
+    ] {
+        Mock::given(m)
+            .and(path("/test-item/data.bin"))
+            .and(q)
+            .and(header("x-archive-queue-derive", "1"))
+            .and(header("x-archive-keep-old-version", "1"))
+            .and(header("x-archive-auto-make-bucket", "1"))
+            .and(header("x-archive-size-hint", "5"))
+            .and(header("x-archive-meta00-title", "Hello"))
+            .and(header("x-archive-interactive-priority", "1"))
+            .respond_with(resp)
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.metadata = vec![("title".into(), "Hello".into())];
+        o.headers = vec![("x-archive-interactive-priority".into(), "1".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        true,
+        Some(5),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn no_derive_and_no_backup_reach_the_completion_request() {
+    // Not the first file: no bucket creation, no metadata; --no-derive and
+    // --no-backup: derive 0 and no keep-old-version, on both requests.
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+    mount_one_part_upload(&server).await;
+
+    for (m, q, resp) in [
+        (method("POST"), query_param("uploads", ""), initiate_ok()),
+        (
+            method("POST"),
+            query_param("uploadId", "mp-1"),
+            ResponseTemplate::new(200),
+        ),
+    ] {
+        Mock::given(m)
+            .and(path("/test-item/data.bin"))
+            .and(q)
+            .and(header("x-archive-queue-derive", "0"))
+            .and(NoHeader("x-archive-keep-old-version"))
+            .and(NoHeader("x-archive-auto-make-bucket"))
+            .and(NoHeader("x-archive-size-hint"))
+            .and(NoHeader("x-archive-meta00-title"))
+            .respond_with(resp)
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_derive = true;
+        o.no_backup = true;
+        o.metadata = vec![("title".into(), "Hello".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        false,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+/// A custom Content-Type describes the object, so it goes on the initiate
+/// request as before; the completion request's body is the manifest, and
+/// its Content-Type stays application/xml alone (review finding, #62).
+#[tokio::test]
+async fn a_custom_content_type_does_not_reach_the_completion_request() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+    mount_one_part_upload(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploads", ""))
+        .and(HeaderOnce("content-type", "video/mp4"))
+        .respond_with(initiate_ok())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "mp-1"))
+        .and(HeaderOnce("content-type", "application/xml"))
+        .and(header("x-archive-queue-derive", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.headers = vec![("Content-Type".into(), "video/mp4".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+#[tokio::test]
+async fn a_file_that_is_not_the_last_does_not_queue_a_derive_at_completion() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    let f = temp_file(b"hello");
+    mount_one_part_upload(&server).await;
+
+    for (m, q, resp) in [
+        (method("POST"), query_param("uploads", ""), initiate_ok()),
+        (
+            method("POST"),
+            query_param("uploadId", "mp-1"),
+            ResponseTemplate::new(200),
+        ),
+    ] {
+        Mock::given(m)
+            .and(path("/test-item/data.bin"))
+            .and(q)
+            .and(header("x-archive-queue-derive", "0"))
+            .and(header("x-archive-keep-old-version", "1"))
+            .respond_with(resp)
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+}
+
+/// A rerun that resumes an unfinished upload sends no initiate request, so
+/// the completion request is the only one that can carry the item-level
+/// headers; it carries the rerun's list (#62).
+#[tokio::test]
+async fn a_resumed_upload_sends_the_item_headers_on_its_completion_request() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    // 20 bytes, part size 10: part 1 is on IA already, part 2 is sent.
+    let content = b"aaaaabbbbbcccccddddd";
+    let f = temp_file(content);
+    mount_list_uploads(&server, &[("data.bin", "resume-123")]).await;
+    mount_list_parts(
+        &server,
+        "resume-123",
+        &format!(
+            r#"<Part><PartNumber>1</PartNumber><ETag>"{}"</ETag><Size>10</Size></Part>"#,
+            md5_hex(b"aaaaabbbbb")
+        ),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("partNumber", "2"))
+        .and(query_param("uploadId", "resume-123"))
+        .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"etag2\""))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // No initiate request mounted: a POST ?uploads would fail the test.
+    Mock::given(method("POST"))
+        .and(path("/test-item/data.bin"))
+        .and(query_param("uploadId", "resume-123"))
+        .and(header("x-archive-queue-derive", "0"))
+        .and(header("x-archive-keep-old-version", "1"))
+        .and(header("x-archive-size-hint", "20"))
+        .and(header("x-archive-ignore-preexisting-bucket", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_derive = true;
+        o.headers = vec![("x-archive-ignore-preexisting-bucket".into(), "1".into())];
+        o
+    };
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "data.bin",
+        &opts,
+        10,
+        true,
+        true,
+        Some(20),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 20);
 }
 
 #[tokio::test]

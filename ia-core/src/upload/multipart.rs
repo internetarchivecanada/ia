@@ -167,9 +167,13 @@ use super::{build_s3_item_url, build_s3_url};
 /// `POST /{identifier}/{key}?uploads`
 ///
 /// `extra_headers` allows callers to attach metadata (`x-archive-meta*`),
-/// `x-archive-auto-make-bucket`, `x-archive-queue-derive`, and other
-/// item-creation headers to the initiate request. IA S3 only accepts
-/// metadata at item creation time, so these headers must be sent here.
+/// `x-archive-auto-make-bucket`, `x-archive-queue-derive`,
+/// `x-archive-keep-old-version`, and other item-level headers to the
+/// initiate request. IA S3 only accepts metadata at item creation time, so
+/// the metadata headers must be sent here. Send the same list to
+/// [`complete_upload`]: IA takes the derive decision from the completion
+/// request, and a header on both requests reaches IA on whichever one
+/// reads it.
 ///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
 /// need a configurable budget go through `upload_file_multipart`.
@@ -346,6 +350,15 @@ pub(crate) async fn upload_part_with_retry(
 ///
 /// `POST /{identifier}/{key}?uploadId={ID}` with XML body
 ///
+/// `extra_headers` is the same item-level header list that went on the
+/// initiate request (see [`initiate_upload`]). The completion request
+/// creates the task that writes the object, and that is where IA reads
+/// `x-archive-queue-derive` and `x-archive-keep-old-version`; a completion
+/// without `x-archive-queue-derive: 0` queues a derive whatever the initiate
+/// request said (#62). A `Content-Type` or `Content-Length` in the list is
+/// left out here: they describe the object, and this request's body is the
+/// manifest.
+///
 /// Retries per the shared IA-S3 policy with the default budget. Callers that
 /// need a configurable budget go through `upload_file_multipart`.
 pub async fn complete_upload(
@@ -354,14 +367,14 @@ pub async fn complete_upload(
     key: &str,
     upload_id: &str,
     parts: &[(u32, String)],
-    keep_old_version: bool,
+    extra_headers: &[(String, String)],
 ) -> Result<()> {
     complete_upload_with_retry(
         client,
         &default_ctx(identifier, key),
         upload_id,
         parts,
-        keep_old_version,
+        extra_headers,
         None,
     )
     .await
@@ -385,7 +398,7 @@ pub(crate) async fn complete_upload_with_retry(
     ctx: &S3RetryCtx<'_>,
     upload_id: &str,
     parts: &[(u32, String)],
-    keep_old_version: bool,
+    extra_headers: &[(String, String)],
     expected_size: Option<u64>,
 ) -> Result<u32> {
     let (access, secret) = client.require_auth()?;
@@ -404,8 +417,14 @@ pub(crate) async fn complete_upload_with_retry(
             .header("Authorization", format!("LOW {access}:{secret}"))
             .header("Content-Type", "application/xml")
             .header("Content-Length", manifest.len().to_string());
-        if keep_old_version {
-            req = req.header("x-archive-keep-old-version", "1");
+        for (k, v) in extra_headers {
+            // The body here is the manifest, not the object. A custom
+            // Content-Type or Content-Length describes the object and would
+            // be appended as a second value next to the manifest's own.
+            if k.eq_ignore_ascii_case("content-type") || k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
         }
         req.body(manifest.clone()).send()
     })
@@ -709,8 +728,9 @@ use std::time::Instant;
 ///
 /// `is_first_file` / `is_last_file` / `size_hint` control the same IA S3
 /// headers as the single-PUT path (`x-archive-auto-make-bucket`,
-/// `x-archive-queue-derive`, `x-archive-size-hint`), plus metadata headers
-/// on the initiate POST.
+/// `x-archive-queue-derive`, `x-archive-keep-old-version`,
+/// `x-archive-size-hint`, the metadata headers, the custom headers), sent
+/// on both the initiate POST and the completion POST.
 ///
 /// `hashes` is the file's md5 and per-part md5s at `part_size` when the
 /// caller already read the file (`upload_file` does, for the skip check);
@@ -783,8 +803,12 @@ pub async fn upload_file_multipart(
     let (upload_id, existing_parts) =
         try_resume(client, &control_ctx, file, file_size, part_size, part_md5s).await?;
 
-    // Build extra headers for the initiate POST (metadata, auto-make-bucket, etc.)
-    let extra_headers = {
+    // The item-level headers, under the single PUT's rules. The single PUT
+    // sends them all on its one request; a multipart upload sends the same
+    // list on the initiate request and on the completion request, so a
+    // header reaches IA on whichever of the two reads it. IA takes the
+    // derive decision from the completion request (#62).
+    let item_headers = {
         use crate::upload::headers::encode_metadata_headers;
         let mut hdrs = Vec::new();
 
@@ -798,12 +822,17 @@ pub async fn upload_file_multipart(
             hdrs.push(("x-archive-auto-make-bucket".to_string(), "1".to_string()));
         }
 
-        // x-archive-size-hint (first file only)
+        // x-archive-size-hint (first file only, caller provides)
         if let Some(hint) = size_hint {
             hdrs.push(("x-archive-size-hint".to_string(), hint.to_string()));
         }
 
-        // x-archive-queue-derive
+        // x-archive-keep-old-version: 1 unless no_backup
+        if !opts.no_backup {
+            hdrs.push(("x-archive-keep-old-version".to_string(), "1".to_string()));
+        }
+
+        // x-archive-queue-derive: only 1 on last file (unless no_derive)
         if opts.no_derive || !is_last_file {
             hdrs.push(("x-archive-queue-derive".to_string(), "0".to_string()));
         } else {
@@ -836,7 +865,7 @@ pub async fn upload_file_multipart(
         }
         None => {
             let (id, attempts) =
-                initiate_upload_with_retry(client, &control_ctx, &extra_headers).await?;
+                initiate_upload_with_retry(client, &control_ctx, &item_headers).await?;
             total_retries += attempts.saturating_sub(1);
             tracing::debug!(identifier, key, upload_id = %id, "initiated multipart upload");
             (id, Vec::new())
@@ -937,8 +966,8 @@ pub async fn upload_file_multipart(
     // done, part 2 uploaded now) leaving completed_parts out of order.
     completed_parts.sort_by_key(|(num, _)| *num);
 
-    // Complete the multipart upload
-    let keep_old_version = !opts.no_backup;
+    // Complete the multipart upload, with the same item-level headers as
+    // the initiate request.
     // Every byte has been sent by now; a backoff here must say so.
     let completion_ctx = S3RetryCtx {
         bytes_sent: file_size,
@@ -949,7 +978,7 @@ pub async fn upload_file_multipart(
         &completion_ctx,
         &upload_id,
         &completed_parts,
-        keep_old_version,
+        &item_headers,
         Some(file_size),
     )
     .await?;

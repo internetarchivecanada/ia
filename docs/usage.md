@@ -305,6 +305,8 @@ Metadata writes use subcommands. Each takes `-m/--metadata <FIELD:VALUE>` pairs 
 
 Passing `-m` on the bare command (`ia metadata <ID> -m <K:V>`) is shorthand for `ia metadata modify`.
 
+Repeating `-m` for one field under `modify` sets that field to the list of values: `-m subject:a -m subject:b` writes `["a", "b"]`. `field[N]:value` replaces position N of the field's current list and keeps the other positions; `REMOVE_TAG` at a position deletes it. Deleting the last `collection` value is refused.
+
 Chain multiple operations with `+` to apply them in a single request. Valid operations after `+`: `modify`, `append`, `append-list`, `insert`, `remove`. Shared options (`--target`, `--dry-run`, `--json`, etc.) go before the first `+`.
 
 | Write option | Description |
@@ -328,6 +330,12 @@ ia metadata myitem -m "description:Updated description"
 
 # Set multiple fields at once
 ia metadata modify myitem -m "title:New Title" -m "subject:science"
+
+# Set a multi-value field (repeat -m for the same field)
+ia metadata modify myitem -m "subject:physics" -m "subject:space"
+
+# Replace one position of a list and keep the rest
+ia metadata modify myitem -m "collection[0]:featured"
 
 # Append to a string field
 ia metadata append myitem -m "description: (updated 2026)"
@@ -594,7 +602,7 @@ Without `--multipart`, each item is asked once, at the start of a run, which fil
 
 #### Completing a multipart upload
 
-The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). Each part is sent with `Content-MD5`, as a single PUT is, so a part whose bytes arrive changed is refused on receipt (`BadDigest`); `--no-verify` skips the header on parts too. Each part's md5 is also sent to IA in the completion request, and IA compares it with the part it holds before accepting the completion. An accepted completion is the upload: the file is reported `uploaded`, `--delete-after-upload` deletes the local file then, and nothing is polled afterwards. IA assembles the object in the background, so the file may take a minute to appear in the item's listing. The result's `md5` is the local md5, as for a single PUT.
+The skip check applies to `--multipart` as to a single PUT: the one read that gives the per-part md5s also gives the whole-file md5, and a file the item already lists with that md5 is skipped (`--clobber` uploads it anyway; `--clobber --no-verify` skips the read altogether). Each part is sent with `Content-MD5`, as a single PUT is, so a part whose bytes arrive changed is refused on receipt (`BadDigest`); `--no-verify` skips the header on parts too. Each part's md5 is also sent to IA in the completion request, and IA compares it with the part it holds before accepting the completion. The completion request carries the same item-level headers as a single PUT (`x-archive-queue-derive`, `x-archive-keep-old-version`, `x-archive-auto-make-bucket`, `x-archive-size-hint`, the metadata headers, `--header` values other than a `Content-Type` or `Content-Length`, which describe the file and not the completion's XML body), as the initiate request does, so `--no-derive`, `--no-backup` and the rest apply to a multipart upload exactly as to a single PUT. An accepted completion is the upload: the file is reported `uploaded`, `--delete-after-upload` deletes the local file then, and nothing is polled afterwards. IA assembles the object in the background, so the file may take a minute to appear in the item's listing. The result's `md5` is the local md5, as for a single PUT.
 
 #### Multipart part failures
 

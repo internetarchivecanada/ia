@@ -2908,11 +2908,11 @@ fn search_help_names_no_json_code_in_prose() {
 // -- 0.21.0: the series' public API changes ship under one version --
 
 #[test]
-fn version_is_0_21_0() {
+fn version_is_0_21_1() {
     ia().arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.21.0"));
+        .stdout(predicate::str::contains("0.21.1"));
 }
 
 /// Two unfinished uploads of one file (`a.bin`: u1 and u3). `--abort` would
@@ -2967,4 +2967,330 @@ fn cleanup_with_file_and_two_uploads_says_these_uploads() {
         ))
         .stderr(predicate::str::contains("this upload").not());
     fx.rt.block_on(fx.server.verify());
+}
+
+// ── Repeated and indexed -m keys under modify (#65) ─────────────────────────
+//
+// Every test here points `--host` at a wiremock server; nothing reaches
+// archive.org. The item served has `collection: ["old", "keep"]`.
+
+fn multi_value_item_server() -> (tokio::runtime::Runtime, wiremock::MockServer, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    let item = serde_json::json!({
+        "metadata": {
+            "identifier": "mv-item",
+            "title": "Multi",
+            "mediatype": "movies",
+            "collection": ["old", "keep"]
+        },
+        "files": [],
+        "server": "ia000000.us.archive.org",
+        "d1": "ia000000.us.archive.org",
+        "d2": "ia000001.us.archive.org",
+        "dir": "/0/items/mv-item",
+        "files_count": 0,
+        "item_size": 0,
+        "is_dark": false
+    });
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/mv-item"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&item))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/metadata/mv-item"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "task_id": 1})),
+            )
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    (rt, server, host)
+}
+
+/// Parse the `--dry-run --json` line for `mv-item` and return its `changes`.
+fn dry_run_changes(stdout: &str) -> Vec<serde_json::Value> {
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"mv-item\""))
+        .unwrap_or_else(|| panic!("no dry-run line for mv-item in: {stdout}"));
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(v["status"], "would_modify", "unexpected line: {line}");
+    v["changes"].as_array().cloned().unwrap_or_default()
+}
+
+/// Apply a JSON Patch (as the dry run prints it, and as the POST carries it)
+/// to the served item's metadata and return the resulting `collection`.
+///
+/// Only the operations `json_patch::diff` emits (`add`, `replace`, `remove`)
+/// on a top-level field or one list position are supported; anything else
+/// fails the test.
+fn collection_after(changes: &[serde_json::Value]) -> serde_json::Value {
+    let mut md = serde_json::json!({
+        "identifier": "mv-item",
+        "title": "Multi",
+        "mediatype": "movies",
+        "collection": ["old", "keep"]
+    });
+    for change in changes {
+        let op = change["op"].as_str().unwrap();
+        let path = change["path"].as_str().unwrap();
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let obj = md.as_object_mut().unwrap();
+        match (op, parts.as_slice()) {
+            ("add" | "replace", [field]) => {
+                obj.insert((*field).to_string(), change["value"].clone());
+            }
+            ("remove", [field]) => {
+                obj.remove(*field);
+            }
+            (_, [field, pos]) => {
+                let list = obj
+                    .get_mut(*field)
+                    .and_then(|v| v.as_array_mut())
+                    .unwrap_or_else(|| panic!("{path}: {field} is not a list"));
+                let idx = if *pos == "-" {
+                    list.len()
+                } else {
+                    pos.parse::<usize>().unwrap()
+                };
+                match op {
+                    "add" => list.insert(idx, change["value"].clone()),
+                    "replace" => list[idx] = change["value"].clone(),
+                    "remove" => {
+                        list.remove(idx);
+                    }
+                    other => panic!("unsupported op {other} in {change}"),
+                }
+            }
+            _ => panic!("unsupported patch op: {change}"),
+        }
+    }
+    md["collection"].clone()
+}
+
+#[test]
+fn metadata_shorthand_repeated_key_sets_a_list() {
+    let (_rt, _server, host) = multi_value_item_server();
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "mv-item",
+            "-m",
+            "collection:a",
+            "-m",
+            "collection:b",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let changes = dry_run_changes(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(
+        collection_after(&changes),
+        serde_json::json!(["a", "b"]),
+        "patch was: {changes:?}"
+    );
+}
+
+#[test]
+fn metadata_modify_repeated_key_sets_a_list() {
+    let (_rt, _server, host) = multi_value_item_server();
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "modify",
+            "mv-item",
+            "-m",
+            "collection:a",
+            "-m",
+            "collection:b",
+            "-m",
+            "title:New",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let changes = dry_run_changes(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(collection_after(&changes), serde_json::json!(["a", "b"]));
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["path"] == "/title" && c["value"] == "New"),
+        "title change missing: {changes:?}"
+    );
+}
+
+#[test]
+fn metadata_modify_continuation_repeated_key_sets_a_list() {
+    let (_rt, _server, host) = multi_value_item_server();
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "modify",
+            "mv-item",
+            "-m",
+            "title:New",
+            "--dry-run",
+            "--json",
+            "+",
+            "modify",
+            "-m",
+            "collection:a",
+            "-m",
+            "collection:b",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let changes = dry_run_changes(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(collection_after(&changes), serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn metadata_modify_indexed_key_sets_the_list_position() {
+    let (_rt, _server, host) = multi_value_item_server();
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "mv-item",
+            "-m",
+            "collection[0]:new",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let changes = dry_run_changes(&String::from_utf8_lossy(&output.stdout));
+    assert!(
+        changes
+            .iter()
+            .all(|c| !c["path"].as_str().unwrap_or("").contains('[')),
+        "indexed key leaked into a literal field name: {changes:?}"
+    );
+    assert_eq!(
+        collection_after(&changes),
+        serde_json::json!(["new", "keep"])
+    );
+}
+
+#[test]
+fn metadata_modify_two_indexed_keys_replace_the_list() {
+    let (_rt, _server, host) = multi_value_item_server();
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "mv-item",
+            "-m",
+            "collection[0]:a",
+            "-m",
+            "collection[1]:b",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let changes = dry_run_changes(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(collection_after(&changes), serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn metadata_modify_repeated_key_posts_a_list_patch() {
+    let (rt, server, host) = multi_value_item_server();
+    ia().env("IA_ACCESS_KEY_ID", "test-access")
+        .env("IA_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "mv-item",
+            "-m",
+            "collection:a",
+            "-m",
+            "collection:b",
+        ])
+        .assert()
+        .success();
+
+    let requests = rt.block_on(server.received_requests()).unwrap();
+    let post = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("no POST reached the mock server");
+    let body = String::from_utf8(post.body.clone()).unwrap();
+    let patch_field = body
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("-patch="))
+        .expect("POST body has no -patch field");
+    let patch_json = urlencoding::decode(patch_field).unwrap();
+    let ops: Vec<serde_json::Value> = serde_json::from_str(&patch_json).unwrap();
+    assert_eq!(
+        collection_after(&ops),
+        serde_json::json!(["a", "b"]),
+        "patch: {ops:?}"
+    );
+}
+
+#[test]
+fn metadata_modify_remove_tag_on_collection_is_refused() {
+    let (_rt, _server, host) = multi_value_item_server();
+    for key in ["collection", "collection[0]"] {
+        let output = ia()
+            .args([
+                "--insecure",
+                "--host",
+                &host,
+                "metadata",
+                "mv-item",
+                "-m",
+                &format!("{key}:REMOVE_TAG"),
+                "-m",
+                "collection[1]:REMOVE_TAG",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{key}: expected failure, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("cannot remove last collection"),
+            "{key}: stderr was: {stderr}"
+        );
+    }
 }
