@@ -1066,7 +1066,7 @@ fn print_schema_detail(field: &SchemaField) {
 
 fn print_schema_table(fields: &[&SchemaField]) {
     let mut table = Table::new();
-    table.load_preset(comfy_table::presets::NOTHING);
+    table.load_style(comfy_table::presets::NOTHING);
     table.set_header(vec![
         Cell::new("FIELD").fg(Color::Cyan),
         Cell::new("LABEL").fg(Color::Cyan),

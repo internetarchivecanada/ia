@@ -128,7 +128,7 @@ pub async fn run(client: &IaClient, args: ListArgs, quiet: u8) -> Result<()> {
 
     // Table output
     let mut table = Table::new();
-    table.load_preset(comfy_table::presets::NOTHING);
+    table.load_style(comfy_table::presets::NOTHING);
 
     if args.headers {
         let headers: Vec<Cell> = columns
