@@ -453,7 +453,7 @@ fn print_table_listing(summary: &TasksSummary, entries: &[TaskEntry], quiet: u8,
     }
 
     let mut table = Table::new();
-    table.load_preset(presets::NOTHING);
+    table.load_style(presets::NOTHING);
     table.set_header(vec![
         Cell::new("TASK_ID").fg(TableColor::DarkGrey),
         Cell::new("IDENTIFIER").fg(TableColor::DarkGrey),
