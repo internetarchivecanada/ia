@@ -420,8 +420,9 @@ pub async fn upload_item(
 
 /// Ask IA once for the item's unfinished multipart uploads and record their
 /// names on the run's [`MultipartFallback`] handle, with the run's retry
-/// budget and, over all attempts, the response wait (120 s): the listing
-/// carries no body, so nothing else bounds its answer (#60), and a run must
+/// budget and, over all attempts, the response wait (120 s). Each attempt's
+/// answer is bounded by `send_with_retry` (#60); the overall bound also
+/// covers reading the answer's body, which that does not, and a run must
 /// not hang before its first file on a server that accepts and goes silent.
 /// A brand-new item has nothing to list. Any other failure does not fail
 /// the item: the run warns and goes on as a run without the listing would,
