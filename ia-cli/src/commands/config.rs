@@ -247,8 +247,13 @@ pub async fn run(
                 (email, password)
             };
 
-            // Build a minimal client for the login request
-            let client = ia_core::IaClient::from_config(config)?;
+            // Build a minimal client for the login request. The request is made
+            // before new credentials exist, so it carries no access key in the
+            // User-Agent even if an older config file holds one.
+            let client = ia_core::IaClient::from_config(ia_core::IaConfig {
+                s3_access: None,
+                ..config
+            })?;
             let auth = ia_core::auth::login(&client, &email, &password).await?;
 
             // Determine where to write the config
