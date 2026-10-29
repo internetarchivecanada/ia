@@ -40,7 +40,7 @@ Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't 
 - Rust 1.88 minimum (`rust-version` in Cargo.toml); `Cargo.lock` is authoritative for dependency versions
 - `Cargo.lock` is tracked (binary crate)
 - `reqwest-middleware` doesn't expose `.json()` — use `.header("content-type", ...).body(serde_json::to_vec(...))`
-- Every HTTP request must include User-Agent: `ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}`
+- Every HTTP request must include User-Agent: `ia/{version} ({OS} {arch}; N; en; {access_key}) Rust/{rust_version}` when an S3 access key is configured (archive.org attributes traffic to an account by it, as the Python library does), otherwise `ia/{version} ({OS} {arch}; N; en) Rust/{rust_version}`. `ia update` sends only `ia/{version}`.
 
 ## Workflow
 
