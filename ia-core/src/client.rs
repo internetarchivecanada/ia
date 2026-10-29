@@ -333,11 +333,11 @@ impl IaClient {
     /// Timing-only HTTP client over the upload transport.
     ///
     /// Like [`Self::http`] but without a read timeout and without the retry
-    /// middleware. Use for multipart part PUTs and S3 control calls, where
-    /// the body send or server-side processing (e.g. assembling a completed
-    /// multipart upload) can stay silent longer than the API read timeout.
-    /// Callers retry through `upload::retry::send_with_retry`; nothing on
-    /// this client retries by itself.
+    /// middleware. Use for multipart part PUTs and S3 control calls: the
+    /// read-timeout clock is not reset by request-body writes, so a large
+    /// body send would trip it. Callers bound the answer and retry through
+    /// `upload::retry::send_with_retry`; nothing on this client retries or
+    /// times out a silent answer by itself.
     pub(crate) fn upload_http(&self) -> &ClientWithMiddleware {
         &self.upload_http
     }

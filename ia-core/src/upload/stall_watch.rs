@@ -30,7 +30,10 @@
 //! hold (up to about half a megabyte); an uplink under a few KB/s can be
 //! judged unanswered. A zero-length body is done at `wrap`, before the
 //! connect, so its wait runs from there. A request with no body stream to
-//! wrap has no clock here, and reading a response body is not bounded.
+//! wrap (#60) is done when it is handed to the transport
+//! ([`BodyWatch::finish_unless_wrapped`]), so its wait also includes the
+//! connect, which the transport's connect timeout bounds on its own.
+//! Reading a response body is not bounded.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -58,7 +61,7 @@ pub(crate) struct BodyWatch {
     /// stream's end. Set once: a later stream end does not restart the
     /// clock.
     done_at: Arc<OnceLock<Instant>>,
-    /// The body length given to `wrap`.
+    /// The body length given to `wrap`; `u64::MAX` until `wrap` is called.
     expected: Arc<AtomicU64>,
     sent: Arc<AtomicU64>,
     window: std::time::Duration,
@@ -70,7 +73,9 @@ pub(crate) struct BodyWatch {
 pub(crate) enum Dead {
     /// The body send moved no bytes for `window_secs`.
     Send { window_secs: u64 },
-    /// The body was handed over in full and no answer came for `wait_secs`.
+    /// The request was sent (its body handed over in full, or, with no
+    /// body, the request handed to the transport) and no answer came for
+    /// `wait_secs`.
     Unanswered { wait_secs: u64 },
 }
 
@@ -96,6 +101,17 @@ impl BodyWatch {
         let _ = self.done_at.set(Instant::now());
     }
 
+    /// The request has been handed to the transport. One that wrapped no
+    /// body stream is done sending now, so its response wait starts here;
+    /// one that wrapped a body is judged by that body's stream as before.
+    pub(crate) fn finish_unless_wrapped(&self) {
+        // `wrap` stores the body length; still at its initial value, no
+        // body stream was wrapped.
+        if self.expected.load(Ordering::SeqCst) == u64::MAX {
+            self.finish();
+        }
+    }
+
     /// Whether the body has been handed over in full.
     #[cfg(test)]
     fn is_done(&self) -> bool {
@@ -106,6 +122,13 @@ impl BodyWatch {
     /// credited to the detector, and the judging stops once `body_len`
     /// bytes have been handed over (or the stream ends).
     pub(crate) fn wrap<S>(&self, inner: S, body_len: u64) -> WatchedBody<S> {
+        // A wrap after `finish_unless_wrapped` came too late: the response
+        // wait already runs, and the body would be judged unanswered while
+        // it is still being sent.
+        debug_assert!(
+            self.done_at.get().is_none(),
+            "wrap the body while building the request, before it is handed over"
+        );
         self.expected.store(body_len, Ordering::SeqCst);
         if body_len == 0 {
             self.finish();
@@ -186,8 +209,9 @@ pub(crate) enum SendEnd<T> {
     /// The body send moved no bytes for `window_secs`; the request was
     /// dropped, closing the connection.
     Stalled { window_secs: u64 },
-    /// The body was handed over in full and no answer came for `wait_secs`;
-    /// the request was dropped, closing the connection.
+    /// The request was sent (its body handed over in full, or, with no
+    /// body, the request handed to the transport) and no answer came for
+    /// `wait_secs`; the request was dropped, closing the connection.
     Unanswered { wait_secs: u64 },
 }
 
@@ -525,6 +549,34 @@ mod tests {
             Some(Dead::Unanswered { wait_secs: 4 }),
             "the wait passed with no answer"
         );
+    }
+
+    /// A request that wrapped no body is done sending when it is handed
+    /// to the transport: its response wait runs from there, so it has a
+    /// bound too (#60).
+    #[tokio::test]
+    async fn a_request_without_a_wrapped_body_waits_from_the_hand_over() {
+        let _policy = shrink_policy();
+        let watch = BodyWatch::new();
+        watch.finish_unless_wrapped();
+        assert!(watch.is_done(), "no body to send: done at the hand-over");
+        assert!(watch.check().is_none(), "within the response wait");
+        tokio::time::sleep(std::time::Duration::from_millis(4200)).await;
+        assert_eq!(
+            watch.check(),
+            Some(Dead::Unanswered { wait_secs: 4 }),
+            "the wait passed with no answer"
+        );
+    }
+
+    /// A wrapped body is judged by its own stream: the hand-over does not
+    /// start the response wait before the body is sent.
+    #[tokio::test]
+    async fn a_wrapped_body_is_not_done_at_the_hand_over() {
+        let watch = BodyWatch::new();
+        let _body = watch.wrap(bytes_chunks(Bytes::from_static(b"x")), 1);
+        watch.finish_unless_wrapped();
+        assert!(!watch.is_done(), "the body has not been sent");
     }
 
     /// The clock starts at the first body poll, not when the watch is

@@ -296,11 +296,12 @@ pub enum IaError {
     },
 
     /// An upload's connection kept dying until the retries were spent: the
-    /// body send moved no bytes for `window_secs` (#38), or the body was
-    /// handed over in full and no answer came for `response_secs` (#40).
-    /// `stalls` counts every stall, so it is one more than the retries
-    /// when every attempt stalled; `unanswered` counts the stalls that
-    /// were an unanswered body.
+    /// body send moved no bytes for `window_secs` (#38), or the request was
+    /// sent (its body handed over in full, or, with no body, the request
+    /// handed to the transport) and no answer came for `response_secs`
+    /// (#40, #60). `stalls` counts every stall, so it is one more than the
+    /// retries when every attempt stalled; `unanswered` counts the stalls
+    /// that were an unanswered request.
     #[error(
         "upload of {identifier}/{key} stalled {stalls} {}: {}",
         if *.stalls == 1 { "time" } else { "times" },
@@ -429,7 +430,7 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
 }
 
 /// Why an upload stalled, for [`IaError::UploadStalled`] and the multipart
-/// part message: the dead-send rule, the unanswered-body rule, or both with
+/// part message: the dead-send rule, the unanswered-request rule, or both with
 /// their counts.
 pub(crate) fn stall_detail(
     stalls: usize,
@@ -441,10 +442,10 @@ pub(crate) fn stall_detail(
     if unanswered == 0 {
         format!("no bytes were sent for {window_secs} s")
     } else if dead_sends == 0 {
-        format!("no answer came within {response_secs} s after the body was sent")
+        format!("no answer came within {response_secs} s after the request was sent")
     } else {
         format!(
-            "{dead_sends} {} moved no bytes for {window_secs} s and {unanswered} {} not come within {response_secs} s after the body was sent",
+            "{dead_sends} {} moved no bytes for {window_secs} s and {unanswered} {} not come within {response_secs} s after the request was sent",
             if dead_sends == 1 { "send" } else { "sends" },
             if unanswered == 1 { "answer did" } else { "answers did" }
         )
@@ -2127,22 +2128,22 @@ mod tests {
     /// #40: every stall an unanswered body names the response wait; a mix
     /// names both rules with their counts.
     #[test]
-    fn upload_stalled_names_the_unanswered_body() {
+    fn upload_stalled_names_the_unanswered_request() {
         assert_eq!(
             upload_stalled_with(3, 3).to_string(),
-            "upload of item/big.iso stalled 3 times: no answer came within 120 s after the body was sent"
+            "upload of item/big.iso stalled 3 times: no answer came within 120 s after the request was sent"
         );
         assert_eq!(
             upload_stalled_with(3, 1).to_string(),
-            "upload of item/big.iso stalled 3 times: 2 sends moved no bytes for 60 s and 1 answer did not come within 120 s after the body was sent"
+            "upload of item/big.iso stalled 3 times: 2 sends moved no bytes for 60 s and 1 answer did not come within 120 s after the request was sent"
         );
         assert_eq!(
             upload_stalled_with(3, 2).to_string(),
-            "upload of item/big.iso stalled 3 times: 1 send moved no bytes for 60 s and 2 answers did not come within 120 s after the body was sent"
+            "upload of item/big.iso stalled 3 times: 1 send moved no bytes for 60 s and 2 answers did not come within 120 s after the request was sent"
         );
         assert_eq!(
             upload_stalled_with(1, 1).to_string(),
-            "upload of item/big.iso stalled 1 time: no answer came within 120 s after the body was sent"
+            "upload of item/big.iso stalled 1 time: no answer came within 120 s after the request was sent"
         );
     }
 

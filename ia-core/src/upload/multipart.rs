@@ -1029,7 +1029,7 @@ impl KeptUpload<'_> {
     ///
     /// An `UploadFailed` is reworded as above; an `UploadStalled` (#38,
     /// #40) as "part N of M stalled K times (no bytes were sent for W s)"
-    /// or "(no answer came within R s after the body was sent)". Anything
+    /// or "(no answer came within R s after the request was sent)". Anything
     /// else the part request produced, in practice IA's spam rejection
     /// (`SpamDetected`), is fatal for the whole item and passes through
     /// unchanged so the item loop still stops on it.
@@ -1658,7 +1658,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains(
-                "part 2 of 3 stalled 11 times (no answer came within 120 s after the body was sent, after 11 attempts): "
+                "part 2 of 3 stalled 11 times (no answer came within 120 s after the request was sent, after 11 attempts): "
             ),
             "{msg}"
         );
@@ -1777,5 +1777,99 @@ mod tests {
     fn validate_parts_treats_a_missing_size_as_not_given() {
         let parts = [part(1, &"aa".repeat(16), 0)];
         assert_eq!(validate_parts(&parts, 25, 10, &local()), Ok(()));
+    }
+
+    // -- answer bound for requests without a body (#60) --
+
+    /// A client with S3 keys pointed at a loopback listener.
+    fn loopback_client(addr: std::net::SocketAddr) -> IaClient {
+        let mut config = crate::IaConfig::default();
+        config.s3_access = Some("test-access".into());
+        config.s3_secret = Some("test-secret".into());
+        config.general.host = addr.to_string();
+        config.general.secure = false;
+        IaClient::from_config(config).unwrap()
+    }
+
+    /// The initiate request, which follows a dead single PUT on the
+    /// default path (#21), to a server that accepts and never answers: it
+    /// is abandoned after the response wait and re-sent, and past the
+    /// budget fails as stalled.
+    #[tokio::test]
+    async fn an_unanswered_initiate_is_retried_then_fails_as_stalled() {
+        use crate::upload::stall_watch::test_support::{shrink_policy, silent_listener};
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = loopback_client(addr);
+        let mut ctx = default_ctx("item", "big.bin");
+        ctx.retries = 1;
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            initiate_upload_with_retry(&client, &ctx, &[]),
+        )
+        .await
+        .expect("the unanswered initiates must be judged within the wait")
+        .expect_err("an unanswered initiate must fail once the retries are spent");
+        assert!(
+            matches!(
+                err,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 2,
+                    response_secs: 4,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A multipart upload to a server that never answers fails as stalled
+    /// at its first request, the resume listing, once `--retries` is spent.
+    #[tokio::test]
+    async fn a_multipart_upload_to_a_silent_server_fails_as_stalled() {
+        use crate::upload::stall_watch::test_support::{shrink_policy, silent_listener};
+        use std::io::Write;
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = loopback_client(addr);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"aaaaabbbbbccccc").unwrap();
+        let opts = UploadOpts {
+            retries: 1,
+            ..UploadOpts::default()
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            upload_file_multipart(
+                &client,
+                "item",
+                f.path(),
+                "big.bin",
+                &opts,
+                10,
+                true,
+                true,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the unanswered listings must be judged within the wait")
+        .expect_err("the upload must fail once the retries are spent");
+        assert!(
+            matches!(
+                err,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
