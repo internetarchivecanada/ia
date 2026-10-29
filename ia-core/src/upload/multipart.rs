@@ -29,16 +29,11 @@ pub const MULTIPART_FALLBACK_MIN_SIZE: u64 = 2 * 1024 * 1024;
 // ── XML parsing helpers ─────────────────────────────────────────────────────
 //
 // S3 returns XML for multipart operations. We use simple string matching
-// (consistent with s3_error.rs) since the XML shapes are well-defined.
+// (shared with s3_error.rs) since the XML shapes are well-defined. Every
+// field is decoded by `extract_xml_field`, so a listed key compares equal
+// to the local name it was escaped from.
 
-/// Extract text between `<Tag>` and `</Tag>`.
-fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(body[start..end].trim().to_string())
-}
+use super::s3_error::extract_xml_field;
 
 /// Extract all occurrences of `<Tag>...</Tag>` blocks.
 fn extract_xml_blocks<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
@@ -1305,6 +1300,12 @@ mod tests {
         assert!(extract_xml_field(xml, "UploadId").is_none());
     }
 
+    #[test]
+    fn extract_field_decodes_entities() {
+        let xml = "<Root><Key>a&amp;b&lt;c&gt;&quot;d&apos;&#38;&#x26;.bin</Key></Root>";
+        assert_eq!(extract_xml_field(xml, "Key").unwrap(), "a&b<c>\"d'&&.bin");
+    }
+
     // -- extract_xml_blocks --
 
     #[test]
@@ -1340,6 +1341,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_initiate_decodes_the_upload_id() {
+        let xml = "<InitiateMultipartUploadResult><UploadId>id&amp;1</UploadId>\
+                   </InitiateMultipartUploadResult>";
+        assert_eq!(parse_initiate_response(xml).unwrap(), "id&1");
+    }
+
+    #[test]
     fn parse_initiate_not_xml() {
         assert!(parse_initiate_response("not xml").is_none());
     }
@@ -1367,6 +1375,29 @@ mod tests {
         assert_eq!(uploads[0].key, "file1.zip");
         assert_eq!(uploads[0].upload_id, "upload-1");
         assert_eq!(uploads[1].key, "file2.zip");
+    }
+
+    /// IA-S3 escapes the listed text; each field comes back as the real
+    /// text, so `a&amp;b.bin` compares equal to the local name `a&b.bin`.
+    #[test]
+    fn parse_list_uploads_decodes_every_field() {
+        let xml = r#"<ListMultipartUploadsResult>
+  <Upload>
+    <Key>a&amp;b.bin</Key>
+    <UploadId>id&amp;1</UploadId>
+    <Initiated>2026-03-06T12:00:00&#46;000Z</Initiated>
+  </Upload>
+  <Upload>
+    <Key>&lt;x&gt; &quot;y&quot; &apos;z&apos; caf&#233; caf&#xE9;.bin</Key>
+    <UploadId>id-2</UploadId>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let uploads = parse_list_uploads_response(xml);
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[0].key, "a&b.bin");
+        assert_eq!(uploads[0].upload_id, "id&1");
+        assert_eq!(uploads[0].initiated, "2026-03-06T12:00:00.000Z");
+        assert_eq!(uploads[1].key, r#"<x> "y" 'z' café café.bin"#);
     }
 
     #[test]
@@ -1405,6 +1436,27 @@ mod tests {
         assert_eq!(parts[0].size, 104857600);
         assert_eq!(parts[1].part_number, 2);
         assert_eq!(parts[1].size, 52428800);
+    }
+
+    /// An ETag listed with escaped quotes, as S3 writes it, decodes to the
+    /// quoted form `validate_parts` strips.
+    #[test]
+    fn parse_list_parts_decodes_the_etag() {
+        let xml = "<ListPartsResult><Part><PartNumber>1</PartNumber>\
+                   <ETag>&quot;etag1&quot;</ETag><Size>10</Size></Part></ListPartsResult>";
+        let parts = parse_list_parts_response(xml);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].etag, "\"etag1\"");
+    }
+
+    #[test]
+    fn next_page_marker_is_decoded() {
+        let xml = "<ListMultipartUploadsResult><IsTruncated>true</IsTruncated>\
+                   <NextKeyMarker>a&amp;b.bin</NextKeyMarker></ListMultipartUploadsResult>";
+        assert_eq!(
+            next_page_marker(xml, "NextKeyMarker").as_deref(),
+            Some("a&b.bin")
+        );
     }
 
     #[test]

@@ -18,8 +18,8 @@ Whitespace is trimmed before decoding, as today, so a space written as `&#32;` a
 **`s3_error.rs`.** `parse_s3_error` has an identical copy of `extract_xml_field` for `<Code>` and `<Message>`. `Message` is shown to users (`describe_s3_failure`), and an IA-S3 message that quotes a file name would show `&amp;`. `Code` values are fixed ASCII names, so decoding them changes nothing. The two copies become one: the function in `s3_error.rs` gains the decoding and becomes `pub(crate)`, and `multipart.rs` uses it instead of its own copy.
 
 ## Tasks
-- [ ] Plan committed first.
-- [ ] Red: unit tests for the decoder (each predefined entity, decimal and hex references, plain text unchanged, one-pass decoding, malformed text returned as sent, trimming before decoding); parser tests for `parse_list_uploads_response` (escaped `Key`, `UploadId`, `Initiated`), `parse_list_parts_response` (escaped `ETag`), `parse_initiate_response`, and the listing's next-page marker; `parse_s3_error` with an escaped `Message`; a hermetic resume test in `ia-core/tests/upload_multipart.rs` for a file whose key is `a&b.bin`, listed as `a&amp;b.bin`, which resumes the existing upload and sends no initiate.
-- [ ] Green: `quick-xml` dependency, decoding in the shared `extract_xml_field`, the duplicate in `multipart.rs` removed, AGENTS.md crate list.
-- [ ] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
+- [x] Plan committed first.
+- [x] Red: unit tests for the decoder (each predefined entity, decimal and hex references, plain text unchanged, one-pass decoding, malformed text returned as sent, trimming before decoding); parser tests for `parse_list_uploads_response` (escaped `Key`, `UploadId`, `Initiated`), `parse_list_parts_response` (escaped `ETag`), `parse_initiate_response`, and the listing's next-page marker; `parse_s3_error` with an escaped `Message`; a hermetic resume test in `ia-core/tests/upload_multipart.rs` for a file whose key is `a&b.bin`, listed as `a&amp;b.bin`, which resumes the existing upload and sends no initiate.
+- [x] Green: `quick-xml` dependency, decoding in the shared `extract_xml_field`, the duplicate in `multipart.rs` removed, AGENTS.md crate list.
+- [x] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code-reviewer pass; PR.

@@ -9,7 +9,8 @@ pub struct S3Error {
 
 /// Parse an S3 XML error response body.
 ///
-/// Extracts `<Code>` and `<Message>` using string matching (no XML crate).
+/// Extracts `<Code>` and `<Message>` using string matching, with XML
+/// character references decoded.
 /// Returns `None` if the body doesn't look like an S3 error.
 ///
 /// Example input:
@@ -28,13 +29,28 @@ pub fn parse_s3_error(body: &str) -> Option<S3Error> {
     Some(S3Error { code, message })
 }
 
-/// Extract text between `<Tag>` and `</Tag>` using simple string matching.
-fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
+/// Extract the text between `<Tag>` and `</Tag>` using simple string
+/// matching, trimmed, with its XML character references decoded
+/// ([`unescape_xml_text`]). Shared with the multipart listing parsers.
+pub(crate) fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();
     let end = body[start..].find(&close)? + start;
-    Some(body[start..end].trim().to_string())
+    Some(unescape_xml_text(body[start..end].trim()))
+}
+
+/// Decode the predefined XML entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`,
+/// `&apos;`) and numeric character references (`&#NN;`, `&#xHH;`) in one
+/// pass, so `&amp;amp;` becomes `&amp;`.
+///
+/// IA-S3 escapes text in its XML answers: a file `a&b.bin` is listed as
+/// `<Key>a&amp;b.bin</Key>`. A field must be decoded before it is compared
+/// with a local name or put in a URL. Text with a malformed or unknown
+/// reference (a bare `&`, `&foo;`, `&#0;`) is returned as sent: a server
+/// that left a bare `&` unescaped most likely sent the real text.
+fn unescape_xml_text(raw: &str) -> String {
+    quick_xml::escape::unescape(raw).map_or_else(|_| raw.to_string(), |text| text.into_owned())
 }
 
 impl S3Error {
@@ -231,6 +247,67 @@ mod tests {
         assert!(parse_s3_error("just plain text").is_none());
         assert!(parse_s3_error("").is_none());
         assert!(parse_s3_error("{}").is_none());
+    }
+
+    #[test]
+    fn parse_decodes_entities_in_the_message() {
+        let xml = "<Error><Code>InvalidArgument</Code>\
+                   <Message>Bad key &quot;a&amp;b.bin&quot;</Message></Error>";
+        let err = parse_s3_error(xml).unwrap();
+        assert_eq!(err.code, "InvalidArgument");
+        assert_eq!(err.message, r#"Bad key "a&b.bin""#);
+    }
+
+    // ── unescape_xml_text ────────────────────────────────────────────────
+
+    #[test]
+    fn unescape_decodes_each_predefined_entity() {
+        assert_eq!(unescape_xml_text("a&amp;b"), "a&b");
+        assert_eq!(unescape_xml_text("a&lt;b"), "a<b");
+        assert_eq!(unescape_xml_text("a&gt;b"), "a>b");
+        assert_eq!(unescape_xml_text("a&quot;b"), "a\"b");
+        assert_eq!(unescape_xml_text("a&apos;b"), "a'b");
+        assert_eq!(unescape_xml_text("&lt;&amp;&gt;&quot;&apos;"), "<&>\"'");
+    }
+
+    #[test]
+    fn unescape_decodes_numeric_references() {
+        assert_eq!(unescape_xml_text("a&#38;b"), "a&b");
+        assert_eq!(unescape_xml_text("a&#x26;b"), "a&b");
+        assert_eq!(unescape_xml_text("caf&#233;"), "café");
+        assert_eq!(unescape_xml_text("caf&#xE9;"), "café");
+        assert_eq!(unescape_xml_text("&#x1F4C1;"), "\u{1F4C1}");
+    }
+
+    #[test]
+    fn unescape_leaves_plain_text_unchanged() {
+        assert_eq!(unescape_xml_text("file.zip"), "file.zip");
+        assert_eq!(
+            unescape_xml_text("dir/caf\u{e9} 1.bin"),
+            "dir/caf\u{e9} 1.bin"
+        );
+        assert_eq!(unescape_xml_text(""), "");
+    }
+
+    #[test]
+    fn unescape_is_one_pass() {
+        assert_eq!(unescape_xml_text("a&amp;amp;b"), "a&amp;b");
+        assert_eq!(unescape_xml_text("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn unescape_returns_malformed_text_as_sent() {
+        for raw in [
+            "a&b.bin", "a&foo;b", "a&#0;b", "a&#xZZ;b", "a&#-1;b", "a&amp",
+        ] {
+            assert_eq!(unescape_xml_text(raw), raw, "{raw}");
+        }
+    }
+
+    #[test]
+    fn extract_field_trims_before_decoding() {
+        let xml = "<Key>\n  &#32;a&amp;b.bin&#32;  \n</Key>";
+        assert_eq!(extract_xml_field(xml, "Key").unwrap(), " a&b.bin ");
     }
 
     #[test]

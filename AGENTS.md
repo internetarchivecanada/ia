@@ -28,7 +28,7 @@ Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive
 - TUI: `ratatui` (default feature, `--dashboard` flag)
 - Metadata write: `json-patch` (RFC 6902); `urlencoding`
 - Spreadsheet: `calamine`; `rust_xlsxwriter`; `csv`
-- Upload: `md-5`
+- Upload: `md-5`; `quick-xml` (decoding XML character references in IA-S3 answers)
 - Update checksum: `aws-lc-rs` (SHA-256; already in the binary as rustls's crypto provider)
 - Auth: `rpassword`
 - Testing: `wiremock` + `assert_cmd` + `tempfile`

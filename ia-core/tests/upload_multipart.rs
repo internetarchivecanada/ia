@@ -1421,6 +1421,104 @@ async fn upload_file_multipart_resumes_from_existing() {
     assert_eq!(result.bytes, 30);
 }
 
+/// IA-S3 lists a key with `&` escaped (`a&amp;b.bin`). The listed key is
+/// decoded before it is compared with the local key, so the existing
+/// upload is resumed and no initiate is sent.
+#[tokio::test]
+async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let content = b"aaaaabbbbbcccccdddddeeeeefffff";
+    let f = temp_file(content);
+
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<ListMultipartUploadsResult>
+  <Upload>
+    <Key>a&amp;b.bin</Key>
+    <UploadId>resume-amp</UploadId>
+    <Initiated>2026-03-06T12:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The key's `&` is percent-encoded in the path.
+    Mock::given(method("GET"))
+        .and(path("/test-item/a%26b.bin"))
+        .and(query_param("uploadId", "resume-amp"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"<ListPartsResult>
+  <Part>
+    <PartNumber>1</PartNumber>
+    <ETag>&quot;{}&quot;</ETag>
+    <Size>10</Size>
+  </Part>
+</ListPartsResult>"#,
+            md5_hex(b"aaaaabbbbb")
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(query_param("uploads", ""))
+        .respond_with(initiate_ok())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    for n in ["2", "3"] {
+        Mock::given(method("PUT"))
+            .and(path("/test-item/a%26b.bin"))
+            .and(query_param("partNumber", n))
+            .and(query_param("uploadId", "resume-amp"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/test-item/a%26b.bin"))
+        .and(query_param("uploadId", "resume-amp"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o
+    };
+
+    let result = multipart::upload_file_multipart(
+        &client,
+        "test-item",
+        f.path(),
+        "a&b.bin",
+        &opts,
+        10,
+        true,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.status, UploadStatus::Uploaded));
+    assert_eq!(result.bytes, 30);
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn upload_file_multipart_no_resume_starts_fresh() {
     let server = MockServer::start().await;
