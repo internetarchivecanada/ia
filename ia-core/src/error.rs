@@ -2128,7 +2128,7 @@ mod tests {
     /// #40: every stall an unanswered body names the response wait; a mix
     /// names both rules with their counts.
     #[test]
-    fn upload_stalled_names_the_unanswered_body() {
+    fn upload_stalled_names_the_unanswered_request() {
         assert_eq!(
             upload_stalled_with(3, 3).to_string(),
             "upload of item/big.iso stalled 3 times: no answer came within 120 s after the request was sent"

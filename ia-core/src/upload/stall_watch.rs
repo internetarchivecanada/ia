@@ -73,7 +73,9 @@ pub(crate) struct BodyWatch {
 pub(crate) enum Dead {
     /// The body send moved no bytes for `window_secs`.
     Send { window_secs: u64 },
-    /// The body was handed over in full and no answer came for `wait_secs`.
+    /// The request was sent (its body handed over in full, or, with no
+    /// body, the request handed to the transport) and no answer came for
+    /// `wait_secs`.
     Unanswered { wait_secs: u64 },
 }
 
@@ -120,6 +122,13 @@ impl BodyWatch {
     /// credited to the detector, and the judging stops once `body_len`
     /// bytes have been handed over (or the stream ends).
     pub(crate) fn wrap<S>(&self, inner: S, body_len: u64) -> WatchedBody<S> {
+        // A wrap after `finish_unless_wrapped` came too late: the response
+        // wait already runs, and the body would be judged unanswered while
+        // it is still being sent.
+        debug_assert!(
+            self.done_at.get().is_none(),
+            "wrap the body while building the request, before it is handed over"
+        );
         self.expected.store(body_len, Ordering::SeqCst);
         if body_len == 0 {
             self.finish();
@@ -200,8 +209,9 @@ pub(crate) enum SendEnd<T> {
     /// The body send moved no bytes for `window_secs`; the request was
     /// dropped, closing the connection.
     Stalled { window_secs: u64 },
-    /// The body was handed over in full and no answer came for `wait_secs`;
-    /// the request was dropped, closing the connection.
+    /// The request was sent (its body handed over in full, or, with no
+    /// body, the request handed to the transport) and no answer came for
+    /// `wait_secs`; the request was dropped, closing the connection.
     Unanswered { wait_secs: u64 },
 }
 

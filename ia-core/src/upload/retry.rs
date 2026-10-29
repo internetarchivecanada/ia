@@ -101,7 +101,14 @@ impl From<S3Failure> for IaError {
 /// abandoned and re-sent at once while the budget lasts; past it the
 /// failure is [`IaError::UploadStalled`]. A request is sent when its body
 /// has been handed over in full, or, with no body stream wrapped, when it
-/// is handed to the transport, so every request here has an answer bound.
+/// is handed to the transport, so the arrival of every answer here is
+/// bounded (#60). Reading the answer's body once its headers have arrived
+/// is not.
+///
+/// `send` must wrap its body stream while it builds the request, not inside
+/// the future it returns: a request whose closure returns without having
+/// called [`BodyWatch::wrap`] is taken to have no body, and its response
+/// wait starts at once.
 ///
 /// Returns the first successful response, or the error from the final
 /// attempt. `context` names the operation for the error message, e.g.
