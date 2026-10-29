@@ -39,6 +39,10 @@ base64 = "0.23"
 # in as rustls's crypto provider, so this adds no code to the binary.
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Decoding XML character references in IA-S3 answers. calamine currently
+# requires the same minor version, so one copy is built; bump the two
+# together.
+quick-xml = "0.42"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -1334,6 +1334,7 @@ dependencies = [
  "json-patch",
  "libc",
  "md-5",
+ "quick-xml",
  "reqwest",
  "reqwest-middleware",
  "reqwest-retry",
