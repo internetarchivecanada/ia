@@ -291,7 +291,7 @@ pub(crate) async fn upload_part_with_retry(
         "{}?partNumber={}&uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
         part_number,
-        upload_id,
+        urlencoding::encode(upload_id),
     );
     let content_length = body.len();
     let digest = {
@@ -401,7 +401,7 @@ pub(crate) async fn complete_upload_with_retry(
     let url = format!(
         "{}?uploadId={}",
         build_s3_url(client, identifier, key),
-        upload_id,
+        urlencoding::encode(upload_id),
     );
 
     let manifest = build_complete_manifest(parts);
@@ -503,7 +503,7 @@ pub(crate) async fn abort_upload_with_ctx(
     let url = format!(
         "{}?uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
-        upload_id,
+        urlencoding::encode(upload_id),
     );
 
     let result = send_with_retry(ctx, "abort multipart", |_watch| {
@@ -669,7 +669,7 @@ pub(crate) async fn list_parts_with_ctx(
     let base = format!(
         "{}?uploadId={}",
         build_s3_url(client, ctx.identifier, ctx.key),
-        upload_id,
+        urlencoding::encode(upload_id),
     );
 
     let mut parts = Vec::new();

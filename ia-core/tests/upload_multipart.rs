@@ -1423,7 +1423,8 @@ async fn upload_file_multipart_resumes_from_existing() {
 
 /// IA-S3 lists a key with `&` escaped (`a&amp;b.bin`). The listed key is
 /// decoded before it is compared with the local key, so the existing
-/// upload is resumed and no initiate is sent.
+/// upload is resumed and no initiate is sent. The upload ID carries an
+/// escaped `&` too: decoded, and percent-encoded in every URL it goes into.
 #[tokio::test]
 async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
     let server = MockServer::start().await;
@@ -1439,7 +1440,7 @@ async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
             r#"<ListMultipartUploadsResult>
   <Upload>
     <Key>a&amp;b.bin</Key>
-    <UploadId>resume-amp</UploadId>
+    <UploadId>resume&amp;1</UploadId>
     <Initiated>2026-03-06T12:00:00.000Z</Initiated>
   </Upload>
 </ListMultipartUploadsResult>"#,
@@ -1451,7 +1452,7 @@ async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
     // The key's `&` is percent-encoded in the path.
     Mock::given(method("GET"))
         .and(path("/test-item/a%26b.bin"))
-        .and(query_param("uploadId", "resume-amp"))
+        .and(query_param("uploadId", "resume&1"))
         .respond_with(ResponseTemplate::new(200).set_body_string(format!(
             r#"<ListPartsResult>
   <Part>
@@ -1477,7 +1478,7 @@ async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
         Mock::given(method("PUT"))
             .and(path("/test-item/a%26b.bin"))
             .and(query_param("partNumber", n))
-            .and(query_param("uploadId", "resume-amp"))
+            .and(query_param("uploadId", "resume&1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -1486,7 +1487,7 @@ async fn a_key_with_an_ampersand_resumes_the_existing_upload() {
 
     Mock::given(method("POST"))
         .and(path("/test-item/a%26b.bin"))
-        .and(query_param("uploadId", "resume-amp"))
+        .and(query_param("uploadId", "resume&1"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)

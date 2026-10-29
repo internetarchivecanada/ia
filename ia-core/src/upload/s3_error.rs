@@ -50,7 +50,11 @@ pub(crate) fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
 /// reference (a bare `&`, `&foo;`, `&#0;`) is returned as sent: a server
 /// that left a bare `&` unescaped most likely sent the real text.
 fn unescape_xml_text(raw: &str) -> String {
-    quick_xml::escape::unescape(raw).map_or_else(|_| raw.to_string(), |text| text.into_owned())
+    // `resolve_xml_entity` names only XML's five entities, whatever
+    // features other crates enable on quick-xml (`escape-html` would widen
+    // plain `unescape` to every HTML5 entity name).
+    quick_xml::escape::unescape_with(raw, quick_xml::escape::resolve_xml_entity)
+        .map_or_else(|_| raw.to_string(), |text| text.into_owned())
 }
 
 impl S3Error {
@@ -287,6 +291,11 @@ mod tests {
             "dir/caf\u{e9} 1.bin"
         );
         assert_eq!(unescape_xml_text(""), "");
+    }
+
+    #[test]
+    fn unescape_leaves_html_entity_names_as_sent() {
+        assert_eq!(unescape_xml_text("a&nbsp;b"), "a&nbsp;b");
     }
 
     #[test]
