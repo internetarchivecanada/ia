@@ -15,9 +15,9 @@ The rule sits in the one place every multipart request goes through, so no call 
 **Docs.** `docs/usage.md`: the `--retries` row and "Stalled uploads" say every IA-S3 request's answer must come within 120 s after the request was sent, and the sentence that a request with no body has no clock is replaced by what the clock covers for one.
 
 ## Tasks
-- [ ] Plan committed first.
-- [ ] Red: in `retry.rs`, a bodiless request (`GET`, no body) to a silent loopback listener is abandoned after the (shortened) wait and re-sent once, then fails as `UploadStalled { stalls: 2, unanswered: 2 }` with two connections seen; in `multipart.rs`, the initiate request against the silent listener fails the same way, and `upload_file_multipart` with `retries = 1` fails as stalled at its first request (the resume listing); a `stall_watch.rs` unit test that a watch marked bodiless judges the wait from the mark.
-- [ ] Green: the bodiless rule in `BodyWatch` and `send_with_retry`; the wording change.
-- [ ] Docs: `docs/usage.md`, `--retries` help.
-- [ ] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
+- [x] Plan committed first.
+- [x] Red: in `retry.rs`, a bodiless request (`GET`, no body) to a silent loopback listener is abandoned after the (shortened) wait and re-sent once, then fails as `UploadStalled { stalls: 2, unanswered: 2 }` with two connections seen; in `multipart.rs`, the initiate request against the silent listener fails the same way, and `upload_file_multipart` with `retries = 1` fails as stalled at its first request (the resume listing); a `stall_watch.rs` unit test that a watch marked bodiless judges the wait from the mark.
+- [x] Green: the bodiless rule in `BodyWatch` and `send_with_retry`; the wording change.
+- [x] Docs: `docs/usage.md`, `--retries` help.
+- [x] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code-reviewer pass; PR.

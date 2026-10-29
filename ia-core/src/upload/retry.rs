@@ -96,10 +96,12 @@ impl From<S3Failure> for IaError {
 /// with a body worth watching wraps its stream with it, the others ignore
 /// it.
 ///
-/// A body send that moves no bytes for a minute, or a body handed over in
-/// full that gets no answer for two minutes (see [`BodyWatch`]), is
+/// A body send that moves no bytes for a minute, or a request that gets no
+/// answer for two minutes after it was sent (see [`BodyWatch`]), is
 /// abandoned and re-sent at once while the budget lasts; past it the
-/// failure is [`IaError::UploadStalled`].
+/// failure is [`IaError::UploadStalled`]. A request is sent when its body
+/// has been handed over in full, or, with no body stream wrapped, when it
+/// is handed to the transport, so every request here has an answer bound.
 ///
 /// Returns the first successful response, or the error from the final
 /// attempt. `context` names the operation for the error message, e.g.
@@ -126,7 +128,13 @@ where
         // Every attempt is judged on its own clock: a re-send is a new
         // connection and gets a full window before it can be judged dead.
         let watch = BodyWatch::new();
-        let sent = match watch_send(&watch, send(&watch)).await {
+        // The closure builds the request, wrapping its body stream if it
+        // has one. A request with no stream to wrap (initiate, complete,
+        // abort, the listings) is done sending once it is handed over, so
+        // its answer wait starts now (#60).
+        let request = send(&watch);
+        watch.finish_unless_wrapped();
+        let sent = match watch_send(&watch, request).await {
             SendEnd::Done(result) => Ok(result),
             SendEnd::Stalled { window_secs: w } => {
                 window_secs = w;
@@ -135,7 +143,7 @@ where
             SendEnd::Unanswered { wait_secs } => {
                 response_secs = wait_secs;
                 unanswered += 1;
-                Err("no answer came within the response wait after the body was sent")
+                Err("no answer came within the response wait after the request was sent")
             }
         };
         let sent = match sent {
@@ -433,5 +441,55 @@ mod stall_tests {
             failure.error
         );
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    /// A request with no body (a listing `GET`) that the server never
+    /// answers is abandoned after the response wait and re-sent; when the
+    /// budget is spent the failure is UploadStalled with every stall an
+    /// unanswered request, and the peer saw one connection per attempt
+    /// (#60).
+    #[tokio::test]
+    async fn unanswered_bodiless_request_is_retried_then_fails_as_stalled() {
+        let _policy = shrink_policy();
+        let (addr, connections) = silent_listener().await;
+        let client = crate::client::configure_transport(
+            reqwest::Client::builder(),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .build()
+        .unwrap();
+        let client = reqwest_middleware::ClientBuilder::new(client).build();
+        let url = format!("http://{addr}/item?uploads");
+        let started = std::time::Instant::now();
+        let failure = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send_with_retry(&ctx(1), "list multipart uploads", |_watch| {
+                client.get(&url).send()
+            }),
+        )
+        .await
+        .expect("the unanswered requests must be judged within the wait")
+        .expect_err("an unanswered request must fail once the retries are spent");
+        assert_eq!(failure.attempts, 2);
+        assert!(failure.code.is_none());
+        assert!(
+            matches!(
+                *failure.error,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 2,
+                    response_secs: 4,
+                    ..
+                }
+            ),
+            "got {:?}",
+            failure.error
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(8),
+            "each attempt waits the whole response wait: {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -368,7 +368,7 @@ pub async fn upload_file(
             SendEnd::Unanswered { wait_secs } => {
                 response_secs = wait_secs;
                 unanswered += 1;
-                Err("no answer came within the response wait after the body was sent")
+                Err("no answer came within the response wait after the request was sent")
             }
         };
         let response = match response {
