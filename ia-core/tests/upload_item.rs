@@ -719,7 +719,10 @@ async fn mount_unfinished_listing(server: &MockServer, uploads: &[(&str, &str)])
 /// gives its md5 and size, so a resume sends no part and completes.
 async fn mount_whole_file_as_part_one(server: &MockServer, key: &str, upload_id: &str, size: u64) {
     use md5::{Digest, Md5};
-    let etag = format!("{:x}", Md5::digest(vec![0x42u8; size as usize]));
+    let etag: String = Md5::digest(vec![0x42u8; size as usize])
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Mock::given(method("GET"))
         .and(path(format!("/test-item/{key}")))
         .and(query_param("uploadId", upload_id))

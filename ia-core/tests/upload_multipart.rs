@@ -18,7 +18,10 @@ fn temp_file(content: &[u8]) -> NamedTempFile {
 
 fn md5_hex(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
-    format!("{:x}", Md5::digest(bytes))
+    Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Create an `IaClient` pointed at a wiremock server with S3 credentials.

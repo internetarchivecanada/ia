@@ -298,7 +298,7 @@ pub(crate) async fn upload_part_with_retry(
         use md5::{Digest, Md5};
         Md5::digest(&body)
     };
-    let local_md5 = format!("\"{digest:x}\"");
+    let local_md5 = format!("\"{}\"", super::checksum::to_hex(&digest));
     let md5_b64 = content_md5.then(|| super::single::base64_encode(&digest));
 
     // The part goes out as a watched stream of 64 KiB slices (no copy), so a

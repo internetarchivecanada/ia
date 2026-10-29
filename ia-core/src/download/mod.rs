@@ -685,7 +685,7 @@ async fn finish_part(
             }
 
             use md5::Digest;
-            let actual_md5 = format!("{:x}", hasher.finalize());
+            let actual_md5 = crate::upload::checksum::to_hex(&hasher.finalize());
             if &actual_md5 != expected_md5 {
                 // Keep the bytes under a name nothing resumes from, so the
                 // copy can be compared against the source or a second
@@ -1382,7 +1382,7 @@ async fn compute_md5(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::upload::checksum::to_hex(&hasher.finalize()))
 }
 
 /// Result of downloading an entire item.
@@ -3234,7 +3234,7 @@ mod tests {
         use md5::{Digest, Md5};
         let mut h = Md5::new();
         h.update(bytes);
-        format!("{:x}", h.finalize())
+        crate::upload::checksum::to_hex(&h.finalize())
     }
 
     #[tokio::test]

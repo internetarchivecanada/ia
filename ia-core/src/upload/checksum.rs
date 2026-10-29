@@ -71,7 +71,7 @@ pub fn compute_file_md5(path: &Path) -> Result<String, std::io::Error> {
         }
         hasher.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(to_hex(&hasher.finalize()))
 }
 
 /// The md5 of a whole file and of each of its parts at a given part size,
@@ -143,7 +143,7 @@ fn hash_reader_and_parts(
             in_part += take as u64;
             chunk = &chunk[take..];
             if in_part == part_size {
-                parts.push(format!("{:x}", part.finalize_reset()));
+                parts.push(to_hex(&part.finalize_reset()));
                 in_part = 0;
             }
         }
@@ -151,10 +151,10 @@ fn hash_reader_and_parts(
     // The tail part, or the single part of an empty file. A file that is an
     // exact multiple of part_size ends on a boundary and has no tail.
     if in_part > 0 || parts.is_empty() {
-        parts.push(format!("{:x}", part.finalize()));
+        parts.push(to_hex(&part.finalize()));
     }
     Ok(FileHashes {
-        md5: format!("{:x}", whole.finalize()),
+        md5: to_hex(&whole.finalize()),
         parts,
         size,
     })
@@ -173,14 +173,12 @@ pub async fn hash_file_and_parts_async(
 
 /// Lowercase hex of a digest. digest 0.11's output array does not implement
 /// `LowerHex`, so `format!("{:x}", ...)` no longer applies.
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Compute the SHA-1 hex digest of a file.
 pub fn compute_file_sha1(path: &Path) -> Result<String, std::io::Error> {
-    // sha1 implements digest 0.11's Digest; the md5 import above is 0.10's.
-    use sha1::Digest as _;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha1::new();
     let mut buffer = [0u8; 1024 * 1024]; // 1 MiB chunks
@@ -680,7 +678,7 @@ mod tests {
     // -- hash_file_and_parts: one pass, whole-file md5 and one md5 per part --
 
     fn md5_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Md5::digest(bytes))
+        to_hex(&Md5::digest(bytes))
     }
 
     fn file_with(bytes: &[u8]) -> tempfile::NamedTempFile {
