@@ -51,11 +51,11 @@ For #16 (parallel `Range` downloads, parked): parts arrive out of order, so a ro
 
 ## Tasks
 
-- [ ] Plan committed first.
-- [ ] Red: the tests below, failing against the current code where they test new behavior.
-- [ ] Green: `DownloadOpts.verify` (default `true`); `checksum` documented as the skip check only; one function decides whether a file is verified (`verify` on, not `_files.xml`, md5 present and non-empty, debug log otherwise), used at both places the md5 state is created; `--no-verify` on `ia download`; `-C` help rewritten.
-- [ ] Docs: `ia download` `long_about` and flag help, `docs/usage.md` (option table, "After an interruption", 416 paragraph, stall paragraph, "Checksum mismatches"), README feature row, `docs/releases/unreleased.md`.
-- [ ] `cargo test`, `cargo clippy --all-targets -- -D warnings`.
+- [x] Plan committed first.
+- [x] Red: the tests below, failing against the current code where they test new behavior (16 of the download unit tests failed before the change: every verification test now on default options, and `-C` without verification).
+- [x] Green: `DownloadOpts.verify` (default `true`); `checksum` documented as the skip check only; one function decides whether a file is verified (`verify` on, not `_files.xml`, md5 present and non-empty, debug log otherwise), used at both places the md5 state is created; `--no-verify` on `ia download`; `-C` help rewritten.
+- [x] Docs: `ia download` `long_about` and flag help, `docs/usage.md` (option table, "After an interruption", 416 paragraph, stall paragraph, a new "Verification" section before "Checksum mismatches"), the `--help` examples, README feature row, `docs/releases/unreleased.md`.
+- [x] `cargo test` green. `cargo clippy --all-targets -- -D warnings` with the local rustc 1.95 reports 59 errors, the same count in the same files as on main before this change, none in lines this change adds; `cargo clippy -p ia-core -p ia-cli -- -D warnings` is clean.
 - [ ] Code-review pass on the full diff; findings fixed or recorded below; PR.
 
 ## Tests
@@ -74,3 +74,5 @@ Hermetic, wiremock (`ia-core/src/download/mod.rs` test module, and `ia-cli/tests
 10. Default options, a 416 shortcut over a `.part` with the wrong bytes: kept as `.md5-mismatch` (existing test, moved to default options).
 11. Item level, default options: the #14 retry rules (same wrong md5 twice stops; a different one retries up to `--retries`; a later good download removes the kept copy). The existing tests switch from `checksum: true` to the default.
 12. CLI: `ia download` against a wiremock item whose md5 is wrong exits 1 by default and 0 with `--no-verify`; `--help` describes `--no-verify` and `-C` as above.
+
+The test helper `test_file_meta` carried the md5 of the empty file as a placeholder; with verification on by default every test serving a non-empty body would have failed on it, so it now carries no md5, and tests that verify use `test_file_meta_with_md5`. The CLI fixtures in `ia-cli/tests/download_search_list.rs` carry the real md5 of the body each one serves.

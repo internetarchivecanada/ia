@@ -134,8 +134,21 @@ pub struct DownloadOpts {
     pub destdir: PathBuf,
     /// Whether to create item subdirectory.
     pub no_directories: bool,
-    /// Verify checksums (opt-in).
+    /// Decide skips by md5: a local file is skipped when its md5 matches
+    /// the item metadata, instead of when its size and mtime match. This
+    /// reads every local file in full. It does not affect
+    /// [`verify`](Self::verify).
     pub checksum: bool,
+    /// Compare the md5 of the downloaded bytes with the item metadata
+    /// before the file is renamed into place (default `true`).
+    ///
+    /// The md5 is computed from the stream as it is written; a resumed
+    /// download first reads the bytes already in the `.part`. A file whose
+    /// metadata has no md5, or an empty one, and `{identifier}_files.xml`,
+    /// whose recorded md5 can never match, are not verified. On a mismatch
+    /// the download fails with [`IaError::ChecksumMismatch`] and its bytes
+    /// are kept as `<name>.md5-mismatch`.
+    pub verify: bool,
     /// Maximum retries per file.
     pub retries: usize,
     /// Don't set file mtime from server.
@@ -172,6 +185,7 @@ impl Default for DownloadOpts {
             destdir: PathBuf::from("."),
             no_directories: false,
             checksum: false,
+            verify: true,
             retries: 5,
             no_timestamps: false,
             dry_run: false,
@@ -271,6 +285,29 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 #[must_use]
 fn is_size_unknowable(identifier: &str, file_name: &str) -> bool {
     file_name.strip_prefix(identifier) == Some("_files.xml")
+}
+
+/// Whether the downloaded bytes of `file` are compared with its md5 before
+/// the rename.
+///
+/// Off with [`DownloadOpts::verify`] unset. Otherwise every file is
+/// verified except one whose metadata has no md5, or an empty one (nothing
+/// to compare with), and `{identifier}_files.xml`, whose recorded md5 is
+/// unknowable for the same reason as its size (see [`is_size_unknowable`]).
+/// Neither is an error: the file completes on the size check alone.
+fn verifies(opts: &DownloadOpts, identifier: &str, file: &FileMetadata) -> bool {
+    if !opts.verify {
+        return false;
+    }
+    if file.md5.as_deref().is_none_or(str::is_empty) {
+        debug!(file = %file.name, "no md5 in the item metadata; not verifying");
+        return false;
+    }
+    if is_size_unknowable(identifier, &file.name) {
+        debug!(file = %file.name, "the item's own file list; not verifying its md5");
+        return false;
+    }
+    true
 }
 
 /// Fail before writing anything when a 206's `Content-Range` total disagrees
@@ -484,7 +521,7 @@ async fn http_error_from(response: reqwest::Response) -> IaError {
 ///   left alone, as [`check_content_range`] leaves it on a 206.
 /// - `total`, the metadata size, and `offset` all agree: the `.part` is the
 ///   whole file. `Ok(())` is returned and the caller finishes it in place
-///   (md5 compare when `--checksum` is on, then the rename) instead of
+///   (md5 compare when the file is verified, then the rename) instead of
 ///   downloading it again.
 /// - `total` equals the metadata size but the `.part` is longer, or the size
 ///   is unknown or exempt (see [`is_size_unknowable`]) so there is no third
@@ -957,9 +994,9 @@ pub async fn download_file(
                 });
             }
         }
-        // Hash the .part from disk when asked to, then finish it without
-        // streaming anything.
-        let hasher = if opts.checksum && file.md5.is_some() {
+        // Hash the .part from disk when the file is verified, then finish
+        // it without streaming anything.
+        let hasher = if verifies(opts, identifier, file) {
             Some(seed_hasher_from_part(identifier, file, &part_path, offset, progress).await?)
         } else {
             None
@@ -1023,7 +1060,7 @@ pub async fn download_file(
     // write-then-re-read-the-whole-file second pass. For resumed downloads,
     // seed it with the bytes already present in .part so the final hash
     // covers the full file.
-    let mut hasher = if opts.checksum && file.md5.is_some() {
+    let mut hasher = if verifies(opts, identifier, file) {
         Some(match resume_from {
             // Seeding reads the full .part before the HTTP stream opens.
             Some(resumed_bytes) => {
@@ -1763,12 +1800,14 @@ mod tests {
         config
     }
 
+    /// A file with no md5, so it is not verified; tests about verification
+    /// use [`test_file_meta_with_md5`].
     fn test_file_meta(name: &str, size: u64) -> FileMetadata {
         FileMetadata {
             name: name.to_string(),
             source: Some("original".to_string()),
             format: None,
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            md5: None,
             size: Some(size),
             mtime: Some(1700000000),
             sha1: None,
@@ -3253,10 +3292,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_meta_with_md5("a.txt", body.len() as u64, &expected);
 
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
             .await
             .unwrap();
@@ -3280,13 +3316,6 @@ mod tests {
 
     const WRONG_MD5: &str = "00000000000000000000000000000000";
 
-    fn checksum_opts() -> DownloadOpts {
-        DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        }
-    }
-
     /// A failed md5 check keeps the bytes as `<name>.md5-mismatch` and the
     /// error names that path (#14). Nothing is left as `.part`, so the
     /// next attempt starts from byte 0.
@@ -3302,7 +3331,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3346,7 +3375,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3372,7 +3401,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3383,8 +3412,16 @@ mod tests {
         assert!(!kept_path.exists(), "the earlier bad copy should be gone");
     }
 
-    /// A completion without --checksum does not touch an existing bad
-    /// copy: nothing was verified, so there is no reason to drop evidence.
+    fn no_verify_opts() -> DownloadOpts {
+        DownloadOpts {
+            verify: false,
+            ..Default::default()
+        }
+    }
+
+    /// With verification off (--no-verify), a wrong md5 is not noticed and
+    /// the file completes; an existing bad copy is left alone, since
+    /// nothing was verified and there is no reason to drop evidence.
     #[tokio::test]
     async fn unverified_download_leaves_an_earlier_kept_copy() {
         let body = b"correct content".to_vec();
@@ -3399,6 +3436,191 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
+            &no_verify_opts(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert_eq!(std::fs::read(&kept_path).unwrap(), b"an earlier bad copy");
+    }
+
+    /// Verification is on by default (#13): with no option set, a wrong
+    /// md5 fails the download and keeps its bytes as `.md5-mismatch`.
+    #[tokio::test]
+    async fn default_options_verify_the_md5() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+        assert!(DownloadOpts::default().verify);
+        assert!(!DownloadOpts::default().checksum);
+
+        let err = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+        assert!(!dir.path().join("b.txt").exists());
+        assert!(!dir.path().join("b.txt.part").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("b.txt.md5-mismatch")).unwrap(),
+            body
+        );
+    }
+
+    /// -C is the skip check only: with verification off it does not
+    /// compare the downloaded bytes either.
+    #[tokio::test]
+    async fn checksum_skip_without_verify_does_not_verify_the_download() {
+        let body = b"correct content".to_vec();
+        let mock_server = MockServer::start().await;
+        let (client, dir) = mount_body(&mock_server, &body).await;
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, WRONG_MD5);
+        let opts = DownloadOpts {
+            checksum: true,
+            verify: false,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+        assert!(!dir.path().join("b.txt.md5-mismatch").exists());
+    }
+
+    /// -C with verification off still skips a local file whose md5 matches,
+    /// without a request.
+    #[tokio::test]
+    async fn checksum_skip_without_verify_still_skips_a_matching_file() {
+        let body = b"already here".to_vec();
+        let mock_server = MockServer::start().await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), &body).unwrap();
+        let file = test_file_meta_with_md5("b.txt", body.len() as u64, &md5_hex(&body));
+        let opts = DownloadOpts {
+            checksum: true,
+            verify: false,
+            ..Default::default()
+        };
+
+        let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            DownloadStatus::Skipped("checksum match".to_string())
+        );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Without -C the skip check is size and mtime only, even with
+    /// verification on: a local file whose bytes differ from the md5 but
+    /// whose size and mtime match is skipped without being read (no
+    /// Verifying event) and without a request.
+    #[tokio::test]
+    async fn default_skip_check_does_not_read_local_files() {
+        let mock_server = MockServer::start().await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("b.txt");
+        std::fs::write(&local, b"0123456789").unwrap();
+        let mut file = test_file_meta_with_md5("b.txt", 10, WRONG_MD5);
+        file.mtime = Some(1_700_000_000);
+        filetime::set_file_mtime(&local, filetime::FileTime::from_unix_time(1_700_000_000, 0))
+            .unwrap();
+
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            Some(&*cb),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            DownloadStatus::Skipped("size+mtime match".to_string())
+        );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+        let seen = events.lock().unwrap();
+        assert!(!seen.contains(&DownloadStatus::Verifying), "{seen:?}");
+    }
+
+    /// No md5 in the metadata, or an empty one: nothing to verify against,
+    /// so the file completes on the size check alone.
+    #[tokio::test]
+    async fn missing_or_empty_md5_is_not_verified() {
+        for md5 in [None, Some(String::new())] {
+            let body = b"correct content".to_vec();
+            let mock_server = MockServer::start().await;
+            let (client, dir) = mount_body(&mock_server, &body).await;
+            let mut file = test_file_meta("b.txt", body.len() as u64);
+            file.md5 = md5.clone();
+
+            let result = download_file(
+                &client,
+                "test-item",
+                &file,
+                dir.path(),
+                &DownloadOpts::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("md5 {md5:?}: {e}"));
+
+            assert_eq!(result.status, DownloadStatus::Complete, "md5 {md5:?}");
+            assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), body);
+            assert!(!dir.path().join("b.txt.md5-mismatch").exists());
+        }
+    }
+
+    /// `{identifier}_files.xml` records its own md5 before its final bytes
+    /// exist, so the recorded md5 never matches; it is not verified.
+    #[tokio::test]
+    async fn files_xml_is_not_verified() {
+        let body = b"<files>...</files>".to_vec();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test-item_files.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta_with_md5("test-item_files.xml", body.len() as u64, WRONG_MD5);
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
             &DownloadOpts::default(),
             None,
         )
@@ -3406,7 +3628,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.status, DownloadStatus::Complete);
-        assert_eq!(std::fs::read(&kept_path).unwrap(), b"an earlier bad copy");
+        assert_eq!(
+            std::fs::read(dir.path().join("test-item_files.xml")).unwrap(),
+            body
+        );
+        assert!(!dir.path().join("test-item_files.xml.md5-mismatch").exists());
+    }
+
+    /// A resume is verified over the whole file: the md5 is seeded from
+    /// the bytes already in the `.part`, so a wrong prefix fails even when
+    /// the server's tail is right, and a right prefix completes.
+    #[tokio::test]
+    async fn resumed_download_verifies_the_part_prefix() {
+        let full = b"0123456789abcdef".to_vec();
+        let on_disk = 6;
+        for (prefix, ok) in [
+            (full[..on_disk].to_vec(), true),
+            (b"XXXXXX".to_vec(), false),
+        ] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/download/test-item/b.txt"))
+                .and(wiremock::matchers::header(
+                    "range",
+                    format!("bytes={on_disk}-").as_str(),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header(
+                            "content-range",
+                            format!("bytes {on_disk}-{}/{}", full.len() - 1, full.len()).as_str(),
+                        )
+                        .set_body_bytes(full[on_disk..].to_vec()),
+                )
+                .mount(&mock_server)
+                .await;
+            let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("b.txt.part"), &prefix).unwrap();
+            let file = test_file_meta_with_md5("b.txt", full.len() as u64, &md5_hex(&full));
+
+            let result = download_file(
+                &client,
+                "test-item",
+                &file,
+                dir.path(),
+                &DownloadOpts::default(),
+                None,
+            )
+            .await;
+
+            if ok {
+                assert_eq!(result.unwrap().status, DownloadStatus::Complete);
+                assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), full);
+            } else {
+                let err = result.unwrap_err();
+                assert!(matches!(err, IaError::ChecksumMismatch { .. }), "{err:?}");
+                assert!(!dir.path().join("b.txt").exists());
+            }
+        }
     }
 
     /// Something the rename cannot replace sits at the kept path (here a
@@ -3428,7 +3708,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3462,7 +3742,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3494,7 +3774,7 @@ mod tests {
             "test-item",
             &file,
             dir.path(),
-            &checksum_opts(),
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -3672,10 +3952,7 @@ mod tests {
             "flaky-item",
             &file,
             dir.path(),
-            &DownloadOpts {
-                checksum: true,
-                ..Default::default()
-            },
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -4021,10 +4298,7 @@ mod tests {
             "flaky-item",
             &file,
             dir.path(),
-            &DownloadOpts {
-                checksum: true,
-                ..Default::default()
-            },
+            &DownloadOpts::default(),
             None,
         )
         .await
@@ -4532,7 +4806,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
         let opts = DownloadOpts {
-            checksum: true,
             ..stall_opts(FLOOR, 5)
         };
 
@@ -4690,7 +4963,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
         let opts = DownloadOpts {
-            checksum: true,
             ..stall_opts(FLOOR, 5)
         };
 
@@ -4724,7 +4996,6 @@ mod tests {
         std::fs::write(dir.path().join("data.bin.part"), &body[..on_disk]).unwrap();
         let file = test_file_meta_with_md5("data.bin", body.len() as u64, &md5_hex(&body));
         let opts = DownloadOpts {
-            checksum: true,
             ..stall_opts(FLOOR, 5)
         };
 
@@ -4883,12 +5154,8 @@ mod tests {
     async fn range_not_satisfiable_at_zero_length_completes_empty_file() {
         let mock_server = MockServer::start().await;
         let (client, dir) = mount_resume_416(&mock_server, "empty.txt", 0, Some("bytes */0")).await;
-        // test_file_meta's md5 is the md5 of the empty string.
-        let file = test_file_meta("empty.txt", 0);
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let file = test_file_meta_with_md5("empty.txt", 0, &md5_hex(b""));
+        let opts = DownloadOpts::default();
 
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None)
             .await
@@ -4946,11 +5213,11 @@ mod tests {
         assert_eq!(mtime, server_mtime);
     }
 
-    /// `--checksum` on a file with no md5 in metadata: nothing to compare,
-    /// so the `.part` is not read back. The only events are Starting and
-    /// Complete; in particular no Downloading, since nothing streamed.
+    /// A file with no md5 in metadata: nothing to compare, so the `.part`
+    /// is not read back. The only events are Starting and Complete; in
+    /// particular no Downloading, since nothing streamed.
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_with_checksum_but_no_md5_skips_hashing() {
+    async fn range_not_satisfiable_at_part_length_without_md5_skips_hashing() {
         let mock_server = MockServer::start().await;
         let (client, dir) =
             mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
@@ -4964,10 +5231,7 @@ mod tests {
                 v.push(p.status);
             }
         });
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
             .await
@@ -5085,10 +5349,7 @@ mod tests {
         std::fs::write(dir.path().join("data.bin.part"), &body[..on_disk]).unwrap();
         let mut file = test_file_meta("data.bin", 32);
         file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = run_download(&client, &file, dir.path(), &opts)
             .await
@@ -5103,10 +5364,10 @@ mod tests {
         assert_eq!(records[1].range_offset(), Some(32));
     }
 
-    /// Mid-stream 416 at full length without --checksum: nothing to hash,
-    /// the `.part` is simply renamed.
+    /// Mid-stream 416 at full length for a file with no md5: nothing to
+    /// hash, the `.part` is simply renamed.
     #[tokio::test]
-    async fn stream_retry_response_416_at_full_length_completes_without_checksum() {
+    async fn stream_retry_response_416_at_full_length_completes_without_md5() {
         let body: Vec<u8> = (0..32u8).collect();
         let body_for_handler = body.clone();
         let over_promising: ConnHandler = Box::new(move |mut stream, request| {
@@ -5298,7 +5559,7 @@ mod tests {
         assert_eq!(mtime_secs(&dir.path().join("disk.img")), 1_500_000_000);
     }
 
-    /// Every progress payload on the shortcut with `--checksum` and an md5:
+    /// Every progress payload on the shortcut with verification and an md5:
     /// Starting at the resume offset, Verifying while the `.part` is hashed
     /// (from zero), Verifying again before the rename, Complete. No
     /// Downloading, since nothing streamed.
@@ -5318,10 +5579,7 @@ mod tests {
                 v.push((p.status, p.bytes_downloaded, p.total_bytes));
             }
         });
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
             .await
@@ -5528,10 +5786,7 @@ mod tests {
         std::fs::write(dir.path().join("data.bin.part"), vec![b'Z'; 12]).unwrap();
         let mut file = test_file_meta("data.bin", 32);
         file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = run_download(&client, &file, dir.path(), &opts)
             .await
@@ -5635,10 +5890,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut file = test_file_meta("data.bin", 32);
         file.md5 = Some("b4ffcb23737cec315a4a4d1aa2a620ce".to_string());
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = run_download(&client, &file, dir.path(), &opts)
             .await
@@ -5805,7 +6057,6 @@ mod tests {
         let item = item_with("bad-item", test_file_meta_with_md5("disk.img", 16, md5));
         let opts = DownloadOpts {
             destdir: dir.to_path_buf(),
-            checksum: true,
             retries,
             ..Default::default()
         };
@@ -6548,7 +6799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_with_checksum_verifies() {
+    async fn range_not_satisfiable_at_part_length_verifies() {
         let mock_server = MockServer::start().await;
         let (client, dir) =
             mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
@@ -6562,10 +6813,7 @@ mod tests {
                 v.push(p.status);
             }
         });
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, Some(&*cb))
             .await
@@ -6593,15 +6841,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_not_satisfiable_at_part_length_with_checksum_mismatch_keeps_md5_mismatch() {
+    async fn range_not_satisfiable_at_part_length_md5_mismatch_keeps_md5_mismatch() {
         let mock_server = MockServer::start().await;
         let (client, dir) =
             mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
         let file = test_file_meta_with_md5("disk.img", 32, "00000000000000000000000000000000");
-        let opts = DownloadOpts {
-            checksum: true,
-            ..Default::default()
-        };
+        let opts = DownloadOpts::default();
 
         let result = download_file(&client, "test-item", &file, dir.path(), &opts, None).await;
 
@@ -6854,23 +7099,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_body_with_checksum_keeps_part() {
+    async fn short_body_with_verification_keeps_part() {
         let mock_server = MockServer::start().await;
         mount_short_then_range(&mock_server, "test-item", "disk.img").await;
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        // test_file_meta carries an md5 that cannot match 20 bytes of data.
-        let file = test_file_meta("disk.img", 32);
+        // An md5 that cannot match 20 bytes of data.
+        let file = test_file_meta_with_md5("disk.img", 32, WRONG_MD5);
 
         let result = download_file(
             &client,
             "test-item",
             &file,
             dir.path(),
-            &DownloadOpts {
-                checksum: true,
-                ..Default::default()
-            },
+            &DownloadOpts::default(),
             None,
         )
         .await;
