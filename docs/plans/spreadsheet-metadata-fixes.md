@@ -16,17 +16,19 @@ loop.
 
 ### Rules
 
-1. **Per row, per field:** the row is applied to an empty item with
-   `apply_set` (`ia-core/src/metadata/write.rs`), the rule `ia metadata`
-   applies to repeated `-m` arguments since #65; one implementation, so
-   the same syntax means the same thing in both places. A bare column is
+1. **Per row, per field:** the indexed columns are placed with
+   `fill_positions` (`ia-core/src/metadata/write.rs`), the slot rule that
+   `apply_set` applies to repeated `-m` arguments of `ia metadata` since
+   #65; one implementation, so the same syntax means the same thing in
+   both places. A bare column is
    the field's list; an indexed column overwrites position N, or is
    appended when N is past the end, in index order. `subject=a` with
    `subject[1]=b` gives `[a, b]`; `subject=a` with `subject[0]=x` gives
    `[x]`. The readers do not keep column order, so columns are applied in
    column-name order, and of two columns for one position the later in
-   that order wins (`subject[0]` over `subject[00]`). `REMOVE_TAG` removes
-   a value, as in `ia metadata`. A blank value is no value. `ia upload`
+   that order wins (`subject[0]` over `subject[00]`). Every cell is a
+   literal value: an upload creates the item, so there is nothing for a
+   removal marker to remove. A blank value is no value. `ia upload`
    `-m` does not accept indexed keys. The Python client builds the indexed
    list without the bare value; this follows #65 instead.
 2. **Fields** are emitted in name order, so the header list is the same on
@@ -153,8 +155,16 @@ Review of the full diff before the pull request:
 - `ItemGroup` gained `#[non_exhaustive]`.
 - Orchestrator review: the row rule was a copy that put the bare value
   first and kept both of two columns for one position, contrary to the #65
-  rule it cited. Fixed: `row_metadata` calls `apply_set`, with tests for
+  rule it cited. Fixed: the slot logic of `apply_set` is extracted into
+  `fill_positions`, which `apply_set` and `row_metadata` both call (the
+  removal step stays in `apply_set`), with tests for
   the overwrite, the append and the repeated position.
+- Orchestrator review: treating a `REMOVE_TAG` cell as a removal caused two
+  defects (a removed field kept its `-m` values; a row of only removals
+  was taken as the item's metadata, so a later row's metadata and the
+  required-field check were skipped). Decision: an upload creates the
+  item, so a cell is always a literal value, as `-m` is on the command
+  line; a test pins it.
 - Docs: header-name case rule narrowed (JSONL `identifier` is matched
   exactly), the first-row-with-metadata rule, the CSV-only compatibility
   with the Python client, and the existing rule that the required-field

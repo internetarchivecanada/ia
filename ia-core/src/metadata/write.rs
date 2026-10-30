@@ -153,10 +153,9 @@ pub fn prepare_metadata(
 /// it, the whole batch errors. An item that had no `collection` field (a
 /// file-level target, for instance) is not affected.
 ///
-/// The spreadsheet upload path applies a row to an empty map with this
-/// function, so a spreadsheet row and `ia metadata -m` follow one rule
-/// (#97).
-pub(crate) fn apply_set(
+/// Pass 2's slot rule is [`fill_positions`], which the spreadsheet upload
+/// path shares (#97).
+fn apply_set(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     changes: &[(String, serde_json::Value)],
     identifier: &str,
@@ -221,30 +220,27 @@ pub(crate) fn apply_set(
             None => indexed.push((field, vec![(idx, value)])),
         }
     }
-    for (field, mut positions) in indexed {
-        let mut list = match obj.remove(&field) {
-            Some(serde_json::Value::Array(items)) => items,
+    for (field, positions) in indexed {
+        // A null slot, existing or marked by REMOVE_TAG, is dropped at the end.
+        let as_slot = |v: serde_json::Value| (!v.is_null()).then_some(v);
+        let mut list: Vec<Option<serde_json::Value>> = match obj.remove(&field) {
+            Some(serde_json::Value::Array(items)) => items.into_iter().map(as_slot).collect(),
             Some(serde_json::Value::Null) | None => Vec::new(),
-            Some(scalar) => vec![scalar],
+            Some(scalar) => vec![Some(scalar)],
         };
-        // Stable, so a position named twice keeps the later value.
-        positions.sort_by_key(|(idx, _)| *idx);
-        for (idx, value) in positions {
-            let value = if *value == remove_tag {
-                serde_json::Value::Null
-            } else {
-                value.clone()
-            };
-            match list.get_mut(idx) {
-                Some(slot) => *slot = value,
-                None => {
-                    if !value.is_null() {
-                        list.push(value);
-                    }
-                }
-            }
-        }
-        let kept: Vec<serde_json::Value> = list.into_iter().filter(|v| !v.is_null()).collect();
+        let positions = positions
+            .into_iter()
+            .map(|(idx, value)| {
+                let value = if *value == remove_tag {
+                    None
+                } else {
+                    as_slot(value.clone())
+                };
+                (idx, value)
+            })
+            .collect();
+        fill_positions(&mut list, positions);
+        let kept: Vec<serde_json::Value> = list.into_iter().flatten().collect();
         if !kept.is_empty() {
             obj.insert(field, serde_json::Value::Array(kept));
         }
@@ -259,6 +255,32 @@ pub(crate) fn apply_set(
     }
 
     Ok(())
+}
+
+/// Place indexed values in a field's list: the slot rule of #65.
+///
+/// `positions` are applied in index order, and the sort is stable, so a
+/// position named twice takes its later value. A position inside the list
+/// overwrites that slot; a position past the end appends, so the list is
+/// never padded and no index can allocate or overflow. A `None` value
+/// empties a slot inside the list and is never appended. What an empty
+/// slot means is the caller's: `apply_set` drops them.
+///
+/// `apply_set` (`ia metadata`) and the spreadsheet upload path
+/// (`upload::batch`) both use this, so the same `field[N]` syntax means
+/// the same thing in both (#97).
+pub(crate) fn fill_positions<T>(list: &mut Vec<Option<T>>, mut positions: Vec<(usize, Option<T>)>) {
+    positions.sort_by_key(|(idx, _)| *idx);
+    for (idx, value) in positions {
+        match list.get_mut(idx) {
+            Some(slot) => *slot = value,
+            None => {
+                if value.is_some() {
+                    list.push(value);
+                }
+            }
+        }
+    }
 }
 
 fn last_collection_error(identifier: &str) -> IaError {

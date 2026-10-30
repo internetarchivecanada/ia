@@ -486,26 +486,22 @@ async fn two_columns_for_one_position_keep_the_later_in_column_name_order() {
 }
 
 #[tokio::test]
-async fn a_row_that_removes_a_field_also_drops_its_command_line_values() {
-    // The row names `subject`, so it replaces the -m values; REMOVE_TAG
-    // leaves nothing, so no subject is sent.
-    let dir = TempDir::new().unwrap();
-    let rec = row_with(&dir, &[("subject", "REMOVE_TAG")]);
-    let (_, headers) = single_put(vec![rec], &[("subject", "cli")]).await;
-    assert_eq!(field_headers(&headers, "subject"), pairs(&[]));
-}
-
-#[tokio::test]
-async fn a_removed_position_drops_only_that_value() {
+async fn a_remove_tag_cell_is_sent_as_a_literal_value() {
+    // An upload creates the item; a cell is a value, as `-m subject:REMOVE_TAG`
+    // is, and replaces the -m values for its field like any other.
     let dir = TempDir::new().unwrap();
     let rec = row_with(
         &dir,
-        &[("subject[0]", "REMOVE_TAG"), ("subject[1]", "keep")],
+        &[("subject", "REMOVE_TAG"), ("creator[0]", "REMOVE_TAG")],
     );
     let (_, headers) = single_put(vec![rec], &[("subject", "cli")]).await;
     assert_eq!(
         field_headers(&headers, "subject"),
-        pairs(&[("x-archive-meta00-subject", "keep")])
+        pairs(&[("x-archive-meta00-subject", "REMOVE_TAG")])
+    );
+    assert_eq!(
+        field_headers(&headers, "creator"),
+        pairs(&[("x-archive-meta00-creator", "REMOVE_TAG")])
     );
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
-use crate::metadata::write::{apply_set, parse_indexed_key};
+use crate::metadata::write::{fill_positions, parse_indexed_key};
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
 use crate::upload::template::REMOTE_NAME_COLUMN;
@@ -23,10 +23,6 @@ type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 pub struct ItemGroup {
     pub identifier: String,
     pub metadata: Vec<(String, String)>,
-    /// Every field the row of `metadata` names in a non-empty column, bare
-    /// or indexed, including one whose values `REMOVE_TAG` removed: each
-    /// replaces the command-line values for that field.
-    pub named_fields: BTreeSet<String>,
     pub files: Vec<PathBuf>,
     /// The remote name of each file in `files`, from the row's
     /// `REMOTE_NAME` column; `None` keeps the file's usual name.
@@ -36,16 +32,15 @@ pub struct ItemGroup {
 impl ItemGroup {
     /// The upload options for this item: `base` with the group's metadata
     /// merged in. A field the spreadsheet names replaces every value `base`
-    /// has for it, as the Python client does, even when the row's values
-    /// for it were all removed with `REMOVE_TAG`; fields it does not name
-    /// are kept (#97). The remote name comes from the row only: a single file
+    /// has for it, as the Python client does; fields it does not name are
+    /// kept (#97). The remote name comes from the row only: a single file
     /// with one is stored under it, and `base.remote_name` is not used, so
     /// one name is never given to every item of a batch.
     #[must_use]
     pub fn item_opts(&self, base: &UploadOpts) -> UploadOpts {
         let mut opts = base.clone();
-        opts.metadata
-            .retain(|(k, _)| !self.named_fields.contains(k.as_str()));
+        let named: HashSet<&str> = self.metadata.iter().map(|(k, _)| k.as_str()).collect();
+        opts.metadata.retain(|(k, _)| !named.contains(k.as_str()));
         opts.metadata.extend(self.metadata.iter().cloned());
         opts.remote_name = match self.remote_names.as_slice() {
             [Some(name)] => Some(name.clone()),
@@ -183,21 +178,18 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
             .filter(|v| !v.is_empty())
             .last();
 
-        let row = row_metadata(&identifier, fields)?;
+        let metadata = row_metadata(fields);
 
         let group = map.entry(identifier.clone()).or_insert_with(|| ItemGroup {
             identifier,
             metadata: Vec::new(),
-            named_fields: BTreeSet::new(),
             files: Vec::new(),
             remote_names: Vec::new(),
         });
 
-        // Use the metadata of the first record for this identifier that
-        // names any field (a row whose only value is REMOVE_TAG counts).
-        if group.named_fields.is_empty() {
-            group.metadata = row.pairs;
-            group.named_fields = row.named;
+        // Use metadata from the first record for this identifier
+        if group.metadata.is_empty() {
+            group.metadata = metadata;
         }
 
         group.files.push(PathBuf::from(file_path));
@@ -209,67 +201,59 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
 
 /// Turn one row's metadata columns into `(field, value)` pairs.
 ///
-/// The row is applied to an empty item with `apply_set`, the rule `ia
-/// metadata` gives repeated `-m` arguments (#65), so the same syntax means
-/// the same thing in both places. A bare column (`subject`) is the field's
-/// list; an indexed column (`subject[N]`) overwrites position N, or is
-/// appended when N is past the end, in index order. `subject=a` with
-/// `subject[1]=b` gives `[a, b]`; `subject=a` with `subject[0]=x` gives
-/// `[x]`. The readers do not keep column order, so the columns are applied
-/// in column-name order, and of two columns for one position the later in
-/// that order wins (`subject[0]` over `subject[00]`). The header encoder
-/// numbers repeated keys in list order, so the values become
-/// `x-archive-meta00-subject`, `x-archive-meta01-subject`, ... (#97).
+/// Per field, a bare column (`subject`) is the field's list, and the
+/// indexed columns (`subject[N]`) are placed in it with `fill_positions`,
+/// the slot rule `ia metadata` gives repeated `-m` arguments (#65), so the
+/// same syntax means the same thing in both places: position N is
+/// overwritten, or the value appended when N is past the end, in index
+/// order. `subject=a` with `subject[1]=b` gives `[a, b]`; `subject=a` with
+/// `subject[0]=x` gives `[x]`. The readers do not keep column order, so the
+/// columns are taken in column-name order, and of two columns for one
+/// position the later in that order wins (`subject[0]` over
+/// `subject[00]`). Every cell is a literal value. Fields come out in name
+/// order. The header encoder numbers repeated keys in list order, so the
+/// values become `x-archive-meta00-subject`, `x-archive-meta01-subject`,
+/// ... (#97).
 ///
 /// An empty value is no value, as the readers treat a blank cell: it
 /// neither sends an empty header nor replaces a `-m` value.
-///
-/// Returns the fields the row names (every non-empty column's field, bare
-/// or indexed, whether or not a value survives) and the pairs.
-fn row_metadata(identifier: &str, fields: HashMap<String, String>) -> Result<RowMetadata> {
-    let mut columns: Vec<(String, serde_json::Value)> = fields
+fn row_metadata(fields: HashMap<String, String>) -> Vec<(String, String)> {
+    let mut columns: Vec<(String, String)> =
+        fields.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+    columns.sort();
+
+    let mut by_field: BTreeMap<String, FieldColumns> = BTreeMap::new();
+    for (column, value) in columns {
+        match parse_indexed_key(&column) {
+            Some((field, idx)) => by_field
+                .entry(field)
+                .or_default()
+                .indexed
+                .push((idx, Some(value))),
+            None => by_field.entry(column).or_default().bare = Some(value),
+        }
+    }
+
+    by_field
         .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(k, v)| (k, serde_json::Value::String(v)))
-        .collect();
-    columns.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let named = columns
-        .iter()
-        .map(|(column, _)| {
-            parse_indexed_key(column)
-                .map(|(field, _)| field)
-                .unwrap_or_else(|| column.clone())
+        .flat_map(|(field, columns)| {
+            let mut list: Vec<Option<String>> = columns.bare.into_iter().map(Some).collect();
+            fill_positions(&mut list, columns.indexed);
+            list.into_iter()
+                .flatten()
+                .map(move |value| (field.clone(), value))
         })
-        .collect();
-
-    let mut item = serde_json::Map::new();
-    apply_set(&mut item, &columns, identifier)?;
-
-    // Every value put in is a string, so every value that comes out is a
-    // string or a list of strings.
-    let pairs = item
-        .into_iter()
-        .flat_map(|(field, value)| {
-            let values = match value {
-                serde_json::Value::Array(items) => items,
-                other => vec![other],
-            };
-            values.into_iter().filter_map(move |v| match v {
-                serde_json::Value::String(s) => Some((field.clone(), s)),
-                _ => None,
-            })
-        })
-        .collect();
-    Ok(RowMetadata { named, pairs })
+        .collect()
 }
 
-/// One row's metadata, from [`row_metadata`].
-struct RowMetadata {
-    /// The fields the row names, whether or not a value survives.
-    named: BTreeSet<String>,
-    /// The `(field, value)` pairs to send.
-    pairs: Vec<(String, String)>,
+/// One field's columns in a row, for [`row_metadata`].
+#[derive(Debug, Default)]
+struct FieldColumns {
+    /// The bare column's value (`subject`).
+    bare: Option<String>,
+    /// The indexed columns (`subject[N]`) as `(N, value)`, in column-name
+    /// order.
+    indexed: Vec<(usize, Option<String>)>,
 }
 
 /// Validate all item groups upfront before uploading.
@@ -422,7 +406,6 @@ mod tests {
                 ("subject".into(), "alpha".into()),
                 ("subject".into(), "beta".into()),
             ],
-            named_fields: BTreeSet::from(["subject".to_string()]),
             files: vec![PathBuf::from("/tmp/a.txt")],
             remote_names: vec![None],
         };
@@ -570,7 +553,6 @@ mod tests {
         let groups = vec![ItemGroup {
             identifier: "test-item".into(),
             metadata: vec![("title".into(), "My Item".into())], // missing mediatype + collection
-            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
@@ -590,7 +572,6 @@ mod tests {
                 ("mediatype".into(), "texts".into()),
                 ("collection".into(), "test_collection".into()),
             ],
-            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
@@ -607,7 +588,6 @@ mod tests {
         let groups = vec![ItemGroup {
             identifier: "test-item".into(),
             metadata: vec![],
-            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
