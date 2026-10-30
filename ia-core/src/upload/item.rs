@@ -623,7 +623,8 @@ async fn upload_one_file(
 /// - If `remote_name` is set and there is exactly one file: use that name
 /// - If `keep_directories`: see [`keep_directories_key`]
 /// - Default: use just the filename (basename)
-/// - If `remote_dir` is set: prepend `{remote_dir}/` to each key
+/// - If `remote_dir` is set: prepend `{remote_dir}/` to each key, with
+///   leading and trailing `/` trimmed from `remote_dir`
 ///
 /// Every key is checked with `validate_key`, so a key that does not name a
 /// file inside the item is refused here, before any request (#96).
@@ -649,11 +650,12 @@ fn compute_keys(files: &[PathBuf], sources: &[PathBuf], opts: &UploadOpts) -> Re
                 .unwrap_or_else(|| file.to_string_lossy().into_owned())
         };
 
-        // Prepend remote_dir if set
-        let key = if let Some(ref dir) = opts.remote_dir {
-            format!("{dir}/{key}")
-        } else {
-            key
+        // Prepend remote_dir if set. Surrounding `/` are trimmed so
+        // `scans/` and `/scans/` give `scans/a.bin`, not `scans//a.bin`
+        // (#100); a value that is only slashes adds no prefix.
+        let key = match opts.remote_dir.as_deref().map(|d| d.trim_matches('/')) {
+            Some(dir) if !dir.is_empty() => format!("{dir}/{key}"),
+            Some(_) | None => key,
         };
 
         validate_key(&key)?;
@@ -786,6 +788,25 @@ mod tests {
         };
         let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["scans/file.txt"]);
+    }
+
+    #[test]
+    fn keys_with_remote_dir_trim_surrounding_slashes() {
+        let files = vec![PathBuf::from("/tmp/file.txt")];
+        for (dir, want) in [
+            ("scans/", "scans/file.txt"),
+            ("/scans/", "scans/file.txt"),
+            ("//scans//", "scans/file.txt"),
+            ("/scans/sub/", "scans/sub/file.txt"),
+            ("/", "file.txt"),
+        ] {
+            let opts = UploadOpts {
+                remote_dir: Some(dir.into()),
+                ..Default::default()
+            };
+            let keys = compute_keys(&files, &files, &opts).unwrap();
+            assert_eq!(keys, vec![want], "--remote-dir {dir}");
+        }
     }
 
     #[test]

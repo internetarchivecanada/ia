@@ -72,6 +72,6 @@ Unit tests in `ia-core/src/upload/item.rs` for `compute_keys` (normalization, th
 
 - [x] Plan committed first.
 - [x] #96: tests (red), `validate_key`, `IaError::InvalidKey`, `build_s3_url` returns `Result`, per-argument expansion and the key rule in `compute_keys`, help and usage text.
-- [ ] #100: tests (red), trimming in `compute_keys`, help and usage text.
+- [x] #100: tests (red), trimming in `compute_keys`, help and usage text.
 - [ ] `cargo test`, `cargo clippy --all-targets -- -D warnings`.
 - [ ] Code review; PR.

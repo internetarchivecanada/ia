@@ -1382,3 +1382,41 @@ fn validate_key_refuses_keys_that_do_not_name_a_file_in_the_item() {
         assert!(upload::validate_key(key).is_ok(), "{key}");
     }
 }
+
+// -- --remote-dir with surrounding slashes (#100) --
+
+#[tokio::test]
+async fn remote_dir_with_surrounding_slashes_gives_one_separator() {
+    for remote_dir in ["scans/", "/scans/", "scans"] {
+        let server = MockServer::start().await;
+        mount_any_put(&server, 1).await;
+
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("a.bin");
+        fs::write(&f, "a").unwrap();
+
+        let mut opts = key_test_opts();
+        opts.remote_dir = Some(remote_dir.into());
+        let results = upload::upload_item(
+            &test_client(&server),
+            "test-item",
+            &[f],
+            &opts,
+            None,
+            None,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results[0].key, "scans/a.bin", "--remote-dir {remote_dir}");
+        assert_eq!(
+            put_paths_inside(&server, "test-item").await,
+            ["/test-item/scans/a.bin"],
+            "--remote-dir {remote_dir}"
+        );
+        server.verify().await;
+    }
+}

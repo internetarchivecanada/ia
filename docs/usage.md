@@ -558,7 +558,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `-m, --metadata <K:V>` | Set metadata field (repeatable) |
 | `--header <K:V>` | Additional HTTP header (repeatable) |
 | `--remote-name <NAME>` | Explicit remote filename (required for stdin) |
-| `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
+| `--remote-dir <PATH>` | Prepend path prefix to remote filenames; leading and trailing `/` are ignored, so `scans`, `scans/` and `/scans/` all give `scans/<name>` |
 | `--keep-directories` | Keep the directory structure in remote filenames (see "Remote file names") |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |

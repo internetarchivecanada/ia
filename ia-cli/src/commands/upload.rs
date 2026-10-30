@@ -125,7 +125,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub remote_name: Option<String>,
 
-    /// Prepend path prefix to all remote filenames
+    /// Prepend path prefix to all remote filenames (leading and trailing `/` are ignored)
     #[arg(long)]
     pub remote_dir: Option<String>,
 
