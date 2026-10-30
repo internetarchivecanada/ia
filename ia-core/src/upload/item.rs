@@ -790,7 +790,7 @@ fn keep_directories_key(file: &Path, source: &Path) -> String {
 /// `path` with `.` components dropped and each `name/..` pair removed,
 /// without touching the filesystem. A `..` directly under the root is
 /// dropped (`/..` is `/`); a leading `..` of a relative path is kept.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out: Vec<Component> = Vec::new();
     for c in path.components() {
         match c {

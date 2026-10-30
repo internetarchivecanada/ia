@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -8,7 +8,7 @@ use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
 use crate::metadata::write::{fill_positions, parse_indexed_key};
 use crate::spreadsheet::SpreadsheetRecord;
-use crate::upload::item::{item_keys, upload_item};
+use crate::upload::item::{item_keys, normalize, upload_item};
 use crate::upload::template::REMOTE_NAME_COLUMN;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
 use crate::upload::validate::validate_file;
@@ -309,12 +309,14 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             }
         }
 
-        // Remote names are keyed by file as written, so one file named on two
-        // rows must not be given two different names; only one would be used.
-        let mut name_of: HashMap<&Path, Option<&str>> = HashMap::new();
+        // One file on two rows must not be given two different names. Paths
+        // are compared after the lexical normalization compute_keys uses,
+        // so `a.txt` and `./a.txt` are one file.
+        let mut name_of: HashMap<PathBuf, Option<&str>> = HashMap::new();
         for (file, name) in group.files.iter().zip(&group.remote_names) {
             let name = name.as_deref();
-            match name_of.get(file.as_path()) {
+            let local = normalize(file);
+            match name_of.get(&local) {
                 Some(other) if *other != name => errors.push(format!(
                     "{}: {} is on two rows with different {REMOTE_NAME_COLUMN} values",
                     group.identifier,
@@ -322,7 +324,7 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
                 )),
                 Some(_) => {}
                 None => {
-                    name_of.insert(file, name);
+                    name_of.insert(local, name);
                 }
             }
         }
@@ -554,6 +556,22 @@ mod tests {
         let records = vec![
             record("item-1", path, &[("remote_name", "one.txt")]),
             record("item-1", path, &[("remote_name", "two.txt")]),
+        ];
+        let groups = group_records(records).unwrap();
+        let err = validate_groups(&groups).unwrap_err().to_string();
+        assert!(err.contains("different REMOTE_NAME values"), "{err}");
+    }
+
+    #[test]
+    fn validate_groups_refuses_two_names_for_one_file_written_two_ways() {
+        // `a.txt` and `./a.txt` are one file, as compute_keys sees them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let plain = format!("{}/a.txt", dir.path().display());
+        let dotted = format!("{}/./a.txt", dir.path().display());
+        let records = vec![
+            record("item-1", &plain, &[("remote_name", "one.txt")]),
+            record("item-1", &dotted, &[("remote_name", "two.txt")]),
         ];
         let groups = group_records(records).unwrap();
         let err = validate_groups(&groups).unwrap_err().to_string();

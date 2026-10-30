@@ -217,10 +217,14 @@ Review of the full diff before the pull request:
 - Assertions on the refusal messages tightened; the release notes say that
   resuming with a joblog from an earlier version uploads a renamed file
   again under its new name.
-- Not changed: one file written two ways on two rows (`a.txt`, `./a.txt`)
-  with two names is uploaded under both, since rows are matched by path as
-  written; `--remote-dir`, `--remote-name` and `--keep-directories` are
-  accepted with `--spreadsheet` and not applied (existing, documented).
+- One file written two ways on two rows (`a.txt`, `./a.txt`) with two
+  names passed validation, which matched rows by path as written, and was
+  uploaded under both. Fixed (orchestrator review of the pull request):
+  `validate_groups` compares paths after the lexical normalization
+  `compute_keys` uses (`item::normalize`), with a test.
+- Not changed: `--remote-dir`, `--remote-name` and `--keep-directories`
+  are accepted with `--spreadsheet` and not applied (existing,
+  documented).
 
 ## Out of scope
 
