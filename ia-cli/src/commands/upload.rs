@@ -129,7 +129,13 @@ pub struct UploadArgs {
     #[arg(long)]
     pub remote_dir: Option<String>,
 
-    /// Preserve relative path structure
+    /// Keep the directory structure in remote filenames
+    ///
+    /// A relative path below the current directory is kept as given, without
+    /// `./` (`scans/sub/a.pdf`). An absolute path, or one starting with `..`,
+    /// keeps only its last directory and what is below it (`../scans` and
+    /// `/data/scans` both give `scans/sub/a.pdf`). A remote name that would
+    /// still leave the item is refused before anything is sent.
     #[arg(long)]
     pub keep_directories: bool,
 

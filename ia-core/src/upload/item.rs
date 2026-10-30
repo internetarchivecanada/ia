@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,7 @@ use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 use crate::upload::validate::{validate_file, validate_required_metadata};
+use crate::upload::validate_key;
 use crate::IaClient;
 
 /// Callback invoked after each file result is produced (for streaming joblog writes).
@@ -90,11 +91,23 @@ pub async fn upload_item(
         }
     }
 
-    // 4. Expand directories and collect files
+    // 4. Expand directories and collect files. Each argument is expanded on
+    //    its own so that `keep_directories` can name a file relative to the
+    //    argument it came from (#96). The list is sorted by file, as before.
     let files_owned = files.to_vec();
-    let expanded = tokio::task::spawn_blocking(move || expand_files(&files_owned))
-        .await
-        .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))??;
+    let mut pairs = tokio::task::spawn_blocking(move || -> Result<Vec<(PathBuf, PathBuf)>> {
+        let mut pairs = Vec::new();
+        for arg in &files_owned {
+            for file in expand_files(std::slice::from_ref(arg))? {
+                pairs.push((file, arg.clone()));
+            }
+        }
+        Ok(pairs)
+    })
+    .await
+    .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))??;
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let (expanded, sources): (Vec<PathBuf>, Vec<PathBuf>) = pairs.into_iter().unzip();
 
     // 5. Check for empty
     if expanded.is_empty() {
@@ -107,7 +120,7 @@ pub async fn upload_item(
     }
 
     // 7. Compute remote keys
-    let keys = compute_keys(&expanded, &opts)?;
+    let keys = compute_keys(&expanded, &sources, &opts)?;
 
     // 7b. One listing of the item's unfinished multipart uploads, so that a
     //     file which switched to multipart in an earlier run (#21), or was
@@ -603,15 +616,21 @@ async fn upload_one_file(
 
 /// Compute remote S3 keys for each file.
 ///
+/// `sources[i]` is the command-line argument `files[i]` came from: the file
+/// itself, or the directory it was found under.
+///
 /// Rules:
 /// - If `remote_name` is set and there is exactly one file: use that name
-/// - If `keep_directories`: use relative path from file's parent structure
+/// - If `keep_directories`: see [`keep_directories_key`]
 /// - Default: use just the filename (basename)
 /// - If `remote_dir` is set: prepend `{remote_dir}/` to each key
-fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
+///
+/// Every key is checked with `validate_key`, so a key that does not name a
+/// file inside the item is refused here, before any request (#96).
+fn compute_keys(files: &[PathBuf], sources: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
     let mut keys = Vec::with_capacity(files.len());
 
-    for file in files {
+    for (file, source) in files.iter().zip(sources) {
         let key = if let Some(ref remote_name) = opts.remote_name {
             if files.len() == 1 {
                 remote_name.clone()
@@ -622,8 +641,7 @@ fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
                     .unwrap_or_else(|| file.to_string_lossy().into_owned())
             }
         } else if opts.keep_directories {
-            // Use the full path as given (relative path preserved)
-            file.to_string_lossy().into_owned()
+            keep_directories_key(file, source)
         } else {
             // Default: basename only
             file.file_name()
@@ -638,10 +656,68 @@ fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
             key
         };
 
+        validate_key(&key)?;
         keys.push(key);
     }
 
     Ok(keys)
+}
+
+/// The `--keep-directories` key for `file`, found under the command-line
+/// argument `source` (#96).
+///
+/// Both paths are normalized lexically: `.` is dropped and `name/..` pairs
+/// cancel. Then:
+/// - a relative argument that does not start with `..` keeps the file's path
+///   as given (`./scans/a.pdf` → `scans/a.pdf`);
+/// - an absolute argument, or one starting with `..`, keeps only its own last
+///   name and what is below it (`../scans` and `/data/scans` both give
+///   `scans/a.pdf`);
+/// - an argument with no last name (`..`, `/`) keeps only what is below it.
+///
+/// Components are joined with `/`. The caller validates the result, so a
+/// path that cannot be named inside the item is refused, not sent.
+fn keep_directories_key(file: &Path, source: &Path) -> String {
+    let file = normalize(file);
+    let source = normalize(source);
+    let below_cwd = source
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    let base = if below_cwd {
+        Path::new("")
+    } else if source.file_name().is_some() {
+        source.parent().unwrap_or(Path::new(""))
+    } else {
+        source.as_path()
+    };
+    // `file` is `source` with names appended, so the prefix always strips;
+    // if it ever did not, the full path is kept and validation refuses it.
+    let rel = file.strip_prefix(base).unwrap_or(&file);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `path` with `.` components dropped and each `name/..` pair removed,
+/// without touching the filesystem. A `..` directly under the root is
+/// dropped (`/..` is `/`); a leading `..` of a relative path is kept.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out: Vec<Component> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir | Component::CurDir) | None => out.push(c),
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => out.push(c),
+        }
+    }
+    out.iter().collect()
 }
 
 #[cfg(test)]
@@ -675,7 +751,7 @@ mod tests {
     fn keys_basename_default() {
         let files = vec![PathBuf::from("/tmp/dir/file.txt")];
         let opts = UploadOpts::default();
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["file.txt"]);
     }
 
@@ -686,7 +762,7 @@ mod tests {
             remote_name: Some("renamed.txt".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["renamed.txt"]);
     }
 
@@ -697,7 +773,7 @@ mod tests {
             remote_name: Some("renamed.txt".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["a.txt", "b.txt"]);
     }
 
@@ -708,7 +784,7 @@ mod tests {
             remote_dir: Some("scans".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["scans/file.txt"]);
     }
 
@@ -719,8 +795,71 @@ mod tests {
             keep_directories: true,
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["relative/path/file.txt"]);
+    }
+
+    /// (file, argument it came from, expected key) for `keep_directories` (#96).
+    #[test]
+    fn keep_directories_keys_stay_inside_the_item() {
+        let cases = [
+            // Relative, below the current directory: the path as given.
+            ("scans/a.pdf", "scans", "scans/a.pdf"),
+            ("./scans/sub/a.pdf", "./scans", "scans/sub/a.pdf"),
+            ("./a.pdf", ".", "a.pdf"),
+            ("scans/../other/a.pdf", "scans/../other", "other/a.pdf"),
+            // Through `..` or absolute: the argument's last name down.
+            ("../scans/a.pdf", "../scans", "scans/a.pdf"),
+            (
+                "../../x/scans/sub/a.pdf",
+                "../../x/scans",
+                "scans/sub/a.pdf",
+            ),
+            ("a/../../scans/a.pdf", "a/../../scans", "scans/a.pdf"),
+            ("/data/scans/a.pdf", "/data/scans", "scans/a.pdf"),
+            ("/data/scans/sub/a.pdf", "/data/scans/", "scans/sub/a.pdf"),
+            ("/data/a.pdf", "/data/a.pdf", "a.pdf"),
+            ("../a.pdf", "../a.pdf", "a.pdf"),
+            // An argument with no last name: only what is below it.
+            ("../x/a.pdf", "..", "x/a.pdf"),
+            ("../../a.pdf", "../..", "a.pdf"),
+            ("/a.pdf", "/", "a.pdf"),
+        ];
+        let opts = UploadOpts {
+            keep_directories: true,
+            ..Default::default()
+        };
+        for (file, source, want) in cases {
+            let keys =
+                compute_keys(&[PathBuf::from(file)], &[PathBuf::from(source)], &opts).unwrap();
+            assert_eq!(keys, vec![want], "file {file}, argument {source}");
+        }
+    }
+
+    #[test]
+    fn keys_that_leave_the_item_are_refused() {
+        let files = vec![PathBuf::from("a.bin")];
+        for opts in [
+            UploadOpts {
+                remote_name: Some("../other/a.bin".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_name: Some("/a.bin".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_dir: Some("../other".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_dir: Some("scans/./sub".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = compute_keys(&files, &files, &opts).unwrap_err();
+            assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+        }
     }
 
     #[test]
@@ -731,7 +870,7 @@ mod tests {
             remote_dir: Some("prefix".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["prefix/dir/file.txt"]);
     }
 

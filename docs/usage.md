@@ -559,7 +559,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--header <K:V>` | Additional HTTP header (repeatable) |
 | `--remote-name <NAME>` | Explicit remote filename (required for stdin) |
 | `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
-| `--keep-directories` | Preserve relative path structure |
+| `--keep-directories` | Keep the directory structure in remote filenames (see "Remote file names") |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
 | `--delete-after-upload` | Delete the local file once IA has accepted the upload with its md5 (refused with `--no-verify`) |
@@ -576,6 +576,16 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
+
+#### Remote file names
+
+By default a file's remote name is its file name. `--remote-name` names a single file. `--keep-directories` keeps the directory structure:
+
+- A relative path below the current directory is kept as given, without `./`: `ia upload my-item ./scans --keep-directories` uploads `scans/sub/a.pdf` as `scans/sub/a.pdf`, and `.` gives the paths below the current directory.
+- An absolute path, or one starting with `..`, keeps only its last directory and what is below it: `../scans` and `/data/scans` both give `scans/sub/a.pdf`.
+- A path with no last directory (`..`, `/`) keeps only what is below it.
+
+Every remote name must be a path inside the item: one that is empty, starts with `/`, or has a `.`, `..` or empty segment is refused before anything is sent, with `invalid remote file name '<name>': <reason>; a remote name is a path inside the item, with no leading '/' and no '.', '..' or empty segments` (`invalid_key` in `--json` errors). This applies however the name is formed, including `--remote-name`, `--remote-dir` and spreadsheet uploads.
 
 #### Retries
 

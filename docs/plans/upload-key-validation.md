@@ -23,7 +23,7 @@ This is a security fix: a request must never leave the item named on the command
 - has a `.` segment;
 - has an empty segment (`a//b`, or a trailing `/`).
 
-A refused key is an error, never rewritten. `build_s3_url` calls the check and returns `Result<String>`, so every request that names a file inside an item is covered: single PUTs, every multipart request, and spreadsheet uploads (`upload_batch` passes the spreadsheet's keys to `upload_file`). `compute_keys` also checks every key it builds, so `upload_item` refuses a bad key before any request is sent, including on a dry run.
+A refused key is an error, never rewritten. `build_s3_url` calls the check and returns `Result<String>` (its callers in `single.rs` and `multipart.rs` propagate the error with `?`), so every request that names a file inside an item is covered: single PUTs, every multipart request, spreadsheet uploads (`upload_batch` calls `upload_item`), and library callers of the public `upload_file`, which takes its key as given. `compute_keys` also checks every key it builds, so `upload_item` refuses a bad key before any request is sent, including on a dry run.
 
 Error (new variant `IaError::InvalidKey { key, reason }`, JSON code `invalid_key`):
 
@@ -62,6 +62,8 @@ Leading and trailing `/` are trimmed before joining: `scans`, `scans/` and `/sca
 - An absolute argument: the PUT is `/test-item/<dir name>/sub/a.bin`.
 - A plain relative directory, given with `./`: the PUT keeps the path below the working directory.
 - `validate_key` directly: each refused form, the error text naming the key and the rule, and valid keys accepted.
+- `--remote-name ../other-item/a.bin` through `upload_item`: refused with `InvalidKey`, no request sent.
+- `upload_file` called directly with `../other-item/a.bin`: refused with `InvalidKey`, no PUT sent.
 - `--remote-dir` given as `scans/`, `/scans/` and `scans`: each PUT is `/test-item/scans/a.bin`.
 
 Unit tests in `ia-core/src/upload/item.rs` for `compute_keys` (normalization, the three argument cases, `--remote-dir` with `..` refused) and in `ia-core/src/upload/mod.rs` for `build_s3_url` refusing a bad key.
@@ -69,7 +71,7 @@ Unit tests in `ia-core/src/upload/item.rs` for `compute_keys` (normalization, th
 ## Tasks
 
 - [x] Plan committed first.
-- [ ] #96: tests (red), `validate_key`, `IaError::InvalidKey`, `build_s3_url` returns `Result`, per-argument expansion and the key rule in `compute_keys`, help and usage text.
+- [x] #96: tests (red), `validate_key`, `IaError::InvalidKey`, `build_s3_url` returns `Result`, per-argument expansion and the key rule in `compute_keys`, help and usage text.
 - [ ] #100: tests (red), trimming in `compute_keys`, help and usage text.
 - [ ] `cargo test`, `cargo clippy --all-targets -- -D warnings`.
 - [ ] Code review; PR.
