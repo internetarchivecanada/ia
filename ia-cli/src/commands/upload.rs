@@ -1003,9 +1003,8 @@ async fn run_import_dry_run(
             style(crate::output::format_bytes(info.group_bytes)).dim(),
         );
 
-        // Metadata (merged: CLI opts overridden by spreadsheet per-group)
-        let merged = merge_metadata(&opts.metadata, &group.metadata);
-        print_metadata(&merged, 4);
+        // Metadata as the upload sends it (ItemGroup::item_opts)
+        print_metadata(&group.item_opts(opts).metadata, 4);
 
         // Files
         for (name, size) in &info.file_details {
@@ -1083,22 +1082,6 @@ fn print_metadata(metadata: &[(String, String)], indent: usize) {
             width = max_key_len + 1, // +1 for the colon
         );
     }
-}
-
-/// Merge CLI metadata with per-item metadata (per-item overrides CLI for same key).
-fn merge_metadata(
-    cli_metadata: &[(String, String)],
-    item_metadata: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut merged: Vec<(String, String)> = cli_metadata.to_vec();
-    for (key, value) in item_metadata {
-        if let Some(existing) = merged.iter_mut().find(|(k, _)| k == key) {
-            existing.1 = value.clone();
-        } else {
-            merged.push((key.clone(), value.clone()));
-        }
-    }
-    merged
 }
 
 fn run_template(args: TemplateArgs) -> Result<()> {
@@ -1833,60 +1816,5 @@ mod tests {
 
         let had_failure = output_results(&results, true, 0, None).unwrap();
         assert!(!had_failure);
-    }
-
-    #[test]
-    fn merge_metadata_no_overlap() {
-        let cli = vec![("mediatype".into(), "texts".into())];
-        let item = vec![("title".into(), "My Book".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("mediatype".into(), "texts".into()),
-                ("title".into(), "My Book".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_metadata_item_overrides_cli() {
-        let cli = vec![
-            ("mediatype".into(), "texts".into()),
-            ("collection".into(), "default-coll".into()),
-        ];
-        let item = vec![("collection".into(), "special-coll".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("mediatype".into(), "texts".into()),
-                ("collection".into(), "special-coll".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_metadata_both_empty() {
-        let merged = merge_metadata(&[], &[]);
-        assert!(merged.is_empty());
-    }
-
-    #[test]
-    fn merge_metadata_duplicate_cli_keys_first_wins() {
-        // If CLI has duplicate keys, only the first is overridden by item metadata
-        let cli = vec![
-            ("subject".into(), "first".into()),
-            ("subject".into(), "second".into()),
-        ];
-        let item = vec![("subject".into(), "override".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("subject".into(), "override".into()),
-                ("subject".into(), "second".into()),
-            ]
-        );
     }
 }

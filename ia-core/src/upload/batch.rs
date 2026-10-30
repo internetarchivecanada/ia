@@ -19,6 +19,7 @@ type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 
 /// A group of files and metadata for a single IA item.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ItemGroup {
     pub identifier: String,
     pub metadata: Vec<(String, String)>,
@@ -32,16 +33,19 @@ impl ItemGroup {
     /// The upload options for this item: `base` with the group's metadata
     /// merged in. A field the spreadsheet names replaces every value `base`
     /// has for it, as the Python client does; fields it does not name are
-    /// kept (#97). A single file with a remote name is stored under it.
+    /// kept (#97). The remote name comes from the row only: a single file
+    /// with one is stored under it, and `base.remote_name` is not used, so
+    /// one name is never given to every item of a batch.
     #[must_use]
     pub fn item_opts(&self, base: &UploadOpts) -> UploadOpts {
         let mut opts = base.clone();
         let named: HashSet<&str> = self.metadata.iter().map(|(k, _)| k.as_str()).collect();
         opts.metadata.retain(|(k, _)| !named.contains(k.as_str()));
         opts.metadata.extend(self.metadata.iter().cloned());
-        if let [Some(name)] = self.remote_names.as_slice() {
-            opts.remote_name = Some(name.clone());
-        }
+        opts.remote_name = match self.remote_names.as_slice() {
+            [Some(name)] => Some(name.clone()),
+            _ => None,
+        };
         opts
     }
 }
@@ -204,12 +208,13 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
 /// (#65). Fields come out in name order, so every run sends the same
 /// headers. The header encoder numbers repeated keys in list order, so the
 /// pairs become `x-archive-meta00-subject`, `x-archive-meta01-subject`, ...
-/// (#97).
+/// (#97). An empty value is no value, as the readers treat a blank cell:
+/// it neither sends an empty header nor replaces a `-m` value.
 fn row_metadata(fields: HashMap<String, String>) -> Vec<(String, String)> {
     // field -> (index, column, value); a bare column has index None, which
     // sorts before every Some.
     let mut by_field: BTreeMap<String, Vec<(Option<usize>, String, String)>> = BTreeMap::new();
-    for (column, value) in fields {
+    for (column, value) in fields.into_iter().filter(|(_, v)| !v.is_empty()) {
         let (field, index) = match parse_indexed_key(&column) {
             Some((name, index)) => (name, Some(index)),
             None => (column.clone(), None),
@@ -262,9 +267,17 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             ));
         }
 
-        for file in &group.files {
+        for (file, remote_name) in group.files.iter().zip(&group.remote_names) {
             if let Err(e) = validate_file(file) {
                 errors.push(format!("{}: {e}", file.display()));
+            }
+            // A directory row expands to its files, which a single remote
+            // name cannot name.
+            if remote_name.is_some() && file.is_dir() {
+                errors.push(format!(
+                    "{}: {REMOTE_NAME_COLUMN} cannot name a directory",
+                    file.display()
+                ));
             }
         }
     }
@@ -416,6 +429,70 @@ mod tests {
                 group.metadata
             );
         }
+    }
+
+    #[test]
+    fn an_empty_value_does_not_replace_the_command_line_value() {
+        let records = vec![record(
+            "item-1",
+            "/tmp/a.txt",
+            &[("collection", ""), ("subject[0]", ""), ("title", "T")],
+        )];
+        let groups = group_records(records).unwrap();
+        assert_eq!(
+            groups[0].metadata,
+            vec![("title".to_string(), "T".to_string())]
+        );
+        let base = UploadOpts {
+            metadata: vec![("collection".into(), "cli-coll".into())],
+            ..Default::default()
+        };
+        assert_eq!(
+            groups[0].item_opts(&base).metadata,
+            vec![
+                ("collection".to_string(), "cli-coll".to_string()),
+                ("title".to_string(), "T".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn item_opts_takes_the_remote_name_from_the_row_only() {
+        let records = vec![
+            record("item-1", "/tmp/a.txt", &[("remote_name", "renamed.txt")]),
+            record("item-2", "/tmp/b.txt", &[]),
+        ];
+        let groups = group_records(records).unwrap();
+        let base = UploadOpts {
+            remote_name: Some("from-caller.txt".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            groups[0].item_opts(&base).remote_name.as_deref(),
+            Some("renamed.txt")
+        );
+        assert_eq!(groups[1].item_opts(&base).remote_name, None);
+    }
+
+    #[test]
+    fn validate_groups_refuses_a_remote_name_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("scans");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.jpg"), "a").unwrap();
+        std::fs::write(sub.join("b.jpg"), "b").unwrap();
+        let records = vec![record(
+            "item-1",
+            sub.to_str().unwrap(),
+            &[
+                ("mediatype", "texts"),
+                ("collection", "test_collection"),
+                ("remote_name", "renamed"),
+            ],
+        )];
+        let groups = group_records(records).unwrap();
+        let err = validate_groups(&groups).unwrap_err().to_string();
+        assert!(err.contains("cannot name a directory"), "{err}");
     }
 
     #[test]

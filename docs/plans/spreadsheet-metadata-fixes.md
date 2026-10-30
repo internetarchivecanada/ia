@@ -19,10 +19,13 @@ loop.
 1. **Per row, per field:** a bare column (`subject`) comes first, then the
    indexed columns (`subject[N]`) in ascending numeric index. Two columns
    that parse to the same index (`subject[0]`, `subject[00]`) are both kept,
-   ordered by column name. This is the rule `prepare_metadata` applies to
-   repeated `-m` arguments since #65 (`collection:a` then `collection[1]:b`
-   gives `[a, b]`). The Python client drops the bare value in this case;
-   the divergence is deliberate, since a value the user gave should not
+   ordered by column name. A blank value is no value. This follows the rule
+   the metadata write path (`ia metadata`, `prepare_metadata` in
+   `ia-core/src/metadata/write.rs`) applies to repeated `-m` arguments since
+   #65 (`collection:a` then `collection[1]:b` gives `[a, b]`); `ia upload`
+   `-m` does not accept indexed keys. The Python client drops the bare
+   value, and keeps only the later of two columns with the same index;
+   both divergences are deliberate, since a value the user gave should not
    vanish.
 2. **Fields** are emitted in name order, so the header list is the same on
    every run.
@@ -59,9 +62,16 @@ in `ia-cli`), and the JSONL template writes `remote_name` through serde.
 - The column is matched as `remote_name` after lowercasing, so any case
   works. It is never item metadata.
 - Per row: the file is stored under the remote name when the column is
-  filled in, otherwise under its usual name (`--remote-dir` still applies).
+  filled in, otherwise under its usual name. The remote name comes from the
+  row only; `UploadOpts::remote_name` given by a caller is not used for a
+  batch.
+- A remote name on a row whose `file` is a directory is refused: the
+  directory expands to several files. (The Python client treats it as a
+  remote directory prefix; not adopted here.)
 - The template writes `REMOTE_NAME` in every format, the name the Python
-  client reads, so one template works with both tools.
+  client reads, so a CSV template works with both tools. Matching the
+  column in any case is a deliberate divergence: the Python client reads
+  only `REMOTE_NAME` and would send a lowercase column as metadata.
 
 ### Change on this branch
 
@@ -96,8 +106,10 @@ a file with a remote name uses it instead of the basename or the
 ### API note
 
 `ItemGroup` is public with public fields; adding `remote_names` breaks
-struct-literal construction by library callers. It ships in a minor
-version.
+struct-literal construction by library callers. It is marked
+`#[non_exhaustive]` in the same change, so only `group_records` builds one
+outside the crate (which keeps `files` and `remote_names` the same length)
+and later fields are not a further break. It ships in a minor version.
 
 ## Tests (`ia-core/tests/upload_batch.rs`, wiremock, reading the PUT)
 
@@ -115,6 +127,33 @@ version.
 
 Unit tests in `batch.rs` and `template.rs` cover the grouping order and the
 JSONL header name.
+
+## Review findings and resolution
+
+Review of the full diff before the pull request:
+
+- The `--spreadsheet --dry-run` listing merged metadata with its own copy
+  of the old overwrite loop (`merge_metadata` in
+  `ia-cli/src/commands/upload.rs`) and showed one indexed value. Fixed: the
+  listing prints `ItemGroup::item_opts(..).metadata`; `merge_metadata` and
+  its tests are removed; a CLI test covers the listing.
+- A remote name on a directory row passed validation and was ignored or
+  misapplied. Fixed: refused in `validate_groups`, with a test.
+- The usage text said `--remote-dir` applies to a spreadsheet batch;
+  `run_import` does not pass it. Fixed in the docs; wiring the flag in is
+  a separate change.
+- An empty value from a library-built record removed the `-m` value for
+  its field. Fixed: blank values are dropped, with a test.
+- `item_opts` kept a caller's `UploadOpts::remote_name` for every item
+  without one. Fixed: the remote name comes from the row only.
+- `ItemGroup` gained `#[non_exhaustive]`.
+- Docs: header-name case rule narrowed (JSONL `identifier` is matched
+  exactly), the first-row-with-metadata rule, the CSV-only compatibility
+  with the Python client, and the existing rule that the required-field
+  check looks at the row and not at `-m`.
+- Not changed: the required-field check itself (`validate_groups` takes no
+  options; validating the merged metadata needs a new function or a
+  signature change, and predates this work).
 
 ## Out of scope
 
