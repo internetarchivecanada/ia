@@ -919,6 +919,57 @@ async fn upload_checksum_skip_when_md5_matches() {
     assert!(matches!(result.status, UploadStatus::Skipped));
 }
 
+/// A checksum file written in uppercase hex (`CertUtil`, `Get-FileHash`)
+/// still matches the item's lowercase md5, so the file is skipped (#99).
+#[tokio::test]
+async fn upload_checksum_skip_with_uppercase_checksum_file() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [
+                {"name": "test.txt", "md5": "5d41402abc4b2a76b9719d911017c592", "size": "5"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let f = temp_file(b"hello");
+    let client = test_client(&server);
+    let checksum_file =
+        upload::checksum::parse_checksums("5D41402ABC4B2A76B9719D911017C592  test.txt\n");
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.checksum = true;
+        o.verify = true;
+        o.checksum_file = Some(checksum_file);
+        o
+    };
+
+    let result = upload::upload_file(
+        &client,
+        "test-item",
+        f.path(),
+        "test.txt",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result.status, UploadStatus::Skipped));
+}
+
 #[tokio::test]
 async fn upload_checksum_no_skip_when_md5_differs() {
     let server = MockServer::start().await;
