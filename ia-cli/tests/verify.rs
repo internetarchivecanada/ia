@@ -655,11 +655,7 @@ async fn verify_uppercase_digests_e2e() {
         .await;
 
     let mut checksum_file = NamedTempFile::new().unwrap();
-    writeln!(
-        checksum_file,
-        "5D41402ABC4B2A76B9719D911017C592  file.txt"
-    )
-    .unwrap();
+    writeln!(checksum_file, "5D41402ABC4B2A76B9719D911017C592  file.txt").unwrap();
 
     let mut spreadsheet = NamedTempFile::with_suffix(".csv").unwrap();
     writeln!(spreadsheet, "identifier,file,md5").unwrap();
