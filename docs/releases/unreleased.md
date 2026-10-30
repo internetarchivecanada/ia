@@ -51,13 +51,18 @@ this file becomes `docs/releases/<version>.md`.
 - **The template's `REMOTE_NAME` column names the file and is never
   item metadata** (#98). The readers lowercase column names, so the
   column used to be sent as metadata `remote_name` while the file kept
-  its local name. It is now matched in any case; a single-row item with
-  it filled in is stored under that name. A filled-in `REMOTE_NAME` in
-  an item of several rows, or on a row whose `file` is a directory,
-  stops the batch before any request. Every template format writes the
+  its local name. It is now matched in any case, and each row's file is
+  stored under its row's `REMOTE_NAME`, or its own name when the cell is
+  empty. A `REMOTE_NAME` on a directory row, one outside the item
+  (`../x`), two files of an item given one name, and one file given two
+  names stop the batch before any request. Every template format writes the
   same columns; the JSONL template now writes `REMOTE_NAME`, not
   `remote_name`.
 - `ia-core`: `ItemGroup` gains `remote_names` and `#[non_exhaustive]`,
   which breaks code that builds it with a struct literal;
   `group_records` builds it. New `ItemGroup::item_opts`, and
   `upload::template::{TEMPLATE_COLUMNS, REMOTE_NAME_COLUMN}`.
+  `UploadOpts` gains `remote_names` (a remote name per file argument,
+  used before `remote_name`, `keep_directories` and the basename) and
+  the builder method `remote_names`; `UploadOpts` is `#[non_exhaustive]`,
+  so the field breaks no code.

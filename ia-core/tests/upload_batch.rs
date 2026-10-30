@@ -562,36 +562,119 @@ async fn an_empty_remote_name_keeps_the_local_file_name() {
     assert_eq!(path, "/item-1/a.txt");
 }
 
-#[tokio::test]
-async fn a_remote_name_in_an_item_of_several_files_is_refused_before_any_request() {
-    // compute_keys takes one remote name per item; per-file names are not
-    // supported yet, and a silently ignored column would store the file
-    // under a name the user did not ask for.
-    let server = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let a = dir.path().join("a.txt");
-    let b = dir.path().join("b.txt");
-    fs::write(&a, "content").unwrap();
-    fs::write(&b, "content").unwrap();
-    let records = through_template_csv(
-        &dir,
-        &[template_row(&a, "renamed.txt"), template_row(&b, "")],
-    );
+/// Write files `names` in `dir`, one template row each for `item-1` with
+/// the paired remote name, and read them back as a batch would.
+fn rows_for(dir: &TempDir, rows: &[(&str, &str)]) -> Vec<(String, HashMap<String, String>)> {
+    let template: Vec<upload::TemplateRow> = rows
+        .iter()
+        .map(|(name, remote)| {
+            let f = dir.path().join(name);
+            fs::write(&f, "content").unwrap();
+            template_row(&f, remote)
+        })
+        .collect();
+    through_template_csv(dir, &template)
+}
 
+/// Run a batch against a server that accepts every PUT; return the
+/// result and the paths of every request it received (method and path),
+/// sorted.
+async fn batch_puts(
+    records: Vec<(String, HashMap<String, String>)>,
+    remote_dir: Option<&str>,
+) -> (
+    ia_core::error::Result<Vec<upload::UploadResult>>,
+    Vec<String>,
+) {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
     let client = test_client(&server);
     let opts = {
         let mut o = UploadOpts::default();
         o.verify = false;
         o.no_collection_check = true;
+        o.remote_dir = remote_dir.map(String::from);
         o
     };
-    let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
+    let result = upload::upload_batch(&client, records, &opts, 1, None, None, None).await;
+    let mut paths: Vec<String> = server
+        .received_requests()
         .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("item-1") && msg.contains("REMOTE_NAME"),
-        "{msg}"
+        .unwrap()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    paths.sort();
+    (result, paths)
+}
+
+/// The PUT paths among `requests` from [`batch_puts`].
+fn put_paths(requests: &[String]) -> Vec<&str> {
+    requests
+        .iter()
+        .filter_map(|r| r.strip_prefix("PUT "))
+        .collect()
+}
+
+#[tokio::test]
+async fn each_row_of_an_item_is_stored_under_its_own_remote_name() {
+    // #98: a remote name per row, and a row without one keeps its name.
+    let dir = TempDir::new().unwrap();
+    let records = rows_for(
+        &dir,
+        &[("a.txt", "one.txt"), ("b.txt", "two.txt"), ("c.txt", "")],
     );
-    assert!(server.received_requests().await.unwrap().is_empty());
+    let (result, paths) = batch_puts(records, None).await;
+    result.unwrap();
+    assert_eq!(
+        put_paths(&paths),
+        vec!["/item-1/c.txt", "/item-1/one.txt", "/item-1/two.txt"]
+    );
+}
+
+#[tokio::test]
+async fn a_remote_name_is_placed_under_the_remote_dir() {
+    let dir = TempDir::new().unwrap();
+    let records = rows_for(&dir, &[("a.txt", "renamed.txt"), ("b.txt", "")]);
+    let (result, paths) = batch_puts(records, Some("scans")).await;
+    result.unwrap();
+    assert_eq!(
+        put_paths(&paths),
+        vec!["/item-1/scans/b.txt", "/item-1/scans/renamed.txt"]
+    );
+}
+
+#[tokio::test]
+async fn a_remote_name_outside_the_item_is_refused_before_any_request() {
+    // compute_keys applies validate_key to a remote name as to every key.
+    let dir = TempDir::new().unwrap();
+    let records = rows_for(&dir, &[("a.txt", "../x.txt"), ("b.txt", "")]);
+    let (result, paths) = batch_puts(records, None).await;
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("../x.txt"), "{msg}");
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+#[tokio::test]
+async fn two_rows_given_one_remote_name_are_refused_before_any_request() {
+    // The second PUT would replace the first.
+    let dir = TempDir::new().unwrap();
+    let records = rows_for(&dir, &[("a.txt", "same.txt"), ("b.txt", "same.txt")]);
+    let (result, paths) = batch_puts(records, None).await;
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("same.txt"), "{msg}");
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+#[tokio::test]
+async fn a_remote_name_equal_to_another_rows_file_name_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let records = rows_for(&dir, &[("a.txt", "b.txt"), ("b.txt", "")]);
+    let (result, paths) = batch_puts(records, None).await;
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("b.txt"), "{msg}");
+    assert!(paths.is_empty(), "{paths:?}");
 }

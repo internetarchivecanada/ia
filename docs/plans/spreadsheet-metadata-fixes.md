@@ -119,7 +119,12 @@ in `ia-cli`), and the JSONL template writes `remote_name` through serde.
   `--keep-directories` clash check.
 - `ItemGroup::item_opts` fills `remote_names` from the rows and leaves
   `remote_name` unset. `validate_groups` drops the multi-row refusal and
-  keeps the directory refusal.
+  keeps the directory refusal. Because the names are keyed by file, one
+  file on two rows of an item with different `REMOTE_NAME` values is
+  refused there (only one name could be used).
+- The clash check, when remote names are present, covers every key of
+  the item, so a remote name equal to another row's file name is refused
+  as well.
 - That commit carries `Fixes #98`.
 
 Tests (`ia-core/tests/upload_batch.rs`): an item of two rows with two
