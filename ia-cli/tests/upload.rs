@@ -450,6 +450,55 @@ fn upload_spreadsheet_csv_dry_run() {
         .success();
 }
 
+#[test]
+fn upload_spreadsheet_dry_run_lists_the_metadata_and_name_the_upload_sends() {
+    // The listing used its own merge, which kept one value of subject[0]/
+    // subject[1] and a -m value next to it (#97); it now shows what the
+    // upload sends, and the REMOTE_NAME (#98).
+    let dir = TempDir::new().unwrap();
+    let data_file = dir.path().join("hello.txt");
+    fs::write(&data_file, "hello world").unwrap();
+
+    let csv_path = dir.path().join("batch.csv");
+    fs::write(
+        &csv_path,
+        format!(
+            "identifier,file,REMOTE_NAME,mediatype,collection,subject[0],subject[1]\n\
+             test-item-dry,{},renamed.txt,texts,test_collection,alpha,beta\n",
+            data_file.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = empty_config();
+    let out = ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--spreadsheet",
+            csv_path.to_str().unwrap(),
+            "-m",
+            "subject:from-cli",
+            "-m",
+            "creator:cli-creator",
+            "--dry-run",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(out).unwrap();
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cli-creator"), "{stderr}");
+    assert!(!stderr.contains("from-cli"), "{stderr}");
+    assert!(stderr.contains("renamed.txt"), "{stderr}");
+    assert!(!stderr.contains("remote_name"), "{stderr}");
+}
+
 // ─── Flag acceptance ─────────────────────────────────────────────────────────
 
 #[test]

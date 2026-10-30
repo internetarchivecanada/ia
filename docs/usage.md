@@ -646,11 +646,15 @@ ia upload cleanup my-item big.iso --abort
 
 **`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
-Required columns: `identifier`, `file`. All other columns become metadata.
+Required columns: `identifier`, `file`. Header names in CSV, TSV, XLSX and ODS files are case-insensitive, and so are JSONL keys other than `identifier`: `REMOTE_NAME`, `Remote_Name` and `remote_name` are the same column. An optional `REMOTE_NAME` column names the file on IA: a row with it filled in stores its file under that name, and a row without it keeps the file's name. `REMOTE_NAME` is never sent as item metadata. For now it is supported only for an identifier with one row whose `file` is a file, not a directory; otherwise a filled-in `REMOTE_NAME` stops the batch before any upload. All other columns become metadata. When several rows share an identifier, the metadata of the first of them that has any is used, and a blank cell is no value.
+
+A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each value is sent as its own header, in ascending numeric index (`subject[2]` before `subject[10]`), whatever the column order. A row follows the rule `ia metadata` applies to `-m`: a bare `subject` column is the field's list, and `subject[N]` overwrites position N or, past the end, is appended. So `subject=a` with `subject[1]=b` sends `a` and `b`, and `subject=a` with `subject[0]=x` sends only `x`. Of two columns for one position (`subject[0]` and `subject[00]`), the later in column-name order wins.
+
+`-m` values apply to every item. A field the row fills in (bare or indexed) replaces every `-m` value for that field, as in the Python client; `-m` fields the row leaves empty are sent as given. With `-m mediatype:texts` and a row whose `mediatype` is `audio`, that item is `audio`. A row that fills in any metadata must itself have `mediatype` and `collection`: the required-field check looks at the row, not at `-m`.
 
 Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
-**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
+**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`. Every format (CSV, TSV, XLSX, JSONL) writes the same columns: `identifier`, `file`, `REMOTE_NAME`, `mediatype`, `collection`, `title`, `creator`, `date`, `description`, `subject`, `language`. `REMOTE_NAME` is upper case because that is the name the Python client reads, so a CSV template works with both tools. (The Python client reads only CSV and matches `REMOTE_NAME` in upper case only.)
 
 | Flag | Description |
 |------|-------------|

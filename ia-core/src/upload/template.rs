@@ -13,11 +13,33 @@ pub struct TemplateOpts {
     pub identifier_from_dirname: bool,
 }
 
+/// The template column that names a file on IA, written as the Python
+/// client reads it. Spreadsheet column names are case-insensitive: the
+/// readers lowercase them, and the batch upload matches this name in any
+/// case. It is never sent as item metadata.
+pub const REMOTE_NAME_COLUMN: &str = "REMOTE_NAME";
+
+/// The template's columns, in order, as every template format writes them.
+pub const TEMPLATE_COLUMNS: [&str; 11] = [
+    "identifier",
+    "file",
+    REMOTE_NAME_COLUMN,
+    "mediatype",
+    "collection",
+    "title",
+    "creator",
+    "date",
+    "description",
+    "subject",
+    "language",
+];
+
 /// A single row in the upload template.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TemplateRow {
     pub identifier: String,
     pub file: String,
+    #[serde(rename = "REMOTE_NAME")]
     pub remote_name: String,
     pub mediatype: String,
     pub collection: String,
@@ -68,20 +90,7 @@ pub fn generate_template(dir: &Path, opts: &TemplateOpts) -> Result<Vec<Template
 pub fn write_template_csv<W: std::io::Write>(rows: &[TemplateRow], writer: &mut W) -> Result<()> {
     let mut csv_writer = csv::Writer::from_writer(writer);
 
-    // Header
-    csv_writer.write_record([
-        "identifier",
-        "file",
-        "REMOTE_NAME",
-        "mediatype",
-        "collection",
-        "title",
-        "creator",
-        "date",
-        "description",
-        "subject",
-        "language",
-    ])?;
+    csv_writer.write_record(TEMPLATE_COLUMNS)?;
 
     // Rows
     for row in rows {
@@ -328,6 +337,35 @@ mod tests {
         ] {
             assert!(header.contains(col), "header missing column: {col}");
         }
+    }
+
+    #[test]
+    fn jsonl_template_keys_match_the_csv_header() {
+        let row = TemplateRow {
+            identifier: "id".into(),
+            file: "/path".into(),
+            remote_name: "r.txt".into(),
+            mediatype: String::new(),
+            collection: String::new(),
+            title: String::new(),
+            creator: String::new(),
+            date: String::new(),
+            description: String::new(),
+            subject: String::new(),
+            language: String::new(),
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected = TEMPLATE_COLUMNS.to_vec();
+        let mut keys = keys;
+        expected.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(keys, expected);
     }
 
     #[test]
