@@ -8,7 +8,7 @@ use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
 use crate::metadata::write::{fill_positions, parse_indexed_key};
 use crate::spreadsheet::SpreadsheetRecord;
-use crate::upload::item::upload_item;
+use crate::upload::item::{item_keys, normalize, upload_item};
 use crate::upload::template::REMOTE_NAME_COLUMN;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
 use crate::upload::validate::validate_file;
@@ -33,19 +33,23 @@ impl ItemGroup {
     /// The upload options for this item: `base` with the group's metadata
     /// merged in. A field the spreadsheet names replaces every value `base`
     /// has for it, as the Python client does; fields it does not name are
-    /// kept (#97). The remote name comes from the row only: a single file
-    /// with one is stored under it, and `base.remote_name` is not used, so
-    /// one name is never given to every item of a batch.
+    /// kept (#97). Remote names come from the rows only, one per file in
+    /// `remote_names` (#98); `base.remote_name` and `base.remote_names` are
+    /// not used, so a caller's name is never given to every item of a
+    /// batch.
     #[must_use]
     pub fn item_opts(&self, base: &UploadOpts) -> UploadOpts {
         let mut opts = base.clone();
         let named: HashSet<&str> = self.metadata.iter().map(|(k, _)| k.as_str()).collect();
         opts.metadata.retain(|(k, _)| !named.contains(k.as_str()));
         opts.metadata.extend(self.metadata.iter().cloned());
-        opts.remote_name = match self.remote_names.as_slice() {
-            [Some(name)] => Some(name.clone()),
-            _ => None,
-        };
+        opts.remote_name = None;
+        opts.remote_names = self
+            .files
+            .iter()
+            .zip(&self.remote_names)
+            .filter_map(|(file, name)| Some((file.clone(), name.clone()?)))
+            .collect();
         opts
     }
 }
@@ -81,8 +85,10 @@ pub async fn upload_batch(
     // 1. Group records by identifier
     let groups = group_records(records)?;
 
-    // 2. Pre-validate all groups
+    // 2. Pre-validate all groups, and every item's remote keys, so that a
+    //    refusal stops the batch before any request (#98)
     validate_groups(&groups)?;
+    check_keys(&groups, opts)?;
 
     // 3. Upload items concurrently
     // Return (identifier, Result) so we can attribute failures to specific items.
@@ -256,6 +262,34 @@ struct FieldColumns {
     indexed: Vec<(usize, Option<String>)>,
 }
 
+/// Compute every group's remote keys as the upload will, with `base`
+/// merged in by [`ItemGroup::item_opts`], and report every refusal
+/// together: a remote name outside the item (`../x`), two files given one
+/// key, a remote name for a directory (#98). Makes no request. Call it
+/// after [`validate_groups`]; [`upload_batch`] does.
+///
+/// # Errors
+///
+/// Returns `IaError::Config` listing each refused item.
+pub fn check_keys(groups: &[ItemGroup], base: &UploadOpts) -> Result<()> {
+    let errors: Vec<String> = groups
+        .iter()
+        .filter_map(|group| {
+            item_keys(&group.files, &group.item_opts(base))
+                .err()
+                .map(|e| format!("{}: {e}", group.identifier))
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(IaError::Config(format!(
+            "batch validation failed:\n  {}",
+            errors.join("\n  ")
+        )))
+    }
+}
+
 /// Validate all item groups upfront before uploading.
 ///
 /// Checks identifiers and file existence/type. Collects all errors
@@ -275,16 +309,24 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             }
         }
 
-        // A remote name applies to an item's only file; a name per file in
-        // a larger item is not supported yet. Refuse it rather than store
-        // the file under a name the row did not ask for.
-        if group.files.len() > 1 && group.remote_names.iter().any(Option::is_some) {
-            errors.push(format!(
-                "{}: {REMOTE_NAME_COLUMN} is supported only for an identifier with one row; \
-                 this one has {} rows",
-                group.identifier,
-                group.files.len()
-            ));
+        // One file on two rows must not be given two different names. Paths
+        // are compared after the lexical normalization compute_keys uses,
+        // so `a.txt` and `./a.txt` are one file.
+        let mut name_of: HashMap<PathBuf, Option<&str>> = HashMap::new();
+        for (file, name) in group.files.iter().zip(&group.remote_names) {
+            let name = name.as_deref();
+            let local = normalize(file);
+            match name_of.get(&local) {
+                Some(other) if *other != name => errors.push(format!(
+                    "{}: {} is on two rows with different {REMOTE_NAME_COLUMN} values",
+                    group.identifier,
+                    file.display(),
+                )),
+                Some(_) => {}
+                None => {
+                    name_of.insert(local, name);
+                }
+            }
         }
 
         for (file, remote_name) in group.files.iter().zip(&group.remote_names) {
@@ -478,21 +520,62 @@ mod tests {
     }
 
     #[test]
-    fn item_opts_takes_the_remote_name_from_the_row_only() {
+    fn item_opts_takes_the_remote_names_from_the_rows_only() {
         let records = vec![
-            record("item-1", "/tmp/a.txt", &[("remote_name", "renamed.txt")]),
-            record("item-2", "/tmp/b.txt", &[]),
+            record("item-1", "/tmp/a.txt", &[("remote_name", "one.txt")]),
+            record("item-1", "/tmp/b.txt", &[("remote_name", "two.txt")]),
+            record("item-1", "/tmp/c.txt", &[]),
+            record("item-2", "/tmp/d.txt", &[]),
         ];
         let groups = group_records(records).unwrap();
         let base = UploadOpts {
             remote_name: Some("from-caller.txt".into()),
+            remote_names: HashMap::from([(PathBuf::from("/tmp/d.txt"), "caller.txt".into())]),
             ..Default::default()
         };
+        let opts = groups[0].item_opts(&base);
+        assert_eq!(opts.remote_name, None);
         assert_eq!(
-            groups[0].item_opts(&base).remote_name.as_deref(),
-            Some("renamed.txt")
+            opts.remote_names,
+            HashMap::from([
+                (PathBuf::from("/tmp/a.txt"), "one.txt".to_string()),
+                (PathBuf::from("/tmp/b.txt"), "two.txt".to_string()),
+            ])
         );
-        assert_eq!(groups[1].item_opts(&base).remote_name, None);
+        let opts = groups[1].item_opts(&base);
+        assert_eq!(opts.remote_name, None);
+        assert!(opts.remote_names.is_empty());
+    }
+
+    #[test]
+    fn validate_groups_refuses_one_file_given_two_remote_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "a").unwrap();
+        let path = file.to_str().unwrap();
+        let records = vec![
+            record("item-1", path, &[("remote_name", "one.txt")]),
+            record("item-1", path, &[("remote_name", "two.txt")]),
+        ];
+        let groups = group_records(records).unwrap();
+        let err = validate_groups(&groups).unwrap_err().to_string();
+        assert!(err.contains("different REMOTE_NAME values"), "{err}");
+    }
+
+    #[test]
+    fn validate_groups_refuses_two_names_for_one_file_written_two_ways() {
+        // `a.txt` and `./a.txt` are one file, as compute_keys sees them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let plain = format!("{}/a.txt", dir.path().display());
+        let dotted = format!("{}/./a.txt", dir.path().display());
+        let records = vec![
+            record("item-1", &plain, &[("remote_name", "one.txt")]),
+            record("item-1", &dotted, &[("remote_name", "two.txt")]),
+        ];
+        let groups = group_records(records).unwrap();
+        let err = validate_groups(&groups).unwrap_err().to_string();
+        assert!(err.contains("different REMOTE_NAME values"), "{err}");
     }
 
     #[test]

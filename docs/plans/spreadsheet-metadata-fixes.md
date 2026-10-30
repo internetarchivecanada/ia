@@ -100,12 +100,38 @@ in `ia-cli`), and the JSONL template writes `remote_name` through serde.
 
 ### Change on the second branch (after #96/#100)
 
-`compute_keys` takes a remote name per file (for example a
-`&[Option<String>]` parallel to `files`, or per-file keys on `UploadOpts`):
-a file with a remote name uses it instead of the basename or the
-`--keep-directories` path, then `--remote-dir` is prefixed as for any key.
-`validate_groups` drops the multi-file refusal. That commit carries
-`Fixes #98`.
+- `UploadOpts::remote_names: HashMap<PathBuf, String>` (new; `UploadOpts`
+  is `#[non_exhaustive]`, so this is not a break), with a builder method:
+  the remote name for a file argument, keyed by the path as passed to
+  `upload_item`.
+- `compute_keys` (`ia-core/src/upload/item.rs`), per file, in order:
+  1. its argument has an entry in `remote_names`: that name. An entry for
+     an argument that is a directory is refused (a directory expands to
+     several files).
+  2. `remote_name` with exactly one file: that name (unchanged).
+  3. `keep_directories`: the kept path (unchanged).
+  4. the basename (unchanged).
+
+  Then `--remote-dir` is prefixed and `validate_key` applied, as for every
+  key, so a remote name such as `../x` is refused before any request.
+- Two different files given one key, where a remote name produced it, are
+  refused (the second PUT would replace the first), extending the existing
+  `--keep-directories` clash check.
+- `ItemGroup::item_opts` fills `remote_names` from the rows and leaves
+  `remote_name` unset. `validate_groups` drops the multi-row refusal and
+  keeps the directory refusal. Because the names are keyed by file, one
+  file on two rows of an item with different `REMOTE_NAME` values is
+  refused there (only one name could be used).
+- The clash check, when remote names are present, covers every key of
+  the item, so a remote name equal to another row's file name is refused
+  as well.
+- That commit carries `Fixes #98`.
+
+Tests (`ia-core/tests/upload_batch.rs`): an item of two rows with two
+different `REMOTE_NAME`s gives two PUT paths; a row without one keeps its
+name next to a row with one; `REMOTE_NAME` with `--remote-dir`; a
+`REMOTE_NAME` of `../x` refused with no request; two rows with the same
+`REMOTE_NAME` refused with no request. Unit tests for `compute_keys`.
 
 ### API note
 
@@ -172,6 +198,33 @@ Review of the full diff before the pull request:
 - Not changed: the required-field check itself (`validate_groups` takes no
   options; validating the merged metadata needs a new function or a
   signature change, and predates this work).
+
+## Review findings, second branch
+
+- Refusals of a remote name (`../x`, two files given one key) happened in
+  `compute_keys` inside `upload_item`, per item, so another item could be
+  uploaded before the batch stopped. Fixed: `check_keys` (public, in
+  `batch.rs`) runs `compute_keys` for every item through
+  `item::item_keys` before any request; `upload_batch`, the dry run and
+  the dashboard call it. Tests with two items and in the CLI dry run.
+- With any remote name in an item, the clash check covered every key and
+  blamed remote names for two plain basenames meeting. Fixed: a clash is
+  refused only under `--keep-directories` or when one of the two files has
+  a remote name, and the message names the cause. Plain basenames that
+  meet are left as before.
+- A `remote_names` entry keyed by a path that is not one of the arguments
+  (another spelling, an empty directory) was ignored. Fixed: refused.
+- Assertions on the refusal messages tightened; the release notes say that
+  resuming with a joblog from an earlier version uploads a renamed file
+  again under its new name.
+- One file written two ways on two rows (`a.txt`, `./a.txt`) with two
+  names passed validation, which matched rows by path as written, and was
+  uploaded under both. Fixed (orchestrator review of the pull request):
+  `validate_groups` compares paths after the lexical normalization
+  `compute_keys` uses (`item::normalize`), with a test.
+- Not changed: `--remote-dir`, `--remote-name` and `--keep-directories`
+  are accepted with `--spreadsheet` and not applied (existing,
+  documented).
 
 ## Out of scope
 

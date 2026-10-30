@@ -997,6 +997,7 @@ pub async fn run_upload_batch_tui(
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
     ia_core::upload::batch::validate_groups(&groups)?;
+    ia_core::upload::batch::check_keys(&groups, &opts)?;
 
     // 2. Extract identifiers for TUI state initialization
     let identifiers: Vec<String> = groups.iter().map(|g| g.identifier.clone()).collect();
