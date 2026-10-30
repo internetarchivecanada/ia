@@ -44,7 +44,8 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--exclude-source <TYPE>` | Exclude by source type |
 | `--destdir <PATH>` | Destination directory (repeatable for disk pool, default: `.`) |
 | `--no-directories` | Don't create item subdirectory |
-| `-C, --checksum` | Verify md5 checksums; without it the md5 is never checked (a local file is skipped on size and mtime, a download accepted on size; see "Checksum mismatches") |
+| `-C, --checksum` | Skip a local file only when its md5 matches the item metadata, instead of when its size and mtime match; reads every local file, so it is slower. Does not affect verification of downloads |
+| `--no-verify` | Don't check the md5 of downloaded files; a download is accepted on its size alone (see "Verification") |
 | `-R, --retries <N>` | Max retries per file, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--no-timestamps` | Don't set file modification times |
@@ -58,7 +59,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 
 #### After an interruption
 
-Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and with `--checksum` its md5 too. `--joblog` adds a second layer on top: an item whose files a previous run all finished is skipped without a request (an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). A `.part` that is a symlink is removed and that file starts over; nothing is ever written through a link. The sections below give the rules in detail.
+Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and its md5 too when the metadata has one, unless `--no-verify` is given. `--joblog` adds a second layer on top: an item whose files a previous run all finished is skipped without a request (an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). A `.part` that is a symlink is removed and that file starts over; nothing is ever written through a link. The sections below give the rules in detail.
 
 #### Retries
 
@@ -75,21 +76,35 @@ Each file streams to `<name>.part` and is renamed into place only when the numbe
 
 If the server answers a `Range` request with a `Content-Range` total that differs from the metadata size, nothing from that response is written and the file fails with `server reports N bytes for <name> but item metadata says M bytes`. Retrying cannot fix that, so the command moves on to the next file.
 
-If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree and the `.part` file is exactly that long, it already holds the whole file: nothing more is downloaded, the md5 is compared when `--checksum` is on, and the `.part` file is renamed into place. When the two agree but the `.part` file is longer, it is deleted and the file is reported as `download resume failed for <name>: the server answered 416 to a resume from byte M of its N-byte copy; the .part file is longer than the file, so the .part file was removed` (in `--json` output the error code is `download_failed` and this text is the message), which is retried from the beginning.
+If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.part` file is already as long as the server's copy of the file or longer, and resuming it can never succeed. The 416's `Content-Range: bytes */N` gives the server's length. When that differs from the metadata size, the file fails with the same `server reports N bytes ... but item metadata says M bytes` message and the `.part` file is left alone. When the two agree and the `.part` file is exactly that long, it already holds the whole file: nothing more is downloaded, the md5 of the `.part` file is compared (unless `--no-verify`), and the `.part` file is renamed into place. When the two agree but the `.part` file is longer, it is deleted and the file is reported as `download resume failed for <name>: the server answered 416 to a resume from byte M of its N-byte copy; the .part file is longer than the file, so the .part file was removed` (in `--json` output the error code is `download_failed` and this text is the message), which is retried from the beginning.
 
 Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final. The one exception is a 416 on a resume: with no metadata size to compare against, the server's length is taken as the file's, so the `.part` file is removed and the download restarts, even when the `.part` file is already that long; the message then says the item metadata has no size that can confirm it.
 
 #### Slow and stalled downloads
 
-A connection that keeps sending bytes too slowly is treated like one that dropped (the re-request rule is at the end of this section). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison made with `--checksum` still covers the whole file.
+A connection that keeps sending bytes too slowly is treated like one that dropped (the re-request rule is at the end of this section). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison still covers the whole file.
 
 The default floor is `10K`, 10 KiB/s. `RATE` is bytes per second: a plain number, or a number followed by `K`, `M`, or `G` for powers of 1024 (`10K` is 10240, `1M` is 1048576). `--min-speed 0` turns the check off; then only the transport's 60 s read timeout, which resets on every chunk, can end a silent stream, and a stream that trickles never ends.
 
 Each stall spends one of the file's `--retries` (default 5). When they are gone, the file fails with `download of <name> stalled N times: X B/s over the last 60 s is below the --min-speed floor of Y B/s`, where N counts every stall; the `.part` file is kept for a later run, and the file is not attempted again in this one (in `--json` output the error code is `download_failed` and this text is the message). A dropped connection is re-requested up to three times per attempt, after waits of 0.5 s, 1.5 s and 4.5 s, without spending a stall. `--retries 0` means the first stall fails the file.
 
+#### Verification
+
+Every download's md5 is computed from the stream as it is written and compared with the item metadata when the stream ends, before the file is renamed into place. On a fresh download this costs CPU time only; nothing is read back from disk. A resumed download first reads the bytes already in its `.part` file, so its md5 covers the whole file; at the 400 to 600 MB/s measured on an Apple M1 Pro that is about 2 s per GB, shown as verifying. A file whose metadata has no md5 is not checked, nor is `<identifier>_files.xml`, which records its own md5 before it is final. `--no-verify` turns the check off, and a download is then accepted on its size alone.
+
+Which local files are skipped is a separate choice. By default a local file is skipped when its size and mtime match the item metadata, without being read. With `-C`/`--checksum` it is skipped only when its md5 matches, which reads every local file in full.
+
+```bash
+# Accept downloads on size alone (no md5 check)
+ia download nasa --no-verify
+
+# Re-check existing local files by md5 before deciding what to download
+ia download nasa -C
+```
+
 #### Checksum mismatches
 
-With `--checksum`, a local file whose md5 matches the item metadata is skipped, and a downloaded file's md5 is computed from the stream and compared when the stream ends. On a mismatch the bytes are kept beside the file as `<name>.md5-mismatch` and the error names that path: `checksum mismatch for <name>: expected X, got Y; kept the download at <path>`. Nothing is left as `.part`, so the file is downloaded again from byte 0. Keeping the copy is what makes the next step possible: comparing it against a second download, or against the source, tells a corrupt transfer from a bad source file or wrong metadata.
+On a mismatch the bytes are kept beside the file as `<name>.md5-mismatch` and the error names that path: `checksum mismatch for <name>: expected X, got Y; kept the download at <path>`. Nothing is left as `.part`, so the file is downloaded again from byte 0. Keeping the copy is what makes the next step possible: comparing it against a second download, or against the source, tells a corrupt transfer from a bad source file or wrong metadata.
 
 If the second download has the same wrong md5, the transfer is not corrupting anything and the source file or its metadata is wrong. The file then fails for good with `checksum mismatch for <name> twice in a row (expected X, got Y): the source file or its metadata is likely wrong; kept the download at <path>` (in `--json` output the error code is `download_failed` and this text is the message). A different wrong md5 means the transfer is corrupting data, and retrying continues up to `--retries`. Only one `.md5-mismatch` copy is kept per file: a new mismatch replaces it, and it is deleted once a later attempt verifies. A download that ends with a mismatch therefore needs room for two copies of the file while the retry runs.
 
