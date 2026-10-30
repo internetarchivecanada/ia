@@ -2888,14 +2888,39 @@ fn upload_rejects_min_speed() {
 // -- help states each rule once, on the flag it belongs to (Part 2, PR 2) --
 
 #[test]
-fn download_checksum_short_help_says_what_is_checked_without_it() {
-    ia().args(["download", "--help"])
+fn download_short_help_names_the_skip_check_and_no_verify() {
+    ia().args(["download", "-h"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Verify md5 checksums (without it the md5 is never checked)",
+            "Skip a local file only when its md5 matches (reads every local file)",
         ))
-        .stdout(predicate::str::contains("slower, reads every local file").not());
+        .stdout(predicate::str::contains(
+            "Don't check the md5 of downloaded files",
+        ))
+        .stdout(predicate::str::contains("the md5 is never checked").not());
+}
+
+/// -C is the skip check only; verification is on by default and its rules
+/// live on --no-verify (#13).
+#[test]
+fn download_help_splits_the_skip_check_from_verification() {
+    let out = ia().args(["download", "--help"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("It does not change whether downloaded files are verified (see --no-verify)"),
+        "{text}"
+    );
+    assert!(
+        flat.contains("and its md5 too when the metadata has one, unless --no-verify is given"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("twice in a row").count(),
+        1,
+        "the mismatch rules belong on --no-verify alone:\n{text}"
+    );
 }
 
 #[test]

@@ -33,7 +33,8 @@ use crate::output::DownloadDisplay;
         or specific files when file names are given. Supports batch downloads via search queries, \
         item lists, or piped identifiers from stdin.\n\n\
         Each file streams to <name>.part and is renamed into place once its byte count matches \
-        the item metadata (its md5 too with --checksum). A dropped connection, or a stream slower \
+        the item metadata, and its md5 too when the metadata has one, unless --no-verify is \
+        given. A dropped connection, or a stream slower \
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
         starts over.",
@@ -48,6 +49,7 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
          \n\n  <dim># Ride out a flaky link: 20 retries per file</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
+         \n\n  <dim># Accept downloads on size alone (no md5 check)</dim>\n  <bold>$ ia download nasa --no-verify</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
 )]
@@ -94,13 +96,24 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_directories: bool,
 
-    /// Verify md5 checksums (without it the md5 is never checked)
+    /// Skip a local file only when its md5 matches (reads every local file)
     ///
-    /// Before downloading, a local file whose md5 matches the item metadata
-    /// is skipped; this reads every local file, so it is slower. While
-    /// downloading, the md5 is computed from the stream
-    /// and compared when the stream ends. On a mismatch the bytes are kept
-    /// beside the file as <name>.md5-mismatch and the error names that
+    /// Without it, a local file is skipped when its size and mtime match
+    /// the item metadata. With it, a local file is skipped only when its
+    /// md5 matches the item metadata; this reads every local file in full,
+    /// so it is slower. It does not change whether downloaded files are
+    /// verified (see --no-verify).
+    #[arg(short = 'C', long)]
+    checksum: bool,
+
+    /// Don't check the md5 of downloaded files
+    ///
+    /// By default the md5 of each download is computed from the stream and
+    /// compared with the item metadata before the file is renamed into
+    /// place; a resumed download first reads the bytes already in its .part.
+    /// Files with no md5 in the metadata (or an empty one), and the item's own
+    /// <identifier>_files.xml, are not checked. On a mismatch the bytes are
+    /// kept beside the file as <name>.md5-mismatch and the error names that
     /// path, so a corrupt transfer can be told from a bad source file or
     /// wrong metadata; nothing is left as .part, and the file is downloaded
     /// again from byte 0. If the second download has the same wrong md5,
@@ -108,9 +121,10 @@ pub struct DownloadArgs {
     /// with "checksum mismatch ... twice in a row". A different wrong md5
     /// means the transfer is corrupting data and retrying continues up to
     /// --retries. Only one .md5-mismatch copy is kept per file, and it is
-    /// deleted once a later attempt verifies.
-    #[arg(short = 'C', long)]
-    checksum: bool,
+    /// deleted once a later attempt verifies. With --no-verify a download
+    /// is accepted on its size alone.
+    #[arg(long)]
+    no_verify: bool,
 
     /// Max retries per file (also the number of stalls allowed, see --min-speed)
     ///
@@ -456,6 +470,7 @@ pub async fn run(
         o.destdir = destdir;
         o.no_directories = args.no_directories;
         o.checksum = args.checksum;
+        o.verify = !args.no_verify;
         o.retries = args.retries;
         o.no_timestamps = args.no_timestamps;
         o.dry_run = args.dry_run;
