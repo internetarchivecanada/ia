@@ -293,3 +293,164 @@ async fn batch_upload_dry_run() {
     assert_eq!(results.len(), 1);
     assert!(matches!(results[0].status, UploadStatus::DryRun));
 }
+
+/// Upload `records` against a fresh wiremock server that accepts every PUT,
+/// and return the one PUT's path and its `x-archive-meta*` headers.
+async fn single_put(
+    records: Vec<(String, HashMap<String, String>)>,
+    cli_metadata: &[(&str, &str)],
+) -> (String, Vec<(String, String)>) {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = test_client(&server);
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o.metadata = pairs(cli_metadata);
+        o
+    };
+    upload::upload_batch(&client, records, &opts, 1, None, None, None)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let put = requests
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("one PUT");
+    let headers = put
+        .headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("x-archive-meta"))
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    (put.url.path().to_string(), headers)
+}
+
+/// The `x-archive-meta*` headers for one field, sorted by header name (that
+/// is, by the two-digit index), as `(header, value)`.
+fn field_headers(headers: &[(String, String)], field: &str) -> Vec<(String, String)> {
+    let suffix = format!("-{field}");
+    let mut out: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| name.ends_with(&suffix))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// A record for `item-1` with a real file `a.txt`, `mediatype` and
+/// `collection`, plus `extra` columns as a reader produces them.
+fn row_with(dir: &TempDir, extra: &[(&str, &str)]) -> (String, HashMap<String, String>) {
+    let f = dir.path().join("a.txt");
+    fs::write(&f, "content").unwrap();
+    let (id, mut fields) = record("item-1", f.to_str().unwrap(), "texts", "test_collection");
+    for (k, v) in extra {
+        fields.insert((*k).into(), (*v).into());
+    }
+    (id, fields)
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn indexed_columns_reach_ia_as_one_header_each_in_index_order() {
+    // #97: subject[0]/subject[1] used to collapse into one header.
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(&dir, &[("subject[0]", "alpha"), ("subject[1]", "beta")]);
+    let (_, headers) = single_put(vec![rec], &[]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[
+            ("x-archive-meta00-subject", "alpha"),
+            ("x-archive-meta01-subject", "beta"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_row_field_replaces_the_command_line_values_for_that_field() {
+    // As in the Python client: the row's values for a field replace the -m
+    // values for it; -m fields the row does not name are kept.
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(&dir, &[("subject[0]", "alpha"), ("subject[1]", "beta")]);
+    let (_, headers) = single_put(
+        vec![rec],
+        &[
+            ("subject", "from-cli"),
+            ("subject", "also-from-cli"),
+            ("creator", "cli-creator"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[
+            ("x-archive-meta00-subject", "alpha"),
+            ("x-archive-meta01-subject", "beta"),
+        ])
+    );
+    assert_eq!(
+        field_headers(&headers, "creator"),
+        pairs(&[("x-archive-meta00-creator", "cli-creator")])
+    );
+}
+
+#[tokio::test]
+async fn indexed_columns_are_ordered_by_numeric_index_not_column_order() {
+    // Column order [2], [10], [0]; string order would put [10] before [2].
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, "content").unwrap();
+    let csv = dir.path().join("batch.csv");
+    fs::write(
+        &csv,
+        format!(
+            "identifier,file,mediatype,collection,subject[2],subject[10],subject[0]\n\
+             item-1,{},texts,test_collection,two,ten,zero\n",
+            f.display()
+        ),
+    )
+    .unwrap();
+    let records = ia_core::spreadsheet::read_spreadsheet(&csv).unwrap();
+    let (_, headers) = single_put(records, &[]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[
+            ("x-archive-meta00-subject", "zero"),
+            ("x-archive-meta01-subject", "two"),
+            ("x-archive-meta02-subject", "ten"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_bare_column_comes_before_the_indexed_columns_of_the_same_field() {
+    // The #65 rule for -m: `subject:a` then `subject[0]:b` keeps both, bare first.
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(&dir, &[("subject[0]", "indexed"), ("subject", "bare")]);
+    let (_, headers) = single_put(vec![rec], &[]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[
+            ("x-archive-meta00-subject", "bare"),
+            ("x-archive-meta01-subject", "indexed"),
+        ])
+    );
+}

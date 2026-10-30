@@ -286,7 +286,7 @@ pub struct ImportArgs {
     #[arg()]
     pub spreadsheet: PathBuf,
 
-    /// Set metadata field (repeatable, KEY:VALUE) — merged with spreadsheet data
+    /// Set metadata field (repeatable, KEY:VALUE); a field a spreadsheet row fills in replaces it for that item
     #[arg(short = 'm', long = "metadata")]
     pub metadata: Vec<String>,
 

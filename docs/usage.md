@@ -619,7 +619,11 @@ ia upload cleanup my-item big.iso --abort
 
 **`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
-Required columns: `identifier`, `file`. All other columns become metadata.
+Required columns: `identifier`, `file`. All other columns become metadata. When several rows share an identifier, the first row's metadata is used.
+
+A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each value is sent as its own header, in ascending numeric index (`subject[2]` before `subject[10]`), whatever the column order. A bare `subject` column in the same row is kept and comes first.
+
+`-m` values apply to every item. A field the row fills in (bare or indexed) replaces every `-m` value for that field, as in the Python client; `-m` fields the row leaves empty are sent as given. With `-m mediatype:texts` and a row whose `mediatype` is `audio`, that item is `audio`.
 
 Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
