@@ -6,6 +6,7 @@
 //!   parallel-transfer-probe upload <512MiB-file> <results.jsonl>
 //!   parallel-transfer-probe download <scratch-dir> <results.jsonl>
 //!   parallel-transfer-probe cleanup <results.jsonl>
+//!   parallel-transfer-probe single-h1 <bytes> <results.jsonl>
 
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
@@ -142,7 +143,8 @@ async fn main() -> Result<()> {
             let client = s3_client(&keys)?;
             cleanup(&client, &keys, &Log::open(Path::new(&args[2]))?).await
         }
-        _ => bail!("usage: upload <file> <log> | download <dir> <log> | cleanup <log>"),
+        Some("single-h1") if args.len() == 4 => single_h1(&keys, args[2].parse()?, &Log::open(Path::new(&args[3]))?).await,
+        _ => bail!("usage: upload <file> <log> | download <dir> <log> | cleanup <log> | single-h1 <bytes> <log>"),
     }
 }
 
@@ -527,6 +529,35 @@ async fn download(keys: &Keys, dir: &Path, log: &Log) -> Result<()> {
         "downloaded {} bytes in total",
         received.load(Ordering::SeqCst)
     );
+    Ok(())
+}
+
+/// Follow-up run added after review: one HTTP/1.1 stream through the
+/// `/download/` redirect for the first `bytes` of the file, so the
+/// single-stream baseline can be compared on the same transport as the
+/// parallel runs.
+async fn single_h1(keys: &Keys, bytes: u64, log: &Log) -> Result<()> {
+    ensure!(bytes <= 1024 * MIB, "follow-up limited to 1 GiB");
+    let url = format!("https://archive.org/download/{DL_ITEM}/{DL_FILE}?cnt=0");
+    let out = Arc::new(tempfile_in_memory()?);
+    let counter = Arc::new(AtomicU64::new(0));
+    let rec = fetch_range(
+        dl_client(keys, true)?,
+        keys.clone(),
+        url,
+        0,
+        bytes - 1,
+        out,
+        true,
+        Instant::now(),
+        counter,
+    )
+    .await;
+    println!(
+        "single-h1: {} MB/s, bytes {}, hops {}, errors {}",
+        rec["mbps"], rec["bytes"], rec["hops"], rec["errors"]
+    );
+    log.write(json!({"event": "followup_single_h1", "rec": rec}));
     Ok(())
 }
 

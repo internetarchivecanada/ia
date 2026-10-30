@@ -117,6 +117,8 @@ From `ia-core/src/upload/multipart.rs` and `ia-core/src/download/mod.rs`:
   bytes, duration, MB/s. Per run: wall time, MB/s, md5 match.
 - Budget: the probe refuses to start a request that would take the
   session total over 20 GiB.
+  (As built, the check runs once before each full-file run, not before
+  each request; the datanode checks are not checked. See Results.)
 
 ### Environment and pacing
 
@@ -153,7 +155,8 @@ MB/s is 10^6 bytes per second throughout.
   serial upload to IA (4.19 MB/s) exceeded it, so the practical uplink
   is about 4 MB/s.
 - Upload runs: 2026-10-30 19:20:22 to 19:59:43 UTC. Download runs:
-  20:00:02 to 20:46:51 UTC. The two never overlapped; runs were 30 s apart.
+  20:00:02 to 20:46:51 UTC, and one follow-up request 20:57:10 to
+  21:00:48 UTC. The two never overlapped; runs were 30 s apart.
 - Probe built with reqwest 0.13.5 (rustls), Rust 1.95.
 
 ### Upload (#22)
@@ -175,16 +178,20 @@ Per-connection rate is the run's MB/s divided by its concurrency.
 | 100 MiB | 1 | 8 | 128.0 | 4.19 | 4.19 | 22.3 | 1.35 |
 | 100 MiB | 4 | 9 | 132.2 | 4.06 | 1.02 | 96.1 | 3.08 |
 
-Mean of the two repeats, against serial at the same part size:
+Mean of the two repeats (100 MiB rows: one run each), against serial at the same part size:
 
 | Part size | Concurrency | Mean MB/s | Speed-up |
 |---|---|---|---|
-| 16 MiB | 1 | 2.21 | 1.00 |
+| 16 MiB | 1 | 2.20 | 1.00 |
 | 16 MiB | 2 | 3.00 | 1.36 |
-| 16 MiB | 4 | 2.90 | 1.32 |
+| 16 MiB | 4 | 2.90 | 1.31 |
 | 16 MiB | 8 | 2.33 | 1.05 |
 | 100 MiB | 1 | 4.19 | 1.00 |
 | 100 MiB | 4 | 4.06 | 0.97 |
+
+Medians in these tables are recomputed from the per-part records (the
+mean of the two middle values for an even count); the probe's own logged
+`median_*` fields take the upper middle value and differ for runs 4 and 9.
 
 "Answer wait" is the time from the probe handing the last body slice to
 the connection until the response arrived. It includes draining the
@@ -231,15 +238,26 @@ other runs HTTP/1.1. Time to the first byte, including the `/download/`
 redirect, ranged from 343 ms to 6,240 ms; the slowest were the two
 requests of run 7 (6.0 and 6.2 s).
 
-Totals: 34 requests through `/download/` in 9 runs, 4 direct datanode
-requests, 20,010,139,648 bytes received (18.64 GiB), no stream error, no
-retry.
+Totals for the planned runs: 34 requests through `/download/` in 9 runs,
+4 direct datanode requests, 20,010,139,648 bytes received (18.64 GiB), no
+stream error, no retry.
+
+Follow-up run, added after review. The single-stream baseline above ran
+over HTTP/2 and the parallel runs over HTTP/1.1, so one more request was
+made to compare on the same transport: the first 1 GiB
+(1,073,741,824 bytes) through `/download/` on one HTTP/1.1 connection
+(`single-h1` in the probe), 20:57:10 to 21:00:48 UTC. It was redirected to
+`ia800807`, answered 206, and ran at 4.93 MB/s with no error, in line with
+the HTTP/2 single streams (5.67 and 4.74 MB/s). Session total received,
+with this run: 21,083,881,472 bytes (19.64 GiB).
 
 ### Datanodes (#15)
 
 All 34 `/download/` requests were redirected to `ia800807.us.archive.org`,
-the item's `d2` and its `server` field. Direct Range requests for the
-first 64 MiB, with the `LOW` authorization header, on this public file:
+the item's `d2` (and, in the item metadata read before the runs, its
+`server` field). Direct Range requests for the first 64 MiB, each on one
+HTTP/1.1 connection, with the `LOW` authorization header, on this public
+file:
 
 | When | Node | Status | MB/s |
 |---|---|---|---|
@@ -255,14 +273,16 @@ two checks, one sample each.
 
 - IA-S3: no 503, no `SlowDown`, no `Retry-After` and no S3 error code on
   any of the 268 part PUTs, at up to 8 concurrent parts. The 10 initiates
-  were answered 200 and the 10 aborts 204. `check_limit` before the run
-  reported `over_limit: 0`.
+  were answered 200 and the 10 aborts 204. An unauthenticated `check_limit`
+  call for the item before the runs (terminal output, not in the
+  records) reported `over_limit: 0`.
 - Datanode: no error status, no `Retry-After`, no stream reset across
   9 runs with up to 8 concurrent connections from one client.
 - The answer to a part PUT took longer as concurrency rose (median wait
   1.4 to 2.5 s serial, 2.1 to 3.8 s at 4 concurrent parts, 4.1 to 6.0 s at 8). With the
   local socket-buffer caveat above, that is consistent with the
-  concurrent parts sharing one uplink rather than with IA-side throttling.
+  concurrent parts sharing one uplink; the probe cannot distinguish this
+  from queuing on IA's side.
 
 ### Test item end state
 
@@ -280,13 +300,15 @@ No multipart upload was completed.
 Do not build it. On this client, with an uplink near 4 MB/s, one stream
 at the default 100 MiB part size reached 4.19 MB/s and four concurrent
 100 MiB parts reached 4.06 MB/s: no gain. Concurrency helped only at
-16 MiB parts (1.36× at two, 1.32× at four, 1.05× at eight), by
-overlapping the wait for IA's answer after each part, and even the best
+16 MiB parts (1.36× at two, 1.31× at four, 1.05× at eight), consistent
+with overlapping the wait for IA's answer after each part, and even the best
 16 MiB run (3.16 MB/s) stayed below the serial 100 MiB run, so the
 existing large default part size already recovers more than parallelism
-does. IA-S3 accepted all 268 part PUTs on the first attempt with no 503
-`SlowDown` or `Retry-After` at up to eight concurrent parts, so throttling
-is not the obstacle; the uplink is. The probe cannot show the case the
+does. IA-S3 accepted all 268 part PUTs on the first attempt and sent no 503
+`SlowDown`, `Retry-After` or other throttling response at up to eight
+concurrent parts; the serial 100 MiB run reached about the uplink rate,
+and more concurrency did not raise total throughput and at eight
+lowered it. The probe cannot show the case the
 issue was opened for, a client whose single stream falls well short of
 its uplink (a fast link over a long path), so the issue can be closed
 under its own "if it doesn't pay off" criterion and reopened only with a
@@ -294,31 +316,39 @@ measurement from such a client; if it is ever built, the default stays 1.
 
 ### #16, parallel Range requests within one file
 
-Build it, with each Range request on its own HTTP/1.1 connection, a
-default of 4 streams per file and a ceiling of 8. For a 2.04 GiB file on
-a 259.5 Mbit/s downlink, one stream averaged 5.21 MB/s, while separate
+Build it, with the Range requests on separate connections, a default of
+4 streams per file and a ceiling of 8. For a 2.04 GiB file on a
+259.5 Mbit/s downlink, one stream averaged 5.21 MB/s over HTTP/2 and
+4.93 MB/s over HTTP/1.1 (the follow-up run, first 1 GiB), while separate
 HTTP/1.1 connections averaged 8.71 MB/s at 2 streams (1.67×), 12.55 MB/s
 at 4 (2.41×) and 18.24 MB/s at 8 (3.50×), every md5 correct and no error
-or throttling response from the datanode. Per-stream rate fell only from
-5.2 to 2.4 MB/s as streams were added, and the same datanode served
-19.2 MB/s to eight connections, so the single-stream rate is a
-per-connection limit, not the datanode's or the local link's. Four
-streams multiplexed over one HTTP/2 connection gave 4.71 MB/s, no better
-than one stream; `ia-core`'s clients negotiate HTTP/2 with the
-datanodes, so an implementation that sends concurrent ranges through the
-existing client would gain nothing, and the range requests need an
-HTTP/1.1-only client. The default is 4 rather than 8 to keep one
-client's load on one datanode at four connections until IA ops state
-what they accept; 8 measured faster and drew no throttling here.
+or throttling response from the datanode. Per-stream rate fell from 5.2
+to 2.4 MB/s as streams were added, while the same datanode served
+19.2 MB/s in total to eight connections, so the limit on one full-file
+stream is neither the datanode's total capacity nor the local link;
+short single-connection requests ran faster (8.4 to 18.2 MB/s for
+64 MiB), so its cause (per-connection window, transfer length, or load
+at the time) is not determined. Four ranges multiplexed on one HTTP/2
+connection with reqwest's default settings gave 4.71 MB/s, no gain;
+`ia-core`'s clients negotiate HTTP/2 with the datanodes, so the ranges
+need separate connections (HTTP/1.1 was the transport tested; separate
+HTTP/2 connections and tuned HTTP/2 windows were not). The default is 4
+rather than 8 to keep one client's load on one datanode at four
+connections until IA ops state what they accept; 8 measured faster and
+drew no throttling here.
 
 ## What the probe could not determine
 
+- Why one full-file stream runs at about 5 MB/s when short requests to
+  the same node ran faster (see the #16 recommendation).
+
 - Results for other locations, networks or times of day. All runs came
-  from one Wi-Fi client in one 87-minute window; repeats of the same setting
+  from one Wi-Fi client between 19:20 and 21:01 UTC; repeats of the same setting
   differed by up to 16% of the faster run (download single stream 5.67
   versus 4.74 MB/s; upload 16 MiB ×4 3.16 versus 2.64 MB/s).
 - Parallel uploads from a client whose single stream does not fill its
-  uplink. Here one 100 MiB-part stream already reached the uplink.
+  uplink. Here one 100 MiB-part stream already exceeded the `networkQuality`
+  uplink figure.
 - IA's own latency per part. The answer wait includes the local socket
   buffer draining, and the probe has no view of the wire.
 - Behavior at more than 8 streams or parts, or with `-j` files multiplied
