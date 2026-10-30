@@ -62,6 +62,7 @@ pub struct JsonErrorBody {
 ///         IaError::SpamDetected { .. } => (),
 ///         IaError::CollectionNotFound { .. } => (),
 ///         IaError::InvalidIdentifier { .. } => (),
+///         IaError::InvalidKey { .. } => (),
 ///         IaError::InvalidArgument(_) => (),
 ///         IaError::Csv(_) => (),
 ///         IaError::MissingRequiredMetadata { .. } => (),
@@ -118,6 +119,7 @@ pub struct JsonErrorBody {
 ///         IaError::SpamDetected { .. } => (),
 ///         IaError::CollectionNotFound { .. } => (),
 ///         IaError::InvalidIdentifier { .. } => (),
+///         IaError::InvalidKey { .. } => (),
 ///         IaError::InvalidArgument(_) => (),
 ///         IaError::Csv(_) => (),
 ///         IaError::MissingRequiredMetadata { .. } => (),
@@ -334,6 +336,15 @@ pub enum IaError {
     #[error("invalid identifier '{identifier}': {reason}")]
     InvalidIdentifier { identifier: String, reason: String },
 
+    /// A remote file name that does not name a file inside the item: it is
+    /// empty, starts with `/`, or has a `.`, `..` or empty segment. Refused
+    /// before any request is sent (see `upload::validate_key`).
+    #[error(
+        "invalid remote file name '{key}': {reason}; a remote name is a path inside the item, \
+         with no leading '/' and no '.', '..' or empty segments"
+    )]
+    InvalidKey { key: String, reason: String },
+
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
@@ -536,6 +547,7 @@ impl IaError {
             IaError::SpamDetected { .. } => false, // permanent
             IaError::CollectionNotFound { .. } => false,
             IaError::InvalidIdentifier { .. } => false,
+            IaError::InvalidKey { .. } => false,
             IaError::InvalidArgument(_) => false,
             IaError::Csv(_) => false,
             IaError::MissingRequiredMetadata { .. } => false,
@@ -787,6 +799,11 @@ impl IaError {
                 extra.insert("identifier".into(), identifier.clone().into());
                 extra.insert("reason".into(), reason.clone().into());
                 "invalid_identifier"
+            }
+            IaError::InvalidKey { key, reason } => {
+                extra.insert("key".into(), key.clone().into());
+                extra.insert("reason".into(), reason.clone().into());
+                "invalid_key"
             }
             IaError::InvalidArgument(_) => "invalid_argument",
             IaError::Csv(_) => "csv_error",

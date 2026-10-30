@@ -1,8 +1,9 @@
 //! Integration tests for multi-file item upload (`upload_item`).
 
 use ia_core::upload::{self, UploadOpts, UploadStatus};
-use ia_core::{IaClient, IaConfig};
+use ia_core::{IaClient, IaConfig, IaError};
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1101,4 +1102,376 @@ async fn a_multipart_run_lists_once_per_file_not_also_per_item() {
         "{results:?}"
     );
     server.verify().await;
+}
+
+// -- Remote keys stay inside the item (#96) --
+
+/// Options for the key tests: no verification, no collection check.
+fn key_test_opts() -> UploadOpts {
+    let mut o = UploadOpts::default();
+    o.verify = false;
+    o.no_collection_check = true;
+    o
+}
+
+/// Accept any PUT, `times` times.
+async fn mount_any_put(server: &MockServer, times: u64) {
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+/// The path of every PUT the server received, after the checks that each
+/// stays inside `identifier`: it starts with `/<identifier>/` and has no
+/// empty segment.
+async fn put_paths_inside(server: &MockServer, identifier: &str) -> Vec<String> {
+    let prefix = format!("/{identifier}/");
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .map(|r| r.url.path().to_string())
+        .collect();
+    for p in &paths {
+        assert!(p.starts_with(&prefix), "PUT left the item: {p}");
+        assert!(
+            !p[1..].split('/').any(str::is_empty),
+            "PUT has an empty segment: {p}"
+        );
+    }
+    paths
+}
+
+#[tokio::test]
+async fn keep_directories_with_a_dotdot_argument_stays_in_the_item() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 1).await;
+
+    // Integration tests run in the package directory, so a directory made in
+    // its parent (the workspace root) is reachable as `../<name>`.
+    let dir = tempfile::Builder::new()
+        .prefix("upload-keys-")
+        .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
+        .unwrap();
+    let name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let scans = dir.path().join("scans");
+    fs::create_dir(&scans).unwrap();
+    fs::write(scans.join("a.bin"), "a").unwrap();
+    let arg = PathBuf::from(format!("../{name}/scans"));
+
+    let mut opts = key_test_opts();
+    opts.keep_directories = true;
+    let results = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &[arg],
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results[0].key, "scans/a.bin");
+    assert_eq!(
+        put_paths_inside(&server, "test-item").await,
+        ["/test-item/scans/a.bin"]
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn keep_directories_with_an_absolute_argument_stays_in_the_item() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 1).await;
+
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("scans").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("a.bin"), "a").unwrap();
+
+    let mut opts = key_test_opts();
+    opts.keep_directories = true;
+    let results = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &[dir.path().join("scans")],
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results[0].key, "scans/sub/a.bin");
+    assert_eq!(
+        put_paths_inside(&server, "test-item").await,
+        ["/test-item/scans/sub/a.bin"]
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn keep_directories_with_a_relative_argument_keeps_its_path() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 1).await;
+
+    // Integration tests run in the package directory, so a directory made
+    // there is reachable by a plain relative path.
+    let dir = tempfile::Builder::new()
+        .prefix("upload-keys-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .unwrap();
+    let name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let sub = dir.path().join("scans").join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("a.bin"), "a").unwrap();
+    let arg = PathBuf::from(format!("./{name}/scans"));
+
+    let mut opts = key_test_opts();
+    opts.keep_directories = true;
+    let results = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &[arg],
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results[0].key, format!("{name}/scans/sub/a.bin"));
+    assert_eq!(
+        put_paths_inside(&server, "test-item").await,
+        [format!("/test-item/{name}/scans/sub/a.bin")]
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn a_remote_name_that_leaves_the_item_is_refused_before_any_request() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 0).await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.bin");
+    fs::write(&f, "a").unwrap();
+
+    // With the collection check on: the key is refused before it is sent.
+    let mut opts = key_test_opts();
+    opts.no_collection_check = false;
+    opts.metadata = vec![
+        ("mediatype".into(), "texts".into()),
+        ("collection".into(), "test_collection".into()),
+    ];
+    opts.remote_name = Some("../other-item/a.bin".into());
+    let err = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &[f],
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// `upload_file` is public and takes its key from the caller, so the check
+/// in the URL builder must refuse a bad key there too.
+#[tokio::test]
+async fn upload_file_refuses_a_key_that_leaves_the_item() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 0).await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.bin");
+    fs::write(&f, "a").unwrap();
+
+    let err = upload::upload_file(
+        &test_client(&server),
+        "test-item",
+        &f,
+        "../other-item/a.bin",
+        &key_test_opts(),
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+    // The skip check may read the item's metadata first; no PUT is sent.
+    assert!(put_paths_inside(&server, "test-item").await.is_empty());
+}
+
+/// The multipart requests build their URLs the same way, so a bad key is
+/// refused there too, and no request names it.
+#[tokio::test]
+async fn a_multipart_upload_refuses_a_key_that_leaves_the_item() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 0).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // The resume check lists the item's uploads first; that names no key.
+    mount_empty_resume_listing(&server).await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.bin");
+    fs::write(&f, "a").unwrap();
+
+    let mut opts = key_test_opts();
+    opts.multipart = true;
+    let err = upload::upload_file(
+        &test_client(&server),
+        "test-item",
+        &f,
+        "../other-item/a.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("a.bin")),
+        "a request named the key: {:?}",
+        requests
+            .iter()
+            .map(|r| r.url.to_string())
+            .collect::<Vec<_>>()
+    );
+    server.verify().await;
+}
+
+#[test]
+fn invalid_key_has_its_own_json_code() {
+    let err = IaError::InvalidKey {
+        key: "../a.bin".into(),
+        reason: "it has a '..' segment".into(),
+    };
+    assert!(!err.is_retryable());
+    let json = serde_json::to_value(err.to_json_error()).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_key");
+    assert_eq!(json["error"]["key"], "../a.bin");
+    assert_eq!(json["error"]["reason"], "it has a '..' segment");
+}
+
+#[test]
+fn validate_key_refuses_keys_that_do_not_name_a_file_in_the_item() {
+    let refused = [
+        ("", "it is empty"),
+        ("/a.bin", "it starts with '/'"),
+        ("/data/scans/a.bin", "it starts with '/'"),
+        ("..", "it has a '..' segment"),
+        ("../scans/a.bin", "it has a '..' segment"),
+        ("scans/../../a.bin", "it has a '..' segment"),
+        (".", "it has a '.' segment"),
+        ("./a.bin", "it has a '.' segment"),
+        ("scans/./a.bin", "it has a '.' segment"),
+        ("scans//a.bin", "it has an empty segment"),
+        ("scans/", "it has an empty segment"),
+    ];
+    for (key, reason) in refused {
+        let err = upload::validate_key(key).unwrap_err();
+        assert!(matches!(err, IaError::InvalidKey { .. }), "{key}: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("'{key}'")), "{key}: {msg}");
+        assert!(msg.contains(reason), "{key}: {msg}");
+        assert!(
+            msg.contains("a remote name is a path inside the item"),
+            "{key}: {msg}"
+        );
+    }
+
+    for key in [
+        "a.bin",
+        "scans/sub/a.bin",
+        ".hidden",
+        "...",
+        "a..b/c.bin",
+        "my file.pdf",
+    ] {
+        assert!(upload::validate_key(key).is_ok(), "{key}");
+    }
+}
+
+// -- --remote-dir with surrounding slashes (#100) --
+
+#[tokio::test]
+async fn remote_dir_with_surrounding_slashes_gives_one_separator() {
+    for remote_dir in ["scans/", "/scans/", "scans"] {
+        let server = MockServer::start().await;
+        mount_any_put(&server, 1).await;
+
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("a.bin");
+        fs::write(&f, "a").unwrap();
+
+        let mut opts = key_test_opts();
+        opts.remote_dir = Some(remote_dir.into());
+        let results = upload::upload_item(
+            &test_client(&server),
+            "test-item",
+            &[f],
+            &opts,
+            None,
+            None,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results[0].key, "scans/a.bin", "--remote-dir {remote_dir}");
+        assert_eq!(
+            put_paths_inside(&server, "test-item").await,
+            ["/test-item/scans/a.bin"],
+            "--remote-dir {remote_dir}"
+        );
+        server.verify().await;
+    }
 }
