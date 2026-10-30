@@ -33,7 +33,8 @@ use crate::output::DownloadDisplay;
         or specific files when file names are given. Supports batch downloads via search queries, \
         item lists, or piped identifiers from stdin.\n\n\
         Each file streams to <name>.part and is renamed into place once its byte count matches \
-        the item metadata, and its md5 too unless --no-verify is given. A dropped connection, or a stream slower \
+        the item metadata, and its md5 too when the metadata has one, unless --no-verify is \
+        given. A dropped connection, or a stream slower \
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
         starts over.",
@@ -110,7 +111,7 @@ pub struct DownloadArgs {
     /// By default the md5 of each download is computed from the stream and
     /// compared with the item metadata before the file is renamed into
     /// place; a resumed download first reads the bytes already in its .part.
-    /// Files with no md5 in the metadata, and the item's own
+    /// Files with no md5 in the metadata (or an empty one), and the item's own
     /// <identifier>_files.xml, are not checked. On a mismatch the bytes are
     /// kept beside the file as <name>.md5-mismatch and the error names that
     /// path, so a corrupt transfer can be told from a bad source file or

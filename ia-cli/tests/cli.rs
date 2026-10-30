@@ -2851,7 +2851,7 @@ fn upload_rejects_min_speed() {
 // -- help states each rule once, on the flag it belongs to (Part 2, PR 2) --
 
 #[test]
-fn download_checksum_short_help_says_what_is_checked_without_it() {
+fn download_short_help_names_the_skip_check_and_no_verify() {
     ia().args(["download", "-h"])
         .assert()
         .success()
@@ -2876,7 +2876,7 @@ fn download_help_splits_the_skip_check_from_verification() {
         "{text}"
     );
     assert!(
-        flat.contains("and its md5 too unless --no-verify is given"),
+        flat.contains("and its md5 too when the metadata has one, unless --no-verify is given"),
         "{text}"
     );
     assert_eq!(

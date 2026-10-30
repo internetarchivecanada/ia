@@ -23,7 +23,12 @@ this file becomes `docs/releases/<version>.md`.
 - **`-C`/`--checksum` on `ia download` is only the skip check.** It still
   skips a local file when its md5 matches the item metadata (reading
   every local file); it no longer controls verification of downloads.
-  `-C --no-verify` gives the md5 skip check without verification.
+  `-C --no-verify` gives the md5 skip check without verification. Two
+  failures `-C` used to produce are gone: a file whose metadata md5 is
+  empty no longer fails with a checksum mismatch, and
+  `<identifier>_files.xml` no longer fails twice and ends with "the
+  source file or its metadata is likely wrong"; both complete on the
+  size check.
 - `ia-core`: `DownloadOpts` gains `verify: bool` (default `true`).
   `DownloadOpts.checksum` now means only the md5 skip check. A consumer
   that set `checksum = true` keeps both behaviors; one that left it

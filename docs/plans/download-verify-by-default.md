@@ -56,7 +56,7 @@ For #16 (parallel `Range` downloads, parked): parts arrive out of order, so a ro
 - [x] Green: `DownloadOpts.verify` (default `true`); `checksum` documented as the skip check only; one function decides whether a file is verified (`verify` on, not `_files.xml`, md5 present and non-empty, debug log otherwise), used at both places the md5 state is created; `--no-verify` on `ia download`; `-C` help rewritten.
 - [x] Docs: `ia download` `long_about` and flag help, `docs/usage.md` (option table, "After an interruption", 416 paragraph, stall paragraph, a new "Verification" section before "Checksum mismatches"), the `--help` examples, README feature row, `docs/releases/unreleased.md`.
 - [x] `cargo test` green. `cargo clippy --all-targets -- -D warnings` with the local rustc 1.95 reports 59 errors, the same count in the same files as on main before this change, none in lines this change adds; `cargo clippy -p ia-core -p ia-cli -- -D warnings` is clean.
-- [ ] Code-review pass on the full diff; findings fixed or recorded below; PR.
+- [x] Code-review pass on the full diff; findings fixed or recorded below; PR.
 
 ## Tests
 
@@ -76,3 +76,17 @@ Hermetic, wiremock (`ia-core/src/download/mod.rs` test module, and `ia-cli/tests
 12. CLI: `ia download` against a wiremock item whose md5 is wrong exits 1 by default and 0 with `--no-verify`; `--help` describes `--no-verify` and `-C` as above.
 
 The test helper `test_file_meta` carried the md5 of the empty file as a placeholder; with verification on by default every test serving a non-empty body would have failed on it, so it now carries no md5, and tests that verify use `test_file_meta_with_md5`. The CLI fixtures in `ia-cli/tests/download_search_list.rs` carry the real md5 of the body each one serves.
+
+## Review (2026-10-30), closed before the PR
+
+No correctness defect was found. Every path that creates the md5 state (fresh stream, resume, 416 shortcut) goes through `verifies`; the mid-stream re-request and the stall path carry the existing state forward; `finish_part` and the per-file retry loop are unchanged, so the mismatch rules are exactly those of #14. The zip-member path never took `DownloadOpts` and zip members carry no md5, so they were never verified and still are not. The TUI receives the same options the command builds.
+
+Taken:
+- Tests for verification off on the 416 shortcut and on a resume (no `Verifying` event; a wrong md5 or a wrong `.part` prefix does not stop the rename). Checked to fail when `verifies` ignores `verify`.
+- The `long_about` says the md5 is compared "when the metadata has one"; the `--no-verify` help names an empty md5 as well as a missing one; `docs/usage.md` matches.
+- The release notes say that two failures `-C` used to produce are gone: an empty metadata md5, and `_files.xml` failing twice.
+- The short-help test was renamed to say what it checks.
+
+Not changed:
+- Every verified download now sends a `Verifying` progress event just before the rename, so the progress display shows "verifying" briefly on each file. This is the event `finish_part` has always sent under `--checksum`; finishing an md5 that was computed during the stream takes microseconds.
+- `default_skip_check_does_not_read_local_files` also passes on the code before this change. It guards that the default skip check still does not read local files; it is not a red test.

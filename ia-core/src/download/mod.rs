@@ -5559,6 +5559,95 @@ mod tests {
         assert_eq!(mtime_secs(&dir.path().join("disk.img")), 1_500_000_000);
     }
 
+    /// --no-verify on the 416 shortcut: the `.part` is not read back (no
+    /// Verifying event) and a wrong md5 does not stop the rename.
+    #[tokio::test]
+    async fn range_not_satisfiable_at_part_length_without_verify_skips_hashing() {
+        let mock_server = MockServer::start().await;
+        let (client, dir) =
+            mount_resume_416(&mock_server, "disk.img", 32, Some("bytes */32")).await;
+        let file = test_file_meta_with_md5("disk.img", 32, WRONG_MD5);
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &no_verify_opts(),
+            Some(&*cb),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk.img")).unwrap(),
+            vec![b'A'; 32]
+        );
+        assert!(!dir.path().join("disk.img.md5-mismatch").exists());
+        let seen = events.lock().unwrap();
+        assert!(!seen.contains(&DownloadStatus::Verifying), "{seen:?}");
+    }
+
+    /// --no-verify on a resume: the `.part` prefix is not read back (no
+    /// Verifying event), so a wrong prefix is not noticed.
+    #[tokio::test]
+    async fn resumed_download_without_verify_does_not_read_the_part() {
+        let full = b"0123456789abcdef".to_vec();
+        let on_disk = 6;
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/b.txt"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "content-range",
+                        format!("bytes {on_disk}-{}/{}", full.len() - 1, full.len()).as_str(),
+                    )
+                    .set_body_bytes(full[on_disk..].to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt.part"), b"XXXXXX").unwrap();
+        let file = test_file_meta_with_md5("b.txt", full.len() as u64, &md5_hex(&full));
+        let events: Arc<std::sync::Mutex<Vec<DownloadStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(move |p| {
+            if let Ok(mut v) = captured.lock() {
+                v.push(p.status);
+            }
+        });
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &no_verify_opts(),
+            Some(&*cb),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        let mut expected = b"XXXXXX".to_vec();
+        expected.extend_from_slice(&full[on_disk..]);
+        assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), expected);
+        let seen = events.lock().unwrap();
+        assert!(!seen.contains(&DownloadStatus::Verifying), "{seen:?}");
+    }
+
     /// Every progress payload on the shortcut with verification and an md5:
     /// Starting at the resume offset, Verifying while the `.part` is hashed
     /// (from zero), Verifying again before the rename, Complete. No

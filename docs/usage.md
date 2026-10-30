@@ -59,7 +59,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 
 #### After an interruption
 
-Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and its md5 too unless `--no-verify` is given. `--joblog` adds a second layer on top: an item whose files a previous run all finished is skipped without a request (an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). A `.part` that is a symlink is removed and that file starts over; nothing is ever written through a link. The sections below give the rules in detail.
+Killing `ia download`, or losing the connection, leaves each unfinished file as `<name>.part`. The rerun continues from the bytes already on disk with a `Range` request; nothing is fetched twice. The finished file is renamed into place only when its size matches the item's metadata, and its md5 too when the metadata has one, unless `--no-verify` is given. `--joblog` adds a second layer on top: an item whose files a previous run all finished is skipped without a request (an item with any failed file is entered again in full, and its finished files are then skipped by the local size and mtime check). A `.part` that is a symlink is removed and that file starts over; nothing is ever written through a link. The sections below give the rules in detail.
 
 #### Retries
 
