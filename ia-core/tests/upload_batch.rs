@@ -441,17 +441,47 @@ async fn indexed_columns_are_ordered_by_numeric_index_not_column_order() {
 }
 
 #[tokio::test]
-async fn a_bare_column_comes_before_the_indexed_columns_of_the_same_field() {
-    // The #65 rule for -m: `subject:a` then `subject[0]:b` keeps both, bare first.
+async fn an_indexed_column_overwrites_the_bare_value_at_its_position() {
+    // The #65 rule (`apply_set`): the bare value is the list, and
+    // `subject[0]` overwrites position 0.
     let dir = TempDir::new().unwrap();
     let rec = row_with(&dir, &[("subject[0]", "indexed"), ("subject", "bare")]);
     let (_, headers) = single_put(vec![rec], &[]).await;
     assert_eq!(
         field_headers(&headers, "subject"),
+        pairs(&[("x-archive-meta00-subject", "indexed")])
+    );
+}
+
+#[tokio::test]
+async fn an_indexed_column_past_the_bare_value_is_appended() {
+    // The #65 rule: `subject:a` then `subject[1]:b` gives [a, b].
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(&dir, &[("subject[1]", "b"), ("subject", "a")]);
+    let (_, headers) = single_put(vec![rec], &[]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
         pairs(&[
-            ("x-archive-meta00-subject", "bare"),
-            ("x-archive-meta01-subject", "indexed"),
+            ("x-archive-meta00-subject", "a"),
+            ("x-archive-meta01-subject", "b"),
         ])
+    );
+}
+
+#[tokio::test]
+async fn two_columns_for_one_position_keep_the_later_in_column_name_order() {
+    // The #65 rule keeps the later value for a position named twice. The
+    // readers do not keep column order, so "later" is column-name order:
+    // "subject[00]" < "subject[0]".
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(
+        &dir,
+        &[("subject[0]", "zero"), ("subject[00]", "zero-zero")],
+    );
+    let (_, headers) = single_put(vec![rec], &[]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[("x-archive-meta00-subject", "zero")])
     );
 }
 

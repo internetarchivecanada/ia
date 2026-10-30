@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
-use crate::metadata::write::parse_indexed_key;
+use crate::metadata::write::apply_set;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
 use crate::upload::template::REMOTE_NAME_COLUMN;
@@ -178,7 +178,7 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
             .filter(|v| !v.is_empty())
             .last();
 
-        let metadata = row_metadata(fields);
+        let metadata = row_metadata(&identifier, fields)?;
 
         let group = map.entry(identifier.clone()).or_insert_with(|| ItemGroup {
             identifier,
@@ -201,39 +201,49 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
 
 /// Turn one row's metadata columns into `(field, value)` pairs.
 ///
-/// Per field, a bare column (`subject`) comes first, then the indexed
-/// columns (`subject[N]`) in ascending numeric index; two columns with the
-/// same index (`subject[0]`, `subject[00]`) are ordered by column name.
-/// This is the order `prepare_metadata` gives repeated `-m` arguments
-/// (#65). Fields come out in name order, so every run sends the same
-/// headers. The header encoder numbers repeated keys in list order, so the
-/// pairs become `x-archive-meta00-subject`, `x-archive-meta01-subject`, ...
-/// (#97). An empty value is no value, as the readers treat a blank cell:
-/// it neither sends an empty header nor replaces a `-m` value.
-fn row_metadata(fields: HashMap<String, String>) -> Vec<(String, String)> {
-    // field -> (index, column, value); a bare column has index None, which
-    // sorts before every Some.
-    let mut by_field: BTreeMap<String, Vec<(Option<usize>, String, String)>> = BTreeMap::new();
-    for (column, value) in fields.into_iter().filter(|(_, v)| !v.is_empty()) {
-        let (field, index) = match parse_indexed_key(&column) {
-            Some((name, index)) => (name, Some(index)),
-            None => (column.clone(), None),
-        };
-        by_field
-            .entry(field)
-            .or_default()
-            .push((index, column, value));
-    }
-
-    by_field
+/// The row is applied to an empty item with `apply_set`, the rule `ia
+/// metadata` gives repeated `-m` arguments (#65), so the same syntax means
+/// the same thing in both places. A bare column (`subject`) is the field's
+/// list; an indexed column (`subject[N]`) overwrites position N, or is
+/// appended when N is past the end, in index order. `subject=a` with
+/// `subject[1]=b` gives `[a, b]`; `subject=a` with `subject[0]=x` gives
+/// `[x]`. The readers do not keep column order, so the columns are applied
+/// in column-name order, and of two columns for one position the later in
+/// that order wins (`subject[0]` over `subject[00]`). The header encoder
+/// numbers repeated keys in list order, so the values become
+/// `x-archive-meta00-subject`, `x-archive-meta01-subject`, ... (#97).
+///
+/// An empty value is no value, as the readers treat a blank cell: it
+/// neither sends an empty header nor replaces a `-m` value.
+fn row_metadata(
+    identifier: &str,
+    fields: HashMap<String, String>,
+) -> Result<Vec<(String, String)>> {
+    let mut columns: Vec<(String, serde_json::Value)> = fields
         .into_iter()
-        .flat_map(|(field, mut columns)| {
-            columns.sort();
-            columns
-                .into_iter()
-                .map(move |(_, _, value)| (field.clone(), value))
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+    columns.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut item = serde_json::Map::new();
+    apply_set(&mut item, &columns, identifier)?;
+
+    // Every value put in is a string, so every value that comes out is a
+    // string or a list of strings.
+    Ok(item
+        .into_iter()
+        .flat_map(|(field, value)| {
+            let values = match value {
+                serde_json::Value::Array(items) => items,
+                other => vec![other],
+            };
+            values.into_iter().filter_map(move |v| match v {
+                serde_json::Value::String(s) => Some((field.clone(), s)),
+                _ => None,
+            })
         })
-        .collect()
+        .collect())
 }
 
 /// Validate all item groups upfront before uploading.
@@ -344,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn group_records_orders_values_bare_first_then_by_numeric_index() {
+    fn group_records_applies_the_set_rule_of_issue_65() {
         let records = vec![record(
             "item-1",
             "/tmp/a.txt",
@@ -365,10 +375,11 @@ mod tests {
             .collect();
         assert_eq!(
             values,
+            // The bare value is the list [bare]. Position 0 is overwritten,
+            // by "subject[00]" and then "subject[0]" (column-name order, the
+            // later wins); 2 and 10 are past the end and appended in index
+            // order.
             vec![
-                ("subject", "bare"),
-                // Same index: by column name, and "subject[00]" < "subject[0]".
-                ("subject", "zero-b"),
                 ("subject", "zero-a"),
                 ("subject", "two"),
                 ("subject", "ten"),

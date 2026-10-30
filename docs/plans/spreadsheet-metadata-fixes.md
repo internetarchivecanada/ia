@@ -16,17 +16,19 @@ loop.
 
 ### Rules
 
-1. **Per row, per field:** a bare column (`subject`) comes first, then the
-   indexed columns (`subject[N]`) in ascending numeric index. Two columns
-   that parse to the same index (`subject[0]`, `subject[00]`) are both kept,
-   ordered by column name. A blank value is no value. This follows the rule
-   the metadata write path (`ia metadata`, `prepare_metadata` in
-   `ia-core/src/metadata/write.rs`) applies to repeated `-m` arguments since
-   #65 (`collection:a` then `collection[1]:b` gives `[a, b]`); `ia upload`
-   `-m` does not accept indexed keys. The Python client drops the bare
-   value, and keeps only the later of two columns with the same index;
-   both divergences are deliberate, since a value the user gave should not
-   vanish.
+1. **Per row, per field:** the row is applied to an empty item with
+   `apply_set` (`ia-core/src/metadata/write.rs`), the rule `ia metadata`
+   applies to repeated `-m` arguments since #65; one implementation, so
+   the same syntax means the same thing in both places. A bare column is
+   the field's list; an indexed column overwrites position N, or is
+   appended when N is past the end, in index order. `subject=a` with
+   `subject[1]=b` gives `[a, b]`; `subject=a` with `subject[0]=x` gives
+   `[x]`. The readers do not keep column order, so columns are applied in
+   column-name order, and of two columns for one position the later in
+   that order wins (`subject[0]` over `subject[00]`). `REMOVE_TAG` removes
+   a value, as in `ia metadata`. A blank value is no value. `ia upload`
+   `-m` does not accept indexed keys. The Python client builds the indexed
+   list without the bare value; this follows #65 instead.
 2. **Fields** are emitted in name order, so the header list is the same on
    every run.
 3. **Row against `-m`:** if the row names a field (bare or indexed), the
@@ -119,7 +121,9 @@ and later fields are not a further break. It ships in a minor version.
    row does not name is still sent.
 3. Columns `subject[2]`, `subject[10]`, `subject[0]` → values in index order
    0, 2, 10 (10 checks numeric, not string, order).
-4. Bare `subject` plus `subject[0]` → bare first.
+4. Bare `subject` plus `subject[0]` → only the indexed value; bare plus
+   `subject[1]` → both; `subject[0]` plus `subject[00]` → the value of
+   `subject[0]`.
 5. A CSV written by `write_template_csv` with `REMOTE_NAME` filled in, read
    by `read_spreadsheet` → `PUT /item-1/renamed.txt`, no
    `remote--name` header.
@@ -147,6 +151,10 @@ Review of the full diff before the pull request:
 - `item_opts` kept a caller's `UploadOpts::remote_name` for every item
   without one. Fixed: the remote name comes from the row only.
 - `ItemGroup` gained `#[non_exhaustive]`.
+- Orchestrator review: the row rule was a copy that put the bare value
+  first and kept both of two columns for one position, contrary to the #65
+  rule it cited. Fixed: `row_metadata` calls `apply_set`, with tests for
+  the overwrite, the append and the repeated position.
 - Docs: header-name case rule narrowed (JSONL `identifier` is matched
   exactly), the first-row-with-metadata rule, the CSV-only compatibility
   with the Python client, and the existing rule that the required-field

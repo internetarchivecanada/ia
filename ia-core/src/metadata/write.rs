@@ -152,7 +152,11 @@ pub fn prepare_metadata(
 /// if the item had a collection before this batch and would have none after
 /// it, the whole batch errors. An item that had no `collection` field (a
 /// file-level target, for instance) is not affected.
-fn apply_set(
+///
+/// The spreadsheet upload path applies a row to an empty map with this
+/// function, so a spreadsheet row and `ia metadata -m` follow one rule
+/// (#97).
+pub(crate) fn apply_set(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     changes: &[(String, serde_json::Value)],
     identifier: &str,
