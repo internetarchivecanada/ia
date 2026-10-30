@@ -224,7 +224,7 @@ impl TuiState {
                 }
                 DownloadStatus::Verifying => {
                     // Show activity during MD5 hashing (can take seconds
-                    // per large file under --checksum). The item stays in
+                    // per large file when verifying). The item stays in
                     // Downloading/Resolving; the Workers panel below shows
                     // the active file with a verifying marker.
                     if matches!(item.status, ItemStatus::Pending | ItemStatus::Resolving) {

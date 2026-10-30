@@ -2331,6 +2331,43 @@ fn cleanup_abort_deletes_only_that_file() {
     fx.rt.block_on(fx.server.verify());
 }
 
+/// An unfinished upload whose key ia-cli now refuses to send (an empty
+/// segment, as an earlier version made with `--remote-dir scans/`, #100) is
+/// named in a warning and left on IA; the other uploads are still listed and
+/// aborted, and no request names the refused key.
+#[test]
+fn cleanup_skips_an_upload_whose_key_it_cannot_send() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    let fx = cleanup_fixture(1, 0);
+    fx.rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/my-item"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<ListMultipartUploadsResult>\
+                 <Upload><Key>a.bin</Key><UploadId>u1</UploadId><Initiated>2026-10-02T01:00:00.000Z</Initiated></Upload>\
+                 <Upload><Key>scans//c.bin</Key><UploadId>u3</UploadId><Initiated>2026-10-02T03:00:00.000Z</Initiated></Upload>\
+                 </ListMultipartUploadsResult>",
+            ))
+            .with_priority(1)
+            .mount(&fx.server)
+            .await;
+    });
+    cleanup_cmd(&fx, &["--abort-all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("aborted my-item/a.bin"))
+        .stderr(predicate::str::contains("upload u3 is left on IA"))
+        .stderr(predicate::str::contains("'scans//c.bin'"));
+    fx.rt.block_on(fx.server.verify());
+    let requests = fx.rt.block_on(fx.server.received_requests()).unwrap();
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("c.bin")),
+        "a request named the refused key"
+    );
+}
+
 #[test]
 fn cleanup_abort_all_deletes_every_upload() {
     let fx = cleanup_fixture(1, 1);
@@ -2851,14 +2888,39 @@ fn upload_rejects_min_speed() {
 // -- help states each rule once, on the flag it belongs to (Part 2, PR 2) --
 
 #[test]
-fn download_checksum_short_help_says_what_is_checked_without_it() {
-    ia().args(["download", "--help"])
+fn download_short_help_names_the_skip_check_and_no_verify() {
+    ia().args(["download", "-h"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Verify md5 checksums (without it the md5 is never checked)",
+            "Skip a local file only when its md5 matches (reads every local file)",
         ))
-        .stdout(predicate::str::contains("slower, reads every local file").not());
+        .stdout(predicate::str::contains(
+            "Don't check the md5 of downloaded files",
+        ))
+        .stdout(predicate::str::contains("the md5 is never checked").not());
+}
+
+/// -C is the skip check only; verification is on by default and its rules
+/// live on --no-verify (#13).
+#[test]
+fn download_help_splits_the_skip_check_from_verification() {
+    let out = ia().args(["download", "--help"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("It does not change whether downloaded files are verified (see --no-verify)"),
+        "{text}"
+    );
+    assert!(
+        flat.contains("and its md5 too when the metadata has one, unless --no-verify is given"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("twice in a row").count(),
+        1,
+        "the mismatch rules belong on --no-verify alone:\n{text}"
+    );
 }
 
 #[test]
@@ -2907,11 +2969,11 @@ fn search_help_names_no_json_code_in_prose() {
 // -- 0.21.0: the series' public API changes ship under one version --
 
 #[test]
-fn version_is_0_23_1() {
+fn version_is_0_24_0() {
     ia().arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.23.1"));
+        .stdout(predicate::str::contains("0.24.0"));
 }
 
 /// Two unfinished uploads of one file (`a.bin`: u1 and u3). `--abort` would

@@ -9,7 +9,8 @@ use console::style;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
-use ia_core::upload::batch::{group_records, validate_groups};
+use ia_core::upload::batch::{check_keys, group_records, validate_groups};
+use ia_core::upload::template::TEMPLATE_COLUMNS;
 use ia_core::upload::{
     generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
     UploadProgress, UploadResult, UploadStatus,
@@ -125,11 +126,20 @@ pub struct UploadArgs {
     #[arg(long)]
     pub remote_name: Option<String>,
 
-    /// Prepend path prefix to all remote filenames
+    /// Prepend path prefix to all remote filenames (leading and trailing `/` are ignored)
     #[arg(long)]
     pub remote_dir: Option<String>,
 
-    /// Preserve relative path structure
+    /// Keep the directory structure in remote filenames
+    ///
+    /// A relative path below the current directory is kept as given, without
+    /// `./` (`scans/sub/a.pdf`). An absolute path, or one starting with `..`,
+    /// keeps only its last name (directory or file) and what is below it
+    /// (`../scans` and `/data/scans` both give `scans/sub/a.pdf`;
+    /// `/data/a.pdf` gives `a.pdf`). A path with no last name (`..`, `/`)
+    /// keeps only what is below it. Two files that would get the same name,
+    /// or a name that would leave the item, are refused before anything is
+    /// sent.
     #[arg(long)]
     pub keep_directories: bool,
 
@@ -286,7 +296,7 @@ pub struct ImportArgs {
     #[arg()]
     pub spreadsheet: PathBuf,
 
-    /// Set metadata field (repeatable, KEY:VALUE) — merged with spreadsheet data
+    /// Set metadata field (repeatable, KEY:VALUE); a field a spreadsheet row fills in replaces it for that item
     #[arg(short = 'm', long = "metadata")]
     pub metadata: Vec<String>,
 
@@ -926,6 +936,7 @@ async fn run_import_dry_run(
 ) -> Result<()> {
     let groups = group_records(records)?;
     validate_groups(&groups)?;
+    check_keys(&groups, opts)?;
 
     // Check collections exist (unless --no-collection-check)
     if !opts.no_collection_check {
@@ -957,14 +968,15 @@ async fn run_import_dry_run(
         let mut file_details = Vec::new();
         total_files += group.files.len();
 
-        for file in &group.files {
+        for (file, remote_name) in group.files.iter().zip(&group.remote_names) {
             let size = std::fs::metadata(file)
                 .map(|m| m.len())
                 .context(format!("cannot read file: {}", file.display()))?;
-            let name = file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| file.display().to_string());
+            let name = remote_name.clone().unwrap_or_else(|| {
+                file.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string())
+            });
             file_details.push((name, size));
             group_bytes += size;
         }
@@ -1001,9 +1013,8 @@ async fn run_import_dry_run(
             style(crate::output::format_bytes(info.group_bytes)).dim(),
         );
 
-        // Metadata (merged: CLI opts overridden by spreadsheet per-group)
-        let merged = merge_metadata(&opts.metadata, &group.metadata);
-        print_metadata(&merged, 4);
+        // Metadata as the upload sends it (ItemGroup::item_opts)
+        print_metadata(&group.item_opts(opts).metadata, 4);
 
         // Files
         for (name, size) in &info.file_details {
@@ -1081,22 +1092,6 @@ fn print_metadata(metadata: &[(String, String)], indent: usize) {
             width = max_key_len + 1, // +1 for the colon
         );
     }
-}
-
-/// Merge CLI metadata with per-item metadata (per-item overrides CLI for same key).
-fn merge_metadata(
-    cli_metadata: &[(String, String)],
-    item_metadata: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut merged: Vec<(String, String)> = cli_metadata.to_vec();
-    for (key, value) in item_metadata {
-        if let Some(existing) = merged.iter_mut().find(|(k, _)| k == key) {
-            existing.1 = value.clone();
-        } else {
-            merged.push((key.clone(), value.clone()));
-        }
-    }
-    merged
 }
 
 fn run_template(args: TemplateArgs) -> Result<()> {
@@ -1221,6 +1216,31 @@ async fn run_cleanup_inner(client: &IaClient, args: CleanupArgs) -> Result<()> {
                 ),
             }
         }
+        return Ok(());
+    }
+
+    // A key IA lists but ia-core refuses to send (an empty segment or a
+    // leading '/' left by an earlier version, #96, #100) cannot be listed or
+    // aborted. Name it and leave that upload on IA rather than fail the
+    // whole command.
+    let (targets, refused): (Vec<_>, Vec<_>) = targets
+        .into_iter()
+        .map(|u| {
+            let check = ia_core::upload::validate_key(&u.key);
+            (u, check)
+        })
+        .partition(|(_, check)| check.is_ok());
+    for (u, check) in &refused {
+        if let Err(e) = check {
+            eprintln!(
+                "{}: upload {} is left on IA: {e}",
+                style("warning").yellow().bold(),
+                u.upload_id,
+            );
+        }
+    }
+    let targets: Vec<_> = targets.into_iter().map(|(u, _)| u).collect();
+    if targets.is_empty() {
         return Ok(());
     }
 
@@ -1573,20 +1593,7 @@ fn write_template_tsv<W: std::io::Write>(
     rows: &[ia_core::upload::TemplateRow],
     writer: &mut W,
 ) -> Result<()> {
-    let columns = [
-        "identifier",
-        "file",
-        "REMOTE_NAME",
-        "mediatype",
-        "collection",
-        "title",
-        "creator",
-        "date",
-        "description",
-        "subject",
-        "language",
-    ];
-    writeln!(writer, "{}", columns.join("\t")).context("failed to write TSV header")?;
+    writeln!(writer, "{}", TEMPLATE_COLUMNS.join("\t")).context("failed to write TSV header")?;
     for row in rows {
         writeln!(
             writer,
@@ -1618,21 +1625,7 @@ fn write_template_xlsx(
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
 
-    let columns = [
-        "identifier",
-        "file",
-        "REMOTE_NAME",
-        "mediatype",
-        "collection",
-        "title",
-        "creator",
-        "date",
-        "description",
-        "subject",
-        "language",
-    ];
-
-    for (col, name) in columns.iter().enumerate() {
+    for (col, name) in TEMPLATE_COLUMNS.iter().enumerate() {
         worksheet
             .write_string(0, col as u16, *name)
             .map_err(|e: XlsxError| anyhow::anyhow!("XLSX write error: {e}"))?;
@@ -1858,60 +1851,5 @@ mod tests {
 
         let had_failure = output_results(&results, true, 0, None).unwrap();
         assert!(!had_failure);
-    }
-
-    #[test]
-    fn merge_metadata_no_overlap() {
-        let cli = vec![("mediatype".into(), "texts".into())];
-        let item = vec![("title".into(), "My Book".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("mediatype".into(), "texts".into()),
-                ("title".into(), "My Book".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_metadata_item_overrides_cli() {
-        let cli = vec![
-            ("mediatype".into(), "texts".into()),
-            ("collection".into(), "default-coll".into()),
-        ];
-        let item = vec![("collection".into(), "special-coll".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("mediatype".into(), "texts".into()),
-                ("collection".into(), "special-coll".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_metadata_both_empty() {
-        let merged = merge_metadata(&[], &[]);
-        assert!(merged.is_empty());
-    }
-
-    #[test]
-    fn merge_metadata_duplicate_cli_keys_first_wins() {
-        // If CLI has duplicate keys, only the first is overridden by item metadata
-        let cli = vec![
-            ("subject".into(), "first".into()),
-            ("subject".into(), "second".into()),
-        ];
-        let item = vec![("subject".into(), "override".into())];
-        let merged = merge_metadata(&cli, &item);
-        assert_eq!(
-            merged,
-            vec![
-                ("subject".into(), "override".into()),
-                ("subject".into(), "second".into()),
-            ]
-        );
     }
 }

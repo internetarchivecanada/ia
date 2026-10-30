@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +100,11 @@ pub struct UploadOpts {
     pub metadata: Vec<(String, String)>,
     /// Explicit remote filename (required for stdin uploads).
     pub remote_name: Option<String>,
+    /// Remote filename per file argument, keyed by the path exactly as
+    /// passed to `upload_item`; it takes precedence over `remote_name`,
+    /// `keep_directories` and the basename for that file. An argument that
+    /// is a directory cannot have one. `remote_dir` still applies.
+    pub remote_names: HashMap<PathBuf, String>,
     /// Prepend this path prefix to all remote filenames.
     pub remote_dir: Option<String>,
     /// Preserve relative directory structure in remote filenames.
@@ -151,6 +157,7 @@ impl Default for UploadOpts {
         Self {
             metadata: Vec::new(),
             remote_name: None,
+            remote_names: HashMap::new(),
             remote_dir: None,
             keep_directories: false,
             verify: true,
@@ -222,6 +229,13 @@ impl UploadOptsBuilder {
     /// Set the explicit remote filename.
     pub fn remote_name(mut self, name: impl Into<String>) -> Self {
         self.opts.remote_name = Some(name.into());
+        self
+    }
+
+    /// Set the remote filename per file argument (see
+    /// [`UploadOpts::remote_names`]).
+    pub fn remote_names(mut self, names: HashMap<PathBuf, String>) -> Self {
+        self.opts.remote_names = names;
         self
     }
 

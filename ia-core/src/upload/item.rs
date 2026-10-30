@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,7 @@ use crate::upload::types::{
     UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 use crate::upload::validate::{validate_file, validate_required_metadata};
+use crate::upload::validate_key;
 use crate::IaClient;
 
 /// Callback invoked after each file result is produced (for streaming joblog writes).
@@ -77,24 +78,12 @@ pub async fn upload_item(
         validate_required_metadata(&opts.metadata)?;
     }
 
-    // 3b. Check that collections actually exist on archive.org
-    if !opts.no_collection_check {
-        let collections: Vec<&str> = opts
-            .metadata
-            .iter()
-            .filter(|(k, _)| k == "collection")
-            .map(|(_, v)| v.as_str())
-            .collect();
-        if !collections.is_empty() {
-            crate::upload::validate::check_collections(client, &collections).await?;
-        }
-    }
-
-    // 4. Expand directories and collect files
+    // 4. Expand directories and collect files (see `expand_with_sources`).
     let files_owned = files.to_vec();
-    let expanded = tokio::task::spawn_blocking(move || expand_files(&files_owned))
-        .await
-        .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))??;
+    let (expanded, sources) =
+        tokio::task::spawn_blocking(move || expand_with_sources(&files_owned))
+            .await
+            .map_err(|e| IaError::Io(std::io::Error::other(format!("spawn_blocking: {e}"))))??;
 
     // 5. Check for empty
     if expanded.is_empty() {
@@ -107,7 +96,21 @@ pub async fn upload_item(
     }
 
     // 7. Compute remote keys
-    let keys = compute_keys(&expanded, &opts)?;
+    let keys = compute_keys(&expanded, &sources, &opts)?;
+
+    // 7a. Check that collections actually exist on archive.org. After the
+    //     keys, so that a refused key is refused before any request (#96).
+    if !opts.no_collection_check {
+        let collections: Vec<&str> = opts
+            .metadata
+            .iter()
+            .filter(|(k, _)| k == "collection")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if !collections.is_empty() {
+            crate::upload::validate::check_collections(client, &collections).await?;
+        }
+    }
 
     // 7b. One listing of the item's unfinished multipart uploads, so that a
     //     file which switched to multipart in an earlier run (#21), or was
@@ -601,18 +604,79 @@ async fn upload_one_file(
     }
 }
 
+/// Expand the file arguments into files, each paired with the argument it
+/// came from. Each argument is expanded on its own so that
+/// `keep_directories` can name a file relative to the argument it came
+/// from (#96). Sorted by file.
+fn expand_with_sources(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut pairs = Vec::new();
+    for arg in files {
+        for file in expand_files(std::slice::from_ref(arg))? {
+            pairs.push((file, arg.clone()));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pairs.into_iter().unzip())
+}
+
+/// The remote keys [`upload_item`] gives `files` with `opts`, computed the
+/// same way and with the same refusals, without any request. The batch
+/// upload checks every item with it before the first upload, so a key one
+/// item would refuse stops the whole batch (#98).
+pub(crate) fn item_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
+    let (expanded, sources) = expand_with_sources(files)?;
+    compute_keys(&expanded, &sources, opts)
+}
+
 /// Compute remote S3 keys for each file.
 ///
+/// `sources[i]` is the command-line argument `files[i]` came from: the file
+/// itself, or the directory it was found under.
+///
 /// Rules:
+/// - If the file's argument has an entry in `remote_names`: use that name
+///   (#98). An entry for an argument that is a directory, or that is not
+///   one of the arguments, is refused.
 /// - If `remote_name` is set and there is exactly one file: use that name
-/// - If `keep_directories`: use relative path from file's parent structure
+/// - If `keep_directories`: see [`keep_directories_key`]
 /// - Default: use just the filename (basename)
-/// - If `remote_dir` is set: prepend `{remote_dir}/` to each key
-fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
+/// - If `remote_dir` is set: prepend `{remote_dir}/` to each key, with
+///   leading and trailing `/` trimmed from `remote_dir`
+///
+/// Every key is checked with `validate_key`, so a key that does not name a
+/// file inside the item is refused here, before any request (#96).
+fn compute_keys(files: &[PathBuf], sources: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
+    // A name keyed by a path that is not an argument as passed (another
+    // spelling of it, or a directory with no files) would be ignored.
+    let mut unmatched: Vec<&PathBuf> = opts
+        .remote_names
+        .keys()
+        .filter(|arg| !sources.contains(arg))
+        .collect();
+    unmatched.sort();
+    if let Some(arg) = unmatched.first() {
+        return Err(IaError::InvalidArgument(format!(
+            "a remote name is given for {}, which is not among the files to upload",
+            arg.display(),
+        )));
+    }
+
     let mut keys = Vec::with_capacity(files.len());
 
-    for file in files {
-        let key = if let Some(ref remote_name) = opts.remote_name {
+    for (file, source) in files.iter().zip(sources) {
+        let named = opts.remote_names.get(source);
+        let key = if let Some(name) = named {
+            // A directory argument expands to its files, which one name
+            // cannot name.
+            if file != source {
+                return Err(IaError::InvalidArgument(format!(
+                    "the remote name '{name}' is given to the directory {}; a remote name \
+                     names one file",
+                    source.display(),
+                )));
+            }
+            name.clone()
+        } else if let Some(ref remote_name) = opts.remote_name {
             if files.len() == 1 {
                 remote_name.clone()
             } else {
@@ -622,8 +686,7 @@ fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
                     .unwrap_or_else(|| file.to_string_lossy().into_owned())
             }
         } else if opts.keep_directories {
-            // Use the full path as given (relative path preserved)
-            file.to_string_lossy().into_owned()
+            keep_directories_key(file, source)
         } else {
             // Default: basename only
             file.file_name()
@@ -631,17 +694,118 @@ fn compute_keys(files: &[PathBuf], opts: &UploadOpts) -> Result<Vec<String>> {
                 .unwrap_or_else(|| file.to_string_lossy().into_owned())
         };
 
-        // Prepend remote_dir if set
-        let key = if let Some(ref dir) = opts.remote_dir {
-            format!("{dir}/{key}")
-        } else {
-            key
+        // Prepend remote_dir if set. Surrounding `/` are trimmed so
+        // `scans/` and `/scans/` give `scans/a.bin`, not `scans//a.bin`
+        // (#100); a value that is only slashes adds no prefix.
+        let key = match opts.remote_dir.as_deref().map(|d| d.trim_matches('/')) {
+            Some(dir) if !dir.is_empty() => format!("{dir}/{key}"),
+            Some(_) | None => key,
         };
 
+        validate_key(&key)?;
         keys.push(key);
     }
 
+    // Keeping only an argument's last name can give two different files one
+    // key (`/a/scans` and `/b/scans`), and so can a per-file remote name
+    // (two rows named alike, or a name equal to another file's); the second
+    // PUT would replace the first. Such a clash is refused. Two basenames
+    // that meet with neither option are left as they always were. The same
+    // file reached through overlapping arguments is fine.
+    if opts.keep_directories || !opts.remote_names.is_empty() {
+        let mut seen: std::collections::HashMap<&str, (PathBuf, &PathBuf, bool)> =
+            std::collections::HashMap::new();
+        for ((key, file), source) in keys.iter().zip(files).zip(sources) {
+            let local = normalize(file);
+            let named = opts.remote_names.contains_key(source);
+            match seen.get(key.as_str()) {
+                Some((other, other_file, other_named))
+                    if *other != local && (opts.keep_directories || named || *other_named) =>
+                {
+                    let (cause, advice) = if named || *other_named {
+                        (
+                            "the remote names give",
+                            "give each file its own remote name",
+                        )
+                    } else {
+                        (
+                            "--keep-directories gives",
+                            "upload them from a common parent directory, or in separate \
+                             runs with --remote-dir",
+                        )
+                    };
+                    return Err(IaError::InvalidArgument(format!(
+                        "{cause} the remote name '{key}' to both {} and {}; {advice}",
+                        other_file.display(),
+                        file.display(),
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(key, (local, file, named));
+                }
+            }
+        }
+    }
+
     Ok(keys)
+}
+
+/// The `--keep-directories` key for `file`, found under the command-line
+/// argument `source` (#96).
+///
+/// Both paths are normalized lexically: `.` is dropped and `name/..` pairs
+/// cancel. Then:
+/// - a relative argument that does not start with `..` keeps the file's path
+///   as given (`./scans/a.pdf` → `scans/a.pdf`);
+/// - an absolute argument, or one starting with `..`, keeps only its own last
+///   name and what is below it (`../scans` and `/data/scans` both give
+///   `scans/a.pdf`);
+/// - an argument with no last name (`..`, `/`) keeps only what is below it.
+///
+/// Components are joined with `/`. The caller validates the result, so a
+/// path that cannot be named inside the item is refused, not sent.
+fn keep_directories_key(file: &Path, source: &Path) -> String {
+    let file = normalize(file);
+    let source = normalize(source);
+    let below_cwd = source
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)));
+    let base = if below_cwd {
+        Path::new("")
+    } else if source.file_name().is_some() {
+        source.parent().unwrap_or(Path::new(""))
+    } else {
+        source.as_path()
+    };
+    // `file` is `source` with names appended, so the prefix always strips;
+    // if it ever did not, the full path is kept and validation refuses it.
+    let rel = file.strip_prefix(base).unwrap_or(&file);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `path` with `.` components dropped and each `name/..` pair removed,
+/// without touching the filesystem. A `..` directly under the root is
+/// dropped (`/..` is `/`); a leading `..` of a relative path is kept.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    let mut out: Vec<Component> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir | Component::CurDir) | None => out.push(c),
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => out.push(c),
+        }
+    }
+    out.iter().collect()
 }
 
 #[cfg(test)]
@@ -675,7 +839,7 @@ mod tests {
     fn keys_basename_default() {
         let files = vec![PathBuf::from("/tmp/dir/file.txt")];
         let opts = UploadOpts::default();
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["file.txt"]);
     }
 
@@ -686,7 +850,7 @@ mod tests {
             remote_name: Some("renamed.txt".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["renamed.txt"]);
     }
 
@@ -697,8 +861,136 @@ mod tests {
             remote_name: Some("renamed.txt".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["a.txt", "b.txt"]);
+    }
+
+    fn remote_names(pairs: &[(&str, &str)]) -> std::collections::HashMap<PathBuf, String> {
+        pairs
+            .iter()
+            .map(|(file, name)| (PathBuf::from(file), (*name).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn keys_with_remote_names_per_file() {
+        let files = vec![
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from("/tmp/b.txt"),
+            PathBuf::from("/tmp/c.txt"),
+        ];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/a.txt", "one.txt"), ("/tmp/b.txt", "two.txt")]),
+            ..Default::default()
+        };
+        let keys = compute_keys(&files, &files, &opts).unwrap();
+        assert_eq!(keys, vec!["one.txt", "two.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn keys_remote_names_take_precedence_over_keep_directories() {
+        // a.txt is its own argument; b.txt was found under the argument
+        // `scans`, so --keep-directories gives it `scans/b.txt`.
+        let files = vec![PathBuf::from("scans/a.txt"), PathBuf::from("scans/b.txt")];
+        let sources = vec![PathBuf::from("scans/a.txt"), PathBuf::from("scans")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("scans/a.txt", "one.txt")]),
+            keep_directories: true,
+            ..Default::default()
+        };
+        let keys = compute_keys(&files, &sources, &opts).unwrap();
+        assert_eq!(keys, vec!["one.txt", "scans/b.txt"]);
+    }
+
+    #[test]
+    fn keys_remote_names_take_precedence_over_remote_name() {
+        let files = vec![PathBuf::from("/tmp/a.txt")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/a.txt", "one.txt")]),
+            remote_name: Some("ignored.txt".into()),
+            ..Default::default()
+        };
+        let keys = compute_keys(&files, &files, &opts).unwrap();
+        assert_eq!(keys, vec!["one.txt"]);
+    }
+
+    #[test]
+    fn keys_remote_names_take_the_remote_dir_prefix() {
+        let files = vec![PathBuf::from("/tmp/a.txt")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/a.txt", "one.txt")]),
+            remote_dir: Some("/scans/".into()),
+            ..Default::default()
+        };
+        let keys = compute_keys(&files, &files, &opts).unwrap();
+        assert_eq!(keys, vec!["scans/one.txt"]);
+    }
+
+    #[test]
+    fn keys_remote_name_outside_the_item_is_refused() {
+        let files = vec![PathBuf::from("/tmp/a.txt")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/a.txt", "../x.txt")]),
+            ..Default::default()
+        };
+        assert!(compute_keys(&files, &files, &opts).is_err());
+    }
+
+    #[test]
+    fn keys_remote_name_for_a_directory_argument_is_refused() {
+        let files = vec![PathBuf::from("/tmp/scans/a.txt")];
+        let sources = vec![PathBuf::from("/tmp/scans")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/scans", "renamed")]),
+            ..Default::default()
+        };
+        let err = compute_keys(&files, &sources, &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("directory"), "{err}");
+    }
+
+    #[test]
+    fn keys_two_files_given_one_key_by_remote_names_are_refused() {
+        let files = vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/tmp/a.txt", "b.txt")]),
+            ..Default::default()
+        };
+        let err = compute_keys(&files, &files, &opts).unwrap_err().to_string();
+        assert!(
+            err.contains("the remote names give the remote name 'b.txt'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keys_basenames_that_meet_with_no_remote_name_involved_are_left_alone() {
+        // As without remote names: only a clash a remote name (or
+        // --keep-directories) produced is refused.
+        let files = vec![
+            PathBuf::from("/a/x.txt"),
+            PathBuf::from("/b/x.txt"),
+            PathBuf::from("/c/y.txt"),
+        ];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("/c/y.txt", "z.txt")]),
+            ..Default::default()
+        };
+        let keys = compute_keys(&files, &files, &opts).unwrap();
+        assert_eq!(keys, vec!["x.txt", "x.txt", "z.txt"]);
+    }
+
+    #[test]
+    fn keys_remote_name_for_a_path_that_is_not_an_argument_is_refused() {
+        // Another spelling of the argument would otherwise be ignored.
+        let files = vec![PathBuf::from("a.txt")];
+        let opts = UploadOpts {
+            remote_names: remote_names(&[("./a.txt", "one.txt")]),
+            ..Default::default()
+        };
+        let err = compute_keys(&files, &files, &opts).unwrap_err().to_string();
+        assert!(err.contains("not among the files to upload"), "{err}");
     }
 
     #[test]
@@ -708,8 +1000,27 @@ mod tests {
             remote_dir: Some("scans".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["scans/file.txt"]);
+    }
+
+    #[test]
+    fn keys_with_remote_dir_trim_surrounding_slashes() {
+        let files = vec![PathBuf::from("/tmp/file.txt")];
+        for (dir, want) in [
+            ("scans/", "scans/file.txt"),
+            ("/scans/", "scans/file.txt"),
+            ("//scans//", "scans/file.txt"),
+            ("/scans/sub/", "scans/sub/file.txt"),
+            ("/", "file.txt"),
+        ] {
+            let opts = UploadOpts {
+                remote_dir: Some(dir.into()),
+                ..Default::default()
+            };
+            let keys = compute_keys(&files, &files, &opts).unwrap();
+            assert_eq!(keys, vec![want], "--remote-dir {dir}");
+        }
     }
 
     #[test]
@@ -719,8 +1030,103 @@ mod tests {
             keep_directories: true,
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["relative/path/file.txt"]);
+    }
+
+    /// (file, argument it came from, expected key) for `keep_directories` (#96).
+    #[test]
+    fn keep_directories_keys_stay_inside_the_item() {
+        let cases = [
+            // Relative, below the current directory: the path as given.
+            ("scans/a.pdf", "scans", "scans/a.pdf"),
+            ("./scans/sub/a.pdf", "./scans", "scans/sub/a.pdf"),
+            ("./a.pdf", ".", "a.pdf"),
+            ("scans/../other/a.pdf", "scans/../other", "other/a.pdf"),
+            // Through `..` or absolute: the argument's last name down.
+            ("../scans/a.pdf", "../scans", "scans/a.pdf"),
+            (
+                "../../x/scans/sub/a.pdf",
+                "../../x/scans",
+                "scans/sub/a.pdf",
+            ),
+            ("a/../../scans/a.pdf", "a/../../scans", "scans/a.pdf"),
+            ("/data/scans/a.pdf", "/data/scans", "scans/a.pdf"),
+            ("/data/scans/sub/a.pdf", "/data/scans/", "scans/sub/a.pdf"),
+            ("/data/a.pdf", "/data/a.pdf", "a.pdf"),
+            ("../a.pdf", "../a.pdf", "a.pdf"),
+            // An argument with no last name: only what is below it.
+            ("../x/a.pdf", "..", "x/a.pdf"),
+            ("../../a.pdf", "../..", "a.pdf"),
+            ("/a.pdf", "/", "a.pdf"),
+        ];
+        let opts = UploadOpts {
+            keep_directories: true,
+            ..Default::default()
+        };
+        for (file, source, want) in cases {
+            let keys =
+                compute_keys(&[PathBuf::from(file)], &[PathBuf::from(source)], &opts).unwrap();
+            assert_eq!(keys, vec![want], "file {file}, argument {source}");
+        }
+    }
+
+    /// Taking only the argument's last name can give two different files the
+    /// same key; the second PUT would replace the first. Refused, naming both.
+    /// The same file reached through overlapping arguments is not a clash.
+    #[test]
+    fn keep_directories_refuses_two_files_with_one_key() {
+        let opts = UploadOpts {
+            keep_directories: true,
+            ..Default::default()
+        };
+        let clashes = [
+            (
+                ["/a/scans/x.pdf", "/b/scans/x.pdf"],
+                ["/a/scans", "/b/scans"],
+            ),
+            (["../a/x.pdf", "../b/x.pdf"], ["../a/x.pdf", "../b/x.pdf"]),
+        ];
+        for (files, sources) in clashes {
+            let files = files.map(PathBuf::from);
+            let sources = sources.map(PathBuf::from);
+            let err = compute_keys(&files, &sources, &opts).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, IaError::InvalidArgument(_)), "{err:?}");
+            assert!(msg.contains(&files[0].display().to_string()), "{msg}");
+            assert!(msg.contains(&files[1].display().to_string()), "{msg}");
+        }
+
+        let files = [PathBuf::from("./scans/a.pdf"), PathBuf::from("scans/a.pdf")];
+        let sources = [PathBuf::from("./scans"), PathBuf::from("scans")];
+        let keys = compute_keys(&files, &sources, &opts).unwrap();
+        assert_eq!(keys, vec!["scans/a.pdf", "scans/a.pdf"]);
+    }
+
+    #[test]
+    fn keys_that_leave_the_item_are_refused() {
+        let files = vec![PathBuf::from("a.bin")];
+        for opts in [
+            UploadOpts {
+                remote_name: Some("../other/a.bin".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_name: Some("/a.bin".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_dir: Some("../other".into()),
+                ..Default::default()
+            },
+            UploadOpts {
+                remote_dir: Some("scans/./sub".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = compute_keys(&files, &files, &opts).unwrap_err();
+            assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+        }
     }
 
     #[test]
@@ -731,7 +1137,7 @@ mod tests {
             remote_dir: Some("prefix".into()),
             ..Default::default()
         };
-        let keys = compute_keys(&files, &opts).unwrap();
+        let keys = compute_keys(&files, &files, &opts).unwrap();
         assert_eq!(keys, vec!["prefix/dir/file.txt"]);
     }
 

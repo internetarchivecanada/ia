@@ -44,7 +44,7 @@ fn metadata_response() -> serde_json::Value {
                 "source": "original",
                 "format": "Text PDF",
                 "size": "16",
-                "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                "md5": "6cd98d126a1637303a2c468ab30cc8eb",
                 "mtime": "1700000000"
             },
             {
@@ -52,7 +52,7 @@ fn metadata_response() -> serde_json::Value {
                 "source": "metadata",
                 "format": "Metadata",
                 "size": "13",
-                "md5": "abc123",
+                "md5": "017178cf37d945097ef6c252eb355994",
                 "mtime": "1700000001"
             }
         ]
@@ -552,7 +552,7 @@ async fn download_batch_with_multiple_destdirs() {
                     "source": "original",
                     "format": "Text",
                     "size": "5",
-                    "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                    "md5": "594f803b380a41396ed63dca39503542",
                     "mtime": "1700000000"
                 }
             ]
@@ -576,7 +576,7 @@ async fn download_batch_with_multiple_destdirs() {
                     "source": "original",
                     "format": "Text",
                     "size": "5",
-                    "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                    "md5": "a21075a36eeddd084e17611a238c7101",
                     "mtime": "1700000000"
                 }
             ]
@@ -707,7 +707,7 @@ async fn download_on_item_error_shows_in_batch() {
                     "source": "original",
                     "format": "Text",
                     "size": "4",
-                    "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                    "md5": "755f85c2723bb39381c7379a604160d8",
                     "mtime": "1700000000"
                 }
             ]
@@ -771,8 +771,17 @@ async fn download_on_item_error_shows_in_batch() {
 
 // ─── Streaming search-to-download tests ─────────────────────────────────────
 
-/// Mock helpers for multi-page search tests.
-fn mock_item_metadata(identifier: &str, file_name: &str, size: &str) -> serde_json::Value {
+/// md5 of `b"hello"`.
+const HELLO_MD5: &str = "5d41402abc4b2a76b9719d911017c592";
+
+/// Mock helpers for multi-page search tests. `md5` must be the md5 of the
+/// body the test serves, since downloads are verified by default.
+fn mock_item_metadata(
+    identifier: &str,
+    file_name: &str,
+    size: &str,
+    md5: &str,
+) -> serde_json::Value {
     json!({
         "metadata": {
             "identifier": identifier,
@@ -785,7 +794,7 @@ fn mock_item_metadata(identifier: &str, file_name: &str, size: &str) -> serde_js
             "source": "original",
             "format": "Text",
             "size": size,
-            "md5": "d41d8cd98f00b204e9800998ecf8427e",
+            "md5": md5,
             "mtime": "1700000000"
         }]
     })
@@ -822,7 +831,8 @@ async fn download_search_streaming_batch() {
         Mock::given(method("GET"))
             .and(path(format!("/metadata/{id}")))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(mock_item_metadata(id, file, "5")),
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_item_metadata(id, file, "5", HELLO_MD5)),
             )
             .mount(&mock_server)
             .await;
@@ -905,6 +915,7 @@ async fn download_search_streaming_num_found_failure() {
             "fallback-item",
             "data.txt",
             "4",
+            "8d777f385d3dfec8815d20f7496026dc",
         )))
         .mount(&mock_server)
         .await;
@@ -985,6 +996,7 @@ async fn download_search_streaming_json_output() {
             "json-item",
             "doc.txt",
             "3",
+            "900150983cd24fb0d6963f7d28e17f72",
         )))
         .mount(&mock_server)
         .await;
@@ -1179,6 +1191,83 @@ async fn multi_disk_resume_skips_existing_items() {
     );
 }
 
+/// A download whose md5 does not match the item metadata fails by default
+/// (#13) and is accepted with --no-verify.
+#[tokio::test]
+async fn download_verifies_md5_by_default_and_no_verify_turns_it_off() {
+    let mock_server = MockServer::start().await;
+    let host = mock_server.uri().replace("http://", "");
+    let config = empty_config();
+
+    let meta = json!({
+        "metadata": {"identifier": "test-item"},
+        "files": [
+            {
+                "name": "file1.txt",
+                "source": "original",
+                "format": "Data",
+                "size": "5",
+                "md5": "00000000000000000000000000000000",
+                "mtime": "1700000000"
+            }
+        ],
+        "server": "ia000.us.archive.org",
+        "d1": "ia000.us.archive.org",
+        "d2": "ia000.us.archive.org",
+        "dir": "/0/items/test-item"
+    });
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&meta))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/test-item/file1.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&mock_server)
+        .await;
+
+    let run = |extra: &[&str], destdir: &std::path::Path| {
+        let mut args = vec![
+            "--host",
+            &host,
+            "--insecure",
+            "download",
+            "test-item",
+            "--retries",
+            "0",
+            "--destdir",
+            destdir.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        ia_with_config(&config).args(args).output().unwrap()
+    };
+
+    let verified = TempDir::new().unwrap();
+    let output = run(&[], verified.path());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a wrong md5 must fail: {stderr}");
+    assert!(stderr.contains("checksum mismatch"), "{stderr}");
+    let item_dir = verified.path().join("test-item");
+    assert!(!item_dir.join("file1.txt").exists());
+    assert_eq!(
+        fs::read(item_dir.join("file1.txt.md5-mismatch")).unwrap(),
+        b"hello"
+    );
+
+    let unverified = TempDir::new().unwrap();
+    let output = run(&["--no-verify"], unverified.path());
+    assert!(
+        output.status.success(),
+        "--no-verify accepts the file: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(unverified.path().join("test-item").join("file1.txt")).unwrap(),
+        b"hello"
+    );
+}
+
 // ─── --search-parameter tests ────────────────────────────────────────────────
 
 #[test]
@@ -1233,13 +1322,13 @@ async fn download_search_with_identifier_template() {
                 },
                 "files": [
                     {"name": pdf, "source": "original", "format": "PDF",
-                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "size": "5", "md5": "5d41402abc4b2a76b9719d911017c592",
                      "mtime": "1700000000"},
                     {"name": meta, "source": "original", "format": "Metadata",
-                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "size": "5", "md5": "5d41402abc4b2a76b9719d911017c592",
                      "mtime": "1700000000"},
                     {"name": "noise.txt", "source": "original", "format": "Text",
-                     "size": "5", "md5": "d41d8cd98f00b204e9800998ecf8427e",
+                     "size": "5", "md5": "5d41402abc4b2a76b9719d911017c592",
                      "mtime": "1700000000"}
                 ]
             })))

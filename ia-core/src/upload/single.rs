@@ -172,7 +172,7 @@ pub async fn upload_file(
     }
 
     // Build S3 URL
-    let s3_url = build_s3_url(client, identifier, key);
+    let s3_url = build_s3_url(client, identifier, key)?;
 
     // Get auth
     let (access, secret) = client.require_auth()?;
@@ -851,7 +851,7 @@ mod tests {
     fn build_s3_url_production() {
         let config = crate::IaConfig::default();
         let client = crate::IaClient::from_config(config).unwrap();
-        let url = build_s3_url(&client, "test-item", "file.txt");
+        let url = build_s3_url(&client, "test-item", "file.txt").unwrap();
         assert_eq!(url, "https://s3.us.archive.org/test-item/file.txt");
     }
 
@@ -861,7 +861,7 @@ mod tests {
         config.general.host = "127.0.0.1:8080".to_string();
         config.general.secure = false;
         let client = crate::IaClient::from_config(config).unwrap();
-        let url = build_s3_url(&client, "test-item", "file.txt");
+        let url = build_s3_url(&client, "test-item", "file.txt").unwrap();
         assert_eq!(url, "http://127.0.0.1:8080/test-item/file.txt");
     }
 
@@ -869,7 +869,7 @@ mod tests {
     fn build_s3_url_encodes_special_chars() {
         let config = crate::IaConfig::default();
         let client = crate::IaClient::from_config(config).unwrap();
-        let url = build_s3_url(&client, "test-item", "path/to/my file.txt");
+        let url = build_s3_url(&client, "test-item", "path/to/my file.txt").unwrap();
         // Slashes preserved, spaces encoded per-segment
         assert_eq!(
             url,

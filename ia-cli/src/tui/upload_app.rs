@@ -997,6 +997,7 @@ pub async fn run_upload_batch_tui(
     // 1. Group and validate (reuse batch.rs logic)
     let groups = ia_core::upload::batch::group_records(records)?;
     ia_core::upload::batch::validate_groups(&groups)?;
+    ia_core::upload::batch::check_keys(&groups, &opts)?;
 
     // 2. Extract identifiers for TUI state initialization
     let identifiers: Vec<String> = groups.iter().map(|g| g.identifier.clone()).collect();
@@ -1023,16 +1024,7 @@ pub async fn run_upload_batch_tui(
 
     for group in groups {
         let client = client.clone();
-        let mut item_opts = opts.clone();
-        // Merge spreadsheet metadata — same logic as batch.rs lines 58-66:
-        // spreadsheet metadata overrides CLI metadata for same keys.
-        for (key, value) in group.metadata {
-            if let Some(existing) = item_opts.metadata.iter_mut().find(|(k, _)| k == &key) {
-                existing.1 = value;
-            } else {
-                item_opts.metadata.push((key, value));
-            }
-        }
+        let item_opts = group.item_opts(&opts);
 
         let sem = Arc::clone(&semaphore);
         let progress_state = Arc::clone(&state);
