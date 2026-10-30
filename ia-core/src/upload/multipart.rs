@@ -196,7 +196,7 @@ pub(crate) async fn initiate_upload_with_retry(
 ) -> Result<(String, u32)> {
     let (access, secret) = client.require_auth()?;
     let (identifier, key) = (ctx.identifier, ctx.key);
-    let url = format!("{}?uploads", build_s3_url(client, identifier, key));
+    let url = format!("{}?uploads", build_s3_url(client, identifier, key)?);
 
     let sent = send_with_retry(ctx, "initiate multipart", |_watch| {
         let mut req = client
@@ -287,9 +287,14 @@ pub(crate) async fn upload_part_with_retry(
         code: None,
         attempts: 0,
     })?;
+    let object_url = build_s3_url(client, ctx.identifier, ctx.key).map_err(|e| S3Failure {
+        error: Box::new(e),
+        code: None,
+        attempts: 0,
+    })?;
     let url = format!(
         "{}?partNumber={}&uploadId={}",
-        build_s3_url(client, ctx.identifier, ctx.key),
+        object_url,
         part_number,
         urlencoding::encode(upload_id),
     );
@@ -400,7 +405,7 @@ pub(crate) async fn complete_upload_with_retry(
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, identifier, key),
+        build_s3_url(client, identifier, key)?,
         urlencoding::encode(upload_id),
     );
 
@@ -502,7 +507,7 @@ pub(crate) async fn abort_upload_with_ctx(
     let (access, secret) = client.require_auth()?;
     let url = format!(
         "{}?uploadId={}",
-        build_s3_url(client, ctx.identifier, ctx.key),
+        build_s3_url(client, ctx.identifier, ctx.key)?,
         urlencoding::encode(upload_id),
     );
 
@@ -668,7 +673,7 @@ pub(crate) async fn list_parts_with_ctx(
     let (access, secret) = client.require_auth()?;
     let base = format!(
         "{}?uploadId={}",
-        build_s3_url(client, ctx.identifier, ctx.key),
+        build_s3_url(client, ctx.identifier, ctx.key)?,
         urlencoding::encode(upload_id),
     );
 
