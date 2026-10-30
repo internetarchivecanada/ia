@@ -751,6 +751,58 @@ mod tests {
             )
         }
 
+        /// An uppercase checksum file (as written by `CertUtil` or
+        /// `Get-FileHash`) verifies against IA's lowercase digests (#99).
+        async fn verify_uppercase_checksum_file(match_names: bool) -> Vec<VerifyResult> {
+            let mock_server = MockServer::start().await;
+            let host = mock_server
+                .uri()
+                .strip_prefix("http://")
+                .unwrap()
+                .to_string();
+            let client = make_test_client(&host);
+
+            let files_json = r#"{"name": "a.txt", "source": "original", "md5": "5d41402abc4b2a76b9719d911017c592", "size": "5"}"#;
+            Mock::given(method("GET"))
+                .and(path("/metadata/test-item"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(metadata_json(files_json)))
+                .mount(&mock_server)
+                .await;
+
+            let checksums = crate::upload::checksum::parse_checksums_multi(
+                "5D41402ABC4B2A76B9719D911017C592  a.txt\n",
+                None,
+            );
+            let inputs: Vec<VerifyInput> = checksums
+                .into_iter()
+                .map(|(filename, entry)| VerifyInput::Hash {
+                    filename,
+                    hash: entry.hash,
+                })
+                .collect();
+            let opts = VerifyOpts {
+                match_names,
+                ..VerifyOpts::default()
+            };
+            verify_item(&client, "test-item", &inputs, &opts)
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn verify_uppercase_checksum_file_with_match_names() {
+            let results = verify_uppercase_checksum_file(true).await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].status, VerifyStatus::Verified);
+        }
+
+        #[tokio::test]
+        async fn verify_uppercase_checksum_file_hash_only() {
+            let results = verify_uppercase_checksum_file(false).await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].status, VerifyStatus::Verified);
+        }
+
         #[tokio::test]
         async fn verify_item_all_verified() {
             let mock_server = MockServer::start().await;
