@@ -573,8 +573,8 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `-m, --metadata <K:V>` | Set metadata field (repeatable) |
 | `--header <K:V>` | Additional HTTP header (repeatable) |
 | `--remote-name <NAME>` | Explicit remote filename (required for stdin) |
-| `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
-| `--keep-directories` | Preserve relative path structure |
+| `--remote-dir <PATH>` | Prepend path prefix to remote filenames; leading and trailing `/` are ignored, so `scans`, `scans/` and `/scans/` all give `scans/<name>` |
+| `--keep-directories` | Keep the directory structure in remote filenames (see "Remote file names") |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
 | `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file; hex case is ignored (`--checksums` is accepted as an alias) |
 | `--delete-after-upload` | Delete the local file once IA has accepted the upload with its md5 (refused with `--no-verify`) |
@@ -591,6 +591,18 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--dry-run` | Validate everything, upload nothing |
 | `--dashboard` | Full-screen TUI dashboard |
 | `--json` | Output results as JSONL |
+
+#### Remote file names
+
+By default a file's remote name is its file name. `--remote-name` names a single file. `--keep-directories` keeps the directory structure:
+
+- A relative path below the current directory is kept as given, without `./`: `ia upload my-item ./scans --keep-directories` uploads `scans/sub/a.pdf` as `scans/sub/a.pdf`, and `.` gives the paths below the current directory.
+- An absolute path, or one starting with `..`, keeps only its last name (directory or file) and what is below it: `../scans` and `/data/scans` both give `scans/sub/a.pdf`, and `/data/a.pdf` gives `a.pdf`.
+- A path with no last name (`..`, `/`) keeps only what is below it.
+- Paths are read as written: `.` is dropped and `name/..` cancels without looking at the disk, so `link/../scans` gives `scans/...` even when `link` is a symlink.
+- Two different files that would get the same name (`/a/scans` and `/b/scans` both give `scans/x.pdf`) are refused, naming both: `--keep-directories gives the remote name 'scans/x.pdf' to both /a/scans/x.pdf and /b/scans/x.pdf; ...`.
+
+Every remote name must be a path inside the item: one that is empty, starts with `/`, or has a `.`, `..` or empty segment is refused before anything is sent, with `invalid remote file name '<name>': <reason>; a remote name is a path inside the item, with no leading '/' and no '.', '..' or empty segments` (`invalid_key` in `--json` errors). This applies however the name is formed, including `--remote-name`, `--remote-dir` and spreadsheet uploads.
 
 #### Retries
 
@@ -650,7 +662,7 @@ Supports the same options as the bare command: `-m`, `--header`, `--checksum-fil
 | `--identifier-from-dirname` | Generate identifiers from parent directory names |
 | `--json` | Output template as JSONL |
 
-**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item. Lists by default, with or without FILE: each unfinished upload with its upload ID, when it started, and the parts IA holds (count and bytes). Nothing is aborted unless asked, and there is no interactive prompt. An abort tells IA to delete every part already uploaded; a rerun of the upload resumes from those parts instead, so abort only what you mean to discard. An unfinished upload left alone may be cleaned up by IA after 30 days or more.
+**`ia upload cleanup <IDENTIFIER> [FILE]`** — List or abort incomplete multipart uploads for an item. Lists by default, with or without FILE: each unfinished upload with its upload ID, when it started, and the parts IA holds (count and bytes). Nothing is aborted unless asked, and there is no interactive prompt. An abort tells IA to delete every part already uploaded; a rerun of the upload resumes from those parts instead, so abort only what you mean to discard. An unfinished upload left alone may be cleaned up by IA after 30 days or more. An upload whose remote name ia-cli no longer sends (see "Remote file names"; earlier versions could make one with an empty segment, such as `scans//a.bin`) is named in a warning, `upload <id> is left on IA: invalid remote file name ...`, and neither listed nor aborted; the other uploads are handled as usual.
 
 | Flag | Description |
 |------|-------------|
