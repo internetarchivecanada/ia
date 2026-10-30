@@ -10,6 +10,7 @@ use console::style;
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::upload::batch::{group_records, validate_groups};
+use ia_core::upload::template::TEMPLATE_COLUMNS;
 use ia_core::upload::{
     generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
     UploadProgress, UploadResult, UploadStatus,
@@ -957,14 +958,15 @@ async fn run_import_dry_run(
         let mut file_details = Vec::new();
         total_files += group.files.len();
 
-        for file in &group.files {
+        for (file, remote_name) in group.files.iter().zip(&group.remote_names) {
             let size = std::fs::metadata(file)
                 .map(|m| m.len())
                 .context(format!("cannot read file: {}", file.display()))?;
-            let name = file
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| file.display().to_string());
+            let name = remote_name.clone().unwrap_or_else(|| {
+                file.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string())
+            });
             file_details.push((name, size));
             group_bytes += size;
         }
@@ -1573,20 +1575,7 @@ fn write_template_tsv<W: std::io::Write>(
     rows: &[ia_core::upload::TemplateRow],
     writer: &mut W,
 ) -> Result<()> {
-    let columns = [
-        "identifier",
-        "file",
-        "REMOTE_NAME",
-        "mediatype",
-        "collection",
-        "title",
-        "creator",
-        "date",
-        "description",
-        "subject",
-        "language",
-    ];
-    writeln!(writer, "{}", columns.join("\t")).context("failed to write TSV header")?;
+    writeln!(writer, "{}", TEMPLATE_COLUMNS.join("\t")).context("failed to write TSV header")?;
     for row in rows {
         writeln!(
             writer,
@@ -1618,21 +1607,7 @@ fn write_template_xlsx(
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
 
-    let columns = [
-        "identifier",
-        "file",
-        "REMOTE_NAME",
-        "mediatype",
-        "collection",
-        "title",
-        "creator",
-        "date",
-        "description",
-        "subject",
-        "language",
-    ];
-
-    for (col, name) in columns.iter().enumerate() {
+    for (col, name) in TEMPLATE_COLUMNS.iter().enumerate() {
         worksheet
             .write_string(0, col as u16, *name)
             .map_err(|e: XlsxError| anyhow::anyhow!("XLSX write error: {e}"))?;

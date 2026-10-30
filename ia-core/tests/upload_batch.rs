@@ -454,3 +454,94 @@ async fn a_bare_column_comes_before_the_indexed_columns_of_the_same_field() {
         ])
     );
 }
+
+/// A template row for `file` in `item-1` with `remote_name` filled in.
+fn template_row(file: &std::path::Path, remote_name: &str) -> upload::TemplateRow {
+    upload::TemplateRow {
+        identifier: "item-1".into(),
+        file: file.to_string_lossy().into_owned(),
+        remote_name: remote_name.into(),
+        mediatype: "texts".into(),
+        collection: "test_collection".into(),
+        title: String::new(),
+        creator: String::new(),
+        date: String::new(),
+        description: String::new(),
+        subject: String::new(),
+        language: String::new(),
+    }
+}
+
+/// Write `rows` as the template CSV and read them back as a batch would.
+fn through_template_csv(
+    dir: &TempDir,
+    rows: &[upload::TemplateRow],
+) -> Vec<(String, HashMap<String, String>)> {
+    let csv = dir.path().join("batch.csv");
+    let mut out = fs::File::create(&csv).unwrap();
+    upload::write_template_csv(rows, &mut out).unwrap();
+    drop(out);
+    ia_core::spreadsheet::read_spreadsheet(&csv).unwrap()
+}
+
+#[tokio::test]
+async fn the_template_remote_name_column_names_the_file_and_is_not_metadata() {
+    // #98: the readers lowercase REMOTE_NAME, so it was sent as metadata
+    // `remote_name` and the file kept its local name.
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, "content").unwrap();
+    let records = through_template_csv(&dir, &[template_row(&f, "renamed.txt")]);
+
+    let (path, headers) = single_put(records, &[]).await;
+    assert_eq!(path, "/item-1/renamed.txt");
+    assert!(
+        headers.iter().all(|(name, _)| !name.contains("remote")),
+        "remote name sent as metadata: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_remote_name_keeps_the_local_file_name() {
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, "content").unwrap();
+    let records = through_template_csv(&dir, &[template_row(&f, "")]);
+
+    let (path, _) = single_put(records, &[]).await;
+    assert_eq!(path, "/item-1/a.txt");
+}
+
+#[tokio::test]
+async fn a_remote_name_in_an_item_of_several_files_is_refused_before_any_request() {
+    // compute_keys takes one remote name per item; per-file names are not
+    // supported yet, and a silently ignored column would store the file
+    // under a name the user did not ask for.
+    let server = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "content").unwrap();
+    fs::write(&b, "content").unwrap();
+    let records = through_template_csv(
+        &dir,
+        &[template_row(&a, "renamed.txt"), template_row(&b, "")],
+    );
+
+    let client = test_client(&server);
+    let opts = {
+        let mut o = UploadOpts::default();
+        o.verify = false;
+        o.no_collection_check = true;
+        o
+    };
+    let err = upload::upload_batch(&client, records, &opts, 1, None, None, None)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("item-1") && msg.contains("REMOTE_NAME"),
+        "{msg}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

@@ -619,7 +619,7 @@ ia upload cleanup my-item big.iso --abort
 
 **`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
-Required columns: `identifier`, `file`. All other columns become metadata. When several rows share an identifier, the first row's metadata is used.
+Required columns: `identifier`, `file`. Column names are case-insensitive: `REMOTE_NAME`, `Remote_Name` and `remote_name` are the same column. An optional `REMOTE_NAME` column names the file on IA: a row with it filled in stores its file under that name (`--remote-dir` still applies), and a row without it keeps the file's name. `REMOTE_NAME` is never sent as item metadata. For now it is supported only for an identifier with one row; a filled-in `REMOTE_NAME` in an item of several rows stops the batch before any upload. All other columns become metadata. When several rows share an identifier, the first row's metadata is used.
 
 A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each value is sent as its own header, in ascending numeric index (`subject[2]` before `subject[10]`), whatever the column order. A bare `subject` column in the same row is kept and comes first.
 
@@ -627,7 +627,7 @@ A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each 
 
 Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
-**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`.
+**`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`. Every format (CSV, TSV, XLSX, JSONL) writes the same columns: `identifier`, `file`, `REMOTE_NAME`, `mediatype`, `collection`, `title`, `creator`, `date`, `description`, `subject`, `language`. `REMOTE_NAME` is upper case because that is the name the Python client reads, so one template works with both tools.
 
 | Flag | Description |
 |------|-------------|

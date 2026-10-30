@@ -81,6 +81,8 @@ in `ia-cli`), and the JSONL template writes `remote_name` through serde.
   `REMOTE_NAME`.
 - `docs/usage.md`: column names are case-insensitive; `REMOTE_NAME`; the
   multi-value and `-m` rules.
+- The `--spreadsheet --dry-run` listing shows a file's remote name when the
+  row has one.
 
 ### Change on the second branch (after #96/#100)
 

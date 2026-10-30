@@ -9,6 +9,7 @@ use crate::identifier::validate_identifier;
 use crate::metadata::write::parse_indexed_key;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
+use crate::upload::template::REMOTE_NAME_COLUMN;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
 use crate::upload::validate::validate_file;
 use crate::IaClient;
@@ -22,19 +23,25 @@ pub struct ItemGroup {
     pub identifier: String,
     pub metadata: Vec<(String, String)>,
     pub files: Vec<PathBuf>,
+    /// The remote name of each file in `files`, from the row's
+    /// `REMOTE_NAME` column; `None` keeps the file's usual name.
+    pub remote_names: Vec<Option<String>>,
 }
 
 impl ItemGroup {
     /// The upload options for this item: `base` with the group's metadata
     /// merged in. A field the spreadsheet names replaces every value `base`
     /// has for it, as the Python client does; fields it does not name are
-    /// kept (#97).
+    /// kept (#97). A single file with a remote name is stored under it.
     #[must_use]
     pub fn item_opts(&self, base: &UploadOpts) -> UploadOpts {
         let mut opts = base.clone();
         let named: HashSet<&str> = self.metadata.iter().map(|(k, _)| k.as_str()).collect();
         opts.metadata.retain(|(k, _)| !named.contains(k.as_str()));
         opts.metadata.extend(self.metadata.iter().cloned());
+        if let [Some(name)] = self.remote_names.as_slice() {
+            opts.remote_name = Some(name.clone());
+        }
         opts
     }
 }
@@ -151,8 +158,21 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
             ))
         })?;
 
-        // Strip REMOTE_NAME from metadata — it's a template column, not an IA metadata field
-        fields.remove("REMOTE_NAME");
+        // The template's REMOTE_NAME column names the file on IA; it is
+        // never item metadata. The spreadsheet readers lowercase column
+        // names, and records built by a library caller may not, so the
+        // match ignores case (#98).
+        let mut remote_columns: Vec<String> = fields
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case(REMOTE_NAME_COLUMN))
+            .cloned()
+            .collect();
+        remote_columns.sort();
+        let remote_name = remote_columns
+            .iter()
+            .filter_map(|k| fields.remove(k))
+            .filter(|v| !v.is_empty())
+            .last();
 
         let metadata = row_metadata(fields);
 
@@ -160,6 +180,7 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
             identifier,
             metadata: Vec::new(),
             files: Vec::new(),
+            remote_names: Vec::new(),
         });
 
         // Use metadata from the first record for this identifier
@@ -168,6 +189,7 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
         }
 
         group.files.push(PathBuf::from(file_path));
+        group.remote_names.push(remote_name);
     }
 
     Ok(map.into_values().collect())
@@ -226,6 +248,18 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             if let Err(e) = crate::upload::validate::validate_required_metadata(&group.metadata) {
                 errors.push(format!("{}: {e}", group.identifier));
             }
+        }
+
+        // A remote name applies to an item's only file; a name per file in
+        // a larger item is not supported yet. Refuse it rather than store
+        // the file under a name the row did not ask for.
+        if group.files.len() > 1 && group.remote_names.iter().any(Option::is_some) {
+            errors.push(format!(
+                "{}: {REMOTE_NAME_COLUMN} is supported only for an identifier with one row; \
+                 this one has {} rows",
+                group.identifier,
+                group.files.len()
+            ));
         }
 
         for file in &group.files {
@@ -339,12 +373,15 @@ mod tests {
                 ("subject".into(), "beta".into()),
             ],
             files: vec![PathBuf::from("/tmp/a.txt")],
+            remote_names: vec![None],
         };
-        let mut base = UploadOpts::default();
-        base.metadata = vec![
-            ("subject".into(), "cli".into()),
-            ("creator".into(), "C".into()),
-        ];
+        let base = UploadOpts {
+            metadata: vec![
+                ("subject".into(), "cli".into()),
+                ("creator".into(), "C".into()),
+            ],
+            ..Default::default()
+        };
         let opts = group.item_opts(&base);
         assert_eq!(
             opts.metadata,
@@ -354,6 +391,31 @@ mod tests {
                 ("subject".to_string(), "beta".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn group_records_takes_the_remote_name_column_in_any_case_out_of_metadata() {
+        let records = vec![
+            record("item-1", "/tmp/a.txt", &[("remote_name", "lower.txt")]),
+            record("item-2", "/tmp/b.txt", &[("REMOTE_NAME", "upper.txt")]),
+            record("item-3", "/tmp/c.txt", &[("title", "T")]),
+        ];
+        let groups = group_records(records).unwrap();
+        let names: Vec<Option<&str>> = groups
+            .iter()
+            .map(|g| g.remote_names[0].as_deref())
+            .collect();
+        assert_eq!(names, vec![Some("lower.txt"), Some("upper.txt"), None]);
+        for group in &groups {
+            assert!(
+                !group
+                    .metadata
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("remote_name")),
+                "{:?}",
+                group.metadata
+            );
+        }
     }
 
     #[test]
@@ -394,6 +456,7 @@ mod tests {
             identifier: "test-item".into(),
             metadata: vec![("title".into(), "My Item".into())], // missing mediatype + collection
             files: vec![file],
+            remote_names: vec![None],
         }];
         let err = validate_groups(&groups).unwrap_err();
         assert!(err.to_string().contains("mediatype"));
@@ -412,6 +475,7 @@ mod tests {
                 ("collection".into(), "test_collection".into()),
             ],
             files: vec![file],
+            remote_names: vec![None],
         }];
         validate_groups(&groups).unwrap();
     }
@@ -427,6 +491,7 @@ mod tests {
             identifier: "test-item".into(),
             metadata: vec![],
             files: vec![file],
+            remote_names: vec![None],
         }];
         validate_groups(&groups).unwrap();
     }
