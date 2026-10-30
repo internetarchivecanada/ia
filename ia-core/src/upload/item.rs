@@ -78,19 +78,6 @@ pub async fn upload_item(
         validate_required_metadata(&opts.metadata)?;
     }
 
-    // 3b. Check that collections actually exist on archive.org
-    if !opts.no_collection_check {
-        let collections: Vec<&str> = opts
-            .metadata
-            .iter()
-            .filter(|(k, _)| k == "collection")
-            .map(|(_, v)| v.as_str())
-            .collect();
-        if !collections.is_empty() {
-            crate::upload::validate::check_collections(client, &collections).await?;
-        }
-    }
-
     // 4. Expand directories and collect files. Each argument is expanded on
     //    its own so that `keep_directories` can name a file relative to the
     //    argument it came from (#96). The list is sorted by file, as before.
@@ -121,6 +108,20 @@ pub async fn upload_item(
 
     // 7. Compute remote keys
     let keys = compute_keys(&expanded, &sources, &opts)?;
+
+    // 7a. Check that collections actually exist on archive.org. After the
+    //     keys, so that a refused key is refused before any request (#96).
+    if !opts.no_collection_check {
+        let collections: Vec<&str> = opts
+            .metadata
+            .iter()
+            .filter(|(k, _)| k == "collection")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if !collections.is_empty() {
+            crate::upload::validate::check_collections(client, &collections).await?;
+        }
+    }
 
     // 7b. One listing of the item's unfinished multipart uploads, so that a
     //     file which switched to multipart in an earlier run (#21), or was
@@ -662,6 +663,32 @@ fn compute_keys(files: &[PathBuf], sources: &[PathBuf], opts: &UploadOpts) -> Re
         keys.push(key);
     }
 
+    // Keeping only an argument's last name can give two different files one
+    // key (`/a/scans` and `/b/scans`); the second PUT would replace the
+    // first. The same file reached through overlapping arguments is fine.
+    if opts.keep_directories {
+        let mut seen: std::collections::HashMap<&str, (PathBuf, &PathBuf)> =
+            std::collections::HashMap::new();
+        for (key, file) in keys.iter().zip(files) {
+            let local = normalize(file);
+            match seen.get(key.as_str()) {
+                Some((other, other_file)) if *other != local => {
+                    return Err(IaError::InvalidArgument(format!(
+                        "--keep-directories gives the remote name '{key}' to both {} and {}; \
+                         upload them from a common parent directory, or in separate runs \
+                         with --remote-dir",
+                        other_file.display(),
+                        file.display(),
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(key, (local, file));
+                }
+            }
+        }
+    }
+
     Ok(keys)
 }
 
@@ -855,6 +882,38 @@ mod tests {
                 compute_keys(&[PathBuf::from(file)], &[PathBuf::from(source)], &opts).unwrap();
             assert_eq!(keys, vec![want], "file {file}, argument {source}");
         }
+    }
+
+    /// Taking only the argument's last name can give two different files the
+    /// same key; the second PUT would replace the first. Refused, naming both.
+    /// The same file reached through overlapping arguments is not a clash.
+    #[test]
+    fn keep_directories_refuses_two_files_with_one_key() {
+        let opts = UploadOpts {
+            keep_directories: true,
+            ..Default::default()
+        };
+        let clashes = [
+            (
+                ["/a/scans/x.pdf", "/b/scans/x.pdf"],
+                ["/a/scans", "/b/scans"],
+            ),
+            (["../a/x.pdf", "../b/x.pdf"], ["../a/x.pdf", "../b/x.pdf"]),
+        ];
+        for (files, sources) in clashes {
+            let files = files.map(PathBuf::from);
+            let sources = sources.map(PathBuf::from);
+            let err = compute_keys(&files, &sources, &opts).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, IaError::InvalidArgument(_)), "{err:?}");
+            assert!(msg.contains(&files[0].display().to_string()), "{msg}");
+            assert!(msg.contains(&files[1].display().to_string()), "{msg}");
+        }
+
+        let files = [PathBuf::from("./scans/a.pdf"), PathBuf::from("scans/a.pdf")];
+        let sources = [PathBuf::from("./scans"), PathBuf::from("scans")];
+        let keys = compute_keys(&files, &sources, &opts).unwrap();
+        assert_eq!(keys, vec!["scans/a.pdf", "scans/a.pdf"]);
     }
 
     #[test]

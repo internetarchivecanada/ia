@@ -2331,6 +2331,43 @@ fn cleanup_abort_deletes_only_that_file() {
     fx.rt.block_on(fx.server.verify());
 }
 
+/// An unfinished upload whose key ia-cli now refuses to send (an empty
+/// segment, as an earlier version made with `--remote-dir scans/`, #100) is
+/// named in a warning and left on IA; the other uploads are still listed and
+/// aborted, and no request names the refused key.
+#[test]
+fn cleanup_skips_an_upload_whose_key_it_cannot_send() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+    let fx = cleanup_fixture(1, 0);
+    fx.rt.block_on(async {
+        Mock::given(method("GET"))
+            .and(path("/my-item"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<ListMultipartUploadsResult>\
+                 <Upload><Key>a.bin</Key><UploadId>u1</UploadId><Initiated>2026-10-02T01:00:00.000Z</Initiated></Upload>\
+                 <Upload><Key>scans//c.bin</Key><UploadId>u3</UploadId><Initiated>2026-10-02T03:00:00.000Z</Initiated></Upload>\
+                 </ListMultipartUploadsResult>",
+            ))
+            .with_priority(1)
+            .mount(&fx.server)
+            .await;
+    });
+    cleanup_cmd(&fx, &["--abort-all"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("aborted my-item/a.bin"))
+        .stderr(predicate::str::contains("upload u3 is left on IA"))
+        .stderr(predicate::str::contains("'scans//c.bin'"));
+    fx.rt.block_on(fx.server.verify());
+    let requests = fx.rt.block_on(fx.server.received_requests()).unwrap();
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("c.bin")),
+        "a request named the refused key"
+    );
+}
+
 #[test]
 fn cleanup_abort_all_deletes_every_upload() {
     let fx = cleanup_fixture(1, 1);

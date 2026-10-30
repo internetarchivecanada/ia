@@ -3,7 +3,7 @@
 use ia_core::upload::{self, UploadOpts, UploadStatus};
 use ia_core::{IaClient, IaConfig, IaError};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1146,39 +1146,28 @@ async fn put_paths_inside(server: &MockServer, identifier: &str) -> Vec<String> 
     paths
 }
 
-/// A relative path from the working directory to `target` that climbs out
-/// through `..`.
-fn relative_from_cwd(target: &Path) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let target = target.canonicalize().unwrap();
-    let common = cwd
-        .components()
-        .zip(target.components())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let rel: PathBuf = std::iter::repeat_n(Component::ParentDir, cwd.components().count() - common)
-        .chain(target.components().skip(common))
-        .collect();
-    assert!(
-        rel.starts_with(".."),
-        "expected a path through '..': {rel:?}"
-    );
-    rel
-}
-
 #[tokio::test]
 async fn keep_directories_with_a_dotdot_argument_stays_in_the_item() {
     let server = MockServer::start().await;
     mount_any_put(&server, 1).await;
 
+    // Integration tests run in the package directory, so a directory made in
+    // its parent (the workspace root) is reachable as `../<name>`.
     let dir = tempfile::Builder::new()
         .prefix("upload-keys-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
         .unwrap();
+    let name = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let scans = dir.path().join("scans");
     fs::create_dir(&scans).unwrap();
     fs::write(scans.join("a.bin"), "a").unwrap();
-    let arg = relative_from_cwd(&scans);
+    let arg = PathBuf::from(format!("../{name}/scans"));
 
     let mut opts = key_test_opts();
     opts.keep_directories = true;
@@ -1294,7 +1283,13 @@ async fn a_remote_name_that_leaves_the_item_is_refused_before_any_request() {
     let f = dir.path().join("a.bin");
     fs::write(&f, "a").unwrap();
 
+    // With the collection check on: the key is refused before it is sent.
     let mut opts = key_test_opts();
+    opts.no_collection_check = false;
+    opts.metadata = vec![
+        ("mediatype".into(), "texts".into()),
+        ("collection".into(), "test_collection".into()),
+    ];
     opts.remote_name = Some("../other-item/a.bin".into());
     let err = upload::upload_item(
         &test_client(&server),
@@ -1342,6 +1337,66 @@ async fn upload_file_refuses_a_key_that_leaves_the_item() {
     assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
     // The skip check may read the item's metadata first; no PUT is sent.
     assert!(put_paths_inside(&server, "test-item").await.is_empty());
+}
+
+/// The multipart requests build their URLs the same way, so a bad key is
+/// refused there too, and no request names it.
+#[tokio::test]
+async fn a_multipart_upload_refuses_a_key_that_leaves_the_item() {
+    let server = MockServer::start().await;
+    mount_any_put(&server, 0).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // The resume check lists the item's uploads first; that names no key.
+    mount_empty_resume_listing(&server).await;
+
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("a.bin");
+    fs::write(&f, "a").unwrap();
+
+    let mut opts = key_test_opts();
+    opts.multipart = true;
+    let err = upload::upload_file(
+        &test_client(&server),
+        "test-item",
+        &f,
+        "../other-item/a.bin",
+        &opts,
+        true,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, IaError::InvalidKey { .. }), "{err:?}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|r| !r.url.path().contains("a.bin")),
+        "a request named the key: {:?}",
+        requests
+            .iter()
+            .map(|r| r.url.to_string())
+            .collect::<Vec<_>>()
+    );
+    server.verify().await;
+}
+
+#[test]
+fn invalid_key_has_its_own_json_code() {
+    let err = IaError::InvalidKey {
+        key: "../a.bin".into(),
+        reason: "it has a '..' segment".into(),
+    };
+    assert!(!err.is_retryable());
+    let json = serde_json::to_value(err.to_json_error()).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_key");
+    assert_eq!(json["error"]["key"], "../a.bin");
+    assert_eq!(json["error"]["reason"], "it has a '..' segment");
 }
 
 #[test]

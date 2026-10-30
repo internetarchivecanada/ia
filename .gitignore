@@ -19,6 +19,10 @@ Thumbs.db
 # Test downloads
 /test_downloads/
 
+# Temporary directories of the upload key tests, left only if a run is killed
+/upload-keys-*/
+/ia-core/upload-keys-*/
+
 # Worktrees
 .worktrees/
 

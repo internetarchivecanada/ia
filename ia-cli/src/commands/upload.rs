@@ -133,9 +133,12 @@ pub struct UploadArgs {
     ///
     /// A relative path below the current directory is kept as given, without
     /// `./` (`scans/sub/a.pdf`). An absolute path, or one starting with `..`,
-    /// keeps only its last directory and what is below it (`../scans` and
-    /// `/data/scans` both give `scans/sub/a.pdf`). A remote name that would
-    /// still leave the item is refused before anything is sent.
+    /// keeps only its last name (directory or file) and what is below it
+    /// (`../scans` and `/data/scans` both give `scans/sub/a.pdf`;
+    /// `/data/a.pdf` gives `a.pdf`). A path with no last name (`..`, `/`)
+    /// keeps only what is below it. Two files that would get the same name,
+    /// or a name that would leave the item, are refused before anything is
+    /// sent.
     #[arg(long)]
     pub keep_directories: bool,
 
@@ -1227,6 +1230,31 @@ async fn run_cleanup_inner(client: &IaClient, args: CleanupArgs) -> Result<()> {
                 ),
             }
         }
+        return Ok(());
+    }
+
+    // A key IA lists but ia-core refuses to send (an empty segment or a
+    // leading '/' left by an earlier version, #96, #100) cannot be listed or
+    // aborted. Name it and leave that upload on IA rather than fail the
+    // whole command.
+    let (targets, refused): (Vec<_>, Vec<_>) = targets
+        .into_iter()
+        .map(|u| {
+            let check = ia_core::upload::validate_key(&u.key);
+            (u, check)
+        })
+        .partition(|(_, check)| check.is_ok());
+    for (u, check) in &refused {
+        if let Err(e) = check {
+            eprintln!(
+                "{}: upload {} is left on IA: {e}",
+                style("warning").yellow().bold(),
+                u.upload_id,
+            );
+        }
+    }
+    let targets: Vec<_> = targets.into_iter().map(|(u, _)| u).collect();
+    if targets.is_empty() {
         return Ok(());
     }
 

@@ -73,5 +73,22 @@ Unit tests in `ia-core/src/upload/item.rs` for `compute_keys` (normalization, th
 - [x] Plan committed first.
 - [x] #96: tests (red), `validate_key`, `IaError::InvalidKey`, `build_s3_url` returns `Result`, per-argument expansion and the key rule in `compute_keys`, help and usage text.
 - [x] #100: tests (red), trimming in `compute_keys`, help and usage text.
-- [ ] `cargo test`, `cargo clippy --all-targets -- -D warnings`.
-- [ ] Code review; PR.
+- [x] `cargo test -p ia-core -p ia-cli`; `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings` (the CI command) is clean. `cargo clippy --all-targets -- -D warnings` fails on lints in test code that predates this change (`field_reassign_with_default` and others, in files this change does not touch or on lines it does not change); none is on a changed line.
+- [x] Code review; PR.
+
+## Review, closed before the PR
+
+Taken:
+
+- `ia upload cleanup` listed and aborted every upload through `build_s3_url`, so one upload IA lists under a key that is now refused (an empty segment left by an earlier version, such as `scans//a.bin`) failed the whole command, and `--abort-all` aborted nothing. Such an upload is now named in a warning and left on IA; the others are listed and aborted. Test: `cleanup_skips_an_upload_whose_key_it_cannot_send` in `ia-cli/tests/cli.rs`.
+- Keeping only an argument's last name can give two different files one key (`/a/scans` and `/b/scans` both give `scans/x.pdf`), and the second PUT would replace the first. `compute_keys` refuses that with `--keep-directories`, naming both files; the same file reached through overlapping arguments (compared after normalization) is not a clash. Basename collisions without `--keep-directories` are unchanged. Test: `keep_directories_refuses_two_files_with_one_key`.
+- The collection-existence check ran before the keys were computed, so a refused key came after a request. It now runs after `compute_keys`; the `--remote-name` test runs with the check on and asserts that no request is sent.
+- Help and usage text said "last directory" where a file argument keeps its file name, and the help did not mention `..` or `/`. Corrected; the usage text also states that normalization is lexical (symlinks are not resolved) and the clash refusal.
+- The `..` integration test computed a path from the working directory to `CARGO_TARGET_TMPDIR`, which fails if the target directory is inside the package or on another Windows drive. It now makes its directory in the workspace root and names it `../<name>`. Both temporary-directory patterns are in `.gitignore`, for a run that is killed before cleanup.
+- Added a test for the `invalid_key` JSON code and a test that a multipart upload refuses a bad key with no request naming it.
+
+Not changed:
+
+- A library caller of `upload_file` with `dry_run` gets `DryRun` for a bad key, and with verification on the file is hashed (and the item's metadata read) before the key is refused, because the check sits in `build_s3_url`, after those steps. No request names the key either way, and `upload_item` (every CLI path) refuses it before any of this. An earlier check would mean a further edit to `single.rs`, which is being changed in parallel for another issue.
+- Normalization is lexical: `link/../scans` gives `scans/...` even when `link` is a symlink to another tree. The key stays inside the item; the usage text states it.
+- An upload whose key is refused cannot be aborted by ia-cli. Addressing such keys would need a second, looser rule for keys IA itself lists; that is left open.
