@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -8,7 +8,7 @@ use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
 use crate::metadata::write::{fill_positions, parse_indexed_key};
 use crate::spreadsheet::SpreadsheetRecord;
-use crate::upload::item::upload_item;
+use crate::upload::item::{item_keys, upload_item};
 use crate::upload::template::REMOTE_NAME_COLUMN;
 use crate::upload::types::{UploadOpts, UploadProgress, UploadResult};
 use crate::upload::validate::validate_file;
@@ -85,8 +85,10 @@ pub async fn upload_batch(
     // 1. Group records by identifier
     let groups = group_records(records)?;
 
-    // 2. Pre-validate all groups
+    // 2. Pre-validate all groups, and every item's remote keys, so that a
+    //    refusal stops the batch before any request (#98)
     validate_groups(&groups)?;
+    check_keys(&groups, opts)?;
 
     // 3. Upload items concurrently
     // Return (identifier, Result) so we can attribute failures to specific items.
@@ -260,6 +262,34 @@ struct FieldColumns {
     indexed: Vec<(usize, Option<String>)>,
 }
 
+/// Compute every group's remote keys as the upload will, with `base`
+/// merged in by [`ItemGroup::item_opts`], and report every refusal
+/// together: a remote name outside the item (`../x`), two files given one
+/// key, a remote name for a directory (#98). Makes no request. Call it
+/// after [`validate_groups`]; [`upload_batch`] does.
+///
+/// # Errors
+///
+/// Returns `IaError::Config` listing each refused item.
+pub fn check_keys(groups: &[ItemGroup], base: &UploadOpts) -> Result<()> {
+    let errors: Vec<String> = groups
+        .iter()
+        .filter_map(|group| {
+            item_keys(&group.files, &group.item_opts(base))
+                .err()
+                .map(|e| format!("{}: {e}", group.identifier))
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(IaError::Config(format!(
+            "batch validation failed:\n  {}",
+            errors.join("\n  ")
+        )))
+    }
+}
+
 /// Validate all item groups upfront before uploading.
 ///
 /// Checks identifiers and file existence/type. Collects all errors
@@ -279,19 +309,20 @@ pub fn validate_groups(groups: &[ItemGroup]) -> Result<()> {
             }
         }
 
-        // Remote names are keyed by file, so one file named on two rows
-        // must not be given two different names; only one would be used.
-        let mut name_of: HashMap<&PathBuf, Option<&String>> = HashMap::new();
+        // Remote names are keyed by file as written, so one file named on two
+        // rows must not be given two different names; only one would be used.
+        let mut name_of: HashMap<&Path, Option<&str>> = HashMap::new();
         for (file, name) in group.files.iter().zip(&group.remote_names) {
-            match name_of.get(file) {
-                Some(other) if *other != name.as_ref() => errors.push(format!(
+            let name = name.as_deref();
+            match name_of.get(file.as_path()) {
+                Some(other) if *other != name => errors.push(format!(
                     "{}: {} is on two rows with different {REMOTE_NAME_COLUMN} values",
                     group.identifier,
                     file.display(),
                 )),
                 Some(_) => {}
                 None => {
-                    name_of.insert(file, name.as_ref());
+                    name_of.insert(file, name);
                 }
             }
         }

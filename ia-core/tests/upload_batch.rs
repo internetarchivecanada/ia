@@ -665,7 +665,10 @@ async fn two_rows_given_one_remote_name_are_refused_before_any_request() {
     let records = rows_for(&dir, &[("a.txt", "same.txt"), ("b.txt", "same.txt")]);
     let (result, paths) = batch_puts(records, None).await;
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("same.txt"), "{msg}");
+    assert!(
+        msg.contains("the remote names give the remote name 'same.txt'"),
+        "{msg}"
+    );
     assert!(paths.is_empty(), "{paths:?}");
 }
 
@@ -675,6 +678,62 @@ async fn a_remote_name_equal_to_another_rows_file_name_is_refused() {
     let records = rows_for(&dir, &[("a.txt", "b.txt"), ("b.txt", "")]);
     let (result, paths) = batch_puts(records, None).await;
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("b.txt"), "{msg}");
+    assert!(
+        msg.contains("the remote names give the remote name 'b.txt'"),
+        "{msg}"
+    );
     assert!(paths.is_empty(), "{paths:?}");
+}
+
+/// A record for `id` with a real file `dir/sub/name`, `mediatype`,
+/// `collection`, and `remote_name` when given (as a reader produces it).
+fn record_in(
+    dir: &TempDir,
+    id: &str,
+    sub: &str,
+    name: &str,
+    remote_name: Option<&str>,
+) -> (String, HashMap<String, String>) {
+    let folder = dir.path().join(sub);
+    fs::create_dir_all(&folder).unwrap();
+    let f = folder.join(name);
+    fs::write(&f, "content").unwrap();
+    let (id, mut fields) = record(id, f.to_str().unwrap(), "texts", "test_collection");
+    if let Some(remote) = remote_name {
+        fields.insert("remote_name".into(), remote.into());
+    }
+    (id, fields)
+}
+
+#[tokio::test]
+async fn a_refused_remote_name_in_one_item_stops_every_item_before_any_request() {
+    // The keys of every item are checked before the first upload, so
+    // item-2 is not uploaded while item-1 is refused.
+    let dir = TempDir::new().unwrap();
+    let records = vec![
+        record_in(&dir, "item-1", "one", "a.txt", Some("../x.txt")),
+        record_in(&dir, "item-2", "two", "b.txt", None),
+    ];
+    let (result, paths) = batch_puts(records, None).await;
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("item-1") && msg.contains("../x.txt"), "{msg}");
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+#[tokio::test]
+async fn a_basename_clash_no_remote_name_caused_is_left_as_before() {
+    // Two rows with the same basename and no REMOTE_NAME are not refused
+    // because a third row of the item has one (they never were refused).
+    let dir = TempDir::new().unwrap();
+    let records = vec![
+        record_in(&dir, "item-1", "a", "x.txt", None),
+        record_in(&dir, "item-1", "b", "x.txt", None),
+        record_in(&dir, "item-1", "c", "y.txt", Some("z.txt")),
+    ];
+    let (result, paths) = batch_puts(records, None).await;
+    result.unwrap();
+    assert_eq!(
+        put_paths(&paths),
+        vec!["/item-1/x.txt", "/item-1/x.txt", "/item-1/z.txt"]
+    );
 }

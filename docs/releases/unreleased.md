@@ -57,7 +57,10 @@ this file becomes `docs/releases/<version>.md`.
   (`../x`), two files of an item given one name, and one file given two
   names stop the batch before any request. Every template format writes the
   same columns; the JSONL template now writes `REMOTE_NAME`, not
-  `remote_name`.
+  `remote_name`. A joblog from an earlier version recorded such a file
+  under its local name, so resuming that run with `--joblog` uploads it
+  again under its `REMOTE_NAME`; the copy under the local name stays on
+  the item.
 - `ia-core`: `ItemGroup` gains `remote_names` and `#[non_exhaustive]`,
   which breaks code that builds it with a struct literal;
   `group_records` builds it. New `ItemGroup::item_opts`, and
@@ -65,4 +68,5 @@ this file becomes `docs/releases/<version>.md`.
   `UploadOpts` gains `remote_names` (a remote name per file argument,
   used before `remote_name`, `keep_directories` and the basename) and
   the builder method `remote_names`; `UploadOpts` is `#[non_exhaustive]`,
-  so the field breaks no code.
+  so the field breaks no code. New `upload::batch::check_keys` computes
+  every item's remote keys before any request; `upload_batch` calls it.
