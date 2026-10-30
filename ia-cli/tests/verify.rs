@@ -633,3 +633,74 @@ async fn verify_spreadsheet_with_hash_column_e2e() {
         .assert()
         .success();
 }
+
+/// Digests written in uppercase hex (`CertUtil`, `Get-FileHash`) verify
+/// against IA's lowercase digests, from a checksum file and from a
+/// spreadsheet column (#99).
+#[tokio::test]
+async fn verify_uppercase_digests_e2e() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "test-item"},
+            "files": [{
+                "name": "file.txt",
+                "md5": "5d41402abc4b2a76b9719d911017c592",
+                "size": "5"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut checksum_file = NamedTempFile::new().unwrap();
+    writeln!(
+        checksum_file,
+        "5D41402ABC4B2A76B9719D911017C592  file.txt"
+    )
+    .unwrap();
+
+    let mut spreadsheet = NamedTempFile::with_suffix(".csv").unwrap();
+    writeln!(spreadsheet, "identifier,file,md5").unwrap();
+    writeln!(
+        spreadsheet,
+        "test-item,file.txt,5D41402ABC4B2A76B9719D911017C592"
+    )
+    .unwrap();
+
+    let host = server.uri().replace("http://", "");
+    for match_names in [false, true] {
+        let mut checksum_cmd = ia_cmd();
+        checksum_cmd.args([
+            "--insecure",
+            "-H",
+            &host,
+            "verify",
+            "test-item",
+            "--checksum-file",
+            checksum_file.path().to_str().unwrap(),
+            "--json",
+        ]);
+        let mut spreadsheet_cmd = ia_cmd();
+        spreadsheet_cmd.args([
+            "--insecure",
+            "-H",
+            &host,
+            "verify",
+            "--spreadsheet",
+            spreadsheet.path().to_str().unwrap(),
+            "--json",
+        ]);
+        for cmd in [&mut checksum_cmd, &mut spreadsheet_cmd] {
+            if match_names {
+                cmd.arg("--match-names");
+            }
+            cmd.env("IA_S3_ACCESS", "test")
+                .env("IA_S3_SECRET", "test")
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("\"status\":\"verified\""));
+        }
+    }
+}

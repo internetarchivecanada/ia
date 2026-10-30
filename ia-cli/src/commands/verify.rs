@@ -388,10 +388,11 @@ async fn run_spreadsheet(
         }
 
         let input = if let Some(hash) = fields.get(hash_col).filter(|h| !h.is_empty()) {
-            // Use pre-computed hash from spreadsheet column
+            // Use pre-computed hash from spreadsheet column, in the
+            // lowercase form IA reports (Windows tools write uppercase)
             VerifyInput::Hash {
                 filename: file_val.clone(),
-                hash: hash.clone(),
+                hash: hash.to_ascii_lowercase(),
             }
         } else {
             // Need local file

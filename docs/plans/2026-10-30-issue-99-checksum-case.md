@@ -9,6 +9,8 @@
 
 **Decision.** A digest is lowercase from the moment it enters the program. The four parse functions (`try_parse_gnu`, `try_parse_bsd`, `try_parse_gnu_multi`, `try_parse_bsd_multi` in `ia-core/src/upload/checksum.rs`) return `hash.to_ascii_lowercase()`. Every comparison downstream then sees the form IA uses; no call site gains a case-insensitive compare. Digests computed from a file (`to_hex`) are already lowercase, so no other constructor of a local hash needs a change. `types.rs` is not touched.
 
+**The spreadsheet column.** `ia verify --spreadsheet` takes a digest from the `md5`/`sha1`/`crc32` column without a checksum-file parser, so `run_spreadsheet` (`ia-cli/src/commands/verify.rs`) lowercases it where it builds `VerifyInput::Hash`. This is the second place an externally written digest enters the program; the rule is the same, normalize on the way in.
+
 **Validation.** The parsers already reject a digest with a non-hex character, and a digest of the wrong length for MD5 (`parse_checksums`, BSD lines) or for an unforced GNU line (auto-detect from length). A GNU line under an explicit `--checksum-type` takes any hex length by design (`parse_multi_forced_algorithm_overrides_detection`); that is unchanged.
 
 **Out of scope.** Library callers that fill `UploadOpts::checksum_file` or `VerifyOpts::checksums` by hand, bypassing the parsers, keep the digest as given. `md5sum -b` lines with a leading `*` in the file name.
@@ -18,4 +20,5 @@
 - [x] Red: a unit test in `checksum.rs` that an uppercase GNU and BSD line parses to lowercase in both parsers; wiremock tests for `verify_item` with an uppercase checksum file in match-names and hash-only modes (`Verified`); a wiremock test in `ia-core/tests/upload_single.rs` that an uppercase `checksum_file` digest for a file already on the item is skipped with no PUT.
 - [x] Green: lowercase in the four parse functions.
 - [x] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
-- [ ] Code-reviewer pass; PR.
+- [x] Code-reviewer pass: the spreadsheet column (fixed, with a CLI test for both `--checksum-file` and `--spreadsheet`) and the docs sentence (added) were taken; the unvalidated library fields are listed under out of scope.
+- [ ] PR.

@@ -561,7 +561,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--remote-dir <PATH>` | Prepend path prefix to remote filenames |
 | `--keep-directories` | Preserve relative path structure |
 | `--clobber` | Force re-upload even when remote file has matching MD5 |
-| `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file (`--checksums` is accepted as an alias) |
+| `--checksum-file <PATH>` | Path to pre-computed MD5 checksums file; hex case is ignored (`--checksums` is accepted as an alias) |
 | `--delete-after-upload` | Delete the local file once IA has accepted the upload with its md5 (refused with `--no-verify`) |
 | `--no-verify` | Skip the Content-MD5 header (on the single PUT, and on each part with `--multipart`) |
 | `--no-derive` | Skip derivative generation |
@@ -745,6 +745,8 @@ ia verify my-item ./files/ -q && ./post-upload.sh
 Supports `md5` (default), `sha1`, and `crc32` via `--checksum-type`. When using `--checksum-file`, the algorithm is auto-detected from hash length (32 chars = MD5, 40 chars = SHA-1). CRC32 in GNU format requires explicit `--checksum-type crc32` due to length ambiguity.
 
 Checksum files support both GNU (`hash  filename`) and BSD (`ALG (filename) = hash`) formats.
+
+Digests may be in upper or lower case (`CertUtil` and `Get-FileHash` write uppercase); they are compared in lowercase, as IA reports them. This holds for checksum files and for the spreadsheet hash column.
 
 #### Spreadsheet mode
 
