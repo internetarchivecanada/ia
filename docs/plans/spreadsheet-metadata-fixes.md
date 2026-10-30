@@ -100,12 +100,33 @@ in `ia-cli`), and the JSONL template writes `remote_name` through serde.
 
 ### Change on the second branch (after #96/#100)
 
-`compute_keys` takes a remote name per file (for example a
-`&[Option<String>]` parallel to `files`, or per-file keys on `UploadOpts`):
-a file with a remote name uses it instead of the basename or the
-`--keep-directories` path, then `--remote-dir` is prefixed as for any key.
-`validate_groups` drops the multi-file refusal. That commit carries
-`Fixes #98`.
+- `UploadOpts::remote_names: HashMap<PathBuf, String>` (new; `UploadOpts`
+  is `#[non_exhaustive]`, so this is not a break), with a builder method:
+  the remote name for a file argument, keyed by the path as passed to
+  `upload_item`.
+- `compute_keys` (`ia-core/src/upload/item.rs`), per file, in order:
+  1. its argument has an entry in `remote_names`: that name. An entry for
+     an argument that is a directory is refused (a directory expands to
+     several files).
+  2. `remote_name` with exactly one file: that name (unchanged).
+  3. `keep_directories`: the kept path (unchanged).
+  4. the basename (unchanged).
+
+  Then `--remote-dir` is prefixed and `validate_key` applied, as for every
+  key, so a remote name such as `../x` is refused before any request.
+- Two different files given one key, where a remote name produced it, are
+  refused (the second PUT would replace the first), extending the existing
+  `--keep-directories` clash check.
+- `ItemGroup::item_opts` fills `remote_names` from the rows and leaves
+  `remote_name` unset. `validate_groups` drops the multi-row refusal and
+  keeps the directory refusal.
+- That commit carries `Fixes #98`.
+
+Tests (`ia-core/tests/upload_batch.rs`): an item of two rows with two
+different `REMOTE_NAME`s gives two PUT paths; a row without one keeps its
+name next to a row with one; `REMOTE_NAME` with `--remote-dir`; a
+`REMOTE_NAME` of `../x` refused with no request; two rows with the same
+`REMOTE_NAME` refused with no request. Unit tests for `compute_keys`.
 
 ### API note
 
