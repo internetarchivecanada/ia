@@ -199,6 +199,29 @@ Review of the full diff before the pull request:
   options; validating the merged metadata needs a new function or a
   signature change, and predates this work).
 
+## Review findings, second branch
+
+- Refusals of a remote name (`../x`, two files given one key) happened in
+  `compute_keys` inside `upload_item`, per item, so another item could be
+  uploaded before the batch stopped. Fixed: `check_keys` (public, in
+  `batch.rs`) runs `compute_keys` for every item through
+  `item::item_keys` before any request; `upload_batch`, the dry run and
+  the dashboard call it. Tests with two items and in the CLI dry run.
+- With any remote name in an item, the clash check covered every key and
+  blamed remote names for two plain basenames meeting. Fixed: a clash is
+  refused only under `--keep-directories` or when one of the two files has
+  a remote name, and the message names the cause. Plain basenames that
+  meet are left as before.
+- A `remote_names` entry keyed by a path that is not one of the arguments
+  (another spelling, an empty directory) was ignored. Fixed: refused.
+- Assertions on the refusal messages tightened; the release notes say that
+  resuming with a joblog from an earlier version uploads a renamed file
+  again under its new name.
+- Not changed: one file written two ways on two rows (`a.txt`, `./a.txt`)
+  with two names is uploaded under both, since rows are matched by path as
+  written; `--remote-dir`, `--remote-name` and `--keep-directories` are
+  accepted with `--spreadsheet` and not applied (existing, documented).
+
 ## Out of scope
 
 #96, #99, #100, #13, the single-file upload path, multipart. `ia verify

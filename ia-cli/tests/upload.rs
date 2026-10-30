@@ -499,6 +499,38 @@ fn upload_spreadsheet_dry_run_lists_the_metadata_and_name_the_upload_sends() {
     assert!(!stderr.contains("remote_name"), "{stderr}");
 }
 
+#[test]
+fn upload_spreadsheet_dry_run_refuses_a_remote_name_the_upload_would_refuse() {
+    // The dry run checks every item's remote keys as the upload does.
+    let dir = TempDir::new().unwrap();
+    let data_file = dir.path().join("hello.txt");
+    fs::write(&data_file, "hello world").unwrap();
+
+    let csv_path = dir.path().join("batch.csv");
+    fs::write(
+        &csv_path,
+        format!(
+            "identifier,file,REMOTE_NAME,mediatype,collection\n\
+             test-item-dry,{},../x.txt,texts,test_collection\n",
+            data_file.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--spreadsheet",
+            csv_path.to_str().unwrap(),
+            "--dry-run",
+            "--no-collection-check",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("../x.txt"));
+}
+
 // ─── Flag acceptance ─────────────────────────────────────────────────────────
 
 #[test]

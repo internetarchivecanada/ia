@@ -9,7 +9,7 @@ use console::style;
 
 use ia_core::joblog::{JoblogEntry, JoblogWriter};
 use ia_core::spreadsheet::read_spreadsheet;
-use ia_core::upload::batch::{group_records, validate_groups};
+use ia_core::upload::batch::{check_keys, group_records, validate_groups};
 use ia_core::upload::template::TEMPLATE_COLUMNS;
 use ia_core::upload::{
     generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
@@ -936,6 +936,7 @@ async fn run_import_dry_run(
 ) -> Result<()> {
     let groups = group_records(records)?;
     validate_groups(&groups)?;
+    check_keys(&groups, opts)?;
 
     // Check collections exist (unless --no-collection-check)
     if !opts.no_collection_check {
