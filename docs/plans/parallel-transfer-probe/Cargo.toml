@@ -1,0 +1,21 @@
+[package]
+name = "parallel-transfer-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Measurement probe for parallel multipart uploads (#22) and parallel Range downloads (#16)"
+
+# Its own workspace: not a member of the repository's, so it never affects
+# the repository build.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+configparser = "3"
+futures = "0.3"
+md-5 = "0.11"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
