@@ -44,7 +44,10 @@ this file becomes `docs/releases/<version>.md`.
   (`x-archive-meta00-subject`, `x-archive-meta01-subject`, ...) in
   numeric index order. A row follows the rule `ia metadata` applies to
   `-m`: a bare column is the field's list and `subject[N]` overwrites
-  position N or is appended past the end. A field the row fills in
+  position N or is appended past the end. A cell of `REMOVE_TAG`
+  removes that value (new: it used to be sent as the text
+  `REMOVE_TAG`), and the field still counts as named by the row. A
+  field the row fills in
   replaces every `-m` value for that field, as in the Python client;
   `-m` fields the row leaves empty are still sent. The `--dry-run`
   listing and the `--dashboard` path use the same merge.

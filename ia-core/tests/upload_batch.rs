@@ -485,6 +485,30 @@ async fn two_columns_for_one_position_keep_the_later_in_column_name_order() {
     );
 }
 
+#[tokio::test]
+async fn a_row_that_removes_a_field_also_drops_its_command_line_values() {
+    // The row names `subject`, so it replaces the -m values; REMOVE_TAG
+    // leaves nothing, so no subject is sent.
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(&dir, &[("subject", "REMOVE_TAG")]);
+    let (_, headers) = single_put(vec![rec], &[("subject", "cli")]).await;
+    assert_eq!(field_headers(&headers, "subject"), pairs(&[]));
+}
+
+#[tokio::test]
+async fn a_removed_position_drops_only_that_value() {
+    let dir = TempDir::new().unwrap();
+    let rec = row_with(
+        &dir,
+        &[("subject[0]", "REMOVE_TAG"), ("subject[1]", "keep")],
+    );
+    let (_, headers) = single_put(vec![rec], &[("subject", "cli")]).await;
+    assert_eq!(
+        field_headers(&headers, "subject"),
+        pairs(&[("x-archive-meta00-subject", "keep")])
+    );
+}
+
 /// A template row for `file` in `item-1` with `remote_name` filled in.
 fn template_row(file: &std::path::Path, remote_name: &str) -> upload::TemplateRow {
     upload::TemplateRow {

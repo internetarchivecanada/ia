@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
-use crate::metadata::write::apply_set;
+use crate::metadata::write::{apply_set, parse_indexed_key};
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::item::upload_item;
 use crate::upload::template::REMOTE_NAME_COLUMN;
@@ -23,6 +23,10 @@ type OnResultCallback = Arc<dyn Fn(&UploadResult) + Send + Sync>;
 pub struct ItemGroup {
     pub identifier: String,
     pub metadata: Vec<(String, String)>,
+    /// Every field the row of `metadata` names in a non-empty column, bare
+    /// or indexed, including one whose values `REMOVE_TAG` removed: each
+    /// replaces the command-line values for that field.
+    pub named_fields: BTreeSet<String>,
     pub files: Vec<PathBuf>,
     /// The remote name of each file in `files`, from the row's
     /// `REMOTE_NAME` column; `None` keeps the file's usual name.
@@ -32,15 +36,16 @@ pub struct ItemGroup {
 impl ItemGroup {
     /// The upload options for this item: `base` with the group's metadata
     /// merged in. A field the spreadsheet names replaces every value `base`
-    /// has for it, as the Python client does; fields it does not name are
-    /// kept (#97). The remote name comes from the row only: a single file
+    /// has for it, as the Python client does, even when the row's values
+    /// for it were all removed with `REMOVE_TAG`; fields it does not name
+    /// are kept (#97). The remote name comes from the row only: a single file
     /// with one is stored under it, and `base.remote_name` is not used, so
     /// one name is never given to every item of a batch.
     #[must_use]
     pub fn item_opts(&self, base: &UploadOpts) -> UploadOpts {
         let mut opts = base.clone();
-        let named: HashSet<&str> = self.metadata.iter().map(|(k, _)| k.as_str()).collect();
-        opts.metadata.retain(|(k, _)| !named.contains(k.as_str()));
+        opts.metadata
+            .retain(|(k, _)| !self.named_fields.contains(k.as_str()));
         opts.metadata.extend(self.metadata.iter().cloned());
         opts.remote_name = match self.remote_names.as_slice() {
             [Some(name)] => Some(name.clone()),
@@ -178,18 +183,21 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
             .filter(|v| !v.is_empty())
             .last();
 
-        let metadata = row_metadata(&identifier, fields)?;
+        let row = row_metadata(&identifier, fields)?;
 
         let group = map.entry(identifier.clone()).or_insert_with(|| ItemGroup {
             identifier,
             metadata: Vec::new(),
+            named_fields: BTreeSet::new(),
             files: Vec::new(),
             remote_names: Vec::new(),
         });
 
-        // Use metadata from the first record for this identifier
-        if group.metadata.is_empty() {
-            group.metadata = metadata;
+        // Use the metadata of the first record for this identifier that
+        // names any field (a row whose only value is REMOVE_TAG counts).
+        if group.named_fields.is_empty() {
+            group.metadata = row.pairs;
+            group.named_fields = row.named;
         }
 
         group.files.push(PathBuf::from(file_path));
@@ -215,10 +223,10 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
 ///
 /// An empty value is no value, as the readers treat a blank cell: it
 /// neither sends an empty header nor replaces a `-m` value.
-fn row_metadata(
-    identifier: &str,
-    fields: HashMap<String, String>,
-) -> Result<Vec<(String, String)>> {
+///
+/// Returns the fields the row names (every non-empty column's field, bare
+/// or indexed, whether or not a value survives) and the pairs.
+fn row_metadata(identifier: &str, fields: HashMap<String, String>) -> Result<RowMetadata> {
     let mut columns: Vec<(String, serde_json::Value)> = fields
         .into_iter()
         .filter(|(_, v)| !v.is_empty())
@@ -226,12 +234,21 @@ fn row_metadata(
         .collect();
     columns.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let named = columns
+        .iter()
+        .map(|(column, _)| {
+            parse_indexed_key(column)
+                .map(|(field, _)| field)
+                .unwrap_or_else(|| column.clone())
+        })
+        .collect();
+
     let mut item = serde_json::Map::new();
     apply_set(&mut item, &columns, identifier)?;
 
     // Every value put in is a string, so every value that comes out is a
     // string or a list of strings.
-    Ok(item
+    let pairs = item
         .into_iter()
         .flat_map(|(field, value)| {
             let values = match value {
@@ -243,7 +260,16 @@ fn row_metadata(
                 _ => None,
             })
         })
-        .collect())
+        .collect();
+    Ok(RowMetadata { named, pairs })
+}
+
+/// One row's metadata, from [`row_metadata`].
+struct RowMetadata {
+    /// The fields the row names, whether or not a value survives.
+    named: BTreeSet<String>,
+    /// The `(field, value)` pairs to send.
+    pairs: Vec<(String, String)>,
 }
 
 /// Validate all item groups upfront before uploading.
@@ -396,6 +422,7 @@ mod tests {
                 ("subject".into(), "alpha".into()),
                 ("subject".into(), "beta".into()),
             ],
+            named_fields: BTreeSet::from(["subject".to_string()]),
             files: vec![PathBuf::from("/tmp/a.txt")],
             remote_names: vec![None],
         };
@@ -543,6 +570,7 @@ mod tests {
         let groups = vec![ItemGroup {
             identifier: "test-item".into(),
             metadata: vec![("title".into(), "My Item".into())], // missing mediatype + collection
+            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
@@ -562,6 +590,7 @@ mod tests {
                 ("mediatype".into(), "texts".into()),
                 ("collection".into(), "test_collection".into()),
             ],
+            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
@@ -578,6 +607,7 @@ mod tests {
         let groups = vec![ItemGroup {
             identifier: "test-item".into(),
             metadata: vec![],
+            named_fields: BTreeSet::new(),
             files: vec![file],
             remote_names: vec![None],
         }];
