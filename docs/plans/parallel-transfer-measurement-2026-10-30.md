@@ -361,3 +361,210 @@ drew no throttling here.
   (#15); only a public file was tested.
 - Whether the faster datanode stays faster over a transfer (#15): the two
   direct checks per node, 46 minutes apart, disagreed.
+
+## Follow-up: single-connection profile and datanode resampling (2026-10-30)
+
+Two questions left open above: whether the rate of one connection (about
+5 MB/s for a full-file stream) is a limit that sets in after some bytes or a
+rate that holds from the first byte, and whether the item's two datanodes
+differ in a way that persists. Raw records:
+[`parallel-transfer-probe/results/single-connection-profile.jsonl`](parallel-transfer-probe/results/single-connection-profile.jsonl);
+probe:
+[`parallel-transfer-probe/src/bin/single-connection-profile.rs`](parallel-transfer-probe/src/bin/single-connection-profile.rs).
+MB/s is 10^6 bytes per second; MiB and GiB are binary.
+
+### Method
+
+The probe is a separate binary of the probe project. It sends GET requests
+only, sends no `Authorization` header, does not read the IA-S3 keys, and
+discards the bytes it receives (the full-file run computes their md5). Each
+request uses a fresh client, so it starts on new connections, and follows
+redirects by hand within `*.archive.org`, recording each hop. `/download/`
+requests carry `cnt=0`. Every file request is a `Range: bytes=0-N` request
+from the first byte of `ubuntu-18.04.5-desktop-amd64.iso`, so every request
+read the same leading bytes; caching on the datanode was not controlled.
+The first-session checks sent the `LOW` authorization header; these
+requests send none. One `GET
+/metadata/ubuntu-18.04.5-desktop-amd64` at the start gave `d1`
+`ia600807.us.archive.org`, `d2` `ia800807.us.archive.org`, `server`
+`ia800807.us.archive.org`, and the size and md5 used above.
+
+- Measurement A, rate profile of one connection. Through `/download/` on
+  HTTP/1.1, in this order: 64 MiB, 256 MiB, 1 GiB, the full file
+  (2,193,522,688 bytes), then 64 MiB, 256 MiB and 1 GiB again; then 1 GiB
+  on HTTP/2. At the first chunk past each 16 MiB boundary, the probe
+  records the time, the cumulative bytes and the rate of the slice since
+  the previous record, using the actual bytes (a slice is 16 MiB plus part
+  of one chunk). Slice 1 is timed
+  from the arrival of the response headers, so it excludes the redirect and
+  the time to the first byte; each later slice is timed from the end of the
+  one before.
+- Measurement B, datanode resampling. Seven samples, due every 10 minutes
+  from the first (0 to 60 minutes). Each sample is three 64 MiB requests,
+  each on a fresh HTTP/1.1 connection, always in this order: directly to
+  `d1` (`https://{d1}{dir}/{file}`), directly to `d2`, and through
+  `/download/`, recording the node the redirect chose. Recorded: status,
+  time to the first byte, rate (and slices, as in A).
+- A and B never overlapped; the probe runs one request at a time. A
+  transfer of measurement A started only if it would finish before the
+  next sample was due at an assumed 4 MB/s plus the 30 s pause, or
+  straight after a sample. Each file request started at least 30 s after
+  the previous file request ended. Every sample began on time.
+- Derived figures, computed from the per-slice records: "Wall" runs from
+  the first request (including the redirect) to the last byte; "MB/s" is
+  bytes over wall; "Steady" is the rate over the second half of the
+  transfer, from the first slice boundary at or past half the bytes to the
+  end; "Median of slices 2+" is the median slice rate after slice 1,
+  including a final partial slice; "Slice 1 above all later" marks a
+  transfer whose slice 1 rate is above every later slice of the same
+  transfer. In the run 3 profile, each row's rate is its bytes over its
+  time span, the first row timed from the arrival of the headers.
+- Budget: the probe refuses any file request that would take the bytes
+  received from file requests over 8,000,000,000.
+
+### Environment
+
+- Same client as above: Apple M1 Pro, macOS 27.2, Wi-Fi (`en0`), same
+  location. Probe built with reqwest 0.13.5 (rustls), Rust 1.95.
+- `networkQuality -s` at 21:21:43 UTC: downlink capacity 258.804 Mbit/s
+  (32.4 MB/s), uplink capacity 76.110 Mbit/s, idle latency 18.5 ms
+  (Apple's servers, not IA). The `networkQuality`, macOS and Rust figures
+  are from terminal output, not the records.
+- Run: first request 21:22:31 UTC, last byte 22:24:17 UTC. Measurement A
+  ran from 21:24:41 to 21:57:35 UTC.
+- 8 transfers (A) and 21 requests in 7 samples (B), every one answered 206
+  and complete, no stream error, no retry. Every `/download/` request (8 in A, 7 in B) was
+  redirected to `ia800807` (`d2`). The full-file run's md5 matched the
+  published md5. Received: 7,495,122,944 bytes (6,085,836,800 in A,
+  1,409,286,144 in B), plus the one metadata response.
+
+### Measurement A: rate profile of one connection
+
+All transfers through `/download/`, all served by `ia800807`.
+
+| Run | Start (UTC) | Size | Transport | Wall (s) | MB/s | Slice 1 MB/s | Steady MB/s | Median of slices 2+ | Slice 1 above all later |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 21:24:41 | 64 MiB | HTTP/1.1 | 5.1 | 13.09 | 12.70 | 22.40 | 20.09 | no |
+| 1 | 21:25:16 | 256 MiB | HTTP/1.1 | 46.0 | 5.84 | 5.90 | 6.58 | 6.82 | no |
+| 2 | 21:26:32 | 1 GiB | HTTP/1.1 | 235.2 | 4.56 | 6.90 | 4.78 | 4.87 | no |
+| 3 | 21:34:42 | full (2.04 GiB) | HTTP/1.1 | 375.5 | 5.84 | 9.05 | 5.60 | 5.97 | no |
+| 4 | 21:41:28 | 64 MiB | HTTP/1.1 | 16.1 | 4.18 | 6.06 | 4.61 | 4.39 | yes |
+| 5 | 21:44:34 | 256 MiB | HTTP/1.1 | 46.3 | 5.80 | 11.45 | 5.52 | 5.85 | yes |
+| 6 | 21:45:51 | 1 GiB | HTTP/1.1 | 220.9 | 4.86 | 7.12 | 5.00 | 5.00 | no |
+| 7 | 21:54:21 | 1 GiB | HTTP/2 | 193.5 | 5.55 | 8.16 | 5.69 | 5.74 | no |
+
+Time to the first byte, including the redirect, was 158 ms to 2,805 ms.
+Slice rates within one transfer ranged widely: in the 1 GiB runs from 1.67
+to 7.15 MB/s (run 2), 2.63 to 9.18 (run 6) and 3.18 to 9.86 (run 7).
+
+Full-file run (run 3), rate per 256 MiB of bytes (16 slices each; the last
+row is the remaining 3 slices). Time is from the request start.
+
+| Bytes (MiB) | Time (s) | MB/s | Slowest slice | Fastest slice |
+|---|---|---|---|---|
+| 0 to 256 | 1.9 to 42.9 | 6.54 | 4.00 | 9.05 |
+| 256 to 512 | 42.9 to 85.0 | 6.37 | 4.00 | 9.93 |
+| 512 to 768 | 85.0 to 130.6 | 5.88 | 3.96 | 10.19 |
+| 768 to 1,024 | 130.6 to 175.0 | 6.05 | 4.75 | 9.04 |
+| 1,024 to 1,280 | 175.0 to 218.7 | 6.15 | 4.48 | 8.03 |
+| 1,280 to 1,536 | 218.7 to 260.1 | 6.49 | 4.62 | 10.07 |
+| 1,536 to 1,792 | 260.1 to 309.2 | 5.47 | 3.23 | 6.93 |
+| 1,792 to 2,048 | 309.2 to 366.5 | 4.68 | 3.47 | 6.66 |
+| 2,048 to 2,091.9 | 366.5 to 375.5 | 5.09 | 4.82 | 5.34 |
+
+The first four slices of run 3 ran at 9.05, 5.87, 7.23 and 6.02 MB/s; the
+per-slice values for every transfer are in the JSONL (`rec.slices`).
+
+### Measurement B: datanode resampling
+
+64 MiB from the first byte, each request on a fresh HTTP/1.1 connection.
+Every request answered 206.
+
+| Sample | Start (UTC) | d1 `ia600807` MB/s | d2 `ia800807` MB/s | d1 / d2 | Redirect node | Redirect MB/s |
+|---|---|---|---|---|---|---|
+| 0 | 21:22:31 | 6.34 | 4.04 | 1.57 | `ia800807` (d2) | 5.30 |
+| 1 | 21:32:31 | 4.94 | 4.45 | 1.11 | `ia800807` (d2) | 5.28 |
+| 2 | 21:42:31 | 7.39 | 4.85 | 1.52 | `ia800807` (d2) | 6.28 |
+| 3 | 21:52:31 | 16.99 | 5.85 | 2.90 | `ia800807` (d2) | 13.19 |
+| 4 | 22:02:31 | 14.26 | 5.91 | 2.42 | `ia800807` (d2) | 4.22 |
+| 5 | 22:12:31 | 4.52 | 7.90 | 0.57 | `ia800807` (d2) | 3.75 |
+| 6 | 22:22:31 | 3.62 | 4.63 | 0.78 | `ia800807` (d2) | 4.99 |
+
+Each sample's three requests ran over 80 to 107 s from the first request
+to the last byte; the `d2` request started 33 to 48 s after the `d1`
+request (start times in the JSONL), so the two figures in a row are not
+simultaneous. Median over the seven samples: d1 6.34 MB/s (3.62 to
+16.99), d2 4.85 MB/s (4.04 to 7.90), redirect 5.28 MB/s (3.75 to 13.19).
+Time to the first byte on the direct requests was 81 ms to 217 ms, except
+one of 1,164 ms (d1, sample 5); through the redirect it was 263 ms to
+1,271 ms.
+
+### Interpretation
+
+Measurement A shows no drop that persists within the first 1 GiB of the six
+transfers of 256 MiB or more (runs 1, 2, 3, 5, 6 and 7). Only the single
+full-file run went past 1 GiB, and its rate dropped after 1,536 MiB
+(260 s) and did not recover; one run cannot attribute that drop to a
+limit rather than to a change in conditions, so the data can neither show
+nor rule out a limit that sets in beyond about 1.5 GiB. Seven of the eight transfers had a steady rate of 4.61 to
+6.58 MB/s, and from slice 2 on every transfer of 256 MiB or more had a
+median slice rate of 4.87 to 6.82 MB/s, with slices from 1.67 to
+10.19 MB/s. In six of the eight transfers slice 1 (the first 16 MiB,
+1.5 to 2.8 s) ran faster than the transfer's steady rate (6.06 to
+11.45 MB/s against 4.61 to 5.69), but in only two of them (runs 4 and 5)
+was it faster than every later slice, and runs 0 and 1 had a slower slice
+1 than their steady rate. The full-file run had 5.88 to 6.54 MB/s per
+256 MiB for its first 1,536 MiB and 4.68 to 5.47 MB/s for the remainder
+(after 260 s); with one run, this cannot be told apart from a change in
+conditions at the time. The one 1 GiB run on HTTP/2 (5.55 MB/s) was 14%
+and 22% faster than the two on HTTP/1.1 (4.86, 4.56 MB/s); it ran last
+and only once, so it cannot show whether the transport matters. A single connection is not held to about 5 MB/s at all times: run 0
+reached a steady 22.40 MB/s, above the 19.22 MB/s that eight connections
+reached in total in the first session, and of the 23 requests of 64 MiB
+in this session, 19 ran at 3.62 to 7.90 MB/s and 4 at 13.09 to
+16.99 MB/s, the 4 on both nodes and at three different times (21:24,
+21:52 to 21:53, 22:02). The faster 64 MiB checks of the first session (up
+to 18.24 MB/s, sent with the `LOW` header) are therefore not explained by
+transfer length alone. Explanations the data cannot separate: a limit per
+connection whose level varies over time (for example with load); no
+limit, with the rate set by the TCP window and round-trip time on this
+path under changing conditions (the round-trip time to the datanodes was
+not measured); load on the datanode, varying from minute to minute (disk
+reads are uncertain, since every request read the same leading bytes and
+caching was not controlled); and the local Wi-Fi link. The faster slice 1
+may come from a burst allowance or from buffering on the path, including
+bytes that arrived with the response headers; the data cannot tell which.
+
+Measurement B shows the two datanodes' requests, about 40 s apart in a
+fixed order, differing by a factor of 0.57 to 2.90. The `d1` request was
+faster by more than 40% in four samples (0, 2, 3 and 4, from 21:22 to
+22:02 UTC) and the `d2` request faster in two (5 and 6, at 22:12 and
+22:22 UTC); in sample 1 the two were within 11%, inside the 16% spread
+between repeats seen in the first session. The variation within one node
+was as large as the difference between them: `d2` served 5.85 MB/s
+directly and 13.19 MB/s through the redirect 41 s later (sample 3), and
+`d1` went from 14.26 to 4.52 MB/s between samples 4 and 5. Because the
+order was fixed (`d1` first, after the longest idle gap), a difference in
+one sample cannot be separated from the time between the requests. The
+`/download/` redirect chose `d2`, the item's `server`, for all 15
+requests, including the samples in which `d1`'s request was faster; `d2`
+also received every `/download/` request, so the two nodes did not see
+the same request history from this client. Seven samples of one 64 MiB
+request per node, from one client, cannot show whether a choice made at
+the start of a transfer would remain the better one for its duration, or
+why the nodes differ (load, caching, or network path).
+
+### Questions for IA operations
+
+1. Is the rate of one connection from a datanode shaped, or bounded by TCP
+   send-buffer or congestion-control settings on `ia600807` and
+   `ia800807`? Here one connection usually ran at 4.6 to 6.6 MB/s (seven
+   of eight transfers), but whole 64 MiB requests sometimes ran at 13 to
+   17 MB/s, one transfer had a steady rate of 22.4 MB/s (run 0), and
+   individual 16 MiB slices reached 26.5 MB/s; eight
+   connections to the same node reached 17.25 and 19.22 MB/s in total.
+2. How does `/download/` choose between an item's `d1` and `d2`? In this
+   run it sent all 15 requests to the item's `server` (`d2`), while direct
+   requests to `d1` were at times much faster (up to 2.9×, in requests
+   about 40 s apart). Is a client allowed to fetch from either node
+   directly, and is there a load signal it should use to choose?
