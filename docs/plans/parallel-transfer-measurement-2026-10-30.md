@@ -408,8 +408,8 @@ requests send none. One `GET
 - A and B never overlapped; the probe runs one request at a time. A
   transfer of measurement A started only if it would finish before the
   next sample was due at an assumed 4 MB/s plus the 30 s pause, or
-  straight after a sample. Each request started at least 30 s after the
-  previous one ended. Every sample began on time.
+  straight after a sample. Each file request started at least 30 s after
+  the previous file request ended. Every sample began on time.
 - Derived figures, computed from the per-slice records: "Wall" runs from
   the first request (including the redirect) to the last byte; "MB/s" is
   bytes over wall; "Steady" is the rate over the second half of the
@@ -501,9 +501,12 @@ one of 1,164 ms (d1, sample 5); through the redirect it was 263 ms to
 
 ### Interpretation
 
-Measurement A shows no point at which a single connection's rate drops and
-stays lower, and no sign of a limit that sets in after a fixed number of
-bytes. Seven of the eight transfers had a steady rate of 4.61 to
+Measurement A shows no drop that persists within the first 1 GiB of the six
+transfers of 256 MiB or more (runs 1, 2, 3, 5, 6 and 7). Only the single
+full-file run went past 1 GiB, and its rate dropped after 1,536 MiB
+(260 s) and did not recover; one run cannot attribute that drop to a
+limit rather than to a change in conditions, so the data can neither show
+nor rule out a limit that sets in beyond about 1.5 GiB. Seven of the eight transfers had a steady rate of 4.61 to
 6.58 MB/s, and from slice 2 on every transfer of 256 MiB or more had a
 median slice rate of 4.87 to 6.82 MB/s, with slices from 1.67 to
 10.19 MB/s. In six of the eight transfers slice 1 (the first 16 MiB,
@@ -556,7 +559,9 @@ why the nodes differ (load, caching, or network path).
 1. Is the rate of one connection from a datanode shaped, or bounded by TCP
    send-buffer or congestion-control settings on `ia600807` and
    `ia800807`? Here one connection usually ran at 4.6 to 6.6 MB/s (seven
-   of eight transfers), sometimes reached 13 to 26 MB/s, and eight
+   of eight transfers), but whole 64 MiB requests sometimes ran at 13 to
+   17 MB/s, one transfer had a steady rate of 22.4 MB/s (run 0), and
+   individual 16 MiB slices reached 26.5 MB/s; eight
    connections to the same node reached 17.25 and 19.22 MB/s in total.
 2. How does `/download/` choose between an item's `d1` and `d2`? In this
    run it sent all 15 requests to the item's `server` (`d2`), while direct
