@@ -53,7 +53,7 @@ impl fmt::Display for HashAlgorithm {
 /// A parsed checksum entry with its hash value and detected algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksumEntry {
-    /// The hex-encoded hash value.
+    /// The hex-encoded hash value, in lowercase.
     pub hash: String,
     /// The algorithm that produced this hash.
     pub algorithm: HashAlgorithm,
@@ -232,7 +232,8 @@ pub async fn compute_file_hash_async(
 
 /// Parse a checksums file (GNU md5sum or BSD md5 format).
 ///
-/// Returns a map of filename to hex MD5 digest.
+/// Returns a map of filename to hex MD5 digest, in lowercase as IA reports
+/// it, whatever case the file uses (Windows tools write uppercase).
 /// Skips blank lines and unrecognized formats with a warning.
 pub fn parse_checksums(content: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -272,7 +273,7 @@ fn try_parse_gnu(line: &str) -> Option<(String, String)> {
     let filename = parts[1].trim();
     // MD5 is 32 hex chars
     if hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit()) && !filename.is_empty() {
-        Some((hash.to_string(), filename.to_string()))
+        Some((hash.to_ascii_lowercase(), filename.to_string()))
     } else {
         None
     }
@@ -284,7 +285,7 @@ fn try_parse_bsd(line: &str) -> Option<(String, String)> {
     let (filename, rest) = line.split_once(") = ")?;
     let hash = rest.trim();
     if hash.len() == 32 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some((hash.to_string(), filename.to_string()))
+        Some((hash.to_ascii_lowercase(), filename.to_string()))
     } else {
         None
     }
@@ -313,6 +314,8 @@ pub async fn compute_file_md5_async(
 /// - GNU format: 32-char hex → MD5, 40-char hex → SHA-1
 /// - GNU format with 8-char hex is only accepted if `forced_algorithm` is `Some(Crc32)`
 /// - If `forced_algorithm` is set, all hashes are interpreted as that type
+///
+/// Digests are returned in lowercase, whatever case the file uses.
 ///
 /// Returns a map of filename to [`ChecksumEntry`].
 pub fn parse_checksums_multi(
@@ -377,7 +380,7 @@ fn try_parse_gnu_multi(
         HashAlgorithm::from_hash_len(hash.len())?
     };
 
-    Some((hash.to_string(), filename.to_string(), algorithm))
+    Some((hash.to_ascii_lowercase(), filename.to_string(), algorithm))
 }
 
 /// Try to parse BSD format with multi-algorithm support.
@@ -407,7 +410,7 @@ fn try_parse_bsd_multi(line: &str) -> Option<(String, String, HashAlgorithm)> {
         return None;
     }
 
-    Some((hash.to_string(), filename.to_string(), algorithm))
+    Some((hash.to_ascii_lowercase(), filename.to_string(), algorithm))
 }
 
 #[cfg(test)]
@@ -673,6 +676,50 @@ mod tests {
         let map = parse_checksums_multi(input, None);
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("file.txt"));
+    }
+
+    // --- uppercase hex digests (CertUtil, Get-FileHash) parse to lowercase ---
+
+    #[test]
+    fn parse_lowercases_uppercase_gnu_and_bsd_digests() {
+        let input = "5D41402ABC4B2A76B9719D911017C592  a.txt\n\
+                     MD5 (b.txt) = 5D41402ABC4B2A76B9719D911017C592\n";
+        let map = parse_checksums(input);
+        assert_eq!(map["a.txt"], "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(map["b.txt"], "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn parse_multi_lowercases_uppercase_digests_of_every_algorithm() {
+        let input = "5D41402ABC4B2A76B9719D911017C592  a.txt\n\
+                     AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D  b.txt\n\
+                     MD5 (c.txt) = 5D41402ABC4B2A76B9719D911017C592\n\
+                     SHA1 (d.txt) = AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D\n\
+                     CRC32 (e.txt) = 3610A686\n";
+        let map = parse_checksums_multi(input, None);
+        assert_eq!(map["a.txt"].hash, "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            map["b.txt"].hash,
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+        assert_eq!(map["c.txt"].hash, "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(
+            map["d.txt"].hash,
+            "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"
+        );
+        assert_eq!(map["e.txt"].hash, "3610a686");
+
+        let forced = parse_checksums_multi("3610A686  f.txt\n", Some(HashAlgorithm::Crc32));
+        assert_eq!(forced["f.txt"].hash, "3610a686");
+    }
+
+    #[test]
+    fn parse_rejects_non_hex_and_wrong_length_digests() {
+        let bad = "5D41402ABC4B2A76B9719D911017C59Z  a.txt\n\
+                   5D41402ABC4B2A76B9719D911017C5  b.txt\n\
+                   MD5 (c.txt) = 5D41402ABC4B2A76B9719D911017C592FF\n";
+        assert!(parse_checksums(bad).is_empty());
+        assert!(parse_checksums_multi(bad, None).is_empty());
     }
 
     // -- hash_file_and_parts: one pass, whole-file md5 and one md5 per part --

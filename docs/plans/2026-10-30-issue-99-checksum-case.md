@@ -14,8 +14,8 @@
 **Out of scope.** Library callers that fill `UploadOpts::checksum_file` or `VerifyOpts::checksums` by hand, bypassing the parsers, keep the digest as given. `md5sum -b` lines with a leading `*` in the file name.
 
 ## Tasks
-- [ ] Plan committed first.
-- [ ] Red: a unit test in `checksum.rs` that an uppercase GNU and BSD line parses to lowercase in both parsers; wiremock tests for `verify_item` with an uppercase checksum file in match-names and hash-only modes (`Verified`); a wiremock test in `ia-core/tests/upload_single.rs` that an uppercase `checksum_file` digest for a file already on the item is skipped with no PUT.
-- [ ] Green: lowercase in the four parse functions.
-- [ ] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --all-targets -- -D warnings`.
+- [x] Plan committed first.
+- [x] Red: a unit test in `checksum.rs` that an uppercase GNU and BSD line parses to lowercase in both parsers; wiremock tests for `verify_item` with an uppercase checksum file in match-names and hash-only modes (`Verified`); a wiremock test in `ia-core/tests/upload_single.rs` that an uppercase `checksum_file` digest for a file already on the item is skipped with no PUT.
+- [x] Green: lowercase in the four parse functions.
+- [x] `cargo test --locked -p ia-core -p ia-cli`, `cargo clippy --locked -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code-reviewer pass; PR.
