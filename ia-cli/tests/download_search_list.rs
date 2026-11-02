@@ -220,6 +220,93 @@ async fn download_not_found_item_errors() {
     );
 }
 
+/// The Metadata API answers a missing item with 200 and `{}`, not a 404,
+/// whatever the query.
+async fn mount_missing_item(server: &MockServer, identifier: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/metadata/{identifier}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+/// Every `GET /metadata/...` the server received carried `extended_err=1`,
+/// and there was at least one.
+async fn assert_metadata_gets_send_extended_err(server: &MockServer) {
+    let requests = server.received_requests().await.unwrap();
+    let gets: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path().starts_with("/metadata/"))
+        .collect();
+    assert!(!gets.is_empty(), "no metadata GET was sent");
+    for r in gets {
+        assert!(
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "extended_err" && v == "1"),
+            "metadata GET without extended_err=1: {}",
+            r.url
+        );
+    }
+}
+
+#[tokio::test]
+async fn download_empty_metadata_body_reports_not_found() {
+    let mock_server = MockServer::start().await;
+    mount_missing_item(&mock_server, "missing-item").await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let dir = TempDir::new().unwrap();
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "download",
+            "missing-item",
+            "--destdir",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "expected failure: {stderr}");
+    assert!(
+        stderr.contains("item not found: missing-item"),
+        "expected 'item not found' in error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("0 errors"),
+        "must not report an empty success: {stderr}"
+    );
+    assert_metadata_gets_send_extended_err(&mock_server).await;
+}
+
+#[tokio::test]
+async fn list_empty_metadata_body_reports_not_found() {
+    let mock_server = MockServer::start().await;
+    mount_missing_item(&mock_server, "missing-item").await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let output = ia_cmd()
+        .args(["--insecure", "-H", &host, "list", "missing-item"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "expected failure: {stderr}");
+    assert!(
+        stderr.contains("item not found: missing-item"),
+        "expected 'item not found' in error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no files match filters"),
+        "must not report an empty listing: {stderr}"
+    );
+    assert_metadata_gets_send_extended_err(&mock_server).await;
+}
+
 // ─── List tests ──────────────────────────────────────────────────────────────
 
 #[test]

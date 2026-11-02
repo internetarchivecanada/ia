@@ -526,7 +526,8 @@ pub struct CompoundModifyRequest {
 /// Modify metadata using multiple chained operation groups in a single HTTP round-trip.
 ///
 /// 1. Validates auth credentials
-/// 2. Fetches current metadata via GET /metadata/{identifier}
+/// 2. Fetches current metadata via GET /metadata/{identifier}?extended_err=1;
+///    a missing or unavailable item fails here (see `check_item_body`)
 /// 3. Extracts the target metadata (item-level or file-level)
 /// 4. Chains all groups via `compute_compound_patch()` to produce one JSON Patch
 /// 5. POSTs the single combined patch to /metadata/{identifier}
@@ -545,7 +546,12 @@ pub async fn modify_compound(
 
     // 2. Fetch current metadata
     let url = client.url(&format!("/metadata/{identifier}"));
-    let response = client.http().get(&url).send().await?;
+    let response = client
+        .http()
+        .get(&url)
+        .query(&[super::read::EXTENDED_ERR_PARAM])
+        .send()
+        .await?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(IaError::NotFound(identifier.to_string()));
@@ -563,6 +569,8 @@ pub async fn modify_compound(
         .json()
         .await
         .map_err(reqwest_middleware::Error::from)?;
+    // A missing item is a 200 `{}`, not a 404.
+    super::read::check_item_body(identifier, &item)?;
 
     // 3. Extract source metadata based on target
     let source = extract_target_metadata(&item, &req.target, identifier)?;

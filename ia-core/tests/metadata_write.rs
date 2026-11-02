@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // =============================================================================
@@ -1835,6 +1835,106 @@ async fn modify_compound_set_and_remove_single_post() {
     let resp = modify_compound(&client, &req).await.unwrap();
     assert!(resp.success);
     assert_eq!(resp.task_id, Some(99999));
+}
+
+fn title_change_request(identifier: &str) -> CompoundModifyRequest {
+    CompoundModifyRequest {
+        identifier: identifier.to_string(),
+        groups: vec![ChangeGroup {
+            changes: vec![("title".to_string(), json!("New Title"))],
+            op: MetadataOp::Set,
+        }],
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    }
+}
+
+#[tokio::test]
+async fn modify_compound_fetch_sends_extended_err() {
+    let mock_server = MockServer::start().await;
+
+    // Matches only with extended_err=1, so the write below fails unless
+    // the pre-write fetch sends it.
+    Mock::given(method("GET"))
+        .and(path("/metadata/test-item"))
+        .and(query_param("extended_err", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(standard_item_fixture()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/metadata/test-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(1)))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let resp = modify_compound(&client, &title_change_request("test-item"))
+        .await
+        .unwrap();
+    assert!(resp.success);
+}
+
+#[tokio::test]
+async fn modify_compound_empty_body_is_not_found_and_sends_no_post() {
+    // The Metadata API answers a missing item with 200 and `{}`.
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/missing-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(1)))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let result = modify_compound(&client, &title_change_request("missing-item")).await;
+    assert!(
+        matches!(result, Err(IaError::NotFound(ref id)) if id == "missing-item"),
+        "expected NotFound, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn modify_compound_errcode_body_is_item_unavailable() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/deleted-item"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"error": "item was deleted", "errcode": 104})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(success_response(1)))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let client = IaClient::from_config(mock_config_with_auth(&mock_server.uri())).unwrap();
+    let result = modify_compound(&client, &title_change_request("deleted-item")).await;
+    assert!(
+        matches!(
+            result,
+            Err(IaError::ItemUnavailable {
+                code: Some(104),
+                ..
+            })
+        ),
+        "expected ItemUnavailable 104, got {result:?}"
+    );
 }
 
 #[tokio::test]

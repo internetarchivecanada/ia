@@ -1008,11 +1008,10 @@ fn metadata_export_help_shows_file_input() {
 fn metadata_bare_multiple_ids_accepted() {
     // Multiple positional IDs should be accepted and produce JSONL output.
     //
-    // CRITICAL: this test MUST NOT hit archive.org. A previous version ran
-    // `ia metadata id1 id2 id3` against the live metadata API (read-only GETs
-    // on every test run) and its success depended on archive.org returning
-    // `200 {}` for nonexistent items. We now point `--host` at a wiremock
-    // server that serves the same `{}` responses.
+    // CRITICAL: this test MUST NOT hit archive.org. `--host` points at a
+    // wiremock server. It serves a real item body for each identifier: the
+    // Metadata API's `200 {}` means the item does not exist, which is an
+    // error (see `metadata_missing_item_exits_nonzero`).
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(wiremock::MockServer::start());
 
@@ -1020,9 +1019,9 @@ fn metadata_bare_multiple_ids_accepted() {
         for id in ["id1", "id2", "id3"] {
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path(format!("/metadata/{id}")))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
-                )
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"metadata": {"identifier": id}, "files": []}),
+                ))
                 .mount(&server)
                 .await;
         }
@@ -1030,17 +1029,137 @@ fn metadata_bare_multiple_ids_accepted() {
 
     let host = server.uri().strip_prefix("http://").unwrap().to_string();
 
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "id1",
+            "id2",
+            "id3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().count(),
+        3,
+        "expected 3 JSONL lines: {stdout}"
+    );
+}
+
+// --- missing items: the Metadata API answers 200 `{}` (#118) ---
+
+/// A wiremock server whose `/metadata/missing-item` answers `200 {}` to any
+/// query, as the real Metadata API does for an identifier with no item.
+fn missing_item_server() -> (tokio::runtime::Runtime, wiremock::MockServer, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(wiremock::MockServer::start());
+    rt.block_on(async {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/metadata/missing-item"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+    });
+    let host = server.uri().strip_prefix("http://").unwrap().to_string();
+    (rt, server, host)
+}
+
+/// Every `GET /metadata/...` the server received carried `extended_err=1`,
+/// and there was at least one.
+fn assert_metadata_gets_send_extended_err(
+    rt: &tokio::runtime::Runtime,
+    server: &wiremock::MockServer,
+) {
+    let requests = rt.block_on(server.received_requests()).unwrap();
+    let gets: Vec<_> = requests
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path().starts_with("/metadata/"))
+        .collect();
+    assert!(!gets.is_empty(), "no metadata GET was sent");
+    for r in gets {
+        assert!(
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "extended_err" && v == "1"),
+            "metadata GET without extended_err=1: {}",
+            r.url
+        );
+    }
+}
+
+#[test]
+fn metadata_missing_item_exits_nonzero() {
+    let (rt, server, host) = missing_item_server();
+    ia().args(["--insecure", "--host", &host, "metadata", "missing-item"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("item not found: missing-item"));
+    assert_metadata_gets_send_extended_err(&rt, &server);
+}
+
+#[test]
+fn metadata_exists_missing_item_reports_false() {
+    let (rt, server, host) = missing_item_server();
     ia().args([
         "--insecure",
         "--host",
         &host,
         "metadata",
-        "id1",
-        "id2",
-        "id3",
+        "missing-item",
+        "--exists",
     ])
     .assert()
-    .success();
+    .failure()
+    .stdout(predicate::str::is_empty());
+
+    let output = ia()
+        .args([
+            "--insecure",
+            "--host",
+            &host,
+            "metadata",
+            "missing-item",
+            "--exists",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let line: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        line,
+        serde_json::json!({"identifier": "missing-item", "exists": false})
+    );
+    assert_metadata_gets_send_extended_err(&rt, &server);
+}
+
+#[test]
+fn metadata_modify_dry_run_missing_item_reports_not_found() {
+    let (rt, server, host) = missing_item_server();
+    ia().args([
+        "--insecure",
+        "--host",
+        &host,
+        "metadata",
+        "missing-item",
+        "-m",
+        "title:New",
+        "--dry-run",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("item not found: missing-item"));
+    assert_metadata_gets_send_extended_err(&rt, &server);
 }
 
 #[test]

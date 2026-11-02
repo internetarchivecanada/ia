@@ -53,6 +53,7 @@ These map 1:1 from existing `IaError` variants in `ia-core/src/error.rs`:
 | Code | Description | Extra fields |
 |------|-------------|--------------|
 | `not_found` | Item does not exist | `identifier` |
+| `item_unavailable` | Item exists or existed but cannot be served (Metadata API `extended_err`) | `identifier`, `errcode` (when sent) |
 | `http_error` | Non-200 HTTP response | `status`, `url` |
 | `rate_limited` | 429 from server | `retry_after` (seconds) |
 | `checksum_mismatch` | File hash doesn't match | `file`, `expected`, `actual` |

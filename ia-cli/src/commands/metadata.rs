@@ -2612,7 +2612,12 @@ async fn run_dry_run_compound(
     json: bool,
 ) -> Result<usize> {
     let url = client.url(&format!("/metadata/{identifier}"));
-    let resp = client.http().get(&url).send().await?;
+    let resp = client
+        .http()
+        .get(&url)
+        .query(&[ia_core::metadata::EXTENDED_ERR_PARAM])
+        .send()
+        .await?;
     let status = resp.status().as_u16();
     if status == 404 {
         bail!("item not found: {identifier}");
@@ -2622,6 +2627,8 @@ async fn run_dry_run_compound(
         bail!("failed to fetch metadata for {identifier}: HTTP {status} {body}");
     }
     let item: serde_json::Value = resp.json().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A missing item is a 200 `{}`, not a 404.
+    ia_core::metadata::check_item_body(identifier, &item)?;
 
     let source =
         extract_target_metadata(&item, target, identifier).map_err(|e| anyhow::anyhow!("{e}"))?;

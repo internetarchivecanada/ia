@@ -306,6 +306,8 @@ ia metadata nasa --formats
 ia metadata DARK-item -p dark_ok=1
 ```
 
+Every metadata request sends `extended_err=1`. The Metadata API answers an identifier with no item with HTTP 200 and an empty object, which `ia metadata`, `ia download`, `ia list` and a `--dry-run` write report as `item not found: <id>` with exit code 1 (`ia download --json` reports it with error code `not_found`). `--exists` exits 1 (with `--json`, it prints `"exists": false`). An item that exists or existed but cannot be served is reported as `item unavailable: <id>: <message> (errcode N)` (`ia download --json` error code `item_unavailable`); `--exists` then fails with that error instead of answering yes or no. The codes are listed under "Extended errors" at <https://archive.org/developers/md-read.html>. Metadata reads retry errcode 102 (data node offline or not responding), up to three attempts; the fetch before a metadata write, and its `--dry-run`, do not retry it. A dark item read without `-p dark_ok=1` is reported as before.
+
 #### Writing metadata
 
 Metadata writes use subcommands. Each takes `-m/--metadata <FIELD:VALUE>` pairs (repeatable):
