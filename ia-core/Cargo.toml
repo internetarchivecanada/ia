@@ -32,7 +32,7 @@ libc = "0.2"
 json-patch = "4"
 calamine = "0.37"
 csv = "1"
-rust_xlsxwriter = "0.101"
+rust_xlsxwriter = "0.102"
 indexmap = { version = "2", features = ["serde"] }
 base64 = "0.23"
 # SHA-256 for checking update assets against SHA256SUMS. Already compiled
