@@ -23,11 +23,11 @@ The schema read (`/metadata/ia-metadata/schema`) is a partial read of one elemen
 
 ## Response rule
 
-One public function, `ia_core::metadata::check_item_body(identifier, &serde_json::Value) -> Result<()>`, applied to every 200 body above after it is parsed as JSON and before it is used:
+One public function, `ia_core::metadata::check_item_body(identifier, &serde_json::Value) -> Result<()>`, beside the public constant `ia_core::metadata::EXTENDED_ERR_PARAM` that the three requests send, applied to every 200 body above after it is parsed as JSON and before it is used:
 
 1. A body with a `metadata` or a `files` key is an item. Any `errcode` beside them is ignored, so a code documented as informational (106, a secondary metadata copy was used) never fails a read that returned the item.
-2. Otherwise a body with an `error` key is `IaError::ItemUnavailable`.
-3. Otherwise (`{}`, or any other body with neither key) it is `IaError::NotFound`.
+2. Otherwise a body with an `error` or an `errcode` key is `IaError::ItemUnavailable`. With no `error`, the message is `no message`.
+3. Otherwise (`{}`, or any other body with none of those keys) it is `IaError::NotFound`.
 
 The 404 branch stays.
 
