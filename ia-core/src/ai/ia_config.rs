@@ -190,6 +190,12 @@ pub async fn resolve_ai_config(
         match fetch_ai_config(client, collection).await {
             Ok(config) => return Ok((collection.to_string(), config)),
             Err(IaError::NotFound(_)) => continue,
+            // Deleted (104), pending (101) and the like: no config there.
+            // 102 (data node offline) still fails the lookup.
+            Err(e @ IaError::ItemUnavailable { .. }) if !e.is_retryable() => {
+                debug!(collection, error = %e, "collection unavailable, skipping");
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -648,5 +654,58 @@ mod tests {
             .await
             .expect("fetch_ai_config should succeed when cnt=0 is sent");
         assert_eq!(fetched.result.model_name, "gpt-5-nano");
+    }
+
+    /// A deleted collection (errcode 104) is skipped like a missing one, so
+    /// the next collection's config is used.
+    #[tokio::test]
+    async fn resolve_ai_config_skips_unavailable_collection() {
+        use crate::config::IaConfig;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/deleted-coll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "item was deleted",
+                "errcode": 104
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/metadata/ai-coll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": { "identifier": "ai-coll" },
+                "files": [
+                    { "name": "ai-coll-config.json", "format": "AI Config JSON" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/ai-coll/ai-coll-config.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": default_ai_config().result,
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = IaConfig::default();
+        config.general.host = server.uri().trim_start_matches("http://").to_string();
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+
+        let item: ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "identifier": "some-item",
+                "collection": ["deleted-coll", "ai-coll"]
+            }
+        }))
+        .unwrap();
+        let (collection, _) = resolve_ai_config(&client, &item).await.unwrap();
+        assert_eq!(collection, "ai-coll");
     }
 }

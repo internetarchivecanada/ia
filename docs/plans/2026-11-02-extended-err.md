@@ -25,7 +25,7 @@ The schema read (`/metadata/ia-metadata/schema`) is a partial read of one elemen
 
 One public function, `ia_core::metadata::check_item_body(identifier, &serde_json::Value) -> Result<()>`, beside the public constant `ia_core::metadata::EXTENDED_ERR_PARAM` that the three requests send, applied to every 200 body above after it is parsed as JSON and before it is used:
 
-1. A body with a `metadata` or a `files` key is an item. Any `errcode` beside them is ignored, so a code documented as informational (106, a secondary metadata copy was used) never fails a read that returned the item.
+1. A body with a `metadata`, `files` or `is_dark` key is an item. `is_dark` alone is what a dark item read without `dark_ok=1` answers; it stays an item, as before, since dark handling is out of scope. Any `errcode` beside them is ignored, so a code documented as informational (106, a secondary metadata copy was used) never fails a read that returned the item.
 2. Otherwise a body with an `error` or an `errcode` key is `IaError::ItemUnavailable`. With no `error`, the message is `no message`.
 3. Otherwise (`{}`, or any other body with none of those keys) it is `IaError::NotFound`.
 
@@ -57,7 +57,7 @@ The read loop in `metadata::read::get_with_params` already retries body-decode f
 
 ## `exists()`
 
-Unchanged code, new results through the rule: `Ok(true)` for an item, `Ok(false)` for `{}` (and for a 404), `Err(ItemUnavailable)` for an `errcode` response, so a caller can tell "gone" from "unreachable right now". `upload::validate::check_collections` already logs and skips an `Err`.
+Unchanged code, new results through the rule: `Ok(true)` for an item, `Ok(false)` for `{}` (and for a 404), `Err(ItemUnavailable)` for an `errcode` response, so a caller can tell "gone" from "unreachable right now". `upload::validate::check_collections` already logs and skips an `Err`. `ai::ia_config::resolve_ai_config` skipped a collection on `NotFound`, which is what a deleted or pending collection gave before (`{}`); it now also skips an `ItemUnavailable` that is not retryable.
 
 ## CLI
 

@@ -125,8 +125,10 @@ async fn get_once(
 
 /// Classify a 200 answer from `GET /metadata/{identifier}?extended_err=1`.
 ///
-/// 1. A body with a `metadata` or a `files` key is the item: `Ok(())`. An
-///    `errcode` beside them is ignored, since a code such as 106 (a secondary
+/// 1. A body with a `metadata`, `files` or `is_dark` key is the item:
+///    `Ok(())`. `is_dark` alone is what a dark item read without `dark_ok=1`
+///    answers; it stays an item, as before `extended_err`. An `errcode`
+///    beside these keys is ignored, since a code such as 106 (a secondary
 ///    metadata copy was used) does not stop the item being served.
 /// 2. Otherwise a body with an `error` or an `errcode` key is
 ///    [`IaError::ItemUnavailable`]. An `errcode` that is not an integer in
@@ -147,7 +149,10 @@ async fn get_once(
 /// ));
 /// ```
 pub fn check_item_body(identifier: &str, body: &serde_json::Value) -> Result<()> {
-    if body.get("metadata").is_some() || body.get("files").is_some() {
+    if ["metadata", "files", "is_dark"]
+        .iter()
+        .any(|key| body.get(key).is_some())
+    {
         return Ok(());
     }
     let error = body.get("error");
@@ -688,6 +693,8 @@ mod tests {
 
         assert!(check_item_body("x", &json!({"metadata": {}})).is_ok());
         assert!(check_item_body("x", &json!({"files": []})).is_ok());
+        // A dark item read without dark_ok: kept as an item, as before.
+        assert!(check_item_body("x", &json!({"is_dark": true})).is_ok());
         assert!(matches!(
             check_item_body("x", &json!({})),
             Err(IaError::NotFound(_))
