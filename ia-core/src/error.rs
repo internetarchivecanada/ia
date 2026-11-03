@@ -33,6 +33,7 @@ pub struct JsonErrorBody {
 /// fn classify(e: &IaError) {
 ///     match e {
 ///         IaError::NotFound(_) => (),
+///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
@@ -90,6 +91,7 @@ pub struct JsonErrorBody {
 /// fn classify(e: &IaError) {
 ///     match e {
 ///         IaError::NotFound(_) => (),
+///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
@@ -145,6 +147,19 @@ pub struct JsonErrorBody {
 pub enum IaError {
     #[error("item not found: {0}")]
     NotFound(String),
+
+    /// The Metadata API reports, with `extended_err=1`, that the item exists
+    /// or once existed but cannot be served: for example `errcode` 101
+    /// (creation pending), 102 (data node offline or not responding) or 104
+    /// (deleted). `code` is `None` when the API sent only an `error` message;
+    /// it documents that not every error has a code yet. Only 102 is
+    /// retryable (see [`IaError::is_retryable`]).
+    #[error("item unavailable: {identifier}: {message}{}", errcode_note(code))]
+    ItemUnavailable {
+        identifier: String,
+        code: Option<u16>,
+        message: String,
+    },
 
     /// A non-success HTTP response. `retry_after` is the response's
     /// `Retry-After` header in seconds when it had one, so a loop that
@@ -403,6 +418,14 @@ pub enum IaError {
     Json(#[from] serde_json::Error),
 }
 
+/// The tail of an item-unavailable message: the API's `errcode`, if any.
+fn errcode_note(code: &Option<u16>) -> String {
+    match code {
+        Some(code) => format!(" (errcode {code})"),
+        None => String::new(),
+    }
+}
+
 /// The tail of a checksum-mismatch message: where the download was kept,
 /// or that it could not be.
 fn kept_note(kept: &Option<String>) -> String {
@@ -563,6 +586,10 @@ impl IaError {
             IaError::TaskRerunFailed { .. } => false,
             IaError::TaskNotFound { .. } => false,
             IaError::TaskTimeout { .. } => false,
+            // 102: data node offline or not responding. 101 (creation
+            // pending), 104 (deleted) and the rest will not change within a
+            // retry budget.
+            IaError::ItemUnavailable { code, .. } => *code == Some(102),
             // Permanent — retrying won't help
             IaError::NotFound(_) => false,
             IaError::Auth(_) => false,
@@ -594,6 +621,15 @@ impl IaError {
             IaError::NotFound(id) => {
                 extra.insert("identifier".into(), id.clone().into());
                 "not_found"
+            }
+            IaError::ItemUnavailable {
+                identifier, code, ..
+            } => {
+                extra.insert("identifier".into(), identifier.clone().into());
+                if let Some(code) = code {
+                    extra.insert("errcode".into(), (*code).into());
+                }
+                "item_unavailable"
             }
             IaError::Http {
                 status,
@@ -1112,6 +1148,70 @@ mod tests {
         assert_eq!(v["error"]["code"], "not_found");
         assert_eq!(v["error"]["identifier"], "nasa");
         assert!(v["error"]["message"].as_str().unwrap().contains("nasa"));
+    }
+
+    #[test]
+    fn item_unavailable_displays_message_and_code() {
+        let err = IaError::ItemUnavailable {
+            identifier: "some-item".into(),
+            code: Some(101),
+            message: "item is pending creation".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "item unavailable: some-item: item is pending creation (errcode 101)"
+        );
+    }
+
+    #[test]
+    fn item_unavailable_without_code_omits_it() {
+        let err = IaError::ItemUnavailable {
+            identifier: "some-item".into(),
+            code: None,
+            message: "something went wrong".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "item unavailable: some-item: something went wrong"
+        );
+    }
+
+    #[test]
+    fn json_item_unavailable() {
+        let err = IaError::ItemUnavailable {
+            identifier: "some-item".into(),
+            code: Some(104),
+            message: "item was deleted".into(),
+        };
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "item_unavailable");
+        assert_eq!(v["error"]["identifier"], "some-item");
+        assert_eq!(v["error"]["errcode"], 104);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("item was deleted"));
+
+        let no_code = IaError::ItemUnavailable {
+            identifier: "some-item".into(),
+            code: None,
+            message: "x".into(),
+        };
+        assert!(parse_json_error(&no_code)["error"].get("errcode").is_none());
+    }
+
+    #[test]
+    fn item_unavailable_retries_only_errcode_102() {
+        let with = |code| IaError::ItemUnavailable {
+            identifier: "some-item".into(),
+            code,
+            message: "x".into(),
+        };
+        assert!(with(Some(102)).is_retryable());
+        assert!(!with(Some(101)).is_retryable());
+        assert!(!with(Some(104)).is_retryable());
+        assert!(!with(Some(999)).is_retryable());
+        assert!(!with(None).is_retryable());
     }
 
     #[test]
