@@ -37,7 +37,10 @@ use crate::output::DownloadDisplay;
         given. A dropped connection, or a stream slower \
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
-        starts over.",
+        starts over.\n\n\
+        A file of 256 MiB or more is fetched over --streams Range requests at once (default 4), \
+        each on its own connection, with its progress kept in <name>.part.json so an interrupted \
+        download resumes per part.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -49,6 +52,8 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
          \n\n  <dim># Ride out a flaky link: 20 retries per file</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
+         \n\n  <dim># Fetch a large file over 8 connections at once</dim>\n  <bold>$ ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --streams 8</bold>\
+         \n\n  <dim># Fetch every file over one connection</dim>\n  <bold>$ ia download nasa --streams 1</bold>\
          \n\n  <dim># Accept downloads on size alone (no md5 check)</dim>\n  <bold>$ ia download nasa --no-verify</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
@@ -126,7 +131,7 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_verify: bool,
 
-    /// Max retries per file (also the number of stalls allowed, see --min-speed)
+    /// Max retries per file, or per stream of a large file (also the number of stalls allowed, see --min-speed)
     ///
     /// Each retry waits a random time, up to a cap that doubles from 1 s to
     /// 60 s. A Retry-After header on the failed response (a 429 or a 5xx,
@@ -153,6 +158,37 @@ pub struct DownloadArgs {
     /// stream, and a stream that trickles never ends.
     #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
     min_speed: u64,
+
+    /// Connections per file of 256 MiB or more (1 to 8; 1 means one stream)
+    ///
+    /// A file of 256 MiB or more is cut into 64 MiB parts, which N streams,
+    /// each on its own HTTP/1.1 connection, fetch with Range requests and
+    /// write into the .part file at their offsets. The first request goes
+    /// alone; if the server does not answer it with the range asked for, the
+    /// file is fetched on one stream. Smaller files always use one stream.
+    ///
+    /// Progress is kept beside the .part in <name>.part.json, so an
+    /// interrupted download resumes per part; once every part is on disk the
+    /// .part.json is removed, the md5 of the whole file is checked (unless
+    /// --no-verify), and the file is renamed into place. A rerun with
+    /// --streams 1 keeps the bytes from the start of the file up to the
+    /// first missing one and continues from there.
+    ///
+    /// --min-speed and --retries apply to each stream: a stream re-requests
+    /// the rest of its part after a dropped connection or a stall, and
+    /// retries a failed request after the standard wait or the server's
+    /// Retry-After. When a stream's retries are spent the file fails with
+    /// "download of <name> failed on bytes A-B after N attempts: ...", its
+    /// .part and .part.json are kept for a later run, and it is not attempted
+    /// again in this run. Up to -j files download at once, so a run can hold
+    /// -j times N connections.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "4",
+        value_parser = clap::value_parser!(u8).range(1..=ia_core::download::MAX_STREAMS as i64)
+    )]
+    streams: u8,
 
     /// Don't set file modification times
     #[arg(long)]
@@ -477,6 +513,7 @@ pub async fn run(
         o.filter = filter.clone();
         o.count_views = args.count_views;
         o.min_speed = args.min_speed;
+        o.streams = usize::from(args.streams);
         o
     };
 

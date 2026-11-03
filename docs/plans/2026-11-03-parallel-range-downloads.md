@@ -45,7 +45,7 @@ With `--count-views`, only this first request omits `cnt`; every later part requ
 
 Each stream opens the `.part` file for writing (never truncating), seeks to its part's next unfetched byte, and writes through a 256 KiB buffer, as the single-stream path does. Streams write disjoint ranges through separate file handles. The `.part` grows as streams write past its end; it is not pre-sized, so a file system without sparse files does no extra work. A body byte past the end of the requested range is never written.
 
-The `.part` file is checked for a symlink before every open, as on the single-stream path; a link is removed and the part fails its attempt.
+The `.part` file is checked for a symlink before every open, as on the single-stream path; a link is removed and the file's attempt fails with the retryable `ResumeFailed`, so the next attempt finds no `.part` and starts over.
 
 ### The part journal
 
@@ -78,7 +78,7 @@ A crash therefore loses at most 16 MiB per stream.
 At the start of the parallel path:
 
 1. A `.part` that is a symlink is removed, as on the single-stream path.
-2. A journal is read and checked: it must not be a symlink, must parse, must have `version` 1, `size` and `md5` equal to the current metadata, a `part_size` above zero, one `done` entry per part, every entry no larger than its part, and the `.part` must be a regular file at least as long as the furthest byte the journal claims. A journal that fails any check is deleted together with the `.part`, and the file starts from byte 0: holes cannot be told from data.
+2. A journal is read and checked: it must not be a symlink, must parse, must have `version` 1, `size` and `md5` equal to the current metadata, a `part_size` above zero, one `done` entry per part, every entry no larger than its part, and the `.part` must be a regular file at least as long as the furthest byte the journal claims (a missing `.part` holds no bytes, which is enough for a journal that claims none). A journal that fails any check is deleted together with the `.part`, and the file starts from byte 0: holes cannot be told from data.
 3. Without a journal, a regular `.part` of length L is a contiguous prefix. L above the metadata size: the `.part` is deleted and the file starts from 0. Otherwise the prefix is mapped onto the grid: parts ending at or before L are complete, the part containing L has `done = L − start`.
 4. **Which parts are refetched:** every part with `done < length`, from byte `start + done` to its last byte. Nothing past `done` in a part is trusted. A complete part is not requested.
 5. When every part is already complete, no request is sent; the md5 pass and the rename follow.
@@ -89,7 +89,7 @@ At the start of the parallel path:
 
 A stream is one of the N workers. Its budgets last for the whole download attempt of the file, across the parts it takes:
 
-- **Body-stream error** (connection drop, incomplete body, read timeout, or a body that ends before the part does): the stream records its progress, waits 0.5 s, 1.5 s, 4.5 s, and re-requests the rest of the part with `Range`, up to 3 times, as the single-stream path does (`MAX_STREAM_RETRIES`). A fourth error counts as one failed request (below) and the three are available again.
+- **Body-stream error** (connection drop, incomplete body, read timeout, a body that ends before the part does, or one that would run past it; no byte past the part is written): the stream records its progress, waits 0.5 s, 1.5 s, 4.5 s, and re-requests the rest of the part with `Range`, up to 3 times, as the single-stream path does (`MAX_STREAM_RETRIES`). A fourth error counts as one failed request (below) and the three are available again.
 - **Stall** (below `--min-speed`, with the same window and grace, judged on each stream's own clock): the stream records its progress and re-requests the rest of the part at once. Each stream has `--retries` stalls; one more fails the file with `DownloadStalled`, as today.
 - **Failed request** (an error status that is retryable, a connection failure, a 206 for the wrong range, a 200 to a range request): the stream waits the standard backoff, or the failed response's `Retry-After` when it carried one, and sends the request again, up to `--retries` times. One more fails the file with the new `IaError::RangeFailed`: `download of <name> failed on bytes A-B after N attempts: <last error>`. It is not retryable: the per-file loop would only spend the same budget again against the same server.
 - **Permanent failure** (a non-retryable status such as 403 or 404, `ServerSizeMismatch`): fails the file at once, with that error unchanged.

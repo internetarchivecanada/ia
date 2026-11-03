@@ -58,6 +58,7 @@ pub struct JsonErrorBody {
 ///         IaError::DownloadSizeMismatch { .. } => (),
 ///         IaError::ServerSizeMismatch { .. } => (),
 ///         IaError::DownloadStalled { .. } => (),
+///         IaError::RangeFailed { .. } => (),
 ///         IaError::UploadStalled { .. } => (),
 ///         IaError::UploadFailed { .. } => (),
 ///         IaError::SpamDetected { .. } => (),
@@ -116,6 +117,7 @@ pub struct JsonErrorBody {
 ///         IaError::DownloadSizeMismatch { .. } => (),
 ///         IaError::ServerSizeMismatch { .. } => (),
 ///         IaError::DownloadStalled { .. } => (),
+///         IaError::RangeFailed { .. } => (),
 ///         IaError::UploadStalled { .. } => (),
 ///         IaError::UploadFailed { .. } => (),
 ///         IaError::SpamDetected { .. } => (),
@@ -310,6 +312,25 @@ pub enum IaError {
         min_bytes_per_sec: u64,
         window_secs: u64,
         stalls: usize,
+    },
+
+    /// One stream of a parallel download (#16) spent its `--retries` on the
+    /// requests for one part of the file. `start` and `end` are the part's
+    /// first and last byte (inclusive, as in a `Range` header), `attempts`
+    /// counts the failed attempts, and `source` is the last failure. The
+    /// `.part` file and its journal are kept, so a later run fetches only
+    /// what is missing.
+    #[error(
+        "download of {file} failed on bytes {start}-{end} after {attempts} {}: {source}",
+        if *.attempts == 1 { "attempt" } else { "attempts" }
+    )]
+    RangeFailed {
+        file: String,
+        start: u64,
+        end: u64,
+        attempts: usize,
+        #[source]
+        source: Box<IaError>,
     },
 
     /// An upload's connection kept dying until the retries were spent: the
@@ -564,6 +585,8 @@ impl IaError {
             // The stall budget was `--retries`; starting the file over would
             // only spend it again against the same slow server.
             IaError::DownloadStalled { .. } => false,
+            // Likewise: the stream's budget was `--retries`.
+            IaError::RangeFailed { .. } => false,
             IaError::UploadStalled { .. } => false,
             // Upload errors
             IaError::UploadFailed { .. } => false, // terminal — retry logic is in single.rs
@@ -793,6 +816,19 @@ impl IaError {
                 extra.insert("window_secs".into(), (*window_secs).into());
                 extra.insert("stalls".into(), (*stalls as u64).into());
                 "download_stalled"
+            }
+            IaError::RangeFailed {
+                file,
+                start,
+                end,
+                attempts,
+                ..
+            } => {
+                extra.insert("file".into(), file.clone().into());
+                extra.insert("start".into(), (*start).into());
+                extra.insert("end".into(), (*end).into());
+                extra.insert("attempts".into(), (*attempts as u64).into());
+                "range_failed"
             }
             IaError::UploadStalled {
                 identifier,
@@ -2306,5 +2342,55 @@ mod tests {
         assert_eq!(v["error"]["min_bytes_per_sec"], 10240);
         assert_eq!(v["error"]["window_secs"], 60);
         assert_eq!(v["error"]["stalls"], 5);
+    }
+
+    fn range_failed(attempts: usize) -> IaError {
+        IaError::RangeFailed {
+            file: "disk.img".into(),
+            start: 67108864,
+            end: 134217727,
+            attempts,
+            source: Box::new(IaError::Http {
+                status: 503,
+                message: "Service Unavailable".into(),
+                retry_after: Some(5),
+            }),
+        }
+    }
+
+    #[test]
+    fn range_failed_is_not_retryable() {
+        // The stream's budget was the retries; the outer loop must not
+        // start the file over and spend it again.
+        assert!(!range_failed(6).is_retryable());
+        // The cause's Retry-After was spent by the stream.
+        assert_eq!(range_failed(6).retry_after(), None);
+    }
+
+    #[test]
+    fn range_failed_displays_the_range_and_the_cause() {
+        let msg = range_failed(6).to_string();
+        assert_eq!(
+            msg,
+            "download of disk.img failed on bytes 67108864-134217727 after 6 attempts: \
+             HTTP error 503: Service Unavailable"
+        );
+        assert!(range_failed(1).to_string().contains("after 1 attempt:"));
+    }
+
+    #[test]
+    fn range_failed_chain_does_not_repeat_the_cause() {
+        let err = range_failed(2);
+        assert_eq!(format_error_chain(&err), err.to_string());
+    }
+
+    #[test]
+    fn json_range_failed() {
+        let v = parse_json_error(&range_failed(6));
+        assert_eq!(v["error"]["code"], "range_failed");
+        assert_eq!(v["error"]["file"], "disk.img");
+        assert_eq!(v["error"]["start"], 67108864u64);
+        assert_eq!(v["error"]["end"], 134217727u64);
+        assert_eq!(v["error"]["attempts"], 6);
     }
 }

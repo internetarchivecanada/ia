@@ -1,5 +1,8 @@
 use crate::stall;
+mod parallel;
 pub mod zip;
+
+pub use parallel::{DEFAULT_STREAMS, MAX_STREAMS};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -177,6 +180,20 @@ pub struct DownloadOpts {
     /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
+    /// How many streams, each on its own HTTP/1.1 connection, fetch one
+    /// large file at once (#16); default [`DEFAULT_STREAMS`].
+    ///
+    /// A file of 256 MiB or more is cut into 64 MiB parts, which the streams
+    /// take in turn, each with one `Range` request; `0` and `1` keep the
+    /// single stream, and a value above [`MAX_STREAMS`] is treated as that.
+    /// The first request goes alone: unless it is answered with a 206 for
+    /// the range asked for, the file is fetched on one stream. Progress is
+    /// kept beside the `.part` file in `<name>.part.json`, so an interrupted
+    /// download resumes per part. [`min_speed`](Self::min_speed) and
+    /// [`retries`](Self::retries) apply to each stream; a stream whose
+    /// retries are spent fails the file with [`IaError::RangeFailed`]. The
+    /// md5 is checked in one pass over the assembled file.
+    pub streams: usize,
 }
 
 impl Default for DownloadOpts {
@@ -192,6 +209,7 @@ impl Default for DownloadOpts {
             filter: FileFilter::default(),
             count_views: false,
             min_speed: 10 * 1024,
+            streams: DEFAULT_STREAMS,
         }
     }
 }
@@ -275,6 +293,61 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     }
     let (_range, total) = range_and_total.trim().rsplit_once('/')?;
     total.trim().parse().ok()
+}
+
+/// Extract the first and last byte from a `Content-Range` header value of
+/// the form `bytes <first>-<last>/<complete-length>`, whatever the complete
+/// length. `None` for the `bytes */<complete-length>` form, another unit,
+/// or a value that does not parse.
+///
+/// ```text
+/// "bytes 13-21/22"  -> Some((13, 21))
+/// "bytes 13-21/*"   -> Some((13, 21))
+/// "bytes */22"      -> None
+/// ```
+#[must_use]
+fn parse_content_range_span(value: &str) -> Option<(u64, u64)> {
+    let (unit, range_and_total) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, _total) = range_and_total.trim().rsplit_once('/')?;
+    let (first, last) = range.trim().split_once('-')?;
+    let (first, last) = (first.trim().parse().ok()?, last.trim().parse().ok()?);
+    (first <= last).then_some((first, last))
+}
+
+/// How many times a download re-requests after a body-stream error before
+/// the error ends the attempt: per call of [`download_file`] on one stream,
+/// per stream on parallel ranges.
+///
+/// Real-world incident (us-supreme-court, 2026-04-22): 39 body-stream
+/// decode errors bypassed the retry middleware entirely, dropping items the
+/// server would have happily served a few seconds later.
+const MAX_STREAM_RETRIES: usize = 3;
+
+/// The wait before body-stream re-request `attempt` (counted from 1):
+/// 0.5 s, 1.5 s, 4.5 s.
+fn stream_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(500 * 3u64.saturating_pow(attempt.saturating_sub(1) as u32))
+}
+
+/// The `Range` header a download request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteRange {
+    /// `bytes=N-`: from byte N to the end, to resume a `.part`.
+    From(u64),
+    /// `bytes=first-last`: one part of a parallel download.
+    Span { first: u64, last: u64 },
+}
+
+impl ByteRange {
+    fn header_value(self) -> String {
+        match self {
+            ByteRange::From(offset) => format!("bytes={offset}-"),
+            ByteRange::Span { first, last } => format!("bytes={first}-{last}"),
+        }
+    }
 }
 
 /// Whether a file's metadata `size` cannot be trusted by construction.
@@ -375,6 +448,26 @@ pub(crate) async fn fetch_response(
     resume_from: Option<u64>,
     count_views: bool,
 ) -> Result<reqwest::Response> {
+    fetch_response_via(
+        client.no_redirect_http(),
+        client,
+        url,
+        resume_from.map(ByteRange::From),
+        count_views,
+    )
+    .await
+}
+
+/// [`fetch_response`] over the transport `http` (which must not follow
+/// redirects), with any [`ByteRange`]. A 416 answering a `range` is
+/// returned as a response, as in [`fetch_response`].
+pub(crate) async fn fetch_response_via(
+    http: &reqwest::Client,
+    client: &IaClient,
+    url: &str,
+    range: Option<ByteRange>,
+    count_views: bool,
+) -> Result<reqwest::Response> {
     // Build auth header if credentials are available.
     let auth_value = client
         .config()
@@ -401,12 +494,12 @@ pub(crate) async fn fetch_response(
     let mut resp = None;
 
     for _ in 0..=max_redirects {
-        let mut req = client.no_redirect_http().get(&current_url);
+        let mut req = http.get(&current_url);
         if let Some(ref auth) = auth_value {
             req = req.header("Authorization", auth);
         }
-        if let Some(offset) = resume_from {
-            req = req.header("Range", format!("bytes={offset}-"));
+        if let Some(range) = range {
+            req = req.header("Range", range.header_value());
         }
 
         let r = req
@@ -471,7 +564,7 @@ pub(crate) async fn fetch_response(
     // the caller instead of being collapsed into `IaError::Http` here.
     // Callers that send no Range keep seeing a 416 as the plain HTTP error.
     let range_not_satisfiable =
-        resume_from.is_some() && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+        range.is_some() && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
     if !status.is_success()
         && status != reqwest::StatusCode::PARTIAL_CONTENT
         && !range_not_satisfiable
@@ -927,6 +1020,23 @@ pub async fn download_file(
     // Download URL
     let encoded_name = urlencoding::encode(&file.name);
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
+    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
+
+    // A large file goes over parallel ranges (#16) unless the server does
+    // not answer the first range request with the range it asked for.
+    if parallel::applies(opts, identifier, file) {
+        match parallel::download(
+            client, identifier, file, &file_path, &part_path, &url, opts, progress, start,
+        )
+        .await?
+        {
+            parallel::Outcome::Done(result) => return Ok(result),
+            parallel::Outcome::Unsupported => debug!(
+                file = %file.name,
+                "no 206 for the range asked for; downloading on one stream"
+            ),
+        }
+    }
 
     // Check for partial file (.part) for resume.
     //
@@ -935,13 +1045,16 @@ pub async fn download_file(
     // request; the 206 tail would then land at offset 0 of a fresh .part,
     // and a later run could resume that tail into a wrong file of the
     // right length. Remove the link now, so no Range is ever shaped by it.
-    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
     if let Ok(meta) = fs::symlink_metadata(&part_path).await {
         if meta.file_type().is_symlink() {
             warn!(file = %file.name, "removing symlink .part file before resume");
             fs::remove_file(&part_path).await?;
         }
     }
+    // A part journal beside the .part (#16) means the .part may have holes
+    // and its length is not a resume offset. Cut it back to the bytes on
+    // disk from byte 0, or discard it, before the length is read.
+    parallel::settle_for_single_stream(file, &part_path).await?;
     // Open first, then stat the fd, so the length is of the file actually
     // opened and a directory or other non-regular file is never resumed.
     // (The fd metadata cannot tell a link planted after the check above;
@@ -1079,11 +1192,8 @@ pub async fn download_file(
     let mut last_progress_at = bytes_downloaded;
 
     // Stream-level retry budget. `reqwest-retry` only sees the initial
-    // response status; once we start reading the body it's on us.
-    // Real-world incident (us-supreme-court, 2026-04-22): 39 body-stream
-    // decode errors bypassed the middleware entirely, dropping items the
-    // server would have happily served a few seconds later.
-    const MAX_STREAM_RETRIES: usize = 3;
+    // response status; once we start reading the body it's on us (see
+    // MAX_STREAM_RETRIES).
     let mut stream_attempt: usize = 0;
     // Stall budget, separate from the stream-error budget and capped at
     // `opts.retries` (#11). A stall is not a failure of the connection but
@@ -1205,9 +1315,7 @@ pub async fn download_file(
                     return Err(IaError::Network(m_err));
                 }
                 stream_attempt += 1;
-                let backoff = std::time::Duration::from_millis(
-                    500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
-                );
+                let backoff = stream_retry_backoff(stream_attempt);
                 warn!(
                     file = %file.name,
                     attempt = stream_attempt,
@@ -6417,6 +6525,35 @@ mod tests {
         assert_eq!(parse_content_range_total("bytes 1-2/abc"), None);
         assert_eq!(parse_content_range_total("bytes 1-2/"), None);
         assert_eq!(parse_content_range_total("bytes */*"), None);
+    }
+
+    #[test]
+    fn content_range_span_parses_the_range() {
+        assert_eq!(parse_content_range_span("bytes 13-21/22"), Some((13, 21)));
+        assert_eq!(parse_content_range_span("bytes 13-21/*"), Some((13, 21)));
+        assert_eq!(parse_content_range_span("BYTES 0-0/1"), Some((0, 0)));
+    }
+
+    #[test]
+    fn content_range_span_rejects_the_unsatisfied_form_and_garbage() {
+        assert_eq!(parse_content_range_span("bytes */22"), None);
+        assert_eq!(parse_content_range_span("items 1-2/3"), None);
+        assert_eq!(parse_content_range_span("bytes 21-13/22"), None);
+        assert_eq!(parse_content_range_span("bytes 1-x/22"), None);
+        assert_eq!(parse_content_range_span(""), None);
+    }
+
+    #[test]
+    fn stream_retry_backoff_is_half_a_second_tripled() {
+        let waits: Vec<_> = (1..=MAX_STREAM_RETRIES).map(stream_retry_backoff).collect();
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1500),
+                Duration::from_millis(4500)
+            ]
+        );
     }
 
     #[test]
