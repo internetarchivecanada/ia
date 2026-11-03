@@ -305,32 +305,28 @@ enum Loaded {
     /// A journal that cannot be trusted, and why. The `.part` beside it may
     /// have holes, so both go.
     Invalid(String),
+    /// A file at the journal's path that is not a journal, and why: it is
+    /// too large to be one, cannot be read, or does not parse as one. It is
+    /// most likely an item file that happens to have the name, so it is
+    /// never removed or replaced; the `.part`, if any, is taken as a
+    /// contiguous prefix, and the file is fetched on one stream.
+    Foreign(String),
 }
 
 /// Read and check the journal at `path` for `file`, whose partial download
 /// is at `part_path`.
 ///
-/// Without a `.part` there is nothing to resume or settle, and a file at
-/// `path` is left alone as [`Loaded::Absent`]: it may be an item file that
-/// happens to have the journal's name. Otherwise, besides
-/// [`Journal::check`], the journal must be a regular file that can be read,
-/// and the `.part` must be a regular file that holds every byte the journal
-/// claims and is no longer than the file.
+/// A regular file there that cannot be one of this code's journals (too
+/// large, unreadable, or not parsing as one) is [`Loaded::Foreign`] and is
+/// left alone. A journal of this code is checked against the file and the
+/// `.part`: besides [`Journal::check`], the `.part` must be a regular file
+/// that holds every byte the journal claims and is no longer than the file.
+/// A journal with no `.part` beside it describes nothing and is invalid.
 async fn load_journal(path: &Path, file: &FileMetadata, part_path: &Path) -> Result<Loaded> {
     let meta = match fs::symlink_metadata(path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
-        Err(e) => return Ok(Loaded::Invalid(format!("it cannot be read: {e}"))),
-    };
-    let held = match fs::symlink_metadata(part_path).await {
-        Ok(part) if part.is_file() => part.len(),
-        Ok(_) => {
-            return Ok(Loaded::Invalid(
-                "the .part beside it is not a regular file".to_string(),
-            ))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Ok(Loaded::Foreign(format!("it cannot be examined: {e}"))),
     };
     if meta.file_type().is_symlink() {
         return Ok(Loaded::Invalid("it is a symlink".to_string()));
@@ -339,15 +335,27 @@ async fn load_journal(path: &Path, file: &FileMetadata, part_path: &Path) -> Res
         return Ok(Loaded::Invalid("it is not a regular file".to_string()));
     }
     if meta.len() > MAX_JOURNAL_BYTES {
-        return Ok(Loaded::Invalid(format!("it is {} bytes long", meta.len())));
+        return Ok(Loaded::Foreign(format!("it is {} bytes long", meta.len())));
     }
     let bytes = match fs::read(path).await {
         Ok(bytes) => bytes,
-        Err(e) => return Ok(Loaded::Invalid(format!("it cannot be read: {e}"))),
+        Err(e) => return Ok(Loaded::Foreign(format!("it cannot be read: {e}"))),
     };
     let journal: Journal = match serde_json::from_slice(&bytes) {
         Ok(journal) => journal,
-        Err(e) => return Ok(Loaded::Invalid(format!("it does not parse: {e}"))),
+        Err(e) => return Ok(Loaded::Foreign(format!("it does not parse: {e}"))),
+    };
+    let held = match fs::symlink_metadata(part_path).await {
+        Ok(part) if part.is_file() => part.len(),
+        Ok(_) => {
+            return Ok(Loaded::Invalid(
+                "the .part beside it is not a regular file".to_string(),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Loaded::Invalid("there is no .part beside it".to_string()))
+        }
+        Err(e) => return Err(e.into()),
     };
     if let Err(why) = journal.check(file) {
         return Ok(Loaded::Invalid(why));
@@ -422,6 +430,15 @@ pub(super) async fn settle_for_single_stream(file: &FileMetadata, part_path: &Pa
     let path = journal_path(part_path);
     match load_journal(&path, file, part_path).await? {
         Loaded::Absent => Ok(()),
+        Loaded::Foreign(why) => {
+            debug!(
+                file = %file.name,
+                path = %path.display(),
+                reason = %why,
+                "the file at the part journal's path is not a journal; leaving it"
+            );
+            Ok(())
+        }
         Loaded::Invalid(why) => {
             warn!(
                 file = %file.name,
@@ -470,6 +487,10 @@ pub(super) enum Outcome {
     /// asked for; nothing on disk was changed for it, and the caller fetches
     /// the file on one stream.
     Unsupported,
+    /// A file that is not a journal sits at the journal's path (see
+    /// [`Loaded::Foreign`]); no request was sent, and the caller fetches the
+    /// file on one stream.
+    JournalPathTaken,
 }
 
 /// Fetch `file` over parallel ranges into `part_path`, then verify it and
@@ -522,6 +543,15 @@ pub(super) async fn download(
                 Journal::new(size, file.md5.as_deref(), layout.part_size, 0),
                 false,
             )
+        }
+        Loaded::Foreign(why) => {
+            info!(
+                file = %file.name,
+                path = %journal_file.display(),
+                reason = %why,
+                "a file that is not a part journal has the journal's name; downloading on one stream"
+            );
+            return Ok(Outcome::JournalPathTaken);
         }
         Loaded::Absent => {
             let prefix = prefix_on_disk(file, part_path, size).await?;
@@ -1154,18 +1184,13 @@ async fn fetch_part(
                 _ = stopped(stop) => break Ended::Stopped,
                 next = body.next() => match next {
                     Some(Ok(chunk)) => {
-                        let n = chunk.len() as u64;
-                        // Never write into the next part.
-                        if n > len - done {
-                            break Ended::Error(IaError::ResumeFailed {
-                                file: shared.file.name.clone(),
-                                reason: format!(
-                                    "the server sent more than bytes {}-{}",
-                                    span.0, span.1
-                                ),
-                            });
-                        }
-                        out.write_all(&chunk).await?;
+                        // Never write into the next part: of a chunk that
+                        // runs past the end of the range, only the bytes in
+                        // it are written, and the stream ends there. With
+                        // the part then complete, nothing more is asked.
+                        let room = len - done;
+                        let n = (chunk.len() as u64).min(room);
+                        out.write_all(&chunk[..n as usize]).await?;
                         done += n;
                         unrecorded += n;
                         if let Some(d) = detector.as_mut() {
@@ -1175,6 +1200,15 @@ async fn fetch_part(
                         if unrecorded >= shared.checkpoint {
                             shared.record(k, &mut out, done).await?;
                             unrecorded = 0;
+                        }
+                        if chunk.len() as u64 > room {
+                            break Ended::Error(IaError::ResumeFailed {
+                                file: shared.file.name.clone(),
+                                reason: format!(
+                                    "the server sent more than bytes {}-{}",
+                                    span.0, span.1
+                                ),
+                            });
                         }
                     }
                     Some(Err(e)) => break Ended::Error(IaError::Network(e.into())),
@@ -2102,15 +2136,71 @@ mod tests {
         assert_restarts_from_zero(dir.path(), &body, &file).await;
     }
 
+    /// Run a download over parallel ranges and one over a single stream on a
+    /// directory holding an item file at the journal's path, and return the
+    /// `Range` of every request. The item file must come through untouched
+    /// and the download must finish.
+    async fn download_beside_an_item_file(
+        dir: &Path,
+        body: &[u8],
+        file: &FileMetadata,
+        item_file: &str,
+        streams: usize,
+    ) -> Vec<Option<String>> {
+        let (server, client) = serve(RangeServer::new(body)).await;
+        fetch(&client, file, dir, &opts(streams)).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("big.bin")).unwrap(), body);
+        assert!(!part_path(dir).exists());
+        assert_eq!(
+            std::fs::read_to_string(journal_at(dir)).unwrap(),
+            item_file,
+            "the item file at the journal's path was changed"
+        );
+        ranges(&server).await
+    }
+
     #[tokio::test]
-    async fn a_corrupt_journal_restarts_from_zero() {
+    async fn an_interrupted_file_beside_an_item_file_named_like_its_journal_resumes_on_one_stream()
+    {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        // The item holds big.bin and big.bin.part.json; the second was
+        // downloaded, the first interrupted after 2500 bytes on one stream.
+        let item_file = r#"{"an item's own":"json"}"#;
+        for streams in [4, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(journal_at(dir.path()), item_file).unwrap();
+            std::fs::write(part_path(dir.path()), &body[..2500]).unwrap();
+
+            let got =
+                download_beside_an_item_file(dir.path(), &body, &file, item_file, streams).await;
+
+            // No range request at all: the parallel path does not run.
+            assert_eq!(
+                got,
+                vec![Some("bytes=2500-".to_string())],
+                "streams {streams}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_file_beside_an_item_file_named_like_its_journal_goes_on_one_stream() {
         let _layout = small_layout();
         let body = body_of(LEN);
         let file = file_meta("big.bin", &body);
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), &body, &[1024, 1024], "{\"version\":1,\"size\":");
+        // Not JSON at all, and a truncated journal-like text: neither is
+        // this code's journal.
+        for item_file in ["plain text", "{\"version\":1,\"size\":"] {
+            std::fs::write(journal_at(dir.path()), item_file).unwrap();
+            let _ = std::fs::remove_file(dir.path().join("big.bin"));
 
-        assert_restarts_from_zero(dir.path(), &body, &file).await;
+            let got = download_beside_an_item_file(dir.path(), &body, &file, item_file, 4).await;
+
+            assert_eq!(got, vec![None], "{item_file}");
+        }
     }
 
     #[tokio::test]
@@ -2376,7 +2466,14 @@ mod tests {
         let body = body_of(LEN);
         let file = file_meta("big.bin", &body);
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), &body, &[1024, 1024], "not json");
+        // A journal of this code, written for another version of the file.
+        let old = vec![0xEEu8; LEN];
+        seed(
+            dir.path(),
+            &old,
+            &[1024, 1024],
+            &journal_json(&old, &md5_hex(&old), &[1024, 1024, 0, 0, 0]),
+        );
         let (server, client) = serve(RangeServer::new(&body)).await;
 
         fetch(&client, &file, dir.path(), &opts(1)).await.unwrap();
@@ -2687,6 +2784,39 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, IaError::ServerSizeMismatch { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_one_byte_past_its_range_completes_the_part_with_the_right_bytes() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        // Every answer for the last part, and for the second, carries one
+        // byte more than the range: junk past the end of the file, and the
+        // next part's first byte in the middle of it.
+        let mut last = body[4096..].to_vec();
+        last.push(0xEE);
+        let over_last = ResponseTemplate::new(206)
+            .insert_header("content-range", format!("bytes 4096-4595/{LEN}"))
+            .set_body_bytes(last);
+        let over_second = ResponseTemplate::new(206)
+            .insert_header("content-range", format!("bytes 1024-2047/{LEN}"))
+            .set_body_bytes(body[1024..2049].to_vec());
+        let (server, client) = serve(RangeServer::new(&body).script(4096, 100, over_last).script(
+            1024,
+            100,
+            over_second,
+        ))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.verify = false;
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+        // Each part was complete after one answer: nothing was re-requested.
+        assert_eq!(sorted(ranges(&server).await), all_parts());
     }
 
     #[tokio::test]

@@ -1044,6 +1044,7 @@ pub async fn download_file(
                 // counted.
                 count_views = false;
             }
+            parallel::Outcome::JournalPathTaken => {}
         }
     }
 
