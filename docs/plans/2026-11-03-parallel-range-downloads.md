@@ -43,9 +43,9 @@ With `--count-views`, only this first request omits `cnt`; every later part requ
 
 ### Writing the parts
 
-Each stream opens the `.part` file for writing (never truncating), seeks to its part's next unfetched byte, and writes through a 256 KiB buffer, as the single-stream path does. Streams write disjoint ranges through separate file handles. The `.part` grows as streams write past its end; it is not pre-sized, so a file system without sparse files does no extra work. A body byte past the end of the requested range is never written.
+The `.part` is created once, after the first journal is written and before the streams start. Each stream opens it for writing (never creating or truncating it, so a `.part` that goes away mid-download fails the attempt instead of coming back with holes beside a journal), seeks to its part's next unfetched byte, and writes through a 256 KiB buffer, as the single-stream path does. Streams write disjoint ranges through separate file handles. The `.part` grows as streams write past its end; it is not pre-sized, so a file system without sparse files does no extra work. A body byte past the end of the requested range is never written.
 
-The `.part` file is checked for a symlink before every open, as on the single-stream path; a link is removed and the file's attempt fails with the retryable `ResumeFailed`, so the next attempt finds no `.part` and starts over.
+The `.part` file is checked for a symlink before every open, as on the single-stream path; a link is removed and the file's attempt fails with the retryable `ResumeFailed`, so the next attempt finds no `.part` and starts over. Several streams may see the same link; the first removes it and the others report the same failure. A link can still be put in place between that check and the open, so on Unix the opened file is compared with what is at the path afterwards (device and inode, and not a link) before any byte is written; on a mismatch the handle is dropped unused and the attempt fails the same way.
 
 ### The part journal
 

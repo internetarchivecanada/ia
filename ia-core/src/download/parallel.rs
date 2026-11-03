@@ -559,6 +559,8 @@ pub(super) async fn download(
         if !on_disk {
             write_journal(&journal_file, &journal).await?;
         }
+        // The streams only open the .part; it is created here, once.
+        create_part(file, part_path).await?;
         let streams = opts.streams.min(MAX_STREAMS).min(pending.len());
         info!(
             file = %file.name,
@@ -808,30 +810,87 @@ impl Shared<'_> {
         Ok(())
     }
 
-    /// Open the `.part` for writing at `offset`, never through a link: one
-    /// planted since the download started is removed, and the attempt
-    /// fails.
+    /// Open the `.part` for writing at `offset`, never through a link (see
+    /// [`refuse_link`]). The `.part` is created before the streams start
+    /// and is never created here: a `.part` that went away mid-download
+    /// fails the attempt instead of coming back as a file with holes beside
+    /// a journal that claims bytes it does not hold.
     async fn open_at(&self, offset: u64) -> Result<tokio::io::BufWriter<fs::File>> {
-        if fs::symlink_metadata(self.part_path)
-            .await
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-        {
-            warn!(file = %self.file.name, "removing symlink .part file");
-            fs::remove_file(self.part_path).await?;
-            return Err(IaError::ResumeFailed {
-                file: self.file.name.clone(),
-                reason: ".part path is a symlink".to_string(),
-            });
-        }
-        let mut out = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.part_path)
-            .await?;
+        let mut out = open_part(self.file, self.part_path, false).await?;
         out.seek(std::io::SeekFrom::Start(offset)).await?;
         Ok(tokio::io::BufWriter::with_capacity(256 * 1024, out))
     }
+}
+
+/// Fail the attempt if the `.part` at `part_path` is a link, removing the
+/// link, so no byte is ever written through one planted since the download
+/// started. Several streams can see the same link; the first removes it,
+/// and the others report the same failure rather than the missing file.
+async fn refuse_link(file: &FileMetadata, part_path: &Path) -> Result<()> {
+    if fs::symlink_metadata(part_path)
+        .await
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        warn!(file = %file.name, "removing symlink .part file");
+        remove_if_present(part_path).await?;
+        return Err(IaError::ResumeFailed {
+            file: file.name.clone(),
+            reason: ".part path is a symlink".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Open the `.part` at `part_path` for writing, creating it when `create`
+/// is set and never truncating it, and never through a link.
+///
+/// [`refuse_link`] runs first, but a link can be put in place between that
+/// check and the open. On Unix the open file is therefore compared with
+/// what is at the path afterwards, before anything is written: unless the
+/// path is still a regular file with the same device and inode, the handle
+/// is dropped unused and the attempt fails.
+async fn open_part(file: &FileMetadata, part_path: &Path, create: bool) -> Result<fs::File> {
+    refuse_link(file, part_path).await?;
+    let out = fs::OpenOptions::new()
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(part_path)
+        .await?;
+    #[cfg(unix)]
+    ensure_opened_at_path(file, &out, part_path).await?;
+    Ok(out)
+}
+
+/// Fail unless `opened` is the regular file now at `part_path` (same device
+/// and inode): a link there means the open may have followed it, and
+/// another file there means the `.part` was replaced. A link is removed, as
+/// [`refuse_link`] does. The caller drops `opened` unused on failure.
+#[cfg(unix)]
+async fn ensure_opened_at_path(
+    file: &FileMetadata,
+    opened: &fs::File,
+    part_path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = opened.metadata().await?;
+    let at_path = fs::symlink_metadata(part_path).await?;
+    if !at_path.file_type().is_symlink()
+        && (opened.dev(), opened.ino()) == (at_path.dev(), at_path.ino())
+    {
+        return Ok(());
+    }
+    refuse_link(file, part_path).await?;
+    Err(IaError::ResumeFailed {
+        file: file.name.clone(),
+        reason: ".part path was replaced while it was being opened".to_string(),
+    })
+}
+
+/// Create the `.part` at `part_path` if it is not there, keeping what it
+/// holds if it is, and never through a link.
+async fn create_part(file: &FileMetadata, part_path: &Path) -> Result<()> {
+    open_part(file, part_path, true).await.map(drop)
 }
 
 /// Run `streams` streams over the parts in `shared`'s queue; the first
@@ -3116,8 +3175,56 @@ mod tests {
             let (part, link_to) = (part.clone(), link_to.clone());
             Box::pin(async move {
                 if conn.first == 2048 {
-                    let _ = std::fs::remove_file(&part);
-                    std::os::unix::fs::symlink(&link_to, &part).unwrap();
+                    // In one step: a link made beside it, renamed over it,
+                    // so no stream ever finds the .part missing or regular
+                    // between a removal and the link.
+                    let staged = part.with_extension("staged-link");
+                    std::os::unix::fs::symlink(&link_to, &staged).unwrap();
+                    std::fs::rename(&staged, &part).unwrap();
+                }
+                serve_whole(conn).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
+
+        let err = fetch(&client, &file, dir.path(), &opts(4))
+            .await
+            .unwrap_err();
+
+        // The stream answered for the third part opens the .part after the
+        // link is in place. It, or a stream that saw the link first, removes
+        // the link and fails the file; a stream whose open raced the rename
+        // finds the path replaced and fails; a stream that opens after the
+        // removal finds no .part and fails. Which failure arrives first
+        // depends on scheduling; all are right, and none writes through the
+        // link.
+        assert!(
+            matches!(&err, IaError::ResumeFailed { reason, .. }
+                if reason.contains("symlink") || reason.contains("replaced"))
+                || matches!(&err, IaError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        // The link is gone and nothing put a .part back.
+        assert!(std::fs::symlink_metadata(part_path(dir.path())).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_part_removed_mid_download_is_not_recreated() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let part = part_path(dir.path());
+        // Before answering for the third part, the .part goes away. A
+        // stream that recreated it would leave a file with holes beside a
+        // journal that claims the first part.
+        let gone = part.clone();
+        let handler: RawHandler = Arc::new(move |conn| {
+            let gone = gone.clone();
+            Box::pin(async move {
+                if conn.first == 2048 {
+                    let _ = std::fs::remove_file(&gone);
                 }
                 serve_whole(conn).await;
             })
@@ -3129,10 +3236,113 @@ mod tests {
             .unwrap_err();
 
         assert!(
+            matches!(&err, IaError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+        assert!(!part.exists(), "a stream recreated the .part");
+
+        // A later run ignores the journal (it has no .part) and starts over.
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let mut o = opts(4);
+        o.verify = false;
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+        assert_finished(dir.path(), &body);
+        assert_eq!(sorted(ranges(&server).await), all_parts());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuse_link_removes_a_link_and_reports_it_once_or_many_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", b"x");
+        let part = part_path(dir.path());
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+
+        // Missing and regular: nothing to refuse.
+        refuse_link(&file, &part).await.unwrap();
+        std::fs::write(&part, "bytes").unwrap();
+        refuse_link(&file, &part).await.unwrap();
+        std::fs::remove_file(&part).unwrap();
+
+        // Several streams checking the same link at once: each reports the
+        // link, none the missing file the first removal leaves.
+        for _ in 0..50 {
+            std::os::unix::fs::symlink(&target, &part).unwrap();
+            let results =
+                futures::future::join_all((0..4).map(|_| refuse_link(&file, &part))).await;
+            assert!(
+                results.iter().all(|r| match r {
+                    Err(IaError::ResumeFailed { reason, .. }) => reason.contains("symlink"),
+                    Ok(()) => true,
+                    Err(_) => false,
+                }),
+                "{results:?}"
+            );
+            assert!(results.iter().any(Result::is_err));
+            assert!(std::fs::symlink_metadata(&part).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_open_that_followed_a_link_is_refused_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", b"x");
+        let part = part_path(dir.path());
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+
+        // A regular .part, opened and still at its path: accepted.
+        std::fs::write(&part, "bytes").unwrap();
+        let opened = fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await
+            .unwrap();
+        ensure_opened_at_path(&file, &opened, &part).await.unwrap();
+        drop(opened);
+
+        // The state the check-then-open race leaves: the path became a link
+        // after the check, and the open followed it to the target.
+        std::fs::remove_file(&part).unwrap();
+        std::os::unix::fs::symlink(&target, &part).unwrap();
+        let opened = fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await
+            .unwrap();
+        let err = ensure_opened_at_path(&file, &opened, &part)
+            .await
+            .unwrap_err();
+        assert!(
             matches!(&err, IaError::ResumeFailed { reason, .. } if reason.contains("symlink")),
             "{err:?}"
         );
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(
+            std::fs::symlink_metadata(&part).is_err(),
+            "the link was kept"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+
+        // The .part was opened, then another regular file put at its path.
+        std::fs::write(&part, "first").unwrap();
+        let opened = fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await
+            .unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, "second").unwrap();
+        std::fs::rename(&other, &part).unwrap();
+        let err = ensure_opened_at_path(&file, &opened, &part)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, IaError::ResumeFailed { reason, .. } if reason.contains("replaced")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
