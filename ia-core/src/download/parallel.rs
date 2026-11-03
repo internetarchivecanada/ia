@@ -249,8 +249,15 @@ impl Journal {
                 file.md5.as_deref().unwrap_or("(none)")
             ));
         }
-        if self.part_size == 0 {
-            return Err("its part size is 0".to_string());
+        // Another part size would come from another version of this code;
+        // a tiny one, from a damaged journal, would mean millions of
+        // requests.
+        if self.part_size != layout().part_size {
+            return Err(format!(
+                "its part size is {}, not {}",
+                self.part_size,
+                layout().part_size
+            ));
         }
         let parts = self.size.div_ceil(self.part_size);
         if self.done.len() as u64 != parts {
@@ -301,12 +308,27 @@ enum Loaded {
 }
 
 /// Read and check the journal at `path` for `file`, whose partial download
-/// is at `part_path`. Besides [`Journal::check`], the journal must be a
-/// regular file and the `.part` must hold every byte it claims; a `.part`
-/// that is missing holds none.
+/// is at `part_path`.
+///
+/// Without a `.part` there is nothing to resume or settle, and a file at
+/// `path` is left alone as [`Loaded::Absent`]: it may be an item file that
+/// happens to have the journal's name. Otherwise, besides
+/// [`Journal::check`], the journal must be a regular file that can be read,
+/// and the `.part` must be a regular file that holds every byte the journal
+/// claims and is no longer than the file.
 async fn load_journal(path: &Path, file: &FileMetadata, part_path: &Path) -> Result<Loaded> {
     let meta = match fs::symlink_metadata(path).await {
         Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
+        Err(e) => return Ok(Loaded::Invalid(format!("it cannot be read: {e}"))),
+    };
+    let held = match fs::symlink_metadata(part_path).await {
+        Ok(part) if part.is_file() => part.len(),
+        Ok(_) => {
+            return Ok(Loaded::Invalid(
+                "the .part beside it is not a regular file".to_string(),
+            ))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Loaded::Absent),
         Err(e) => return Err(e.into()),
     };
@@ -319,27 +341,27 @@ async fn load_journal(path: &Path, file: &FileMetadata, part_path: &Path) -> Res
     if meta.len() > MAX_JOURNAL_BYTES {
         return Ok(Loaded::Invalid(format!("it is {} bytes long", meta.len())));
     }
-    let journal: Journal = match serde_json::from_slice(&fs::read(path).await?) {
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok(Loaded::Invalid(format!("it cannot be read: {e}"))),
+    };
+    let journal: Journal = match serde_json::from_slice(&bytes) {
         Ok(journal) => journal,
         Err(e) => return Ok(Loaded::Invalid(format!("it does not parse: {e}"))),
     };
     if let Err(why) = journal.check(file) {
         return Ok(Loaded::Invalid(why));
     }
-    let held = match fs::symlink_metadata(part_path).await {
-        Ok(meta) if meta.is_file() => meta.len(),
-        Ok(_) => {
-            return Ok(Loaded::Invalid(
-                "the .part beside it is not a regular file".to_string(),
-            ))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
-    };
     if held < journal.furthest() {
         return Ok(Loaded::Invalid(format!(
             "it claims bytes up to {} and the .part holds {held}",
             journal.furthest()
+        )));
+    }
+    if held > journal.size {
+        return Ok(Loaded::Invalid(format!(
+            "the .part holds {held} bytes, more than the file's {}",
+            journal.size
         )));
     }
     Ok(Loaded::Valid(journal))
@@ -1122,6 +1144,12 @@ async fn fetch_part(
         drop(body);
         shared.record(k, &mut out, done).await?;
         drop(out);
+        // The part may have arrived in full just as a stall check or a body
+        // error won the race with the end of the body: it is done, and
+        // nothing is spent on it.
+        if done == len {
+            break;
+        }
 
         let err = match ended {
             Ended::Done => break,
@@ -1528,6 +1556,7 @@ mod tests {
 
     #[test]
     fn journal_check_accepts_its_own_file() {
+        let _layout = small_layout();
         let body = body_of(LEN);
         let file = file_meta("big.bin", &body);
         let j = Journal::new(LEN as u64, file.md5.as_deref(), PART, 0);
@@ -1536,6 +1565,7 @@ mod tests {
 
     #[test]
     fn journal_check_rejects_what_does_not_fit() {
+        let _layout = small_layout();
         let body = body_of(LEN);
         let file = file_meta("big.bin", &body);
         let good = Journal::new(LEN as u64, file.md5.as_deref(), PART, 0);
@@ -1572,6 +1602,14 @@ mod tests {
                 "part size",
                 Journal {
                     part_size: 0,
+                    ..good.clone()
+                },
+            ),
+            (
+                "another part size",
+                Journal {
+                    part_size: 2 * PART,
+                    done: vec![0; 3],
                     ..good.clone()
                 },
             ),
@@ -2095,25 +2133,137 @@ mod tests {
         let _layout = small_layout();
         let body = body_of(LEN);
         let file = file_meta("big.bin", &body);
+        // Every range gets its head and then no body, except the second
+        // part, which fails at once: no byte is ever written, so the only
+        // journal on disk is the one written before the first byte.
+        let handler: RawHandler = Arc::new(|mut conn| {
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                if conn.first == 1024 {
+                    let _ = conn
+                        .stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                send_head(&mut conn).await;
+                let mut sink = [0u8; 64];
+                let _ = tokio::time::timeout(LIMIT, conn.stream.read(&mut sink)).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
         let dir = tempfile::tempdir().unwrap();
-        // Every part but the first fails for good, so the download stops
-        // with the first part on disk and the journal kept.
-        let mut responder = RangeServer::new(&body);
-        for first in [1024, 2048, 3072, 4096] {
-            responder = responder.script(first, 1, ResponseTemplate::new(404));
-        }
-        let (_server, client) = serve(responder).await;
+        let mut o = opts(4);
+        o.min_speed = 0;
 
-        let err = fetch(&client, &file, dir.path(), &opts(1 + 4))
-            .await
-            .unwrap_err();
+        let err = fetch(&client, &file, dir.path(), &o).await.unwrap_err();
 
         assert!(matches!(err, IaError::Http { status: 404, .. }), "{err:?}");
         let j = read_journal(dir.path());
         assert_eq!(j.size, LEN as u64);
         assert_eq!(j.md5, file.md5);
         assert_eq!(j.part_size, PART);
-        assert!(j.done[1..].iter().all(|&d| d == 0), "{:?}", j.done);
+        assert_eq!(j.done, vec![0; 5]);
+    }
+
+    #[tokio::test]
+    async fn a_part_longer_than_the_file_beside_a_valid_journal_restarts_from_zero() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let done = [1024, 0, 0, 0, 0];
+        seed(
+            dir.path(),
+            &body,
+            &done,
+            &journal_json(&body, file.md5.as_deref().unwrap(), &done),
+        );
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(part_path(dir.path()))
+            .unwrap();
+        f.set_len(LEN as u64 + 5).unwrap();
+
+        assert_restarts_from_zero(dir.path(), &body, &file).await;
+    }
+
+    #[tokio::test]
+    async fn a_file_named_like_a_journal_without_a_part_is_left_alone_on_one_stream() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        // An item file that happens to have the journal's name.
+        std::fs::write(journal_at(dir.path()), "an item's own file").unwrap();
+        let (_server, client) = serve(RangeServer::new(&body)).await;
+
+        fetch(&client, &file, dir.path(), &opts(1)).await.unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("big.bin")).unwrap(), body);
+        assert_eq!(
+            std::fs::read_to_string(journal_at(dir.path())).unwrap(),
+            "an item's own file"
+        );
+    }
+
+    /// The state a crash leaves between the two steps of settling: the
+    /// journal already rewritten to the contiguous prefix (1524 bytes), the
+    /// `.part` not yet truncated and holding junk past it.
+    fn crashed_while_settling(dir: &Path, body: &[u8], file: &FileMetadata) {
+        let mut part = body[..1524].to_vec();
+        part.extend(vec![0xAB; 3072 - 1524]);
+        std::fs::write(part_path(dir), part).unwrap();
+        std::fs::write(
+            journal_at(dir),
+            journal_json(body, file.md5.as_deref().unwrap(), &[1024, 500, 0, 0, 0]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_settling_resumes_correctly_on_one_stream() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        crashed_while_settling(dir.path(), &body, &file);
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        // Unverified, so an md5 check cannot hide junk left in the file.
+        let mut o = opts(1);
+        o.verify = false;
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+        assert_eq!(ranges(&server).await, vec![Some("bytes=1524-".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_crash_while_settling_resumes_correctly_over_parallel_ranges() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        crashed_while_settling(dir.path(), &body, &file);
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let mut o = opts(4);
+        o.verify = false;
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+        assert_eq!(
+            sorted(ranges(&server).await),
+            sorted(vec![
+                closed(1524, 2047),
+                closed(2048, 3071),
+                closed(3072, 4095),
+                closed(4096, 4595)
+            ])
+        );
     }
 
     // -- the single-stream path and a journal --
@@ -2246,7 +2396,60 @@ mod tests {
             "Retry-After was not waited"
         );
         assert_finished(dir.path(), &body);
-        assert_eq!(ranges(&server).await.len(), 6);
+        // The other streams went on while this one waited: the retried
+        // request is the last to arrive.
+        let got = ranges(&server).await;
+        assert_eq!(got.len(), 6);
+        assert_eq!(got.last().unwrap(), &closed(2048, 3071), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_streams_budget_lasts_across_the_parts_it_takes() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        // Four parts fail once each; two streams with one retry apiece
+        // cannot absorb four failures, so one stream spends its budget on
+        // its second part even though no part failed twice.
+        let mut responder = RangeServer::new(&body);
+        for first in [1024, 2048, 3072, 4096] {
+            responder = responder.script(first, 1, busy("0"));
+        }
+        let (_server, client) = serve(responder).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(2);
+        o.retries = 1;
+
+        let err = fetch(&client, &file, dir.path(), &o).await.unwrap_err();
+
+        assert!(
+            matches!(err, IaError::RangeFailed { attempts: 2, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_views_counts_once_when_the_first_range_falls_back() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let mut responder = RangeServer::new(&body);
+        responder.ignore_range = true;
+        let (server, client) = serve(responder).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.count_views = true;
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        let queries: Vec<Option<String>> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().map(str::to_string))
+            .collect();
+        assert_eq!(queries, vec![None, Some("cnt=0".to_string())]);
     }
 
     fn item_with(file: FileMetadata) -> crate::types::ItemMetadata {
@@ -2838,6 +3041,98 @@ mod tests {
         let j = read_journal(dir.path());
         assert!(j.done[1] > 0 && j.done[1] < 1024, "{:?}", j.done);
         assert_eq!(j.done[0], 1024);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_end_of_its_part_is_never_written() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        // The last part's first answer claims the right range but sends a
+        // chunked body 100 bytes longer; written, it would run past the end
+        // of the file.
+        let handler: RawHandler = Arc::new(|mut conn| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                if conn.first == 4096 && conn.nth == 0 {
+                    let mut data = slice(&conn);
+                    data.extend(vec![0xEE; 100]);
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\n\
+                         content-range: bytes {}-{}/{}\r\n\
+                         transfer-encoding: chunked\r\n\
+                         connection: close\r\n\r\n{:x}\r\n",
+                        conn.first,
+                        conn.last,
+                        conn.body.len(),
+                        data.len()
+                    );
+                    let _ = conn.stream.write_all(head.as_bytes()).await;
+                    let _ = conn.stream.write_all(&data).await;
+                    let _ = conn.stream.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = conn.stream.flush().await;
+                    return;
+                }
+                serve_whole(conn).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.verify = false;
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_part_that_is_a_link_is_removed_and_its_target_untouched() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, body_of(3000)).unwrap();
+        std::os::unix::fs::symlink(&target, part_path(dir.path())).unwrap();
+
+        assert_restarts_from_zero(dir.path(), &body, &file).await;
+        assert_eq!(std::fs::read(&target).unwrap(), body_of(3000));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_planted_at_the_part_mid_download_is_never_written_through() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+        let (part, link_to) = (part_path(dir.path()), target.clone());
+        // Before answering for the third part, swap the .part for a link.
+        let handler: RawHandler = Arc::new(move |conn| {
+            let (part, link_to) = (part.clone(), link_to.clone());
+            Box::pin(async move {
+                if conn.first == 2048 {
+                    let _ = std::fs::remove_file(&part);
+                    std::os::unix::fs::symlink(&link_to, &part).unwrap();
+                }
+                serve_whole(conn).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
+
+        let err = fetch(&client, &file, dir.path(), &opts(4))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, IaError::ResumeFailed { reason, .. } if reason.contains("symlink")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
     }
 
     #[tokio::test]

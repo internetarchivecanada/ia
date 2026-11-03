@@ -1022,6 +1022,10 @@ pub async fn download_file(
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
     let part_path = PathBuf::from(format!("{}.part", file_path.display()));
 
+    // Whether this download's requests may count a view (see
+    // `DownloadOpts::count_views`).
+    let mut count_views = opts.count_views;
+
     // A large file goes over parallel ranges (#16) unless the server does
     // not answer the first range request with the range it asked for.
     if parallel::applies(opts, identifier, file) {
@@ -1031,10 +1035,15 @@ pub async fn download_file(
         .await?
         {
             parallel::Outcome::Done(result) => return Ok(result),
-            parallel::Outcome::Unsupported => debug!(
-                file = %file.name,
-                "no 206 for the range asked for; downloading on one stream"
-            ),
+            parallel::Outcome::Unsupported => {
+                debug!(
+                    file = %file.name,
+                    "no 206 for the range asked for; downloading on one stream"
+                );
+                // That request already counted the view, if one was to be
+                // counted.
+                count_views = false;
+            }
         }
     }
 
@@ -1082,7 +1091,7 @@ pub async fn download_file(
         });
     }
 
-    let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
+    let response = fetch_response(client, &url, resume_from, count_views).await?;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
@@ -1373,8 +1382,7 @@ pub async fn download_file(
 
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
-        let new_resp =
-            fetch_response(client, &url, Some(bytes_downloaded), opts.count_views).await?;
+        let new_resp = fetch_response(client, &url, Some(bytes_downloaded), count_views).await?;
         if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // Close the writer first: the mapping may remove .part.
             drop(output);

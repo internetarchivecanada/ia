@@ -35,7 +35,7 @@ The parallel path sends the request for the first unfetched part on its own, bef
 - **200**, or a 206 without a `Content-Range` naming exactly the requested range: the response is dropped and the file is fetched on the single-stream path. The server does not serve ranges reliably, so splitting would be unsafe.
 - **An error** (a status, a connection failure): returned from `download_file` as the single-stream path returns a failed first request, so the per-file retry loop in `download_item_with_metadata` handles it with its backoff and `Retry-After`.
 
-With `--count-views`, only this first request omits `cnt`; every later part request carries `cnt=0`, so one download counts one view, not one per part.
+With `--count-views`, only this first request omits `cnt`; every later part request carries `cnt=0`, and so do the single-stream requests after a fallback, so one download counts one view, not one per part.
 
 ### Transport
 
@@ -49,7 +49,7 @@ The `.part` file is checked for a symlink before every open, as on the single-st
 
 ### The part journal
 
-**File:** `<name>.part.json`, beside `<name>.part`. An item file literally named `<name>.part.json` would share the path, as one named `<name>.part` already shares the partial file's.
+**File:** `<name>.part.json`, beside `<name>.part`. An item file literally named `<name>.part.json` would share the path, as one named `<name>.part` already shares the partial file's. Without a `.part` beside it, such a file is never read or removed (there is nothing to resume); a parallel download of `<name>` does replace it and then remove it.
 
 **Format:** one JSON object.
 
@@ -78,7 +78,7 @@ A crash therefore loses at most 16 MiB per stream.
 At the start of the parallel path:
 
 1. A `.part` that is a symlink is removed, as on the single-stream path.
-2. A journal is read and checked: it must not be a symlink, must parse, must have `version` 1, `size` and `md5` equal to the current metadata, a `part_size` above zero, one `done` entry per part, every entry no larger than its part, and the `.part` must be a regular file at least as long as the furthest byte the journal claims (a missing `.part` holds no bytes, which is enough for a journal that claims none). A journal that fails any check is deleted together with the `.part`, and the file starts from byte 0: holes cannot be told from data.
+2. Without a `.part`, a journal is ignored (there is nothing to resume; see the file name above). Otherwise it is read and checked: it must not be a symlink, must be readable and parse, must have `version` 1, `size` and `md5` equal to the current metadata, the `part_size` in force (64 MiB; another one comes from another version of this code, and a tiny one from a damaged journal would mean millions of requests), one `done` entry per part, every entry no larger than its part, and the `.part` must be a regular file at least as long as the furthest byte the journal claims and no longer than the file. A journal that fails any check is deleted together with the `.part`, and the file starts from byte 0: holes cannot be told from data.
 3. Without a journal, a regular `.part` of length L is a contiguous prefix. L above the metadata size: the `.part` is deleted and the file starts from 0. Otherwise the prefix is mapped onto the grid: parts ending at or before L are complete, the part containing L has `done = L − start`.
 4. **Which parts are refetched:** every part with `done < length`, from byte `start + done` to its last byte. Nothing past `done` in a part is trusted. A complete part is not requested.
 5. When every part is already complete, no request is sent; the md5 pass and the rename follow.
@@ -90,6 +90,7 @@ At the start of the parallel path:
 A stream is one of the N workers. Its budgets last for the whole download attempt of the file, across the parts it takes:
 
 - **Body-stream error** (connection drop, incomplete body, read timeout, a body that ends before the part does, or one that would run past it; no byte past the part is written): the stream records its progress, waits 0.5 s, 1.5 s, 4.5 s, and re-requests the rest of the part with `Range`, up to 3 times, as the single-stream path does (`MAX_STREAM_RETRIES`). A fourth error counts as one failed request (below) and the three are available again.
+- **A part that arrived in full** is complete, whatever ended its stream at the same moment (a stall check or a body error racing the end of the body): nothing is spent on it.
 - **Stall** (below `--min-speed`, with the same window and grace, judged on each stream's own clock): the stream records its progress and re-requests the rest of the part at once. Each stream has `--retries` stalls; one more fails the file with `DownloadStalled`, as today.
 - **Failed request** (an error status that is retryable, a connection failure, a 206 for the wrong range, a 200 to a range request): the stream waits the standard backoff, or the failed response's `Retry-After` when it carried one, and sends the request again, up to `--retries` times. One more fails the file with the new `IaError::RangeFailed`: `download of <name> failed on bytes A-B after N attempts: <last error>`. It is not retryable: the per-file loop would only spend the same budget again against the same server.
 - **Permanent failure** (a non-retryable status such as 403 or 404, `ServerSizeMismatch`): fails the file at once, with that error unchanged.
@@ -144,9 +145,14 @@ One live read-only run against the public file used by the measurement, to confi
 
 - Connections across files: with `-j 8` (the default) and four streams per file, one client can hold up to 32 connections when eight large files are in flight. The measurement tested one file at up to 8 connections; whether the streams should draw from the `-j` budget is open for the maintainer and IA operations.
 - HTTP/1.1 is not negotiated in the tests (they run over plain HTTP, where it is the only protocol); that the datanode is reached over HTTP/1.1 is confirmed only by the live run.
+- Sync cost on slow disks: on macOS the standard library's `sync_data` and `sync_all` issue `F_FULLFSYNC`, so each record costs two full flushes of the drive's cache. The live run below, on an internal SSD, shows no cost worth measuring; an external hard disk with eight streams was not tested.
 - Power loss: the journal rename is not followed by a sync of the directory. After a power loss the older journal may come back, which claims less and is safe; the md5 pass is the backstop for data the file system lost.
 - Other datanodes, locations and times of day than the measurement's.
 
 ## Out of scope
 
 Upload parallelism (#22), datanode choice (#15), release work.
+
+## Live check (2026-11-03)
+
+One read-only run of the built CLI (debug build) with default flags against the public file the measurement used, `ubuntu-18.04.5-desktop-amd64.iso` in item `ubuntu-18.04.5-desktop-amd64` (2,193,522,688 bytes), from the same client location: the first range request was answered 206, the file was fetched by 4 streams over 33 parts, the md5 matched, and the `.part` and `.part.json` were gone. 164.9 s from start to finish including the md5 pass, 13.3 MB/s, against the measurement's 12.55 MB/s mean for 4 connections.
