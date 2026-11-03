@@ -30,7 +30,7 @@ async-stream = "0.3"
 async-trait = "0.1"
 libc = "0.2"
 json-patch = "4"
-calamine = "0.37"
+calamine = "0.38"
 csv = "1"
 rust_xlsxwriter = "0.102"
 indexmap = { version = "2", features = ["serde"] }
