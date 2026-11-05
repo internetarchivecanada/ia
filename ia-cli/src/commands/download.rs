@@ -526,8 +526,19 @@ pub async fn run(
     }
 
     // One table of server slots for the whole run, shared by every item,
-    // disk and file, so the cap holds across all of them.
-    let server_slots = ServerSlots::new(args.max_connections_per_server as usize);
+    // disk and file, and through slot files in the user's cache directory
+    // with every other ia process, so the cap holds across all of them.
+    let max_per_server = args.max_connections_per_server as usize;
+    let server_slots = match ia_core::download::default_slot_dir() {
+        Some(dir) => ServerSlots::across_processes(max_per_server, dir),
+        None => {
+            tracing::warn!(
+                "no cache directory for the connection slot files (set IA_CACHE_DIR, or HOME); \
+                 --max-connections-per-server holds within this process only"
+            );
+            ServerSlots::new(max_per_server)
+        }
+    };
     let make_opts = |destdir: PathBuf| {
         let mut o = DownloadOpts::default();
         o.destdir = destdir;

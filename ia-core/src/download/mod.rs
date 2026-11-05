@@ -4,7 +4,7 @@ mod slots;
 pub mod zip;
 
 pub use parallel::{DEFAULT_CONNECTIONS_PER_FILE, MAX_CONNECTIONS_PER_FILE};
-pub use slots::{ServerSlots, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
+pub use slots::{default_slot_dir, ServerSlots, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -478,7 +478,7 @@ pub(crate) async fn fetch_response(
 
 /// A download's slot on the server its response came from (see
 /// [`ServerSlots`]), held for as long as the response or its body is read.
-pub(crate) type Slot = Option<tokio::sync::OwnedSemaphorePermit>;
+pub(crate) type Slot = Option<slots::SlotGuard>;
 
 /// [`fetch_response`] over the transport `http` (which must not follow
 /// redirects), with any [`ByteRange`]. A 416 answering a `range` is

@@ -19,13 +19,26 @@ fn hermetic_config() -> &'static NamedTempFile {
 /// Bare `ia-cli` command with no config of its own. Only for tests that
 /// exercise `--config-file` itself; everything else uses `ia()`.
 fn ia_unconfigured() -> Command {
-    assert_cmd::cargo_bin_cmd!("ia-cli")
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    // Slot files for --max-connections-per-server go to the test target
+    // directory, never to the user's cache.
+    cmd.env(
+        "IA_CACHE_DIR",
+        concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+    );
+    cmd
 }
 
 /// Build an `ia-cli` command that cannot load real credentials or reach the
 /// real host. See `hermetic_config`.
 fn ia() -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    // Slot files for --max-connections-per-server go to the test target
+    // directory, never to the user's cache.
+    cmd.env(
+        "IA_CACHE_DIR",
+        concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+    );
     cmd.arg("--config-file")
         .arg(hermetic_config().path())
         .env_remove("IA_ACCESS_KEY_ID")

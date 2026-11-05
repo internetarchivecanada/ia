@@ -7,11 +7,24 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn ia_cmd() -> Command {
-    assert_cmd::cargo_bin_cmd!("ia-cli")
+    let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    // Slot files for --max-connections-per-server go to the test target
+    // directory, never to the user's cache.
+    cmd.env(
+        "IA_CACHE_DIR",
+        concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+    );
+    cmd
 }
 
 fn ia_with_config(config: &NamedTempFile) -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    // Slot files for --max-connections-per-server go to the test target
+    // directory, never to the user's cache.
+    cmd.env(
+        "IA_CACHE_DIR",
+        concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+    );
     cmd.arg("--config-file")
         .arg(config.path())
         .env_remove("IA_ACCESS_KEY_ID")

@@ -23,10 +23,17 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 const MIB: usize = 1024 * 1024;
 const SIZE: usize = 256 * MIB;
 
+/// The cache directory the tests' `ia` processes keep their slot files in,
+/// so a test run never writes to the user's own cache.
+fn test_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("ia-cache")
+}
+
 fn ia_cmd() -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.env_remove("IA_ACCESS_KEY_ID")
-        .env_remove("IA_SECRET_ACCESS_KEY");
+        .env_remove("IA_SECRET_ACCESS_KEY")
+        .env("IA_CACHE_DIR", test_cache());
     cmd
 }
 
@@ -215,11 +222,13 @@ async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per
 
 // ─── The per-server cap, counted on a loopback server ──────────────────────
 
-/// Open download connections, now and at most.
+/// Open download connections, now and at most, and every download request
+/// seen.
 #[derive(Default)]
 struct Gauge {
     open: AtomicUsize,
     most: AtomicUsize,
+    seen: AtomicUsize,
 }
 
 const FILES: usize = 8;
@@ -252,6 +261,12 @@ fn small_item(identifier: &str) -> String {
 /// answers at once with an item of [`FILES`] files; every other request is a
 /// download, held open for [`HOLD`], counted in the gauge, then served.
 async fn holding_server() -> (String, Arc<Gauge>) {
+    holding_server_with(|_| Some(HOLD)).await
+}
+
+/// [`holding_server`], holding each download for `hold(path)`, or until the
+/// client goes away when that is `None`.
+async fn holding_server_with(hold: fn(&str) -> Option<Duration>) -> (String, Arc<Gauge>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let host = listener.local_addr().unwrap().to_string();
     let gauge = Arc::new(Gauge::default());
@@ -278,9 +293,17 @@ async fn holding_server() -> (String, Arc<Gauge>) {
                         small_item(identifier).into_bytes()
                     }
                     None => {
+                        let path = head.split_whitespace().nth(1).unwrap_or("");
+                        gauge.seen.fetch_add(1, Ordering::SeqCst);
                         let now = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
                         gauge.most.fetch_max(now, Ordering::SeqCst);
-                        tokio::time::sleep(HOLD).await;
+                        match hold(path) {
+                            Some(hold) => tokio::time::sleep(hold).await,
+                            None => {
+                                // Until the client hangs up.
+                                while !matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {}
+                            }
+                        }
                         gauge.open.fetch_sub(1, Ordering::SeqCst);
                         FILE_BODY.to_vec()
                     }
@@ -386,5 +409,170 @@ async fn max_connections_per_server_above_jobs_lets_every_job_run() {
     assert_eq!(
         download_small_item(&["-j", "8", "--max-connections-per-server", "16"]).await,
         8
+    );
+}
+
+// ─── The per-server cap across processes ────────────────────────────────────
+
+/// An `ia download` of `item` from `host` into a new directory, with its slot
+/// files under `cache`, started and left running.
+fn spawn_ia(
+    host: &str,
+    item: &str,
+    cache: &std::path::Path,
+    extra: &[&str],
+) -> (std::process::Child, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_ia-cli"))
+        .env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY")
+        .env("IA_CACHE_DIR", cache)
+        .args(["--insecure", "-H", host, "download", item, "--destdir"])
+        .arg(dir.path())
+        .args(extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    (child, dir)
+}
+
+/// Wait for `child` to finish, at most `limit`, and require success.
+async fn finish(child: std::process::Child, limit: Duration) {
+    let out = tokio::time::timeout(
+        limit,
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("ia download did not finish in time")
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn assert_item(dir: &TempDir, item: &str) {
+    for i in 0..FILES {
+        let got = fs::read(dir.path().join(item).join(format!("f{i}.bin"))).unwrap();
+        assert_eq!(got, FILE_BODY, "{item}/f{i}.bin");
+    }
+}
+
+/// Two `ia download` processes, each of an 8-file item with `-j 8`, at once
+/// against one server with one cache; the most connections it saw at once.
+async fn two_processes(extra: &[&str], hold: fn(&str) -> Option<Duration>) -> usize {
+    let (host, gauge) = holding_server_with(hold).await;
+    let cache = TempDir::new().unwrap();
+    let mut args = vec!["-j", "8"];
+    args.extend_from_slice(extra);
+    let (a, dir_a) = spawn_ia(&host, "item-a", cache.path(), &args);
+    let (b, dir_b) = spawn_ia(&host, "item-b", cache.path(), &args);
+    let limit = Duration::from_secs(60);
+    tokio::join!(finish(a, limit), finish(b, limit));
+    assert_item(&dir_a, "item-a");
+    assert_item(&dir_b, "item-b");
+    gauge.most.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn two_processes_with_the_default_cap_never_open_more_than_six_together() {
+    assert_eq!(two_processes(&[], |_| Some(HOLD)).await, 6);
+}
+
+#[tokio::test]
+async fn a_cap_of_one_across_two_processes_runs_one_download_at_a_time() {
+    let most = two_processes(&["--max-connections-per-server", "1"], |_| {
+        Some(Duration::from_millis(100))
+    })
+    .await;
+    assert_eq!(most, 1);
+}
+
+#[tokio::test]
+async fn a_process_killed_while_holding_the_only_slot_frees_it() {
+    // Every download of item-hang is held until its client goes away.
+    let (host, gauge) = holding_server_with(|path| {
+        (!path.contains("/item-hang/")).then_some(Duration::from_millis(100))
+    })
+    .await;
+    let cache = TempDir::new().unwrap();
+    let cap = ["--max-connections-per-server", "1"];
+
+    let (mut first, _first_dir) = spawn_ia(&host, "item-hang", cache.path(), &cap);
+    let started = std::time::Instant::now();
+    while gauge.seen.load(Ordering::SeqCst) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the first process never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (second, second_dir) = spawn_ia(&host, "item-b", cache.path(), &cap);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        gauge.seen.load(Ordering::SeqCst),
+        1,
+        "the second process connected while the first held the only slot"
+    );
+
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    finish(second, Duration::from_secs(30)).await;
+    assert_item(&second_dir, "item-b");
+    assert_eq!(gauge.most.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_cache_that_cannot_hold_slot_files_falls_back_to_the_process_cap() {
+    let (host, gauge) = holding_server().await;
+    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
+    let dir = TempDir::new().unwrap();
+
+    let out = tokio::task::spawn_blocking({
+        let (host, cache, dest) = (
+            host.clone(),
+            not_a_dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        );
+        move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_ia-cli"))
+                .env_remove("IA_ACCESS_KEY_ID")
+                .env_remove("IA_SECRET_ACCESS_KEY")
+                .env("IA_CACHE_DIR", &cache)
+                .args([
+                    "--insecure",
+                    "-H",
+                    &host,
+                    "download",
+                    "small-item",
+                    "-j",
+                    "8",
+                ])
+                .arg("--destdir")
+                .arg(&dest)
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_item(&dir, "small-item");
+    // The cap still holds within the process.
+    assert_eq!(gauge.most.load(Ordering::SeqCst), 6);
+    // One warning, naming the path.
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("slot files"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains(&not_a_dir.path().display().to_string()),
+        "{stderr}"
     );
 }
