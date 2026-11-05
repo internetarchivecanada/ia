@@ -437,9 +437,16 @@ fn assert_big(dir: &TempDir, item: &str, body: &[u8]) {
 }
 
 /// Two `ia download` processes at once, each of one 256 MiB file over 4
-/// connections, against one server with one cache; the most connections it
-/// saw at once.
-async fn two_processes(cap: &str, hold: fn(&str) -> Option<Duration>) -> usize {
+/// connections, against one server with one cache; the most range requests
+/// the server held at once, and how many it saw.
+///
+/// The server counts a request only while it holds it, before answering,
+/// so its count never exceeds the slots held: a count above the cap means
+/// the cap failed, whatever the timing. A count below it proves nothing,
+/// since a stream keeps its slot while it reads its 64 MiB body, which the
+/// server does not count; how far requests overlap depends on how fast the
+/// runner moves those bytes.
+async fn two_processes(cap: &str, hold: fn(&str) -> Option<Duration>) -> (usize, usize) {
     let body = Arc::new(big_body());
     let (host, gauge) = holding_server(Some(Arc::clone(&body)), hold).await;
     let cache = TempDir::new().unwrap();
@@ -454,22 +461,24 @@ async fn two_processes(cap: &str, hold: fn(&str) -> Option<Duration>) -> usize {
     tokio::join!(finish(a, LIMIT), finish(b, LIMIT));
     assert_big(&dir_a, "big-a", &body);
     assert_big(&dir_b, "big-b", &body);
-    gauge.most()
+    (gauge.most(), gauge.seen.load(Ordering::SeqCst))
 }
 
 #[tokio::test]
 async fn two_processes_never_open_more_range_connections_together_than_the_cap() {
     // Each process wants 4 connections, so alone each stays at the cap of
-    // 3; without the slot files the two would reach 6 together.
-    assert_eq!(two_processes("3", |_| Some(HOLD)).await, 3);
+    // 3; without the slot files the two hold up to 6 together.
+    let (most, seen) = two_processes("3", |_| Some(HOLD)).await;
+    assert!(most <= 3, "{most} range requests open at once");
+    // Both processes fetched over ranges: four requests each, at least.
+    assert!(seen >= 8, "{seen} range requests");
 }
 
 #[tokio::test]
 async fn a_cap_of_one_across_two_processes_runs_one_range_connection_at_a_time() {
-    assert_eq!(
-        two_processes("1", |_| Some(Duration::from_millis(100))).await,
-        1
-    );
+    let (most, seen) = two_processes("1", |_| Some(Duration::from_millis(100))).await;
+    assert_eq!(most, 1);
+    assert!(seen >= 8, "{seen} range requests");
 }
 
 #[tokio::test]
@@ -547,8 +556,14 @@ async fn a_cache_that_cannot_hold_slot_files_falls_back_to_the_process_cap() {
     let stderr = finish(child, LIMIT).await;
 
     assert_big(&dir, "big-a", &body);
-    // The cap still holds within the process.
-    assert_eq!(gauge.most(), 2);
+    // The cap still holds within the process: never more than 2 requests
+    // held at once (without it, the three streams after the first request
+    // would be held together), and the file did go over ranges. As in
+    // `two_processes`, a count below the cap depends on the runner's speed.
+    let most = gauge.most();
+    assert!(most <= 2, "{most} range requests open at once");
+    let seen = gauge.seen.load(Ordering::SeqCst);
+    assert!(seen >= 4, "{seen} range requests");
     // One warning, naming the path.
     let warnings: Vec<&str> = stderr
         .lines()
