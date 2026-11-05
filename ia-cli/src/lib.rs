@@ -244,7 +244,7 @@ pub async fn run() -> Result<()> {
         Cli::from_arg_matches(&matches)?
     } else {
         let matches = command().get_matches();
-        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut command()).exit())
     };
 
     // Handle commands that don't need IA config/client
@@ -413,7 +413,19 @@ mod tests {
                 .map(ToString::to_string)
         };
         assert_eq!(help_of("download").as_deref(), Some(DOWNLOAD_JOBS_HELP));
-        assert_eq!(help_of("upload"), None, "global, filled in at build");
+        assert_eq!(help_of("upload"), None, "global, copied in at build");
+        let mut built = command();
+        built.build();
+        let upload_help = built
+            .find_subcommand("upload")
+            .and_then(|c| c.get_arguments().find(|a| a.get_id() == "jobs"))
+            .and_then(|a| a.get_help())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            upload_help.starts_with("Concurrent operations"),
+            "{upload_help}"
+        );
         command().debug_assert();
     }
 }

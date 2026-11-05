@@ -1274,8 +1274,6 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
     }
 }
 
-/// The JSON event for a server's connection budget dropping after it
-/// answered 429 or a 5xx.
 /// A way to print one line on stderr.
 type LinePrinter = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -1346,6 +1344,8 @@ impl DropLines {
     }
 }
 
+/// The JSON event for a server's connection budget dropping after it
+/// answered 429 or a 5xx.
 fn json_budget_drop(drop: &BudgetDrop) -> serde_json::Value {
     serde_json::json!({
         "event": "slow_down",

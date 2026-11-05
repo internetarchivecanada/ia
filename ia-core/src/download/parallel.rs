@@ -3382,10 +3382,19 @@ mod tests {
         let body = body_of(300 * 1024);
         let gauge = Arc::new(Gauge::default());
         let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answered_429 = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handler: RawHandler = {
-            let (gauge, refused) = (Arc::clone(&gauge), Arc::clone(&refused));
+            let (gauge, refused, answered) = (
+                Arc::clone(&gauge),
+                Arc::clone(&refused),
+                Arc::clone(&answered_429),
+            );
             Arc::new(move |mut conn| {
-                let (gauge, refused) = (Arc::clone(&gauge), Arc::clone(&refused));
+                let (gauge, refused, answered) = (
+                    Arc::clone(&gauge),
+                    Arc::clone(&refused),
+                    Arc::clone(&answered),
+                );
                 Box::pin(async move {
                     use tokio::io::AsyncWriteExt;
                     gauge.enter();
@@ -3400,6 +3409,7 @@ mod tests {
                                   content-length: 0\r\nconnection: close\r\n\r\n",
                             )
                             .await;
+                        answered.store(true, Ordering::SeqCst);
                         gauge.leave();
                         return;
                     }
@@ -3446,15 +3456,28 @@ mod tests {
             })
         };
         // The drop comes at 0.3 s; the grace ends 3 s later and the next
-        // one-second check gives the connection back. The other files run
-        // past 6 s.
-        tokio::time::sleep(Duration::from_millis(5000)).await;
-        gauge
-            .most
-            .store(gauge.open.load(Ordering::SeqCst), Ordering::SeqCst);
+        // one-second check gives the connection back, by about 4.3 s. No
+        // file can end before 6 s (300 pauses of 20 ms), so up to 5.8 s every
+        // open connection is a transfer: wait for 3 or fewer, then the server
+        // must see no more until 5.8 s. (Later, a file's next request may
+        // reach the server before it has counted the last one closed.)
+        let start = tokio::time::Instant::now();
+        let window_end = start + Duration::from_millis(5800);
+        while !answered_429.load(Ordering::SeqCst) && tokio::time::Instant::now() < window_end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(answered_429.load(Ordering::SeqCst), "no 429 by 5.8 s");
+        while gauge.open.load(Ordering::SeqCst) > 3 && tokio::time::Instant::now() < window_end {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let open = gauge.open.load(Ordering::SeqCst);
+        assert!(open <= 3, "{open} still open 5.8 s in");
+        gauge.most.store(open, Ordering::SeqCst);
+        tokio::time::sleep_until(window_end).await;
+        let most_in_window = gauge.most();
         run.await.unwrap();
 
-        assert!(gauge.most() <= 3, "{} open after the grace", gauge.most());
+        assert!(most_in_window <= 3, "{most_in_window} open after the grace");
         assert!(
             ranges.lock().unwrap().iter().any(Option::is_some),
             "no whole file was resumed with Range"
@@ -4216,6 +4239,66 @@ mod tests {
             "a connection was kept open for another request"
         );
         assert_eq!(without_close.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_whole_file_re_request_does_not_count_another_view() {
+        let body = body_of(2048);
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let (lines, body) = (Arc::clone(&lines), body.clone());
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    use tokio::io::AsyncWriteExt;
+                    let head = read_head(&mut stream).await;
+                    let first_line = head.lines().next().unwrap_or("").to_string();
+                    let ranged = head.to_ascii_lowercase().contains("\r\nrange: bytes=100-");
+                    lines.lock().unwrap().push(first_line);
+                    if ranged {
+                        let rest = &body[100..];
+                        let answer = format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\n\
+                             content-range: bytes 100-{}/{}\r\n\r\n",
+                            rest.len(),
+                            body.len() - 1,
+                            body.len()
+                        );
+                        let _ = stream.write_all(answer.as_bytes()).await;
+                        let _ = stream.write_all(rest).await;
+                    } else {
+                        // Promise the whole file, send 100 bytes, hang up.
+                        let answer =
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                        let _ = stream.write_all(answer.as_bytes()).await;
+                        let _ = stream.write_all(&body[..100]).await;
+                    }
+                }
+            });
+        }
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let o = DownloadOpts {
+            count_views: true,
+            ..Default::default()
+        };
+
+        fetch(&client, &file_meta("small.bin", &body), dir.path(), &o)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("small.bin")).unwrap(), body);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            !lines[0].contains("cnt=0"),
+            "the first request counts the view"
+        );
+        assert!(lines[1].contains("cnt=0"), "{lines:?}");
     }
 
     #[tokio::test]

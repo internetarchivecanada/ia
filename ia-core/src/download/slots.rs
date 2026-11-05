@@ -439,10 +439,10 @@ impl ServerSlots {
 
     /// The slots free on `server` now, after one for every file about to
     /// start that holds no slot here yet (one whose first request holds a
-    /// slot here is already out of the free ones): free means a permit of this process's live budget is
-    /// available and, across processes, one of the slot files is unlocked
-    /// (counted without taking it). How many extra range streams a file
-    /// starting now may run.
+    /// slot here is already out of the free ones): free means a permit of
+    /// this process's live budget is available and, across processes, one
+    /// of the slot files is unlocked (counted without taking it). How many
+    /// extra range streams a file starting now may run.
     pub(crate) async fn room(&self, server: &str) -> usize {
         let node = self.node(server);
         self.grow(&node);

@@ -1212,6 +1212,9 @@ pub async fn download_file(
     )
     .await;
     let (response, mut slot) = first?;
+    // Only the first request may count a view: every re-request below (after
+    // a body error, a stall or a shed) sends `cnt=0`, as range streams do.
+    count_views = false;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
