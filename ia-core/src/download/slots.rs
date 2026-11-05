@@ -1,9 +1,11 @@
-//! The per-server cap on download connections (`--max-connections-per-server`).
+//! The cap on range connections (`--max-connections-per-server`).
 //!
-//! IA operations asked that one client open at most 6 connections to one
-//! server at once. Every request a download sends takes a slot on the
-//! server it goes to before it is sent and keeps it until its response is
-//! dropped; a request that finds the server full waits for a slot.
+//! IA operations asked for a cap on the connections one client opens for
+//! parallel ranges (`--connections-per-file`). Every range request takes a
+//! slot before it is sent and keeps it until its response is dropped; a
+//! request that finds its pool full waits for a slot. Files fetched on one
+//! stream take no slot. The pool is per server, or one for all servers,
+//! as [`ONE_POOL_FOR_ALL_SERVERS`] says.
 //!
 //! Within a process the slots are a semaphore per server. Across processes
 //! ([`ServerSlots::across_processes`]) each slot is also a file,
@@ -25,6 +27,21 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// The cap unless the caller sets another: IA operations' limit for one
 /// client.
 pub const DEFAULT_MAX_CONNECTIONS_PER_SERVER: usize = 6;
+
+/// Whether the cap is one pool shared by every server, a machine-wide
+/// total, instead of one pool per server. The choice between the two is
+/// this line: [`pool_key`] follows it everywhere.
+pub(crate) const ONE_POOL_FOR_ALL_SERVERS: bool = false;
+
+/// The pool a connection to `server` draws its slot from: the server
+/// itself, or the single shared pool (see [`ONE_POOL_FOR_ALL_SERVERS`]).
+fn pool_key(server: &str) -> &str {
+    if ONE_POOL_FOR_ALL_SERVERS {
+        "all-servers"
+    } else {
+        server
+    }
+}
 
 /// The first wait when every slot file is locked by another process.
 const FIRST_POLL: Duration = Duration::from_millis(50);
@@ -124,6 +141,7 @@ impl ServerSlots {
     /// Wait for a slot on `server` and hold it until the guard is dropped.
     /// `None` only if the semaphore was closed, which this code never does.
     pub(crate) async fn acquire(&self, server: &str) -> Option<SlotGuard> {
+        let key = pool_key(server);
         let semaphore = {
             let mut per_server = self
                 .inner
@@ -132,7 +150,7 @@ impl ServerSlots {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
                 per_server
-                    .entry(server.to_string())
+                    .entry(key.to_string())
                     .or_insert_with(|| Arc::new(Semaphore::new(self.inner.max))),
             )
         };
@@ -144,7 +162,7 @@ impl ServerSlots {
             );
         }
         let permit = semaphore.acquire_owned().await.ok()?;
-        let file = self.lock_slot_file(server).await;
+        let file = self.lock_slot_file(key).await;
         Some(SlotGuard {
             _permit: permit,
             _file: file,
@@ -343,15 +361,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_server_has_its_own_slots() {
+    async fn each_server_has_its_own_slots_unless_one_pool_serves_all() {
         let slots = ServerSlots::new(1);
         let _a = free(&slots, "a.example").await.expect("a");
-        assert!(
+        let per_server = !ONE_POOL_FOR_ALL_SERVERS;
+        assert_eq!(
             free(&slots, "b.example").await.is_some(),
+            per_server,
             "b is another server"
         );
-        assert!(
+        assert_eq!(
             free(&slots, "a.example:8080").await.is_some(),
+            per_server,
             "another port is another server"
         );
     }
@@ -485,10 +506,12 @@ mod tests {
                 .is_some(),
             "b never took the slot a gave back"
         );
-        assert!(
-            free(&b, "t.example").await.is_some(),
-            "another server has its own files"
-        );
+        if !ONE_POOL_FOR_ALL_SERVERS {
+            assert!(
+                free(&b, "t.example").await.is_some(),
+                "another server has its own files"
+            );
+        }
     }
 
     #[tokio::test]
@@ -505,10 +528,11 @@ mod tests {
                 .is_none(),
             "large holds 3 together with small"
         );
-        let names: Vec<String> = std::fs::read_dir(dir.path().join("s.example"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> =
+            std::fs::read_dir(dir.path().join(server_dir_name(pool_key("s.example"))))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
         let mut names = names;
         names.sort();
         assert_eq!(names, vec!["slot-0", "slot-1", "slot-2"]);
@@ -519,7 +543,7 @@ mod tests {
         use fs4::{FileExt, TryLockError};
         let dir = tempfile::tempdir().unwrap();
         let slots = ServerSlots::across_processes(1, dir.path());
-        let path = slot_path(dir.path(), "s.example", 0);
+        let path = slot_path(dir.path(), pool_key("s.example"), 0);
 
         let held = free(&slots, "s.example").await.expect("slot");
         let probe = std::fs::File::open(&path).unwrap();

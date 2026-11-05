@@ -220,7 +220,7 @@ async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per
     );
 }
 
-// ─── The per-server cap, counted on a loopback server ──────────────────────
+// ─── Files on one stream are not held back by the cap ────────────────────────
 
 /// Open download connections, now and at most, and every download request
 /// seen.
@@ -231,6 +231,22 @@ struct Gauge {
     seen: AtomicUsize,
 }
 
+impl Gauge {
+    fn enter(&self) {
+        self.seen.fetch_add(1, Ordering::SeqCst);
+        let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+}
+
 const FILES: usize = 8;
 const FILE_BODY: &[u8] = b"sixteen bytes!!!";
 
@@ -238,18 +254,28 @@ const FILE_BODY: &[u8] = b"sixteen bytes!!!";
 /// request a run sends at once arrives inside it, even on a loaded runner.
 const HOLD: Duration = Duration::from_millis(1000);
 
-/// The metadata of an item of [`FILES`] files named `identifier`.
-fn small_item(identifier: &str) -> String {
-    let files: Vec<serde_json::Value> = (0..FILES)
-        .map(|i| {
-            json!({
-                "name": format!("f{i}.bin"),
-                "source": "original",
-                "size": FILE_BODY.len().to_string(),
-                "mtime": "1700000000"
+/// The metadata of an item named `identifier`: [`FILES`] small files, or one
+/// file `big.bin` of [`SIZE`] bytes when `big` is set.
+fn item_json(identifier: &str, big: bool) -> String {
+    let files: Vec<serde_json::Value> = if big {
+        vec![json!({
+            "name": "big.bin",
+            "source": "original",
+            "size": SIZE.to_string(),
+            "mtime": "1700000000"
+        })]
+    } else {
+        (0..FILES)
+            .map(|i| {
+                json!({
+                    "name": format!("f{i}.bin"),
+                    "source": "original",
+                    "size": FILE_BODY.len().to_string(),
+                    "mtime": "1700000000"
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
     json!({
         "metadata": {"identifier": identifier, "mediatype": "data"},
         "files": files
@@ -257,16 +283,15 @@ fn small_item(identifier: &str) -> String {
     .to_string()
 }
 
-/// A loopback server, one request per connection: `/metadata/<identifier>`
-/// answers at once with an item of [`FILES`] files; every other request is a
-/// download, held open for [`HOLD`], counted in the gauge, then served.
-async fn holding_server() -> (String, Arc<Gauge>) {
-    holding_server_with(|_| Some(HOLD)).await
-}
-
-/// [`holding_server`], holding each download for `hold(path)`, or until the
-/// client goes away when that is `None`.
-async fn holding_server_with(hold: fn(&str) -> Option<Duration>) -> (String, Arc<Gauge>) {
+/// A loopback server, one request per connection. `/metadata/<identifier>`
+/// answers at once: an item of one [`SIZE`]-byte file when `body` is the
+/// large body, else of [`FILES`] small files. A download is counted in the
+/// gauge and held for `hold(path)`, or until the client goes away when that
+/// is `None`; then it is served, as a 206 for a `Range` request.
+async fn holding_server(
+    body: Option<Arc<Vec<u8>>>,
+    hold: fn(&str) -> Option<Duration>,
+) -> (String, Arc<Gauge>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let host = listener.local_addr().unwrap().to_string();
     let gauge = Arc::new(Gauge::default());
@@ -276,7 +301,7 @@ async fn holding_server_with(hold: fn(&str) -> Option<Duration>) -> (String, Arc
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
-            let gauge = Arc::clone(&counted);
+            let (gauge, body) = (Arc::clone(&counted), body.clone());
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -286,133 +311,56 @@ async fn holding_server_with(hold: fn(&str) -> Option<Duration>) -> (String, Arc
                         Ok(n) => head.extend_from_slice(&buf[..n]),
                     }
                 }
-                let head = String::from_utf8_lossy(&head);
-                let body: Vec<u8> = match head.strip_prefix("GET /metadata/") {
-                    Some(rest) => {
-                        let identifier = rest.split(['?', ' ']).next().unwrap_or("");
-                        small_item(identifier).into_bytes()
+                let head = String::from_utf8_lossy(&head).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                if let Some(rest) = path.strip_prefix("/metadata/") {
+                    let identifier = rest.split('?').next().unwrap_or("");
+                    let json = item_json(identifier, body.is_some());
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                    return;
+                }
+                gauge.enter();
+                match hold(&path) {
+                    Some(hold) => tokio::time::sleep(hold).await,
+                    // Until the client hangs up.
+                    None => while !matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {},
+                }
+                // Counted down before the answer, so the client's next
+                // request is never counted alongside this one.
+                gauge.leave();
+                let range = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if !name.trim().eq_ignore_ascii_case("range") {
+                        return None;
                     }
-                    None => {
-                        let path = head.split_whitespace().nth(1).unwrap_or("");
-                        gauge.seen.fetch_add(1, Ordering::SeqCst);
-                        let now = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
-                        gauge.most.fetch_max(now, Ordering::SeqCst);
-                        match hold(path) {
-                            Some(hold) => tokio::time::sleep(hold).await,
-                            None => {
-                                // Until the client hangs up.
-                                while !matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {}
-                            }
-                        }
-                        gauge.open.fetch_sub(1, Ordering::SeqCst);
-                        FILE_BODY.to_vec()
-                    }
+                    let (a, b) = value.trim().strip_prefix("bytes=")?.split_once('-')?;
+                    Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                });
+                let (status, extra, bytes): (&str, String, &[u8]) = match (&body, range) {
+                    (Some(body), Some((a, b))) => (
+                        "206 Partial Content",
+                        format!("content-range: bytes {a}-{b}/{}\r\n", body.len()),
+                        &body[a..=b],
+                    ),
+                    (Some(body), None) => ("200 OK", String::new(), &body[..]),
+                    (None, _) => ("200 OK", String::new(), FILE_BODY),
                 };
                 let reply = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
+                    bytes.len()
                 );
                 let _ = stream.write_all(reply.as_bytes()).await;
-                let _ = stream.write_all(&body).await;
+                let _ = stream.write_all(bytes).await;
                 let _ = stream.flush().await;
             });
         }
     });
     (host, gauge)
 }
-
-/// Run `ia download` with `source` (an identifier, or `--itemlist <file>`)
-/// and `extra` against a holding server, into `disks` destination
-/// directories (more than one makes a disk pool), check every file of
-/// `items` arrived on one of them, and return the most download connections
-/// the server saw at once.
-async fn download_from_holding_server(
-    source: &[&str],
-    items: &[&str],
-    disks: usize,
-    extra: &[&str],
-) -> usize {
-    let (host, gauge) = holding_server().await;
-    let dirs: Vec<TempDir> = (0..disks).map(|_| TempDir::new().unwrap()).collect();
-    let mut args = vec!["--insecure", "-H", &host, "download"];
-    args.extend_from_slice(source);
-    for dir in &dirs {
-        args.extend_from_slice(&["--destdir", dir.path().to_str().unwrap()]);
-    }
-    args.extend_from_slice(extra);
-    let out = tokio::task::spawn_blocking({
-        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        move || ia_cmd().args(&args).output().unwrap()
-    })
-    .await
-    .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    for item in items {
-        for i in 0..FILES {
-            let got = dirs
-                .iter()
-                .find_map(|dir| fs::read(dir.path().join(item).join(format!("f{i}.bin"))).ok())
-                .unwrap_or_else(|| panic!("{item}/f{i}.bin is on no disk"));
-            assert_eq!(got, FILE_BODY);
-        }
-    }
-    gauge.most.load(Ordering::SeqCst)
-}
-
-async fn download_small_item(extra: &[&str]) -> usize {
-    download_from_holding_server(&["small-item"], &["small-item"], 1, extra).await
-}
-
-async fn download_two_items(disks: usize) -> usize {
-    let list = tempfile::NamedTempFile::new().unwrap();
-    fs::write(list.path(), "item-a\nitem-b\n").unwrap();
-    download_from_holding_server(
-        &["--itemlist", list.path().to_str().unwrap()],
-        &["item-a", "item-b"],
-        disks,
-        &["-j", "8"],
-    )
-    .await
-}
-
-#[tokio::test]
-async fn a_batch_of_two_items_on_one_server_shares_one_cap() {
-    assert_eq!(download_two_items(1).await, 6);
-}
-
-#[tokio::test]
-async fn a_batch_across_a_disk_pool_shares_one_cap() {
-    // With several --destdir, each item gets its own options for its disk;
-    // they must still share one table of server slots.
-    assert_eq!(download_two_items(2).await, 6);
-}
-
-#[tokio::test]
-async fn eight_jobs_on_one_server_never_open_more_than_six_connections() {
-    assert_eq!(download_small_item(&["-j", "8"]).await, 6);
-}
-
-#[tokio::test]
-async fn max_connections_per_server_1_serialises_every_job() {
-    assert_eq!(
-        download_small_item(&["-j", "8", "--max-connections-per-server", "1"]).await,
-        1
-    );
-}
-
-#[tokio::test]
-async fn max_connections_per_server_above_jobs_lets_every_job_run() {
-    assert_eq!(
-        download_small_item(&["-j", "8", "--max-connections-per-server", "16"]).await,
-        8
-    );
-}
-
-// ─── The per-server cap across processes ────────────────────────────────────
 
 /// An `ia download` of `item` from `host` into a new directory, with its slot
 /// files under `cache`, started and left running.
@@ -437,8 +385,9 @@ fn spawn_ia(
     (child, dir)
 }
 
-/// Wait for `child` to finish, at most `limit`, and require success.
-async fn finish(child: std::process::Child, limit: Duration) {
+/// Wait for `child` to finish, at most `limit`, require success, and return
+/// its stderr.
+async fn finish(child: std::process::Child, limit: Duration) -> String {
     let out = tokio::time::timeout(
         limit,
         tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
@@ -446,61 +395,99 @@ async fn finish(child: std::process::Child, limit: Duration) {
     .await
     .expect("ia download did not finish in time")
     .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
+    stderr
+}
+
+const LIMIT: Duration = Duration::from_secs(120);
+
+async fn download_small_item(extra: &[&str]) -> usize {
+    let (host, gauge) = holding_server(None, |_| Some(HOLD)).await;
+    let cache = TempDir::new().unwrap();
+    let (child, dir) = spawn_ia(&host, "small-item", cache.path(), extra);
+    finish(child, LIMIT).await;
+    for i in 0..FILES {
+        let got = fs::read(dir.path().join("small-item").join(format!("f{i}.bin"))).unwrap();
+        assert_eq!(got, FILE_BODY);
+    }
+    gauge.most()
+}
+
+#[tokio::test]
+async fn eight_jobs_on_one_stream_are_not_held_back_by_the_cap() {
+    assert_eq!(download_small_item(&["-j", "8"]).await, 8);
+}
+
+#[tokio::test]
+async fn a_cap_of_one_does_not_hold_back_jobs_on_one_stream() {
+    assert_eq!(
+        download_small_item(&["-j", "8", "--max-connections-per-server", "1"]).await,
+        8
     );
 }
 
-fn assert_item(dir: &TempDir, item: &str) {
-    for i in 0..FILES {
-        let got = fs::read(dir.path().join(item).join(format!("f{i}.bin"))).unwrap();
-        assert_eq!(got, FILE_BODY, "{item}/f{i}.bin");
-    }
+// ─── Range connections, across processes ────────────────────────────────────
+
+fn assert_big(dir: &TempDir, item: &str, body: &[u8]) {
+    let got = fs::read(dir.path().join(item).join("big.bin")).unwrap();
+    assert!(got == body, "{item}/big.bin differs from the body");
+    assert!(!dir.path().join(item).join("big.bin.part.json").exists());
 }
 
-/// Two `ia download` processes, each of an 8-file item with `-j 8`, at once
-/// against one server with one cache; the most connections it saw at once.
-async fn two_processes(extra: &[&str], hold: fn(&str) -> Option<Duration>) -> usize {
-    let (host, gauge) = holding_server_with(hold).await;
+/// Two `ia download` processes at once, each of one 256 MiB file over 4
+/// connections, against one server with one cache; the most connections it
+/// saw at once.
+async fn two_processes(cap: &str, hold: fn(&str) -> Option<Duration>) -> usize {
+    let body = Arc::new(big_body());
+    let (host, gauge) = holding_server(Some(Arc::clone(&body)), hold).await;
     let cache = TempDir::new().unwrap();
-    let mut args = vec!["-j", "8"];
-    args.extend_from_slice(extra);
-    let (a, dir_a) = spawn_ia(&host, "item-a", cache.path(), &args);
-    let (b, dir_b) = spawn_ia(&host, "item-b", cache.path(), &args);
-    let limit = Duration::from_secs(60);
-    tokio::join!(finish(a, limit), finish(b, limit));
-    assert_item(&dir_a, "item-a");
-    assert_item(&dir_b, "item-b");
-    gauge.most.load(Ordering::SeqCst)
+    let args = [
+        "--connections-per-file",
+        "4",
+        "--max-connections-per-server",
+        cap,
+    ];
+    let (a, dir_a) = spawn_ia(&host, "big-a", cache.path(), &args);
+    let (b, dir_b) = spawn_ia(&host, "big-b", cache.path(), &args);
+    tokio::join!(finish(a, LIMIT), finish(b, LIMIT));
+    assert_big(&dir_a, "big-a", &body);
+    assert_big(&dir_b, "big-b", &body);
+    gauge.most()
 }
 
 #[tokio::test]
-async fn two_processes_with_the_default_cap_never_open_more_than_six_together() {
-    assert_eq!(two_processes(&[], |_| Some(HOLD)).await, 6);
+async fn two_processes_never_open_more_range_connections_together_than_the_cap() {
+    // Each process wants 4 connections, so alone each stays at the cap of
+    // 3; without the slot files the two would reach 6 together.
+    assert_eq!(two_processes("3", |_| Some(HOLD)).await, 3);
 }
 
 #[tokio::test]
-async fn a_cap_of_one_across_two_processes_runs_one_download_at_a_time() {
-    let most = two_processes(&["--max-connections-per-server", "1"], |_| {
-        Some(Duration::from_millis(100))
-    })
-    .await;
-    assert_eq!(most, 1);
+async fn a_cap_of_one_across_two_processes_runs_one_range_connection_at_a_time() {
+    assert_eq!(
+        two_processes("1", |_| Some(Duration::from_millis(100))).await,
+        1
+    );
 }
 
 #[tokio::test]
 async fn a_process_killed_while_holding_the_only_slot_frees_it() {
-    // Every download of item-hang is held until its client goes away.
-    let (host, gauge) = holding_server_with(|path| {
-        (!path.contains("/item-hang/")).then_some(Duration::from_millis(100))
+    let body = Arc::new(big_body());
+    // Every download of big-hang is held until its client goes away.
+    let (host, gauge) = holding_server(Some(Arc::clone(&body)), |path| {
+        (!path.contains("/big-hang/")).then_some(Duration::from_millis(100))
     })
     .await;
     let cache = TempDir::new().unwrap();
-    let cap = ["--max-connections-per-server", "1"];
+    let args = [
+        "--connections-per-file",
+        "4",
+        "--max-connections-per-server",
+        "1",
+    ];
 
-    let (mut first, _first_dir) = spawn_ia(&host, "item-hang", cache.path(), &cap);
+    let (mut first, _first_dir) = spawn_ia(&host, "big-hang", cache.path(), &args);
     let started = std::time::Instant::now();
     while gauge.seen.load(Ordering::SeqCst) == 0 {
         assert!(
@@ -509,7 +496,7 @@ async fn a_process_killed_while_holding_the_only_slot_frees_it() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let (second, second_dir) = spawn_ia(&host, "item-b", cache.path(), &cap);
+    let (second, second_dir) = spawn_ia(&host, "big-b", cache.path(), &args);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         gauge.seen.load(Ordering::SeqCst),
@@ -520,51 +507,36 @@ async fn a_process_killed_while_holding_the_only_slot_frees_it() {
     first.kill().unwrap();
     first.wait().unwrap();
 
-    finish(second, Duration::from_secs(30)).await;
-    assert_item(&second_dir, "item-b");
-    assert_eq!(gauge.most.load(Ordering::SeqCst), 1);
+    finish(second, LIMIT).await;
+    assert_big(&second_dir, "big-b", &body);
+    assert_eq!(gauge.most(), 1);
 }
 
 #[tokio::test]
 async fn a_cache_that_cannot_hold_slot_files_falls_back_to_the_process_cap() {
-    let (host, gauge) = holding_server().await;
-    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
-    let dir = TempDir::new().unwrap();
-
-    let out = tokio::task::spawn_blocking({
-        let (host, cache, dest) = (
-            host.clone(),
-            not_a_dir.path().to_path_buf(),
-            dir.path().to_path_buf(),
-        );
-        move || {
-            std::process::Command::new(env!("CARGO_BIN_EXE_ia-cli"))
-                .env_remove("IA_ACCESS_KEY_ID")
-                .env_remove("IA_SECRET_ACCESS_KEY")
-                .env("IA_CACHE_DIR", &cache)
-                .args([
-                    "--insecure",
-                    "-H",
-                    &host,
-                    "download",
-                    "small-item",
-                    "-j",
-                    "8",
-                ])
-                .arg("--destdir")
-                .arg(&dest)
-                .output()
-                .unwrap()
-        }
+    let body = Arc::new(big_body());
+    let (host, gauge) = holding_server(Some(Arc::clone(&body)), |_| {
+        Some(Duration::from_millis(300))
     })
-    .await
-    .unwrap();
+    .await;
+    let not_a_dir = tempfile::NamedTempFile::new().unwrap();
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert_item(&dir, "small-item");
+    let (child, dir) = spawn_ia(
+        &host,
+        "big-a",
+        not_a_dir.path(),
+        &[
+            "--connections-per-file",
+            "4",
+            "--max-connections-per-server",
+            "2",
+        ],
+    );
+    let stderr = finish(child, LIMIT).await;
+
+    assert_big(&dir, "big-a", &body);
     // The cap still holds within the process.
-    assert_eq!(gauge.most.load(Ordering::SeqCst), 6);
+    assert_eq!(gauge.most(), 2);
     // One warning, naming the path.
     let warnings: Vec<&str> = stderr
         .lines()

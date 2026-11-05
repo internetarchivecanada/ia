@@ -3247,33 +3247,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eight_jobs_on_one_server_hold_at_the_default_cap_of_six() {
+    async fn eight_jobs_on_one_stream_are_not_held_back_by_the_cap() {
+        // The cap counts the connections of parallel ranges only; files
+        // fetched on one stream run as -j lets them, as before the cap.
         let body = body_of(2048);
         let (client, gauge) = holding_server(&body, HOLD, false, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
 
         download_files(&client, 8, &body, 8, &DownloadOpts::default(), dir.path()).await;
 
-        assert_eq!(gauge.most(), 6);
+        assert_eq!(gauge.most(), 8);
     }
 
     #[tokio::test]
-    async fn two_servers_with_a_cap_of_six_reach_twelve_in_all() {
-        let body = body_of(2048);
+    async fn two_servers_with_a_cap_of_six_reach_six_each_or_six_in_all() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
         let all = Arc::new(Gauge::default());
         let (a, gauge_a) = holding_server(&body, HOLD, false, vec![Arc::clone(&all)]).await;
         let (b, gauge_b) = holding_server(&body, HOLD, false, vec![Arc::clone(&all)]).await;
         let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let file = file_meta("big.bin", &body);
         // One set of options, so one table of slots, for both servers.
-        let shared = DownloadOpts::default();
+        let mut shared = opts(8);
+        shared.server_slots = ServerSlots::default();
 
-        tokio::join!(
-            download_files(&a, 8, &body, 8, &shared, dir_a.path()),
-            download_files(&b, 8, &body, 8, &shared, dir_b.path()),
+        let (ra, rb) = tokio::join!(
+            fetch(&a, &file, dir_a.path(), &shared),
+            fetch(&b, &file, dir_b.path(), &shared),
         );
+        ra.unwrap();
+        rb.unwrap();
 
-        assert_eq!((gauge_a.most(), gauge_b.most()), (6, 6));
-        assert_eq!(all.most(), 12);
+        assert_finished(dir_a.path(), &body);
+        assert_finished(dir_b.path(), &body);
+        if crate::download::slots::ONE_POOL_FOR_ALL_SERVERS {
+            assert_eq!(all.most(), 6);
+        } else {
+            assert_eq!((gauge_a.most(), gauge_b.most()), (6, 6));
+            assert_eq!(all.most(), 12);
+        }
     }
 
     #[tokio::test]
@@ -3294,77 +3307,6 @@ mod tests {
         assert_eq!(result.status, DownloadStatus::Complete);
         assert_finished(dir.path(), &body);
         assert_eq!(gauge.most(), 1);
-    }
-
-    #[tokio::test]
-    async fn one_stream_gives_its_slot_back_before_waiting_to_re_request() {
-        let body = body_of(2048);
-        // The first request the server sees drops after 10 bytes; its file
-        // then waits 0.5 s before re-requesting. With a cap of 1, the other
-        // file can only be served in that wait if the slot was given back.
-        let arrivals: Arc<Mutex<Vec<(String, bool, std::time::Instant)>>> = Arc::default();
-        let log = Arc::clone(&arrivals);
-        let handler: RawHandler = Arc::new(move |mut conn| {
-            let log = Arc::clone(&log);
-            Box::pin(async move {
-                use tokio::io::AsyncWriteExt;
-                let first_seen = {
-                    let mut log = log.lock().unwrap();
-                    log.push((conn.path.clone(), conn.ranged, std::time::Instant::now()));
-                    log.len() == 1
-                };
-                if first_seen {
-                    send_head(&mut conn).await;
-                    let bytes = slice(&conn);
-                    let _ = conn.stream.write_all(&bytes[..10]).await;
-                    let _ = conn.stream.flush().await;
-                    return;
-                }
-                serve_whole(conn).await;
-            })
-        });
-        let (client, _seen) = spawn_raw(&body, handler).await;
-        let dir = tempfile::tempdir().unwrap();
-        let o = DownloadOpts {
-            server_slots: ServerSlots::new(1),
-            ..Default::default()
-        };
-
-        download_files(&client, 2, &body, 2, &o, dir.path()).await;
-
-        let arrivals = arrivals.lock().unwrap();
-        assert_eq!(arrivals.len(), 3, "{arrivals:?}");
-        let (dropped, other) = (&arrivals[0], &arrivals[1]);
-        assert_ne!(
-            dropped.0, other.0,
-            "the other file came second: {arrivals:?}"
-        );
-        assert!(!other.1, "a fresh request, not the re-request");
-        let gap = other.2 - dropped.2;
-        assert!(
-            gap < Duration::from_millis(400),
-            "the other file waited {gap:?}, through the 0.5 s backoff"
-        );
-    }
-
-    #[tokio::test]
-    async fn once_stopped_the_work_is_never_polled() {
-        // A stream's request must not even start (take a slot, connect)
-        // once the stop is out, however the two branches would be ordered.
-        let (tx, mut rx) = watch::channel(false);
-        tx.send(true).unwrap();
-        let polled = std::sync::atomic::AtomicUsize::new(0);
-        for _ in 0..64 {
-            let work = async {
-                polled.fetch_add(1, Ordering::SeqCst);
-            };
-            assert!(or_stopped(&mut rx, work).await.is_none());
-        }
-        assert_eq!(polled.load(Ordering::SeqCst), 0);
-
-        // Not stopped: the work runs.
-        let (_tx, mut rx) = watch::channel(false);
-        assert_eq!(or_stopped(&mut rx, async { 7 }).await, Some(7));
     }
 
     #[tokio::test]
@@ -3440,21 +3382,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cap_of_one_lets_one_stream_re_request_after_a_dropped_body() {
-        let body = body_of(LEN);
-        let client = dropping_once_at(&body, 0).await;
-        let dir = tempfile::tempdir().unwrap();
-        let file = file_meta("big.bin", &body);
-        let mut o = opts(1);
-        o.server_slots = ServerSlots::new(1);
-
-        // The re-request needs the slot the dropped response held.
-        fetch(&client, &file, dir.path(), &o).await.unwrap();
-
-        assert_finished(dir.path(), &body);
-    }
-
-    #[tokio::test]
     async fn a_cap_of_one_lets_a_range_stream_re_request_after_a_dropped_body() {
         let _layout = small_layout();
         let body = body_of(LEN);
@@ -3470,9 +3397,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cap_of_one_serialises_jobs_and_the_single_stream_path() {
+    async fn a_cap_of_one_does_not_hold_back_jobs_on_one_stream() {
         let body = body_of(2048);
-        let (client, gauge) = holding_server(&body, Duration::from_millis(20), true, vec![]).await;
+        let (client, gauge) = holding_server(&body, HOLD, true, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
         let o = DownloadOpts {
             server_slots: ServerSlots::new(1),
@@ -3481,7 +3408,7 @@ mod tests {
 
         download_files(&client, 4, &body, 8, &o, dir.path()).await;
 
-        assert_eq!(gauge.most(), 1);
+        assert_eq!(gauge.most(), 4);
     }
 
     #[tokio::test]

@@ -199,15 +199,17 @@ pub struct DownloadOpts {
     /// retries are spent fails the file with [`IaError::RangeFailed`]. The
     /// md5 is checked in one pass over the assembled file.
     pub connections_per_file: usize,
-    /// The cap on download connections to one server at once, shared by
-    /// every download that clones these options (see [`ServerSlots`]);
-    /// default [`DEFAULT_MAX_CONNECTIONS_PER_SERVER`], six.
+    /// The cap on the range connections of parallel downloads
+    /// ([`connections_per_file`](Self::connections_per_file)) open to one
+    /// server at once, shared by every download that clones these options
+    /// (see [`ServerSlots`]); default [`DEFAULT_MAX_CONNECTIONS_PER_SERVER`],
+    /// six.
     ///
-    /// Every request a download sends takes a slot on the server it lands
-    /// on (the datanode after the `/download/` redirect, or the request's
-    /// own host) and keeps it until its response is dropped: each file of
-    /// [`download_item`] and each connection of a file. A request that finds
-    /// its server full waits for a slot; nothing is refused.
+    /// Every range request takes a slot on the server it lands on (the
+    /// datanode after the `/download/` redirect, or the request's own host)
+    /// and keeps it until its response is dropped; a request that finds its
+    /// server full waits for a slot, and nothing is refused. Files fetched on
+    /// one stream take no slot.
     pub server_slots: ServerSlots,
 }
 
@@ -1139,17 +1141,9 @@ pub async fn download_file(
         });
     }
 
-    // Every request of the download holds a slot on its server (see
-    // `DownloadOpts::server_slots`) for as long as its response is read.
-    let (response, mut slot) = fetch_response_via(
-        client.no_redirect_http(),
-        client,
-        &url,
-        resume_from.map(ByteRange::From),
-        count_views,
-        Some(&opts.server_slots),
-    )
-    .await?;
+    // One stream takes no slot under `DownloadOpts::server_slots`: the cap
+    // counts the connections of parallel ranges only.
+    let response = fetch_response(client, &url, resume_from, count_views).await?;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
@@ -1157,9 +1151,6 @@ pub async fn download_file(
     {
         let last_modified = last_modified_of(&response);
         range_not_satisfiable(response, identifier, file, offset, &part_path).await?;
-        // The response is consumed: no connection is open any more, so the
-        // slot goes back before the .part is hashed from disk.
-        drop(slot);
         // The .part is the whole file, but never finish it through a
         // symlink: renaming the link into place would leave a Complete
         // download pointing outside dest_dir and the mtime write would go
@@ -1367,11 +1358,8 @@ pub async fn download_file(
                 }
             }
         };
-        // Close the abandoned connection before opening the next one, and
-        // give its slot back now: a body error waits before re-requesting,
-        // and the server's slot must not sit idle through that wait.
+        // Close the abandoned connection before opening the next one.
         drop(stream);
-        drop(slot.take());
 
         match end {
             StreamEnd::Done => break,
@@ -1446,22 +1434,12 @@ pub async fn download_file(
 
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
-        let (new_resp, new_slot) = fetch_response_via(
-            client.no_redirect_http(),
-            client,
-            &url,
-            Some(ByteRange::From(bytes_downloaded)),
-            count_views,
-            Some(&opts.server_slots),
-        )
-        .await?;
-        slot = new_slot;
+        let new_resp = fetch_response(client, &url, Some(bytes_downloaded), count_views).await?;
         if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // Close the writer first: the mapping may remove .part.
             drop(output);
             let last_modified = last_modified_of(&new_resp).or(last_modified);
             range_not_satisfiable(new_resp, identifier, file, bytes_downloaded, &part_path).await?;
-            drop(slot.take());
             // The .part is the whole file: the stream ended after its last
             // byte. The hasher already covers every byte written, so
             // finish in place.
@@ -1494,8 +1472,6 @@ pub async fn download_file(
 
     output.flush().await?;
     drop(output);
-    // The body has ended; the slot goes back before the checks and rename.
-    drop(slot.take());
 
     // The stream ended. Refuse to rename a file whose byte count differs
     // from the item metadata. This runs before the md5 comparison because
