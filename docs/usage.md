@@ -48,7 +48,8 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `--no-verify` | Don't check the md5 of downloaded files; a download is accepted on its size alone (see "Verification") |
 | `-R, --retries <N>` | Max retries per file, or per stream of a file fetched over parallel ranges, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
-| `--streams <N>` | Connections per file of 256 MiB or more, 1 to 8 (default: 4; `1` fetches every file on one stream; see "Large files over parallel ranges") |
+| `--connections-per-file <N>` | Connections used for one file of 256 MiB or more, 1 to 8 (default: 1, one stream); counts against `--max-connections-per-server` (see "Large files over parallel ranges") |
+| `--max-connections-per-server <N>` | Open connections to one server at once, counting every job and every connection per file (default: 6; see "Connections per server") |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
 | `--count-views` | Increment archive.org's public view counter (off by default) |
@@ -91,24 +92,28 @@ Each stall spends one of the file's `--retries` (default 5). When they are gone,
 
 #### Large files over parallel ranges
 
-A file whose metadata size is 256 MiB or more is fetched over several `Range` requests at once, each on its own HTTP/1.1 connection: four by default, set with `--streams` (1 to 8). Measured from one client on 2026-10-30, a 2 GiB file came 2.4 times as fast over four connections as over one, and 3.5 times as fast over eight (`docs/plans/parallel-transfer-measurement-2026-10-30.md`). Smaller files, the item's own `<identifier>_files.xml`, files with no size in the metadata, and every file with `--streams 1` use one stream as described above.
+With `--connections-per-file N` (1 to 8; default 1), a file whose metadata size is 256 MiB or more is fetched over N `Range` requests at once, each on its own HTTP/1.1 connection. Measured from one client on 2026-10-30, a 2 GiB file came 2.4 times as fast over four connections as over one, and 3.5 times as fast over eight (`docs/plans/parallel-transfer-measurement-2026-10-30.md`). Smaller files, the item's own `<identifier>_files.xml`, files with no size in the metadata, and every file without `--connections-per-file` use one stream as described above. Each connection takes a slot under `--max-connections-per-server` (see "Connections per server"), so with the default cap of 6, `--connections-per-file 8` runs one file at 6 connections, without an error; the other streams wait for a slot.
 
 The file is cut into 64 MiB parts. The request for the first part goes alone: unless the server answers it with `206 Partial Content` and a `Content-Range` naming exactly that range, the file is fetched on one stream instead. Then each stream takes the next part nobody has taken, fetches it with one request (`Range: bytes=A-B`), writes it into the `.part` file at its offset, and takes another, until none is left. With `--count-views` only that first request leaves out `cnt=0`, so the download counts one view, not one per part, also when it falls back to one stream.
 
-`<name>.part.json` beside the `.part` file records how many bytes of each part are on disk. It is written before the first byte lands in the `.part` file, then again by each stream after every 16 MiB and whenever its stream ends; each version is written to `<name>.part.json.tmp`, synced, and renamed over the old one, so a crash leaves one whole version, and at most 16 MiB per stream is fetched again. The rerun fetches only the bytes the file lacks: each part from where its record ends. A `.part.json` that was written for another size or md5 of the file, that has no `.part` file beside it, or that does not fit the `.part` file (it claims more bytes than the `.part` file holds, or the `.part` file is longer than the file) is deleted together with the `.part` file, and the file starts over. A file named `<name>.part.json` that is not such a record (it does not parse as one, as with an item file of that name) is never touched: `<name>` is then fetched on one stream. A `.part` file left by a single stream, with no `.part.json`, is kept: its bytes count as the start of the file. A rerun with `--streams 1` keeps the bytes from the start of the file up to the first one missing, removes `.part.json`, and continues from there with one stream.
+`<name>.part.json` beside the `.part` file records how many bytes of each part are on disk. It is written before the first byte lands in the `.part` file, then again by each stream after every 16 MiB and whenever its stream ends; each version is written to `<name>.part.json.tmp`, synced, and renamed over the old one, so a crash leaves one whole version, and at most 16 MiB per stream is fetched again. The rerun fetches only the bytes the file lacks: each part from where its record ends. A `.part.json` that was written for another size or md5 of the file, that has no `.part` file beside it, or that does not fit the `.part` file (it claims more bytes than the `.part` file holds, or the `.part` file is longer than the file) is deleted together with the `.part` file, and the file starts over. A file named `<name>.part.json` that is not such a record (it does not parse as one, as with an item file of that name) is never touched: `<name>` is then fetched on one stream. A `.part` file left by a single stream, with no `.part.json`, is kept: its bytes count as the start of the file. A rerun with `--connections-per-file 1` keeps the bytes from the start of the file up to the first one missing, removes `.part.json`, and continues from there with one stream.
 
 Once every part is on disk, `.part.json` is removed, the md5 of the whole file is computed in one pass over the `.part` file (unless `--no-verify`; about 2 s per GB, shown as verifying), and the file is renamed into place as above.
 
 `--min-speed` and `--retries` apply to each stream. A dropped connection is re-requested for the rest of its part up to three times (after 0.5 s, 1.5 s and 4.5 s); a fourth counts as one failed request. A stall re-requests the rest of the part at once, and each stream has `--retries` stalls before the file fails with `download of <name> stalled N times: ...`. A request that fails with a retryable status (a `429` or a `5xx`), a connection failure, or an answer for another range is sent again after the standard wait, or the server's `Retry-After`, which delays only that stream; when the stream's `--retries` are spent, the file fails with `download of <name> failed on bytes A-B after N attempts: <last error>` (in `--json` output the error code is `download_failed` and this text is the message). A `403`, a `404`, or a `Content-Range` total that differs from the metadata size fails the file at once. When one stream fails the file, the others stop and record what they have; the `.part` and `.part.json` files are kept for a later run, and the file is not attempted again in this one. An error on the first request is retried like any failed attempt (see "Retries").
 
-Up to `--jobs` files (default 8) download at once, and each may use `--streams` connections, so a run can hold `--jobs` times `--streams` connections.
+```bash
+# Fetch a large file over 4 connections at once
+ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --connections-per-file 4
+```
+
+#### Connections per server
+
+`ia download` opens at most `--max-connections-per-server` connections (default 6) to any one server at once, as IA operations asked of each client. Every file downloading under `-j, --jobs` (default 8) and every connection of a file under `--connections-per-file` counts. The server is the one a request lands on: the datanode after archive.org's `/download/` redirect. A request holds its slot from the moment it is sent until its response has been read or abandoned, and a request that finds its server full waits for a slot; nothing is refused or cut short. So `-j 8` runs at most 6 files at once from one datanode, with the other two starting as slots come free, while files on different datanodes each get their own 6. `--connections-per-file 8` with the default cap runs one file at 6 connections. `--max-connections-per-server 1` fetches one thing at a time from each server. Other commands, and `--zip-list` and `--zip-member`, are not counted.
 
 ```bash
-# Fetch a large file over 8 connections at once
-ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --streams 8
-
-# Fetch every file over one connection
-ia download nasa --streams 1
+# Open at most 2 connections to any one server
+ia download nasa --max-connections-per-server 2
 ```
 
 #### Verification
@@ -148,7 +153,7 @@ ia download nasa --source original --format "MPEG4"
 # Download several items (one identifier per line on stdin)
 printf 'item1\nitem2\nitem3\n' | ia download
 
-# Batch download from a search query with 16 parallel downloads
+# Batch download from a search query, 16 files at once (still at most 6 per server)
 ia download --search "collection:nasa AND mediatype:image" --jobs 16
 
 # Batch download from a file of identifiers
@@ -1285,7 +1290,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10) |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10). For `ia download`, files downloaded at once; connections to any one server are also capped by `--max-connections-per-server`, so jobs on the same server may wait for a slot |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |

@@ -1,8 +1,10 @@
 use crate::stall;
 mod parallel;
+mod slots;
 pub mod zip;
 
-pub use parallel::{DEFAULT_STREAMS, MAX_STREAMS};
+pub use parallel::{DEFAULT_CONNECTIONS_PER_FILE, MAX_CONNECTIONS_PER_FILE};
+pub use slots::{ServerSlots, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -180,12 +182,15 @@ pub struct DownloadOpts {
     /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
-    /// How many streams, each on its own HTTP/1.1 connection, fetch one
-    /// large file at once (#16); default [`DEFAULT_STREAMS`].
+    /// How many connections, each a stream on its own HTTP/1.1 connection,
+    /// fetch one large file at once (#16); default
+    /// [`DEFAULT_CONNECTIONS_PER_FILE`], one.
     ///
     /// A file of 256 MiB or more is cut into 64 MiB parts, which the streams
     /// take in turn, each with one `Range` request; `0` and `1` keep the
-    /// single stream, and a value above [`MAX_STREAMS`] is treated as that.
+    /// single stream, and a value above [`MAX_CONNECTIONS_PER_FILE`] is
+    /// treated as that. Each connection takes a slot in
+    /// [`server_slots`](Self::server_slots), so a file may run on fewer.
     /// The first request goes alone: unless it is answered with a 206 for
     /// the range asked for, the file is fetched on one stream. Progress is
     /// kept beside the `.part` file in `<name>.part.json`, so an interrupted
@@ -193,7 +198,17 @@ pub struct DownloadOpts {
     /// [`retries`](Self::retries) apply to each stream; a stream whose
     /// retries are spent fails the file with [`IaError::RangeFailed`]. The
     /// md5 is checked in one pass over the assembled file.
-    pub streams: usize,
+    pub connections_per_file: usize,
+    /// The cap on download connections to one server at once, shared by
+    /// every download that clones these options (see [`ServerSlots`]);
+    /// default [`DEFAULT_MAX_CONNECTIONS_PER_SERVER`], six.
+    ///
+    /// Every request a download sends takes a slot on the server it lands
+    /// on (the datanode after the `/download/` redirect, or the request's
+    /// own host) and keeps it until its response is dropped: each file of
+    /// [`download_item`] and each connection of a file. A request that finds
+    /// its server full waits for a slot; nothing is refused.
+    pub server_slots: ServerSlots,
 }
 
 impl Default for DownloadOpts {
@@ -209,7 +224,8 @@ impl Default for DownloadOpts {
             filter: FileFilter::default(),
             count_views: false,
             min_speed: 10 * 1024,
-            streams: DEFAULT_STREAMS,
+            connections_per_file: DEFAULT_CONNECTIONS_PER_FILE,
+            server_slots: ServerSlots::default(),
         }
     }
 }
@@ -454,20 +470,34 @@ pub(crate) async fn fetch_response(
         url,
         resume_from.map(ByteRange::From),
         count_views,
+        None,
     )
     .await
+    .map(|(response, _slot)| response)
 }
+
+/// A download's slot on the server its response came from (see
+/// [`ServerSlots`]), held for as long as the response or its body is read.
+pub(crate) type Slot = Option<tokio::sync::OwnedSemaphorePermit>;
 
 /// [`fetch_response`] over the transport `http` (which must not follow
 /// redirects), with any [`ByteRange`]. A 416 answering a `range` is
 /// returned as a response, as in [`fetch_response`].
+///
+/// With `slots`, every hop first waits for a slot on its server (the URL's
+/// authority). A redirect gives its slot back before the next hop takes
+/// one, so the request never holds two and never waits while holding one;
+/// the slot of the hop that answered is returned with the response, and the
+/// caller keeps it until the response is dropped. Without `slots`, the slot
+/// is `None`.
 pub(crate) async fn fetch_response_via(
     http: &reqwest::Client,
     client: &IaClient,
     url: &str,
     range: Option<ByteRange>,
     count_views: bool,
-) -> Result<reqwest::Response> {
+    slots: Option<&ServerSlots>,
+) -> Result<(reqwest::Response, Slot)> {
     // Build auth header if credentials are available.
     let auth_value = client
         .config()
@@ -494,6 +524,10 @@ pub(crate) async fn fetch_response_via(
     let mut resp = None;
 
     for _ in 0..=max_redirects {
+        let slot = match slots {
+            Some(slots) => slots.acquire(&server_of(&current_url)).await,
+            None => None,
+        };
         let mut req = http.get(&current_url);
         if let Some(ref auth) = auth_value {
             req = req.header("Authorization", auth);
@@ -535,6 +569,8 @@ pub(crate) async fn fetch_response_via(
                 {
                     debug!(location = %new_url, "following redirect");
                     current_url = new_url.to_string();
+                    // This hop's slot goes back before the next is taken.
+                    drop(slot);
                     continue;
                 }
                 _ => {
@@ -547,11 +583,11 @@ pub(crate) async fn fetch_response_via(
             }
         }
 
-        resp = Some(r);
+        resp = Some((r, slot));
         break;
     }
 
-    let response = resp.ok_or_else(|| IaError::Http {
+    let (response, slot) = resp.ok_or_else(|| IaError::Http {
         status: 0,
         message: "too many redirects".to_string(),
         retry_after: None,
@@ -572,7 +608,16 @@ pub(crate) async fn fetch_response_via(
         return Err(http_error_from(response).await);
     }
 
-    Ok(response)
+    Ok((response, slot))
+}
+
+/// The server a download URL goes to, for [`ServerSlots`]: its authority
+/// (the host, and the port when the URL gives one), or the URL itself if it
+/// does not parse.
+fn server_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|url| url.authority().to_string())
+        .unwrap_or_else(|_| url.to_string())
 }
 
 /// Turn a non-success response into [`IaError::Http`], consuming the body
@@ -1092,7 +1137,17 @@ pub async fn download_file(
         });
     }
 
-    let response = fetch_response(client, &url, resume_from, count_views).await?;
+    // Every request of the download holds a slot on its server (see
+    // `DownloadOpts::server_slots`) for as long as its response is read.
+    let (response, mut slot) = fetch_response_via(
+        client.no_redirect_http(),
+        client,
+        &url,
+        resume_from.map(ByteRange::From),
+        count_views,
+        Some(&opts.server_slots),
+    )
+    .await?;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
@@ -1383,7 +1438,19 @@ pub async fn download_file(
 
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
-        let new_resp = fetch_response(client, &url, Some(bytes_downloaded), count_views).await?;
+        // The abandoned response's slot goes back first: with a cap of one,
+        // the re-request would otherwise wait for it forever.
+        drop(slot.take());
+        let (new_resp, new_slot) = fetch_response_via(
+            client.no_redirect_http(),
+            client,
+            &url,
+            Some(ByteRange::From(bytes_downloaded)),
+            count_views,
+            Some(&opts.server_slots),
+        )
+        .await?;
+        slot = new_slot;
         if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // Close the writer first: the mapping may remove .part.
             drop(output);

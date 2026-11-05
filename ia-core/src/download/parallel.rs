@@ -1,10 +1,11 @@
 //! Parallel Range downloads within one file (#16).
 //!
 //! A file of [`MIN_SIZE`] or more is cut into consecutive [`PART_SIZE`]
-//! parts on a fixed grid. Up to [`DownloadOpts::streams`] streams, each on
-//! its own HTTP/1.1 connection, take the next unfetched part from a shared
-//! queue and fetch it with one closed `Range` request, writing it at its
-//! offset in the `.part` file. Measured on 2026-10-30, four such
+//! parts on a fixed grid. Up to [`DownloadOpts::connections_per_file`]
+//! streams, each on its own HTTP/1.1 connection, take the next unfetched
+//! part from a shared queue and fetch it with one closed `Range` request,
+//! writing it at its offset in the `.part` file. Each request holds a slot
+//! in [`DownloadOpts::server_slots`] (see the `slots` module). Measured on 2026-10-30, four such
 //! connections ran 2.41 times as fast as one, and eight 3.50 times; four
 //! ranges multiplexed on one HTTP/2 connection gained nothing
 //! (`docs/plans/parallel-transfer-measurement-2026-10-30.md`).
@@ -35,18 +36,20 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
+use super::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult, ServerSlots};
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
 use crate::stall;
 use crate::types::FileMetadata;
 
-/// The number of streams per file unless the caller sets another.
-pub const DEFAULT_STREAMS: usize = 4;
+/// Connections per file unless the caller sets another: one, so a file is
+/// fetched on one stream unless the caller asks for more.
+pub const DEFAULT_CONNECTIONS_PER_FILE: usize = 1;
 
-/// The most streams one file uses; a larger [`DownloadOpts::streams`] is
-/// treated as this. The measurement tested up to eight connections.
-pub const MAX_STREAMS: usize = 8;
+/// The most connections one file uses; a larger
+/// [`DownloadOpts::connections_per_file`] is treated as this. The
+/// measurement tested up to eight connections.
+pub const MAX_CONNECTIONS_PER_FILE: usize = 8;
 
 /// The length of every part but the last. rclone's default chunk size for
 /// the same feature; at the per-stream rate measured with four streams a
@@ -54,8 +57,9 @@ pub const MAX_STREAMS: usize = 8;
 /// `/download/` redirect, measured at 0.16 to 6.2 s) costs a few percent.
 const PART_SIZE: u64 = 64 * 1024 * 1024;
 
-/// The smallest file fetched in parallel: four parts, one for each default
-/// stream. rclone's default cutoff for the same feature.
+/// The smallest file fetched in parallel: four parts, one for each of the
+/// 4 connections the measurement recommended. rclone's default cutoff for
+/// the same feature.
 const MIN_SIZE: u64 = 256 * 1024 * 1024;
 
 /// A stream records its progress in the journal each time it has written
@@ -413,7 +417,7 @@ async fn discard(part_path: &Path) -> std::io::Result<()> {
 /// size in the metadata at or above the threshold, and not the item's own
 /// `_files.xml`, whose size is unknowable.
 pub(super) fn applies(opts: &DownloadOpts, identifier: &str, file: &FileMetadata) -> bool {
-    opts.streams >= 2
+    opts.connections_per_file >= 2
         && file.size.is_some_and(|size| size >= layout().min_size)
         && !super::is_size_unknowable(identifier, &file.name)
 }
@@ -579,7 +583,15 @@ pub(super) async fn download(
         // returned to the per-file retry loop, as on one stream, and an
         // answer that is not the range asked for means one stream.
         let span = journal.span(first);
-        let response = fetch_range(client, url, file, span, opts.count_views).await?;
+        let (response, slot) = fetch_range(
+            client,
+            url,
+            file,
+            span,
+            opts.count_views,
+            &opts.server_slots,
+        )
+        .await?;
         if !answers_span(&response, identifier, file, span)? {
             return Ok(Outcome::Unsupported);
         }
@@ -591,7 +603,10 @@ pub(super) async fn download(
         }
         // The streams only open the .part; it is created here, once.
         create_part(file, part_path).await?;
-        let streams = opts.streams.min(MAX_STREAMS).min(pending.len());
+        let streams = opts
+            .connections_per_file
+            .min(MAX_CONNECTIONS_PER_FILE)
+            .min(pending.len());
         info!(
             file = %file.name,
             streams,
@@ -614,7 +629,7 @@ pub(super) async fn download(
             queue: StdMutex::new(pending[1..].iter().copied().collect()),
             journal: tokio::sync::Mutex::new(journal),
         };
-        run_streams(&shared, streams, first, response).await?;
+        run_streams(&shared, streams, first, (response, slot)).await?;
     }
 
     // Every part is on disk and synced, so the .part is the whole file:
@@ -716,13 +731,15 @@ async fn fetch_range(
     file: &FileMetadata,
     (first, last): (u64, u64),
     count_views: bool,
-) -> Result<reqwest::Response> {
-    let response = super::fetch_response_via(
+    slots: &ServerSlots,
+) -> Result<Answer> {
+    let (response, slot) = super::fetch_response_via(
         client.range_http(),
         client,
         url,
         Some(super::ByteRange::Span { first, last }),
         count_views,
+        Some(slots),
     )
     .await?;
     if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -742,8 +759,12 @@ async fn fetch_range(
         }
         return Err(super::http_error_from(response).await);
     }
-    Ok(response)
+    Ok((response, slot))
 }
+
+/// A range request's response and the per-server slot it holds (see
+/// [`ServerSlots`]); the slot goes back when it is dropped.
+type Answer = (reqwest::Response, super::Slot);
 
 /// Whether `response` is a 206 for exactly `span`. A `Content-Range` total
 /// that differs from the metadata size is [`IaError::ServerSizeMismatch`],
@@ -931,10 +952,10 @@ async fn run_streams(
     shared: &Shared<'_>,
     streams: usize,
     first: usize,
-    response: reqwest::Response,
+    answer: Answer,
 ) -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let mut first = Some((first, response));
+    let mut first = Some((first, answer));
     let mut running: FuturesUnordered<_> = (0..streams)
         .map(|_| stream(shared, first.take(), stop_rx.clone()))
         .collect();
@@ -1055,7 +1076,7 @@ async fn or_stopped<F: std::future::Future>(
 /// parts from the queue until it is empty or the stream is told to stop.
 async fn stream(
     shared: &Shared<'_>,
-    mut first: Option<(usize, reqwest::Response)>,
+    mut first: Option<(usize, Answer)>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut budget = Budget::new(shared.opts.retries);
@@ -1063,14 +1084,14 @@ async fn stream(
         if *stop.borrow() {
             return Ok(());
         }
-        let (k, response) = match first.take() {
-            Some((k, response)) => (k, Some(response)),
+        let (k, answer) = match first.take() {
+            Some((k, answer)) => (k, Some(answer)),
             None => match shared.next_part() {
                 Some(k) => (k, None),
                 None => return Ok(()),
             },
         };
-        match fetch_part(shared, k, response, &mut budget, &mut stop).await? {
+        match fetch_part(shared, k, answer, &mut budget, &mut stop).await? {
             Flow::Next => {}
             Flow::Stopped => return Ok(()),
         }
@@ -1086,37 +1107,50 @@ async fn request_span(
     span: (u64, u64),
     budget: &mut Budget,
     stop: &mut watch::Receiver<bool>,
-) -> Result<Option<reqwest::Response>> {
+) -> Result<Option<Answer>> {
     loop {
         // Only the file's first request may count a view (see `download`).
+        // Waiting for a server slot is part of the request, so a stream
+        // told to stop stops waiting.
         let Some(sent) = or_stopped(
             stop,
-            fetch_range(shared.client, shared.url, shared.file, span, false),
+            fetch_range(
+                shared.client,
+                shared.url,
+                shared.file,
+                span,
+                false,
+                &shared.opts.server_slots,
+            ),
         )
         .await
         else {
             return Ok(None);
         };
         let err = match sent {
-            Ok(response) => match answers_span(&response, shared.identifier, shared.file, span) {
-                Ok(true) => return Ok(Some(response)),
-                Ok(false) => IaError::ResumeFailed {
-                    file: shared.file.name.clone(),
-                    reason: format!(
-                        "the server answered {} with Content-Range {} to a request for bytes \
+            // A response that is not used goes, with its slot, before the
+            // stream waits to send the request again.
+            Ok((response, slot)) => {
+                match answers_span(&response, shared.identifier, shared.file, span) {
+                    Ok(true) => return Ok(Some((response, slot))),
+                    Ok(false) => IaError::ResumeFailed {
+                        file: shared.file.name.clone(),
+                        reason: format!(
+                            "the server answered {} with Content-Range {} to a request for bytes \
                          {}-{}",
-                        response.status().as_u16(),
-                        response
-                            .headers()
-                            .get("content-range")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("(none)"),
-                        span.0,
-                        span.1
-                    ),
-                },
-                Err(e) => e,
-            },
+                            response.status().as_u16(),
+                            response
+                                .headers()
+                                .get("content-range")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("(none)"),
+                            span.0,
+                            span.1
+                        ),
+                    },
+                    Err(e) => e,
+                }
+            }
             Err(e) => e,
         };
         if !budget.after_failed_request(shared, k, err, stop).await? {
@@ -1145,7 +1179,7 @@ enum Ended {
 async fn fetch_part(
     shared: &Shared<'_>,
     k: usize,
-    mut response: Option<reqwest::Response>,
+    mut response: Option<Answer>,
     budget: &mut Budget,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<Flow> {
@@ -1157,10 +1191,10 @@ async fn fetch_part(
     let (stall_window, stall_grace) = stall::policy();
     while done < len {
         let span = (start + done, start + len - 1);
-        let body_response = match response.take() {
-            Some(response) => response,
+        let (body_response, slot) = match response.take() {
+            Some(answer) => answer,
             None => match request_span(shared, k, span, budget, stop).await? {
-                Some(response) => response,
+                Some(answer) => answer,
                 None => return Ok(Flow::Stopped),
             },
         };
@@ -1232,9 +1266,11 @@ async fn fetch_part(
                 }
             }
         };
-        // Close the connection, then put what arrived on record: it is the
-        // offset of the next request, or of a later run.
+        // Close the connection and give its slot back (before any wait or
+        // next request), then put what arrived on record: it is the offset
+        // of the next request, or of a later run.
         drop(body);
+        drop(slot);
         shared.record(k, &mut out, done).await?;
         drop(out);
         // The part may have arrived in full just as a stall check or a body
@@ -1325,7 +1361,7 @@ async fn fetch_part(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::download::{download_file, download_item_with_metadata};
+    use crate::download::{download_file, download_item_with_metadata, ServerSlots};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -1379,10 +1415,13 @@ mod tests {
         config
     }
 
-    fn opts(streams: usize) -> DownloadOpts {
+    /// `connections` per file, two retries, and room for every connection
+    /// a test opens unless the test sets the per-server cap itself.
+    fn opts(connections: usize) -> DownloadOpts {
         DownloadOpts {
-            streams,
+            connections_per_file: connections,
             retries: 2,
+            server_slots: ServerSlots::new(64),
             ..Default::default()
         }
     }
@@ -1797,10 +1836,28 @@ mod tests {
     }
 
     #[test]
-    fn default_streams_is_four_and_the_ceiling_eight() {
-        assert_eq!(DownloadOpts::default().streams, 4);
-        assert_eq!(DEFAULT_STREAMS, 4);
-        assert_eq!(MAX_STREAMS, 8);
+    fn one_connection_per_file_by_default_eight_at_most_and_six_per_server() {
+        let defaults = DownloadOpts::default();
+        assert_eq!(defaults.connections_per_file, 1);
+        assert_eq!(DEFAULT_CONNECTIONS_PER_FILE, 1);
+        assert_eq!(MAX_CONNECTIONS_PER_FILE, 8);
+        assert_eq!(defaults.server_slots.max(), 6);
+    }
+
+    #[tokio::test]
+    async fn the_default_options_fetch_a_large_file_on_one_stream() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+
+        fetch(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_finished(dir.path(), &body);
+        assert_eq!(ranges(&server).await, vec![None]);
     }
 
     // -- choosing the path --
@@ -2862,6 +2919,8 @@ mod tests {
     /// One request on the raw server.
     struct RawConn {
         stream: tokio::net::TcpStream,
+        /// The path of the request line, without the query.
+        path: String,
         /// The first and last byte asked for; the whole body without Range.
         first: u64,
         last: u64,
@@ -2926,8 +2985,17 @@ mod tests {
                     *n += 1;
                     *n - 1
                 };
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 let conn = RawConn {
                     stream,
+                    path,
                     first,
                     last,
                     ranged,
@@ -3008,46 +3076,274 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 4);
     }
 
-    /// Serve every request after holding it open for a moment, and return
-    /// the most connections that were open at once.
-    async fn count_concurrency(body: &[u8], streams: usize) -> usize {
-        use std::sync::atomic::AtomicUsize;
-        let open = Arc::new(AtomicUsize::new(0));
-        let most = Arc::new(AtomicUsize::new(0));
-        let (o, m) = (Arc::clone(&open), Arc::clone(&most));
-        let handler: RawHandler = Arc::new(move |conn| {
-            let (open, most) = (Arc::clone(&o), Arc::clone(&m));
+    /// Open connections, now and at most, on one server or several.
+    #[derive(Default)]
+    struct Gauge {
+        open: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gauge {
+        fn enter(&self) {
+            let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+        }
+
+        fn leave(&self) {
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn most(&self) -> usize {
+            self.most.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A raw server that holds every request open for `hold`, counted in
+    /// its own gauge and in every gauge of `also`, then serves it. A request
+    /// for `/download/...` is redirected to `/data/...` on the same server
+    /// when `redirect` is set.
+    async fn holding_server(
+        body: &[u8],
+        hold: Duration,
+        redirect: bool,
+        also: Vec<Arc<Gauge>>,
+    ) -> (IaClient, Arc<Gauge>) {
+        let gauge = Arc::new(Gauge::default());
+        let mut gauges = also;
+        gauges.push(Arc::clone(&gauge));
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let gauges = gauges.clone();
             Box::pin(async move {
-                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
-                most.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                serve_whole(conn).await;
-                open.fetch_sub(1, Ordering::SeqCst);
+                use tokio::io::AsyncWriteExt;
+                gauges.iter().for_each(|g| g.enter());
+                tokio::time::sleep(hold).await;
+                if redirect && conn.path.starts_with("/download/") {
+                    let to = conn.path.replacen("/download/", "/data/", 1);
+                    let _ = conn
+                        .stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 302 Found\r\nlocation: {to}\r\n\
+                                 content-length: 0\r\nconnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                } else {
+                    serve_whole(conn).await;
+                }
+                gauges.iter().for_each(|g| g.leave());
             })
         });
         let (client, _seen) = spawn_raw(body, handler).await;
+        (client, gauge)
+    }
+
+    const HOLD: Duration = Duration::from_millis(300);
+
+    /// Fetch `body` as one file with `opts` from a holding server and return
+    /// the most connections it saw open at once.
+    async fn count_concurrency(body: &[u8], opts: &DownloadOpts) -> usize {
+        let (client, gauge) = holding_server(body, HOLD, false, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", body);
-        fetch(&client, &file, dir.path(), &opts(streams))
-            .await
-            .unwrap();
+        fetch(&client, &file, dir.path(), opts).await.unwrap();
         assert_finished(dir.path(), body);
-        most.load(Ordering::SeqCst)
+        gauge.most()
     }
 
     #[tokio::test]
-    async fn streams_above_the_ceiling_use_the_ceiling() {
+    async fn connections_above_the_ceiling_use_the_ceiling() {
         let _layout = small_layout();
         // Twelve parts, so more than eight streams could start.
         let body = body_of(12 * PART as usize);
-        assert_eq!(count_concurrency(&body, 50).await, MAX_STREAMS);
+        assert_eq!(
+            count_concurrency(&body, &opts(50)).await,
+            MAX_CONNECTIONS_PER_FILE
+        );
     }
 
     #[tokio::test]
-    async fn the_stream_count_is_the_most_connections_open_at_once() {
+    async fn the_connection_count_is_the_most_connections_open_at_once() {
         let _layout = small_layout();
         let body = body_of(12 * PART as usize);
-        assert_eq!(count_concurrency(&body, 3).await, 3);
+        assert_eq!(count_concurrency(&body, &opts(3)).await, 3);
+    }
+
+    // -- the per-server cap --
+
+    #[tokio::test]
+    async fn eight_connections_for_one_file_hold_at_the_default_cap_of_six() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
+        let mut o = opts(8);
+        o.server_slots = ServerSlots::default();
+        assert_eq!(count_concurrency(&body, &o).await, 6);
+    }
+
+    /// An item of `n` small files, all with the body `body`.
+    fn item_of(n: usize, body: &[u8]) -> crate::types::ItemMetadata {
+        let files: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}.bin"),
+                    "source": "original",
+                    "size": body.len().to_string(),
+                    "md5": md5_hex(body),
+                    "mtime": "1700000000",
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "big-item"},
+            "files": files,
+        }))
+        .unwrap()
+    }
+
+    /// Download an item of `n` files into `dir` with `jobs` files at once,
+    /// and check every file arrived whole.
+    async fn download_files(
+        client: &IaClient,
+        n: usize,
+        body: &[u8],
+        jobs: usize,
+        opts: &DownloadOpts,
+        dir: &Path,
+    ) {
+        let mut o = opts.clone();
+        o.destdir = dir.to_path_buf();
+        o.no_directories = true;
+        let item = tokio::time::timeout(
+            LIMIT,
+            download_item_with_metadata(
+                client,
+                "big-item",
+                &item_of(n, body),
+                &o,
+                Arc::new(tokio::sync::Semaphore::new(jobs)),
+                None,
+            ),
+        )
+        .await
+        .expect("the item download hung")
+        .unwrap();
+        assert_eq!(item.files_downloaded, n, "{:?}", item.results);
+        for i in 0..n {
+            assert_eq!(std::fs::read(dir.join(format!("f{i}.bin"))).unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn eight_jobs_on_one_server_hold_at_the_default_cap_of_six() {
+        let body = body_of(2048);
+        let (client, gauge) = holding_server(&body, HOLD, false, vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        download_files(&client, 8, &body, 8, &DownloadOpts::default(), dir.path()).await;
+
+        assert_eq!(gauge.most(), 6);
+    }
+
+    #[tokio::test]
+    async fn two_servers_with_a_cap_of_six_reach_twelve_in_all() {
+        let body = body_of(2048);
+        let all = Arc::new(Gauge::default());
+        let (a, gauge_a) = holding_server(&body, HOLD, false, vec![Arc::clone(&all)]).await;
+        let (b, gauge_b) = holding_server(&body, HOLD, false, vec![Arc::clone(&all)]).await;
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // One set of options, so one table of slots, for both servers.
+        let shared = DownloadOpts::default();
+
+        tokio::join!(
+            download_files(&a, 8, &body, 8, &shared, dir_a.path()),
+            download_files(&b, 8, &body, 8, &shared, dir_b.path()),
+        );
+
+        assert_eq!((gauge_a.most(), gauge_b.most()), (6, 6));
+        assert_eq!(all.most(), 12);
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_serialises_a_parallel_download_through_a_redirect() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        // Every request is redirected once on the same server: the redirect
+        // hop and the request it leads to each need the one slot, so a
+        // request that held its slot across the redirect would wait forever.
+        let (client, gauge) = holding_server(&body, Duration::from_millis(20), true, vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.server_slots = ServerSlots::new(1);
+
+        let result = fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_finished(dir.path(), &body);
+        assert_eq!(gauge.most(), 1);
+    }
+
+    /// A raw server whose first answer for a request starting at `first`
+    /// promises the rest of the range, sends 100 bytes and hangs up.
+    async fn dropping_once_at(body: &[u8], first: u64) -> IaClient {
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                if conn.first == first && conn.nth == 0 {
+                    send_head(&mut conn).await;
+                    let bytes = slice(&conn);
+                    let _ = conn.stream.write_all(&bytes[..100]).await;
+                    let _ = conn.stream.flush().await;
+                    return;
+                }
+                serve_whole(conn).await;
+            })
+        });
+        spawn_raw(body, handler).await.0
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_lets_one_stream_re_request_after_a_dropped_body() {
+        let body = body_of(LEN);
+        let client = dropping_once_at(&body, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(1);
+        o.server_slots = ServerSlots::new(1);
+
+        // The re-request needs the slot the dropped response held.
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_lets_a_range_stream_re_request_after_a_dropped_body() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let client = dropping_once_at(&body, 1024).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.server_slots = ServerSlots::new(1);
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
+
+        assert_finished(dir.path(), &body);
+    }
+
+    #[tokio::test]
+    async fn a_cap_of_one_serialises_jobs_and_the_single_stream_path() {
+        let body = body_of(2048);
+        let (client, gauge) = holding_server(&body, Duration::from_millis(20), true, vec![]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = DownloadOpts::default();
+        o.server_slots = ServerSlots::new(1);
+
+        download_files(&client, 4, &body, 8, &o, dir.path()).await;
+
+        assert_eq!(gauge.most(), 1);
     }
 
     #[tokio::test]

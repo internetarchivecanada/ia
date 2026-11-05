@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use ia_core::disk_pool::DiskPool;
 use ia_core::download::{
     collect_batch_results, BatchDownloadResult, DownloadOpts, DownloadProgress, DownloadStatus,
-    FileDownloadResult, ItemDownloadResult,
+    FileDownloadResult, ItemDownloadResult, ServerSlots,
 };
 use ia_core::error::{format_error_chain, IaError, Result as IaResult};
 use ia_core::files::FileFilter;
@@ -38,9 +38,11 @@ use crate::output::DownloadDisplay;
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
         starts over.\n\n\
-        A file of 256 MiB or more is fetched over --streams Range requests at once (default 4), \
-        each on its own connection, with its progress kept in <name>.part.json so an interrupted \
-        download resumes per part.",
+        With --connections-per-file above 1, a file of 256 MiB or more is fetched over that many \
+        Range requests at once, each on its own connection, with its progress kept in \
+        <name>.part.json so an interrupted download resumes per part. Download connections to one \
+        server are capped by --max-connections-per-server (default 6), counting every job and \
+        every connection per file.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -52,8 +54,8 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
          \n\n  <dim># Ride out a flaky link: 20 retries per file</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
-         \n\n  <dim># Fetch a large file over 8 connections at once</dim>\n  <bold>$ ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --streams 8</bold>\
-         \n\n  <dim># Fetch every file over one connection</dim>\n  <bold>$ ia download nasa --streams 1</bold>\
+         \n\n  <dim># Fetch a large file over 4 connections at once</dim>\n  <bold>$ ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --connections-per-file 4</bold>\
+         \n\n  <dim># Open at most 2 connections to any one server</dim>\n  <bold>$ ia download nasa --max-connections-per-server 2</bold>\
          \n\n  <dim># Accept downloads on size alone (no md5 check)</dim>\n  <bold>$ ia download nasa --no-verify</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
@@ -159,20 +161,24 @@ pub struct DownloadArgs {
     #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
     min_speed: u64,
 
-    /// Connections per file of 256 MiB or more (1 to 8; 1 means one stream)
+    /// Connections used for one file of 256 MiB or more, 1 to 8 (default 1). Counts against --max-connections-per-server.
     ///
-    /// A file of 256 MiB or more is cut into 64 MiB parts, which N streams,
-    /// each on its own HTTP/1.1 connection, fetch with Range requests and
-    /// write into the .part file at their offsets. The first request goes
-    /// alone; if the server does not answer it with the range asked for, the
-    /// file is fetched on one stream. Smaller files always use one stream.
+    /// With N above 1, a file of 256 MiB or more is cut into 64 MiB parts,
+    /// which N streams, each on its own HTTP/1.1 connection, fetch with Range
+    /// requests and write into the .part file at their offsets. The first
+    /// request goes alone; if the server does not answer it with the range
+    /// asked for, the file is fetched on one stream. Smaller files always use
+    /// one stream. Each connection takes a slot under
+    /// --max-connections-per-server, so with the default cap of 6,
+    /// --connections-per-file 8 runs one file at 6 connections; a stream
+    /// waits for a slot and nothing fails.
     ///
     /// Progress is kept beside the .part in <name>.part.json, so an
     /// interrupted download resumes per part; once every part is on disk the
     /// .part.json is removed, the md5 of the whole file is checked (unless
     /// --no-verify), and the file is renamed into place. A rerun with
-    /// --streams 1 keeps the bytes from the start of the file up to the
-    /// first missing one and continues from there.
+    /// --connections-per-file 1 keeps the bytes from the start of the file up
+    /// to the first missing one and continues from there.
     ///
     /// --min-speed and --retries apply to each stream: a stream re-requests
     /// the rest of its part after a dropped connection or a stall, and
@@ -180,15 +186,33 @@ pub struct DownloadArgs {
     /// Retry-After. When a stream's retries are spent the file fails with
     /// "download of <name> failed on bytes A-B after N attempts: ...", its
     /// .part and .part.json are kept for a later run, and it is not attempted
-    /// again in this run. Up to -j files download at once, so a run can hold
-    /// -j times N connections.
+    /// again in this run.
     #[arg(
         long,
         value_name = "N",
-        default_value = "4",
-        value_parser = clap::value_parser!(u8).range(1..=ia_core::download::MAX_STREAMS as i64)
+        default_value = "1",
+        value_parser = clap::value_parser!(u8)
+            .range(1..=ia_core::download::MAX_CONNECTIONS_PER_FILE as i64)
     )]
-    streams: u8,
+    connections_per_file: u8,
+
+    /// Open connections to one server at once, counting every job and every connection per file (default 6).
+    ///
+    /// A server is the host a download request lands on: the datanode after
+    /// archive.org's /download/ redirect. Every file downloading under -j and
+    /// every connection of a file under --connections-per-file holds a slot
+    /// on its server from its request until its response ends; a request
+    /// that finds its server full waits for a slot. Nothing is refused or
+    /// reduced: -j 8 runs at most 6 files at once on one server, and the
+    /// others start as slots come free. The default follows IA operations'
+    /// request that one client open at most 6 connections to one server.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = ia_core::download::DEFAULT_MAX_CONNECTIONS_PER_SERVER as u32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    max_connections_per_server: u32,
 
     /// Don't set file modification times
     #[arg(long)]
@@ -501,6 +525,9 @@ pub async fn run(
         bail!("{msg}");
     }
 
+    // One table of server slots for the whole run, shared by every item,
+    // disk and file, so the cap holds across all of them.
+    let server_slots = ServerSlots::new(args.max_connections_per_server as usize);
     let make_opts = |destdir: PathBuf| {
         let mut o = DownloadOpts::default();
         o.destdir = destdir;
@@ -513,7 +540,8 @@ pub async fn run(
         o.filter = filter.clone();
         o.count_views = args.count_views;
         o.min_speed = args.min_speed;
-        o.streams = usize::from(args.streams);
+        o.connections_per_file = usize::from(args.connections_per_file);
+        o.server_slots = server_slots.clone();
         o
     };
 

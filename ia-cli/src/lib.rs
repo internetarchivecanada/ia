@@ -88,7 +88,11 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify uses 2)
+    /// Files downloaded at once, at most N (default 8). Connections to any one server are also capped by --max-connections-per-server, so jobs on the same server may wait for a slot.
+    ///
+    /// For commands other than download, concurrent operations, at most N
+    /// (default 8); metadata export adapts to the server when -j is omitted,
+    /// and metadata modify uses 2.
     #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 
