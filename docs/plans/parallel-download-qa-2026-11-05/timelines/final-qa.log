@@ -1,0 +1,6 @@
+23:04:38 tty exit=130
+23:04:54 new json SIGINT exit=130
+23:05:09 new plain SIGINT exit=130
+23:05:24 old json SIGINT exit=130
+23:05:39 old plain SIGINT exit=130
+23:05:44 FINAL QA DONE

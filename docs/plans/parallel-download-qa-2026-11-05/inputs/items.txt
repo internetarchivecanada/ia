@@ -1,0 +1,3 @@
+ubuntu-18.04.5-desktop-amd64
+Debian-GNULinux-2.2-arch-i386-CD
+debian_2.2r7_i386
