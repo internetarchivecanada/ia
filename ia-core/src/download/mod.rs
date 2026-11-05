@@ -216,6 +216,10 @@ pub struct DownloadOpts {
     /// budget within the process; [`ServerSlots::across_processes`] shares
     /// it with every other process using the same slot files.
     pub server_slots: ServerSlots,
+    /// The datanode pair of the item being downloaded, set per item by
+    /// [`download_item_with_metadata`] from its metadata: requests to either
+    /// host take slots on the pair (see `slots::Datanodes`).
+    pub(crate) datanodes: Option<Arc<slots::Datanodes>>,
 }
 
 impl Default for DownloadOpts {
@@ -233,6 +237,7 @@ impl Default for DownloadOpts {
             min_speed: 10 * 1024,
             connections_per_file: None,
             server_slots: ServerSlots::default(),
+            datanodes: None,
         }
     }
 }
@@ -503,7 +508,7 @@ pub(crate) async fn fetch_response_via(
     url: &str,
     range: Option<ByteRange>,
     count_views: bool,
-    slots: Option<&ServerSlots>,
+    download: Option<&DownloadOpts>,
 ) -> Result<(reqwest::Response, Slot)> {
     // Build auth header if credentials are available.
     let auth_value = client
@@ -531,11 +536,25 @@ pub(crate) async fn fetch_response_via(
     let mut resp = None;
 
     for _ in 0..=max_redirects {
-        let slot = match slots {
-            Some(slots) => slots.acquire(&server_of(&current_url)).await,
+        let server = server_of(&current_url);
+        let slot = match download {
+            Some(opts) => {
+                let key = opts
+                    .datanodes
+                    .as_deref()
+                    .and_then(|pair| pair.key_for(&server))
+                    .unwrap_or(&server);
+                opts.server_slots.acquire(key).await
+            }
             None => None,
         };
         let mut req = http.get(&current_url);
+        if download.is_some() {
+            // A download's connection lives only as long as its slot: it is
+            // closed when the response ends, so the sockets open to a server
+            // never outnumber the slots held there (see `IaClient::range_http`).
+            req = req.header("Connection", "close");
+        }
         if let Some(ref auth) = auth_value {
             req = req.header("Authorization", auth);
         }
@@ -572,7 +591,11 @@ pub(crate) async fn fetch_response_via(
                 Some(host)
                     if host == "archive.org"
                         || host.ends_with(".archive.org")
-                        || new_url.authority() == config_host =>
+                        || new_url.authority() == config_host
+                        // This crate's own tests redirect between loopback
+                        // servers on different ports, standing for an item's
+                        // two datanodes. Never in a build that ships.
+                        || (cfg!(test) && host == "127.0.0.1") =>
                 {
                     debug!(location = %new_url, "following redirect");
                     current_url = new_url.to_string();
@@ -592,11 +615,11 @@ pub(crate) async fn fetch_response_via(
             }
         }
 
-        resp = Some((r, slot));
+        resp = Some((r, slot, server));
         break;
     }
 
-    let (response, slot) = resp.ok_or_else(|| IaError::Http {
+    let (response, slot, server) = resp.ok_or_else(|| IaError::Http {
         status: 0,
         message: "too many redirects".to_string(),
         retry_after: None,
@@ -616,8 +639,8 @@ pub(crate) async fn fetch_response_via(
     {
         // A 429 or 5xx lowers the server's connection budget (see
         // `ServerSlots::report`); the caller still retries as before.
-        if let (Some(slots), Some(guard)) = (slots, slot.as_ref()) {
-            slots.report(guard, status.as_u16());
+        if let (Some(opts), Some(guard)) = (download, slot.as_ref()) {
+            opts.server_slots.report(guard, &server, status.as_u16());
         }
         return Err(http_error_from(response).await);
     }
@@ -1167,12 +1190,12 @@ pub async fn download_file(
     // Every request of the download holds a slot on its server (see
     // `DownloadOpts::server_slots`) for as long as its response is read.
     let first = fetch_response_via(
-        client.no_redirect_http(),
+        client.range_http(),
         client,
         &url,
         resume_from.map(ByteRange::From),
         count_views,
-        Some(&opts.server_slots),
+        Some(opts),
     )
     .await;
     drop(starting);
@@ -1474,12 +1497,12 @@ pub async fn download_file(
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
         let (new_resp, new_slot) = fetch_response_via(
-            client.no_redirect_http(),
+            client.range_http(),
             client,
             &url,
             Some(ByteRange::From(bytes_downloaded)),
             count_views,
-            Some(&opts.server_slots),
+            Some(opts),
         )
         .await?;
         slot = new_slot;
@@ -1742,11 +1765,15 @@ pub async fn download_item_with_metadata(
     // Concurrent download with shared semaphore
     let mut handles = Vec::new();
 
+    // Requests to either of the item's datanodes count against one budget.
+    let mut item_opts = opts.clone();
+    item_opts.datanodes = slots::Datanodes::of(item).map(Arc::new);
+
     for file in files_owned {
         let client = client.clone();
         let identifier = identifier.to_string();
         let dest_dir = dest_dir.clone();
-        let opts = opts.clone();
+        let opts = item_opts.clone();
         let sem = Arc::clone(&semaphore);
         let progress = progress.clone();
         let disk_full = Arc::clone(&disk_full);

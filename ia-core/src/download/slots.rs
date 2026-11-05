@@ -73,7 +73,9 @@ pub struct ServerSlots {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BudgetDrop {
-    /// The server, as a URL authority (`ia800807.us.archive.org`).
+    /// The server that answered, as a URL authority
+    /// (`ia800807.us.archive.org`). The budget that dropped is that of its
+    /// item's datanode pair when the item's metadata names one.
     pub server: String,
     /// The status that caused the drop: 429, or 500 to 599.
     pub status: u16,
@@ -144,6 +146,45 @@ impl Node {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// An item's two datanodes (`d1`, `d2` in its metadata), counted as one
+/// server: `/download/` sends each request to either, so a budget per host
+/// would let one item hold twice the cap. The key is the two host names,
+/// sorted and joined with `+`, for the in-process budget and the slot-file
+/// directory alike; two items on the same pair share it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Datanodes {
+    key: String,
+    hosts: Vec<String>,
+}
+
+impl Datanodes {
+    /// The pair of `item`, or `None` unless its metadata names both.
+    pub(crate) fn of(item: &crate::types::ItemMetadata) -> Option<Self> {
+        fn named(d: &Option<String>) -> Option<&str> {
+            d.as_deref().map(str::trim).filter(|d| !d.is_empty())
+        }
+        let mut hosts = vec![
+            named(&item.d1)?.to_ascii_lowercase(),
+            named(&item.d2)?.to_ascii_lowercase(),
+        ];
+        hosts.sort();
+        hosts.dedup();
+        Some(Self {
+            key: hosts.join("+"),
+            hosts,
+        })
+    }
+
+    /// The slot key for a request to `server` (a URL authority): the
+    /// pair's, when `server` is one of its two hosts.
+    pub(crate) fn key_for(&self, server: &str) -> Option<&str> {
+        self.hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(server))
+            .then_some(self.key.as_str())
     }
 }
 
@@ -404,7 +445,7 @@ impl ServerSlots {
         Some(guard)
     }
 
-    /// Note the status a server answered on the slot `guard`. A 429 or a
+    /// Note the status `host` answered on the slot `guard`. A 429 or a
     /// 5xx halves the server's budget (rounded up, never below 1: 6, 3, 2, 1),
     /// unless the slot was taken before the last drop, so one round of such
     /// answers drops it once; either way the budget waits a full
@@ -412,7 +453,7 @@ impl ServerSlots {
     /// at once and the rest owed, range streams over the new budget are
     /// asked to stop, and the notice callback runs. Other statuses do
     /// nothing.
-    pub(crate) fn report(&self, guard: &SlotGuard, status: u16) {
+    pub(crate) fn report(&self, guard: &SlotGuard, host: &str, status: u16) {
         if !(status == 429 || (500..=599).contains(&status)) {
             return;
         }
@@ -436,7 +477,7 @@ impl ServerSlots {
             state.owed += lower - forgotten;
             state.shed = state.in_use.saturating_sub(after);
             BudgetDrop {
-                server: guard.server.clone(),
+                server: host.to_string(),
                 status,
                 before,
                 after,
@@ -761,7 +802,7 @@ mod tests {
         let slots = ServerSlots::default();
         for (status, after) in [(429, 3), (503, 2), (500, 1), (429, 1), (599, 1)] {
             let g = free(&slots, S).await.unwrap();
-            slots.report(&g, status);
+            slots.report(&g, S, status);
             drop(g);
             assert_eq!(slots.budget(S), after, "after {status}");
         }
@@ -773,7 +814,7 @@ mod tests {
         let slots = ServerSlots::default();
         let g = free(&slots, S).await.unwrap();
         for status in [200, 206, 301, 404, 416, 428, 600] {
-            slots.report(&g, status);
+            slots.report(&g, S, status);
         }
         drop(g);
         assert_eq!(slots.budget(S), 6);
@@ -786,13 +827,13 @@ mod tests {
         let held = take(&slots, 6).await;
         // Six connections answered 429 together: one drop, not three.
         for g in &held {
-            slots.report(g, 429);
+            slots.report(g, S, 429);
         }
         assert_eq!(slots.budget(S), 3);
         // A slot taken after the drop counts again.
         drop(held);
         let g = free(&slots, S).await.unwrap();
-        slots.report(&g, 429);
+        slots.report(&g, S, 429);
         assert_eq!(slots.budget(S), 2);
     }
 
@@ -800,7 +841,7 @@ mod tests {
     async fn slots_in_use_over_the_new_budget_are_forgotten_as_they_return() {
         let slots = ServerSlots::default();
         let held = take(&slots, 5).await;
-        slots.report(&held[0], 429);
+        slots.report(&held[0], S, 429);
         // One permit was free and is forgotten now; two of the five in use
         // are owed. The budget of 3 is full until those are back.
         assert!(free(&slots, S).await.is_none(), "a slot over the budget");
@@ -812,7 +853,7 @@ mod tests {
     async fn range_streams_over_the_budget_are_asked_to_stop() {
         let slots = ServerSlots::default();
         let held = take(&slots, 6).await;
-        slots.report(&held[0], 503);
+        slots.report(&held[0], S, 503);
         let asked = held.iter().filter(|g| g.take_shed()).count();
         assert_eq!(asked, 3, "6 in use over a budget of 3");
         assert!(!held[0].take_shed(), "no more than that");
@@ -822,7 +863,7 @@ mod tests {
         drop(held2);
         let slots = ServerSlots::default();
         let mut held = take(&slots, 6).await;
-        slots.report(&held[0], 503);
+        slots.report(&held[0], S, 503);
         held.truncate(4); // two whole files ended
         assert_eq!(held.iter().filter(|g| g.take_shed()).count(), 1);
     }
@@ -831,7 +872,7 @@ mod tests {
     async fn the_budget_grows_by_one_per_calm_interval_up_to_the_cap() {
         let slots = ServerSlots::default();
         let g = free(&slots, S).await.unwrap();
-        slots.report(&g, 429);
+        slots.report(&g, S, 429);
         drop(g);
         assert_eq!(slots.budget(S), 3);
 
@@ -850,7 +891,7 @@ mod tests {
     async fn a_429_or_5xx_restarts_the_calm_interval() {
         let slots = ServerSlots::default();
         let g = free(&slots, S).await.unwrap();
-        slots.report(&g, 429); // 3
+        slots.report(&g, S, 429); // 3
         drop(g);
         tokio::time::advance(GROWTH_INTERVAL / 2).await;
         // A late answer from a slot of the old round does not drop the
@@ -862,7 +903,7 @@ mod tests {
             permit: None,
             file: None,
         };
-        slots.report(&stale, 503);
+        slots.report(&stale, S, 503);
         tokio::time::advance(GROWTH_INTERVAL / 2 + Duration::from_secs(1)).await;
         assert_eq!(slots.budget(S), 3, "the interval started again at the 503");
         tokio::time::advance(GROWTH_INTERVAL / 2).await;
@@ -873,7 +914,7 @@ mod tests {
     async fn a_request_waiting_for_a_slot_gets_one_when_the_budget_grows() {
         let slots = ServerSlots::default();
         let held = take(&slots, 6).await;
-        slots.report(&held[0], 429);
+        slots.report(&held[0], S, 429);
         let one_left = held.into_iter().take(3).collect::<Vec<_>>();
         drop(one_left); // 3 held over budget 3? no: all 6 returned or owed
         assert_eq!(slots.budget(S), 3);
@@ -898,12 +939,12 @@ mod tests {
             ServerSlots::default().with_notices(move |d| sink.lock().unwrap().push(d.clone()));
         let held = take(&slots, 6).await;
         for g in &held {
-            slots.report(g, 429);
+            slots.report(g, S, 429);
         }
         drop(held);
         for status in [503, 500, 429] {
             let g = free(&slots, S).await.unwrap();
-            slots.report(&g, status);
+            slots.report(&g, S, status);
         }
         let seen = seen.lock().unwrap();
         let drops: Vec<(u16, usize, usize)> =
@@ -933,6 +974,68 @@ mod tests {
         let _theirs = take(&other, 4).await;
         let ours = ServerSlots::across_processes_with_cap(6, dir.path());
         assert_eq!(ours.room(S).await, 2);
+    }
+
+    // -- an item's datanode pair --
+
+    fn item(d1: Option<&str>, d2: Option<&str>) -> crate::types::ItemMetadata {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "x"},
+            "files": [],
+            "d1": d1,
+            "d2": d2,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pair_is_its_two_hosts_sorted_and_joined() {
+        let pair = Datanodes::of(&item(
+            Some("ia800807.us.archive.org"),
+            Some("IA600807.us.archive.org"),
+        ))
+        .expect("a pair");
+        assert_eq!(pair.key, "ia600807.us.archive.org+ia800807.us.archive.org");
+        assert_eq!(
+            Datanodes::of(&item(
+                Some("ia600807.us.archive.org"),
+                Some("ia800807.us.archive.org")
+            )),
+            Some(pair.clone()),
+            "the order of d1 and d2 does not matter"
+        );
+        assert_eq!(
+            pair.key_for("ia800807.us.archive.org"),
+            Some(pair.key.as_str())
+        );
+        assert_eq!(
+            pair.key_for("IA600807.US.ARCHIVE.ORG"),
+            Some(pair.key.as_str())
+        );
+        assert_eq!(pair.key_for("archive.org"), None);
+        assert_eq!(pair.key_for("ia800808.us.archive.org"), None);
+    }
+
+    #[test]
+    fn without_both_datanodes_there_is_no_pair() {
+        assert_eq!(
+            Datanodes::of(&item(Some("ia800807.us.archive.org"), None)),
+            None
+        );
+        assert_eq!(
+            Datanodes::of(&item(None, Some("ia800807.us.archive.org"))),
+            None
+        );
+        assert_eq!(
+            Datanodes::of(&item(Some(" "), Some("ia800807.us.archive.org"))),
+            None
+        );
+        let one = Datanodes::of(&item(
+            Some("ia800807.us.archive.org"),
+            Some("ia800807.us.archive.org"),
+        ))
+        .unwrap();
+        assert_eq!(one.key, "ia800807.us.archive.org");
     }
 
     // -- across processes --

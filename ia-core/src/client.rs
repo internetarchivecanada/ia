@@ -108,12 +108,15 @@ pub struct IaClient {
     /// to data-node hosts like `ia600XXX.us.archive.org`, and reqwest
     /// strips `Authorization` on redirects by default.
     no_redirect_http: reqwest::Client,
-    /// [`Self::no_redirect_http`] restricted to HTTP/1.1, for the parallel
-    /// Range requests of one file (#16). HTTP/1.1 carries one request at a
-    /// time per connection, so concurrent requests each get their own
-    /// connection; the datanodes negotiate HTTP/2, where they would share
-    /// one, and four ranges multiplexed on one HTTP/2 connection measured no
-    /// faster than a single stream (2026-10-30).
+    /// [`Self::no_redirect_http`] restricted to HTTP/1.1 and keeping no idle
+    /// connection: the transport of every download request (#16). HTTP/1.1
+    /// carries one request at a time per connection, so concurrent requests
+    /// each get their own connection (the datanodes negotiate HTTP/2, where
+    /// four ranges multiplexed on one connection measured no faster than a
+    /// single stream, 2026-10-30). With no idle pool, and `Connection:
+    /// close` on each request, a connection is closed when its response
+    /// ends, so the sockets open to a datanode never outnumber the slots
+    /// held there: IA operations count open connections.
     range_http: reqwest::Client,
     config: IaConfig,
     user_agent: String,
@@ -212,14 +215,16 @@ impl IaClient {
             crate::error::IaError::Config(format!("failed to build no-redirect client: {e}"))
         })?;
 
-        // The same, over HTTP/1.1 only: one connection per concurrent
-        // Range request of a parallel download.
+        // The same, over HTTP/1.1 only and keeping no idle connection: the
+        // download transport. Each request has its own connection, closed
+        // when its response ends.
         let range = configure_transport(
             Self::base_builder(headers),
             connect_timeout,
             Some(read_timeout),
         )
         .http1_only()
+        .pool_max_idle_per_host(0)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| crate::error::IaError::Config(format!("failed to build range client: {e}")))?;
@@ -407,9 +412,9 @@ impl IaClient {
         &self.no_redirect_http
     }
 
-    /// [`Self::no_redirect_http`] restricted to HTTP/1.1, so that concurrent
-    /// requests each open their own connection. For the parallel Range
-    /// requests of one download.
+    /// The download transport: [`Self::no_redirect_http`] restricted to
+    /// HTTP/1.1 and keeping no idle connection, so that each download
+    /// request has its own connection, closed when its response ends.
     pub(crate) fn range_http(&self) -> &reqwest::Client {
         &self.range_http
     }

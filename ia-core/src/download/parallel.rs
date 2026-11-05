@@ -36,7 +36,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult, ServerSlots};
+use super::{DownloadOpts, DownloadProgress, DownloadStatus, FileDownloadResult};
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
 use crate::stall;
@@ -581,15 +581,7 @@ pub(super) async fn download(
         // returned to the per-file retry loop, as on one stream, and an
         // answer that is not the range asked for means one stream.
         let span = journal.span(first);
-        let first_answer = fetch_range(
-            client,
-            url,
-            file,
-            span,
-            opts.count_views,
-            &opts.server_slots,
-        )
-        .await;
+        let first_answer = fetch_range(client, url, file, span, opts.count_views, opts).await;
         // Answered, or failed: no longer a file about to start.
         drop(starting);
         let (response, slot) = first_answer?;
@@ -753,7 +745,7 @@ async fn fetch_range(
     file: &FileMetadata,
     (first, last): (u64, u64),
     count_views: bool,
-    slots: &ServerSlots,
+    opts: &DownloadOpts,
 ) -> Result<Answer> {
     let (response, slot) = super::fetch_response_via(
         client.range_http(),
@@ -761,7 +753,7 @@ async fn fetch_range(
         url,
         Some(super::ByteRange::Span { first, last }),
         count_views,
-        Some(slots),
+        Some(opts),
     )
     .await?;
     if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -1187,7 +1179,7 @@ async fn request_span(
                 shared.file,
                 span,
                 false,
-                &shared.opts.server_slots,
+                shared.opts,
             ),
         )
         .await
@@ -3782,6 +3774,191 @@ mod tests {
             .filter(|v| v.arrived > answered)
             .collect();
         assert!(most_open(&later) <= 3, "{later:#?}");
+    }
+
+    /// The metadata of an item with one file `big.bin` of `body`, on the
+    /// datanodes `d1` and `d2`.
+    fn item_on(body: &[u8], d1: &str, d2: &str) -> crate::types::ItemMetadata {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "big-item"},
+            "files": [{
+                "name": "big.bin",
+                "source": "original",
+                "size": body.len().to_string(),
+                "md5": md5_hex(body),
+                "mtime": "1700000000",
+            }],
+            "d1": d1,
+            "d2": d2,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_items_two_datanodes_share_one_budget_of_six() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
+        // Two "datanodes", counted together, and a front server whose
+        // /download/ redirect alternates between them, as archive.org's may.
+        let both = Arc::new(Gauge::default());
+        let (a, _) = holding_server(&body, HOLD, false, vec![Arc::clone(&both)]).await;
+        let (b, _) = holding_server(&body, HOLD, false, vec![Arc::clone(&both)]).await;
+        let nodes = [a.host().to_string(), b.host().to_string()];
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let to = nodes.clone();
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let node = to[turn.fetch_add(1, Ordering::SeqCst) % 2].clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://{node}{}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n",
+                            conn.path
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            })
+        });
+        let (front, _) = spawn_raw(&body, handler).await;
+        let dir = tempfile::tempdir().unwrap();
+        // Eight streams pinned: more than one server's six.
+        let o = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            no_directories: true,
+            connections_per_file: Some(8),
+            ..Default::default()
+        };
+
+        let item = download_item_with_metadata(
+            &front,
+            "big-item",
+            &item_on(&body, &nodes[0], &nodes[1]),
+            &o,
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(item.files_downloaded, 1, "{:?}", item.results);
+        assert_eq!(std::fs::read(dir.path().join("big.bin")).unwrap(), body);
+        let most = both.most();
+        assert!(most <= 6, "{most} open on the two datanodes together");
+        assert!(most > 1, "the file was not split");
+    }
+
+    #[tokio::test]
+    async fn every_download_connection_carries_one_request_and_asks_to_close() {
+        let _layout = small_layout();
+        let big = body_of(12 * PART as usize);
+        // A server that keeps connections open, and records how many
+        // requests each carried and whether each asked to close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let most_per_connection = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let without_close = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (most, open_ended, all) = (
+            Arc::clone(&most_per_connection),
+            Arc::clone(&without_close),
+            Arc::clone(&requests),
+        );
+        let served = Arc::new(big.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (most, open_ended, all, body) = (
+                    Arc::clone(&most),
+                    Arc::clone(&open_ended),
+                    Arc::clone(&all),
+                    Arc::clone(&served),
+                );
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut on_this = 0;
+                    loop {
+                        let head = read_head(&mut stream).await;
+                        if head.is_empty() {
+                            return;
+                        }
+                        on_this += 1;
+                        most.fetch_max(on_this, Ordering::SeqCst);
+                        all.fetch_add(1, Ordering::SeqCst);
+                        let lower = head.to_ascii_lowercase();
+                        if !lower.contains("\r\nconnection: close") {
+                            open_ended.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let range = lower.lines().find_map(|l| {
+                            l.strip_prefix("range: bytes=").and_then(|r| {
+                                let (a, b) = r.trim().split_once('-')?;
+                                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                            })
+                        });
+                        // The small files are 2048 bytes; the large one is
+                        // served by range.
+                        let (status, extra, bytes) = match range {
+                            Some((a, b)) => (
+                                "206 Partial Content",
+                                format!("content-range: bytes {a}-{b}/{}\r\n", body.len()),
+                                body[a..=b].to_vec(),
+                            ),
+                            None if lower.contains("big.bin") => {
+                                ("200 OK", String::new(), body.to_vec())
+                            }
+                            None => ("200 OK", String::new(), body[..2048].to_vec()),
+                        };
+                        let answer = format!(
+                            "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\n\r\n",
+                            bytes.len()
+                        );
+                        if stream.write_all(answer.as_bytes()).await.is_err()
+                            || stream.write_all(&bytes).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = format!("127.0.0.1:{port}");
+        config.general.secure = false;
+        let client = IaClient::from_config(config).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Small files on one stream each, then a large file split.
+        download_files(
+            &client,
+            10,
+            &big[..2048],
+            8,
+            &DownloadOpts::default(),
+            dir.path(),
+        )
+        .await;
+        fetch(
+            &client,
+            &file_meta("big.bin", &big),
+            dir.path(),
+            &DownloadOpts::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("big.bin")).unwrap(), big);
+        assert_eq!(requests.load(Ordering::SeqCst), 10 + 12);
+        assert_eq!(
+            most_per_connection.load(Ordering::SeqCst),
+            1,
+            "a connection was kept open for another request"
+        );
+        assert_eq!(without_close.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
