@@ -42,10 +42,6 @@ use crate::error::{IaError, Result};
 use crate::stall;
 use crate::types::FileMetadata;
 
-/// Connections per file unless the caller sets another: one, so a file is
-/// fetched on one stream unless the caller asks for more.
-pub const DEFAULT_CONNECTIONS_PER_FILE: usize = 1;
-
 /// The most connections one file uses; a larger
 /// [`DownloadOpts::connections_per_file`] is treated as this. The
 /// measurement tested up to eight connections.
@@ -413,11 +409,12 @@ async fn discard(part_path: &Path) -> std::io::Result<()> {
     remove_journal(&journal_path(part_path)).await
 }
 
-/// Whether `file` is fetched over parallel ranges: two or more streams, a
-/// size in the metadata at or above the threshold, and not the item's own
-/// `_files.xml`, whose size is unknowable.
+/// Whether `file` is fetched over parallel ranges: not pinned to one stream,
+/// a size in the metadata at or above the threshold, and not the item's own
+/// `_files.xml`, whose size is unknowable. Whether it then splits is decided
+/// when its first range request is answered (see [`stream_count`]).
 pub(super) fn applies(opts: &DownloadOpts, identifier: &str, file: &FileMetadata) -> bool {
-    opts.connections_per_file >= 2
+    !matches!(opts.connections_per_file, Some(0 | 1))
         && file.size.is_some_and(|size| size >= layout().min_size)
         && !super::is_size_unknowable(identifier, &file.name)
 }
@@ -510,6 +507,7 @@ pub(super) async fn download(
     opts: &DownloadOpts,
     progress: Option<&(dyn Fn(DownloadProgress) + Send + Sync)>,
     start: std::time::Instant,
+    starting: Option<super::slots::Starting>,
 ) -> Result<Outcome> {
     let Some(size) = file.size else {
         return Ok(Outcome::Unsupported);
@@ -583,7 +581,7 @@ pub(super) async fn download(
         // returned to the per-file retry loop, as on one stream, and an
         // answer that is not the range asked for means one stream.
         let span = journal.span(first);
-        let (response, slot) = fetch_range(
+        let first_answer = fetch_range(
             client,
             url,
             file,
@@ -591,7 +589,10 @@ pub(super) async fn download(
             opts.count_views,
             &opts.server_slots,
         )
-        .await?;
+        .await;
+        // Answered, or failed: no longer a file about to start.
+        drop(starting);
+        let (response, slot) = first_answer?;
         if !answers_span(&response, identifier, file, span)? {
             drop(response);
             drop(slot);
@@ -605,10 +606,8 @@ pub(super) async fn download(
         }
         // The streams only open the .part; it is created here, once.
         create_part(file, part_path).await?;
-        let streams = opts
-            .connections_per_file
-            .min(MAX_CONNECTIONS_PER_FILE)
-            .min(pending.len());
+        let server = slot.as_ref().map(|guard| guard.server().to_string());
+        let streams = stream_count(opts, server.as_deref(), pending.len()).await;
         info!(
             file = %file.name,
             streams,
@@ -630,6 +629,7 @@ pub(super) async fn download(
             reported: StdMutex::new(journal.bytes_done()),
             queue: StdMutex::new(pending[1..].iter().copied().collect()),
             journal: tokio::sync::Mutex::new(journal),
+            active: std::sync::atomic::AtomicUsize::new(streams),
         };
         run_streams(&shared, streams, first, (response, slot)).await?;
     }
@@ -688,6 +688,26 @@ impl Journal {
         let (start, end) = self.bounds(k);
         (start + self.done[k], end - 1)
     }
+}
+
+/// How many streams a file with `pending` parts runs, decided once, after
+/// its first range request was answered on `server` (holding one slot).
+///
+/// Pinned (`connections_per_file` `Some(n)`): `n`, at most
+/// [`MAX_CONNECTIONS_PER_FILE`] and the parts. Automatic (`None`): one plus
+/// the room on `server` (the slots free after one for every other file
+/// about to start), at most [`MAX_CONNECTIONS_PER_FILE`] and the parts; so a
+/// lone large file fills its server's budget, and among other files it
+/// takes nothing they are waiting for.
+async fn stream_count(opts: &DownloadOpts, server: Option<&str>, pending: usize) -> usize {
+    let wanted = match opts.connections_per_file {
+        Some(n) => n,
+        None => match server {
+            Some(server) => 1 + opts.server_slots.room(server).await,
+            None => 1,
+        },
+    };
+    wanted.clamp(1, MAX_CONNECTIONS_PER_FILE).min(pending)
 }
 
 /// How many bytes of the file a `.part` without a journal holds: its length,
@@ -809,6 +829,8 @@ struct Shared<'a> {
     /// The journal as last written. Held while it is written, so records
     /// from several streams go to disk one at a time and in order.
     journal: tokio::sync::Mutex<Journal>,
+    /// The file's streams still running.
+    active: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared<'_> {
@@ -817,6 +839,31 @@ impl Shared<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
+    }
+
+    /// Whether the stream holding `slot` should stop now, because its
+    /// server's budget fell below the connections in use (see
+    /// `SlotGuard::take_shed`). Only while another stream of the file runs,
+    /// so a file always keeps one; a stream that stops is no longer counted.
+    /// The streams of a file run in one task, so nothing runs between the
+    /// count and its update.
+    fn sheds(&self, slot: Option<&super::slots::SlotGuard>) -> bool {
+        let Some(slot) = slot else {
+            return false;
+        };
+        if self.active.load(Ordering::Relaxed) <= 1 || !slot.take_shed() {
+            return false;
+        }
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Put part `k` back at the front of the queue, for a surviving stream.
+    fn give_back(&self, k: usize) {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_front(k);
     }
 
     /// Count `n` more bytes on disk and report progress every
@@ -979,6 +1026,9 @@ async fn run_streams(
 enum Flow {
     Next,
     Stopped,
+    /// The stream stopped to lower its server's connections; its part is
+    /// back on the queue.
+    Shed,
 }
 
 /// One stream's budgets, for the whole download attempt of its file.
@@ -1098,12 +1148,19 @@ async fn stream(
             Some((k, answer)) => (k, Some(answer)),
             None => match shared.next_part() {
                 Some(k) => (k, None),
-                None => return Ok(()),
+                None => {
+                    shared.active.fetch_sub(1, Ordering::Relaxed);
+                    return Ok(());
+                }
             },
         };
         match fetch_part(shared, k, answer, &mut budget, &mut stop).await? {
             Flow::Next => {}
-            Flow::Stopped => return Ok(()),
+            Flow::Stopped => {
+                shared.active.fetch_sub(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Flow::Shed => return Ok(()),
         }
     }
 }
@@ -1180,6 +1237,9 @@ enum Ended {
     Error(IaError),
     /// The stall detector judged the stream too slow.
     Stalled { observed: u64, window_secs: u64 },
+    /// The server's budget fell below the connections in use, and this
+    /// stream gives way.
+    Shed,
 }
 
 /// Fetch the rest of part `k`, starting from `response` when given. Body
@@ -1208,6 +1268,12 @@ async fn fetch_part(
                 None => return Ok(Flow::Stopped),
             },
         };
+        if shared.sheds(slot.as_ref()) {
+            drop(body_response);
+            drop(slot);
+            shared.give_back(k);
+            return Ok(Flow::Shed);
+        }
         let mut out = shared.open_at(start + done).await?;
         let mut body = body_response.bytes_stream();
         // Every response is judged on its own clock, as on one stream.
@@ -1267,7 +1333,10 @@ async fn fetch_part(
                         ),
                     }),
                 },
-                _ = ticker.tick(), if detector.is_some() => {
+                _ = ticker.tick() => {
+                    if shared.sheds(slot.as_ref()) {
+                        break Ended::Shed;
+                    }
                     if let Some(d) = detector.as_mut() {
                         if let Some(observed) = d.check(tokio::time::Instant::now()) {
                             break Ended::Stalled { observed, window_secs: d.window_secs() };
@@ -1286,12 +1355,18 @@ async fn fetch_part(
         // The part may have arrived in full just as a stall check or a body
         // error won the race with the end of the body: it is done, and
         // nothing is spent on it.
-        if done == len {
+        if done == len && !matches!(ended, Ended::Shed) {
             break;
         }
 
         let err = match ended {
             Ended::Done => break,
+            Ended::Shed => {
+                if done < len {
+                    shared.give_back(k);
+                }
+                return Ok(Flow::Shed);
+            }
             Ended::Stopped => return Ok(Flow::Stopped),
             Ended::Stalled {
                 observed,
@@ -1429,9 +1504,9 @@ mod tests {
     /// a test opens unless the test sets the per-server cap itself.
     fn opts(connections: usize) -> DownloadOpts {
         DownloadOpts {
-            connections_per_file: connections,
+            connections_per_file: Some(connections),
             retries: 2,
-            server_slots: ServerSlots::new(64),
+            server_slots: ServerSlots::with_cap(64),
             ..Default::default()
         }
     }
@@ -1846,16 +1921,16 @@ mod tests {
     }
 
     #[test]
-    fn one_connection_per_file_by_default_eight_at_most_and_six_per_server() {
+    fn the_split_is_automatic_by_default_eight_at_most_and_six_per_server() {
         let defaults = DownloadOpts::default();
-        assert_eq!(defaults.connections_per_file, 1);
-        assert_eq!(DEFAULT_CONNECTIONS_PER_FILE, 1);
+        assert_eq!(defaults.connections_per_file, None);
         assert_eq!(MAX_CONNECTIONS_PER_FILE, 8);
         assert_eq!(defaults.server_slots.max(), 6);
+        assert_eq!(crate::download::MAX_CONNECTIONS_PER_SERVER, 6);
     }
 
     #[tokio::test]
-    async fn the_default_options_fetch_a_large_file_on_one_stream() {
+    async fn the_default_options_split_a_lone_large_file() {
         let _layout = small_layout();
         let body = body_of(LEN);
         let (server, client) = serve(RangeServer::new(&body)).await;
@@ -1865,6 +1940,24 @@ mod tests {
         fetch(&client, &file, dir.path(), &DownloadOpts::default())
             .await
             .unwrap();
+
+        assert_finished(dir.path(), &body);
+        assert_eq!(sorted(ranges(&server).await), all_parts());
+    }
+
+    #[tokio::test]
+    async fn the_hidden_pin_of_one_never_splits() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let o = DownloadOpts {
+            connections_per_file: Some(1),
+            ..Default::default()
+        };
+
+        fetch(&client, &file, dir.path(), &o).await.unwrap();
 
         assert_finished(dir.path(), &body);
         assert_eq!(ranges(&server).await, vec![None]);
@@ -3247,16 +3340,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eight_jobs_on_one_stream_are_not_held_back_by_the_cap() {
-        // The cap counts the connections of parallel ranges only; files
-        // fetched on one stream run as -j lets them, as before the cap.
+    async fn eight_jobs_on_one_server_hold_at_six() {
         let body = body_of(2048);
         let (client, gauge) = holding_server(&body, HOLD, false, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
 
         download_files(&client, 8, &body, 8, &DownloadOpts::default(), dir.path()).await;
 
-        assert_eq!(gauge.most(), 8);
+        assert_eq!(gauge.most(), 6);
     }
 
     #[tokio::test]
@@ -3296,7 +3387,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
         let mut o = opts(4);
-        o.server_slots = ServerSlots::new(1);
+        o.server_slots = ServerSlots::with_cap(1);
 
         let result = fetch(&client, &file, dir.path(), &o).await.unwrap();
 
@@ -3339,7 +3430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
         let mut o = opts(4);
-        o.server_slots = ServerSlots::new(1);
+        o.server_slots = ServerSlots::with_cap(1);
 
         let err = fetch(&client, &file, dir.path(), &o).await.unwrap_err();
 
@@ -3385,7 +3476,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
         let mut o = opts(4);
-        o.server_slots = ServerSlots::new(1);
+        o.server_slots = ServerSlots::with_cap(1);
 
         fetch(&client, &file, dir.path(), &o).await.unwrap();
 
@@ -3393,18 +3484,304 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cap_of_one_does_not_hold_back_jobs_on_one_stream() {
+    async fn a_cap_of_one_serialises_jobs_through_a_redirect() {
         let body = body_of(2048);
-        let (client, gauge) = holding_server(&body, HOLD, true, vec![]).await;
+        let (client, gauge) = holding_server(&body, Duration::from_millis(20), true, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
         let o = DownloadOpts {
-            server_slots: ServerSlots::new(1),
+            server_slots: ServerSlots::with_cap(1),
             ..Default::default()
         };
 
         download_files(&client, 4, &body, 8, &o, dir.path()).await;
 
-        assert_eq!(gauge.most(), 4);
+        assert_eq!(gauge.most(), 1);
+    }
+
+    // -- the contract, and the back-off --
+
+    /// One request as the recording server saw it.
+    #[derive(Debug, Clone)]
+    struct Visit {
+        path: String,
+        range: Option<(u64, u64)>,
+        arrived: std::time::Instant,
+        left: std::time::Instant,
+    }
+
+    /// What the recording server does with a request.
+    enum Reply {
+        /// Hold it this long, then serve it.
+        Hold(Duration),
+        /// Answer with this status and `Retry-After: 0`, after 50 ms: long
+        /// enough for every request sent with it to have arrived, so that
+        /// one arriving after the answer was sent after it.
+        Status(u16),
+    }
+
+    type Policy = Arc<dyn Fn(&str, Option<(u64, u64)>, usize) -> Reply + Send + Sync>;
+
+    /// A raw server that asks `policy` (path, range, how many requests came
+    /// before) what to do with each request and records every one; a
+    /// request is open from its arrival until just before its answer.
+    async fn recording_server(body: &[u8], policy: Policy) -> (IaClient, Arc<Mutex<Vec<Visit>>>) {
+        let visits: Arc<Mutex<Vec<Visit>>> = Arc::default();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = Arc::clone(&visits);
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let (log, policy, count) = (Arc::clone(&log), Arc::clone(&policy), Arc::clone(&count));
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let arrived = std::time::Instant::now();
+                let range = conn.ranged.then_some((conn.first, conn.last));
+                let nth = count.fetch_add(1, Ordering::SeqCst);
+                let reply = policy(&conn.path, range, nth);
+                match reply {
+                    Reply::Hold(hold) => tokio::time::sleep(hold).await,
+                    Reply::Status(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+                log.lock().unwrap().push(Visit {
+                    path: conn.path.clone(),
+                    range,
+                    arrived,
+                    left: std::time::Instant::now(),
+                });
+                match reply {
+                    Reply::Hold(_) => serve_whole(conn).await,
+                    Reply::Status(status) => {
+                        let _ = conn
+                            .stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 {status} Busy\r\nretry-after: 0\r\n\
+                                     content-length: 0\r\nconnection: close\r\n\r\n"
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    }
+                }
+            })
+        });
+        let (client, _seen) = spawn_raw(body, handler).await;
+        (client, visits)
+    }
+
+    /// The most visits open at once among `visits`.
+    fn most_open(visits: &[Visit]) -> usize {
+        visits
+            .iter()
+            .map(|v| {
+                visits
+                    .iter()
+                    .filter(|w| w.arrived <= v.arrived && v.arrived < w.left)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn holding(hold: Duration) -> Policy {
+        Arc::new(move |_, _, _| Reply::Hold(hold))
+    }
+
+    #[tokio::test]
+    async fn a_lone_large_file_fills_its_servers_six_connections() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
+        let (client, visits) = recording_server(&body, holding(HOLD)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+
+        fetch(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_finished(dir.path(), &body);
+        let visits = visits.lock().unwrap();
+        assert_eq!(most_open(&visits), 6);
+        assert_eq!(visits.len(), 12, "one request per part");
+    }
+
+    #[tokio::test]
+    async fn fifty_small_files_run_six_at_a_time_and_none_is_split() {
+        let body = body_of(2048);
+        let (client, visits) = recording_server(&body, holding(Duration::from_millis(100))).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        download_files(&client, 50, &body, 8, &DownloadOpts::default(), dir.path()).await;
+
+        let visits = visits.lock().unwrap();
+        assert_eq!(most_open(&visits), 6);
+        assert!(visits.iter().all(|v| v.range.is_none()), "a range request");
+        assert_eq!(visits.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn three_large_files_share_six_and_each_starts_before_any_splits() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let (client, visits) = recording_server(&body, holding(HOLD)).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        download_files(&client, 3, &body, 8, &DownloadOpts::default(), dir.path()).await;
+
+        let mut visits = visits.lock().unwrap().clone();
+        assert_eq!(most_open(&visits), 6);
+        visits.sort_by_key(|v| v.arrived);
+        // Files before ranges: every file's first part was asked for before
+        // any file's second stream.
+        let first_parts = visits
+            .iter()
+            .position(|v| v.range.is_some_and(|(a, _)| a != 0))
+            .expect("some file split");
+        let starts: std::collections::HashSet<&str> = visits[..first_parts]
+            .iter()
+            .filter(|v| v.range.is_some_and(|(a, _)| a == 0))
+            .map(|v| v.path.as_str())
+            .collect();
+        assert_eq!(starts.len(), 3, "{visits:#?}");
+    }
+
+    #[tokio::test]
+    async fn three_servers_reach_six_each_and_no_more_than_jobs_in_all() {
+        let body = body_of(2048);
+        // 24 files in all: with -j 24 every file has its place and each
+        // server's 8 are runnable at once.
+        for (jobs, all_most) in [(24, 18), (8, 8)] {
+            let all = Arc::new(Gauge::default());
+            let mut servers = Vec::new();
+            for _ in 0..3 {
+                servers.push(holding_server(&body, HOLD, false, vec![Arc::clone(&all)]).await);
+            }
+            let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+            // One table of slots and one -j for the whole run, as the CLI
+            // has.
+            let shared = DownloadOpts::default();
+            let jobs_sem = Arc::new(tokio::sync::Semaphore::new(jobs));
+            let runs = servers.iter().zip(&dirs).map(|((client, _), dir)| {
+                let mut o = shared.clone();
+                o.destdir = dir.path().to_path_buf();
+                o.no_directories = true;
+                let jobs_sem = Arc::clone(&jobs_sem);
+                let body = body.clone();
+                async move {
+                    download_item_with_metadata(
+                        client,
+                        "big-item",
+                        &item_of(8, &body),
+                        &o,
+                        jobs_sem,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                }
+            });
+            let results = futures::future::join_all(runs).await;
+            assert!(results.iter().all(|r| r.files_downloaded == 8));
+            let each: Vec<usize> = servers.iter().map(|(_, g)| g.most()).collect();
+            if jobs == 24 {
+                assert_eq!(each, vec![6, 6, 6]);
+            } else {
+                assert!(each.iter().all(|&m| m <= 6), "{each:?}");
+            }
+            assert_eq!(all.most(), all_most, "-j {jobs}");
+        }
+    }
+
+    /// Download 16 small files with `-j 8` from a server that answers the
+    /// first request with `status`, then holds every request; return the
+    /// most requests open at once among those that came after that answer.
+    async fn after_a_drop(status: u16) -> usize {
+        let body = body_of(2048);
+        let policy: Policy = Arc::new(move |_, _, nth| {
+            if nth == 0 {
+                Reply::Status(status)
+            } else {
+                Reply::Hold(Duration::from_millis(200))
+            }
+        });
+        let (client, visits) = recording_server(&body, policy).await;
+        let dir = tempfile::tempdir().unwrap();
+        // The request answered with the status was the first to arrive, and
+        // left at once.
+        let o = DownloadOpts {
+            retries: 3,
+            ..Default::default()
+        };
+
+        download_files(&client, 16, &body, 8, &o, dir.path()).await;
+
+        let visits = visits.lock().unwrap().clone();
+        let answered = visits.iter().map(|v| v.left).min().expect("visits");
+        let later: Vec<Visit> = visits
+            .into_iter()
+            .filter(|v| v.arrived > answered)
+            .collect();
+        most_open(&later)
+    }
+
+    #[tokio::test]
+    async fn after_a_429_the_server_sees_at_most_three() {
+        assert_eq!(after_a_drop(429).await, 3);
+    }
+
+    #[tokio::test]
+    async fn after_a_503_the_server_sees_at_most_three() {
+        assert_eq!(after_a_drop(503).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_split_file_under_a_drop_sheds_range_streams_and_completes() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
+        // The first request for the fourth part fails with a 503; every
+        // other request is held a moment.
+        let seen_503 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&seen_503);
+        let policy: Policy = Arc::new(move |_, range, _| {
+            if range.is_some_and(|(a, _)| a == 3 * PART) && !flag.swap(true, Ordering::SeqCst) {
+                Reply::Status(503)
+            } else {
+                Reply::Hold(Duration::from_millis(200))
+            }
+        });
+        let (client, visits) = recording_server(&body, policy).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+
+        fetch(&client, &file, dir.path(), &DownloadOpts::default())
+            .await
+            .unwrap();
+
+        assert_finished(dir.path(), &body);
+        let visits = visits.lock().unwrap().clone();
+        let answered = visits
+            .iter()
+            .filter(|v| v.range.is_some_and(|(a, _)| a == 3 * PART))
+            .map(|v| v.left)
+            .min()
+            .expect("the 503");
+        // Streams whose answers came after the drop gave way, and their
+        // parts were asked for again by the streams that stayed: some part
+        // other than the one that failed was requested twice.
+        let mut times: HashMap<u64, usize> = HashMap::new();
+        for v in &visits {
+            if let Some((a, _)) = v.range {
+                *times.entry(a / PART).or_default() += 1;
+            }
+        }
+        assert!(
+            times.iter().any(|(&k, &n)| k != 3 && n > 1),
+            "no stream gave way: {times:?}"
+        );
+        // From the drop on, at most 3 requests at once.
+        let later: Vec<Visit> = visits
+            .into_iter()
+            .filter(|v| v.arrived > answered)
+            .collect();
+        assert!(most_open(&later) <= 3, "{later:#?}");
     }
 
     #[tokio::test]

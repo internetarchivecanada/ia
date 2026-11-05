@@ -13,8 +13,8 @@ use tracing::{info, warn};
 
 use ia_core::disk_pool::DiskPool;
 use ia_core::download::{
-    collect_batch_results, BatchDownloadResult, DownloadOpts, DownloadProgress, DownloadStatus,
-    FileDownloadResult, ItemDownloadResult, ServerSlots,
+    collect_batch_results, BatchDownloadResult, BudgetDrop, DownloadOpts, DownloadProgress,
+    DownloadStatus, FileDownloadResult, ItemDownloadResult, ServerSlots,
 };
 use ia_core::error::{format_error_chain, IaError, Result as IaResult};
 use ia_core::files::FileFilter;
@@ -38,11 +38,12 @@ use crate::output::DownloadDisplay;
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
         starts over.\n\n\
-        With --connections-per-file above 1, a file of 256 MiB or more is fetched over that many \
-        Range requests at once, each on its own connection, with its progress kept in \
-        <name>.part.json so an interrupted download resumes per part. Those range connections to \
-        one server are capped by --max-connections-per-server (default 6), across every ia process \
-        on this machine.",
+        ia opens at most 6 connections to any one datanode, across every ia process on this \
+        machine, counting whole files and byte ranges alike. A file of 256 MiB or more is split \
+        into byte ranges fetched at once only when its datanode has connections to spare, with \
+        its progress kept in <name>.part.json so an interrupted download resumes per part. A \
+        datanode that answers 429 or a 5xx gets half as many connections for the rest of the run, \
+        growing back by one per minute without another; see docs/usage.md, \"Connections\".",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -54,8 +55,6 @@ use crate::output::DownloadDisplay;
          \n\n  <dim># Give up on a stream averaging under 1 MiB/s and resume it with a Range request</dim>\n  <bold>$ ia download nasa --min-speed 1M</bold>\
          \n\n  <dim># Never abandon a slow stream (only the 60 s read timeout applies)</dim>\n  <bold>$ ia download nasa --min-speed 0</bold>\
          \n\n  <dim># Ride out a flaky link: 20 retries per file</dim>\n  <bold>$ ia download nasa --retries 20</bold>\
-         \n\n  <dim># Fetch a large file over 4 connections at once</dim>\n  <bold>$ ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --connections-per-file 4</bold>\
-         \n\n  <dim># Open at most 2 connections to any one server</dim>\n  <bold>$ ia download nasa --max-connections-per-server 2</bold>\
          \n\n  <dim># Accept downloads on size alone (no md5 check)</dim>\n  <bold>$ ia download nasa --no-verify</bold>\
          \n\n  <dim># Download with JSON output (for scripts/agents)</dim>\n  <bold>$ ia download nasa --json</bold>\n"
     ),
@@ -161,58 +160,18 @@ pub struct DownloadArgs {
     #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
     min_speed: u64,
 
-    /// Connections used for one file of 256 MiB or more, 1 to 8 (default 1). Counts against --max-connections-per-server.
+    /// Pin the connections for one file of 256 MiB or more, 1 to 8 (1: never split)
     ///
-    /// With N above 1, a file of 256 MiB or more is cut into 64 MiB parts,
-    /// which N streams, each on its own HTTP/1.1 connection, fetch with Range
-    /// requests and write into the .part file at their offsets. The first
-    /// request goes alone; if the server does not answer it with the range
-    /// asked for, the file is fetched on one stream. Smaller files always use
-    /// one stream. Each connection takes a slot under
-    /// --max-connections-per-server, so with the default cap of 6,
-    /// --connections-per-file 8 runs one file at 6 connections; a stream
-    /// waits for a slot and nothing fails.
-    ///
-    /// Progress is kept beside the .part in <name>.part.json, so an
-    /// interrupted download resumes per part; once every part is on disk the
-    /// .part.json is removed, the md5 of the whole file is checked (unless
-    /// --no-verify), and the file is renamed into place. A rerun with
-    /// --connections-per-file 1 keeps the bytes from the start of the file up
-    /// to the first missing one and continues from there.
-    ///
-    /// --min-speed and --retries apply to each stream: a stream re-requests
-    /// the rest of its part after a dropped connection or a stall, and
-    /// retries a failed request after the standard wait or the server's
-    /// Retry-After. When a stream's retries are spent the file fails with
-    /// "download of <name> failed on bytes A-B after N attempts: ...", its
-    /// .part and .part.json are kept for a later run, and it is not attempted
-    /// again in this run.
+    /// Hidden; for debugging and support. Without it the number is chosen
+    /// when the file starts, from the connections its datanode has to spare.
     #[arg(
         long,
         value_name = "N",
-        default_value = "1",
+        hide = true,
         value_parser = clap::value_parser!(u8)
             .range(1..=ia_core::download::MAX_CONNECTIONS_PER_FILE as i64)
     )]
-    connections_per_file: u8,
-
-    /// Range connections (--connections-per-file) open to one server at once, across every ia process on this machine (default 6).
-    ///
-    /// A server is the host a range request lands on: the datanode after
-    /// archive.org's /download/ redirect. Each range request holds a slot
-    /// from the moment it is sent until its response ends; one that finds
-    /// its server full waits for a slot, and nothing is refused. Files
-    /// fetched on one stream, as -j downloads them by default, take no slot.
-    /// The slots are shared with every other ia process of this user on this
-    /// machine through slot files in the cache directory (IA_CACHE_DIR to
-    /// choose it); see docs/usage.md, "Connections per server".
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = ia_core::download::DEFAULT_MAX_CONNECTIONS_PER_SERVER as u32,
-        value_parser = clap::value_parser!(u32).range(1..)
-    )]
-    max_connections_per_server: u32,
+    connections_per_file: Option<u8>,
 
     /// Don't set file modification times
     #[arg(long)]
@@ -528,17 +487,34 @@ pub async fn run(
     // One table of server slots for the whole run, shared by every item,
     // disk and file, and through slot files in the user's cache directory
     // with every other ia process, so the cap holds across all of them.
-    let max_per_server = args.max_connections_per_server as usize;
     let server_slots = match ia_core::download::default_slot_dir() {
-        Some(dir) => ServerSlots::across_processes(max_per_server, dir),
+        Some(dir) => ServerSlots::across_processes(dir),
         None => {
             tracing::warn!(
                 "no cache directory for the connection slot files (set IA_CACHE_DIR); \
-                 --max-connections-per-server holds within this process only"
+                 the per-server connection cap holds within this process only"
             );
-            ServerSlots::new(max_per_server)
+            ServerSlots::default()
         }
     };
+    // One line per server per budget drop; with --json, one event.
+    let json_mode = args.json;
+    let show_drops = !args.dashboard && (json_mode || quiet < 2);
+    let server_slots = server_slots.with_notices(move |drop| {
+        if !show_drops {
+            return;
+        }
+        if json_mode {
+            println!("{}", json_budget_drop(drop));
+        } else {
+            eprintln!(
+                "server {} asked us to slow down; using {} connection{}",
+                short_server(&drop.server),
+                drop.after,
+                if drop.after == 1 { "" } else { "s" }
+            );
+        }
+    });
     let make_opts = |destdir: PathBuf| {
         let mut o = DownloadOpts::default();
         o.destdir = destdir;
@@ -551,7 +527,7 @@ pub async fn run(
         o.filter = filter.clone();
         o.count_views = args.count_views;
         o.min_speed = args.min_speed;
-        o.connections_per_file = usize::from(args.connections_per_file);
+        o.connections_per_file = args.connections_per_file.map(usize::from);
         o.server_slots = server_slots.clone();
         o
     };
@@ -1283,6 +1259,27 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
             _ => continue,
         };
         jl.write(&entry);
+    }
+}
+
+/// The JSON event for a server's connection budget dropping after it
+/// answered 429 or a 5xx.
+fn json_budget_drop(drop: &BudgetDrop) -> serde_json::Value {
+    serde_json::json!({
+        "event": "slow_down",
+        "server": drop.server,
+        "status": drop.status,
+        "connections_before": drop.before,
+        "connections_after": drop.after,
+    })
+}
+
+/// A server's name for a notice: the first label of an archive.org host
+/// (`ia800807` for `ia800807.us.archive.org`), else the whole authority.
+fn short_server(server: &str) -> &str {
+    match server.split_once('.') {
+        Some((first, rest)) if rest == "archive.org" || rest.ends_with(".archive.org") => first,
+        _ => server,
     }
 }
 

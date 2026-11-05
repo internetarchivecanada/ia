@@ -1,6 +1,7 @@
-//! `ia download --connections-per-file` (#16): parallel Range requests
-//! within one file, and `--max-connections-per-server`, the cap on download
-//! connections to one server.
+//! `ia download` and its connection contract (#16): at most 6 connections
+//! to one datanode across every `ia` process, large files split
+//! automatically into the connections a datanode has to spare, and the
+//! back-off on 429 and 5xx.
 //!
 //! The part size and threshold are fixed in `ia-core` (64 MiB parts, from
 //! 256 MiB), so the end-to-end test serves a 256 MiB body: the smallest
@@ -137,32 +138,32 @@ async fn download_ranges(server: &MockServer, body: &[u8], extra: &[&str]) -> Ve
 }
 
 #[test]
-fn download_help_describes_both_flags_and_their_defaults() {
+fn download_help_states_the_jobs_rule_and_shows_no_connection_flags() {
     let out = ia_cmd().args(["download", "--help"]).output().unwrap();
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
-    for expected in [
-        "--connections-per-file <N>",
-        "Connections used for one file of 256 MiB or more, 1 to 8 (default 1). Counts against \
-         --max-connections-per-server.",
-        "--max-connections-per-server <N>",
-        "Range connections (--connections-per-file) open to one server at once, across every ia \
-         process on this machine (default 6).",
-        "IA_CACHE_DIR",
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "Files downloaded at once across all servers (default 8). Any one server gets at \
+             most 6 connections, so files on the same server may wait."
+        ),
+        "{help}"
+    );
+    for hidden in [
+        "--connections-per-file",
+        "--max-connections-per-server",
+        "--streams",
     ] {
         assert!(
-            help.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .contains(expected),
-            "missing from download --help: {expected}\n{help}"
+            !help.contains(hidden),
+            "{hidden} in download --help\n{help}"
         );
     }
-    assert!(!help.contains("--streams"), "{help}");
 }
 
 #[test]
-fn connections_per_file_outside_one_to_eight_is_a_usage_error() {
+fn the_hidden_connections_per_file_is_checked_and_the_cap_is_no_flag() {
     for bad in ["0", "9"] {
         ia_cmd()
             .args(["download", "nasa", "--connections-per-file", bad])
@@ -170,28 +171,20 @@ fn connections_per_file_outside_one_to_eight_is_a_usage_error() {
             .code(2)
             .stderr(predicate::str::contains("1..=8"));
     }
-}
-
-#[test]
-fn max_connections_per_server_zero_is_a_usage_error() {
     ia_cmd()
-        .args(["download", "nasa", "--max-connections-per-server", "0"])
+        .args(["download", "nasa", "--max-connections-per-server", "2"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("--max-connections-per-server"));
 }
 
 #[tokio::test]
-async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per_file_4() {
+async fn a_lone_large_file_splits_into_its_parts_and_the_hidden_pin_of_1_keeps_one_get() {
     let body = Arc::new(big_body());
     let server = MockServer::start().await;
 
     mount_big_item(&server, &body).await;
     let ranges = download_ranges(&server, &body, &[]).await;
-    assert_eq!(ranges, vec![None]);
-
-    mount_big_item(&server, &body).await;
-    let ranges = download_ranges(&server, &body, &["--connections-per-file", "4"]).await;
     // Each of the four 64 MiB parts is asked for whole. Under load a stream
     // may also re-request the rest of its part after a dropped body; such a
     // request starts inside the part and ends where the part ends.
@@ -217,25 +210,31 @@ async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per
             .all(|&(a, b)| (b + 1) % part == 0 && a <= b && a >= b + 1 - part),
         "a request outside one part: {ranges:?}"
     );
+
+    mount_big_item(&server, &body).await;
+    let ranges = download_ranges(&server, &body, &["--connections-per-file", "1"]).await;
+    assert_eq!(ranges, vec![None]);
 }
 
-// ─── Files on one stream are not held back by the cap ────────────────────────
+// ─── The cap, counted on a loopback server ───────────────────────────────────
 
-/// Open download connections, now and at most, every download request seen,
-/// and every metadata request answered.
+/// Open download connections, now and at most, every download request seen
+/// and whether any carried `Range`, and every metadata request answered.
 #[derive(Default)]
 struct Gauge {
     open: AtomicUsize,
     most: AtomicUsize,
     seen: AtomicUsize,
+    ranged: AtomicUsize,
     metadata: AtomicUsize,
 }
 
 impl Gauge {
-    fn enter(&self) {
-        self.seen.fetch_add(1, Ordering::SeqCst);
+    fn enter(&self) -> usize {
+        let nth = self.seen.fetch_add(1, Ordering::SeqCst);
         let now = self.open.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
+        nth
     }
 
     fn leave(&self) {
@@ -245,37 +244,39 @@ impl Gauge {
     fn most(&self) -> usize {
         self.most.load(Ordering::SeqCst)
     }
+
+    fn seen(&self) -> usize {
+        self.seen.load(Ordering::SeqCst)
+    }
 }
 
-const FILES: usize = 8;
+/// Files in each item of the loopback server.
+const FILES: usize = 50;
 const FILE_BODY: &[u8] = b"sixteen bytes!!!";
 
-/// How long the server holds each download open. Long enough that every
-/// request a run sends at once arrives inside it, even on a loaded runner.
-const HOLD: Duration = Duration::from_millis(1000);
+/// What the loopback server does with a download request.
+#[derive(Clone, Copy)]
+enum Reply {
+    /// Hold it this long, then serve it.
+    Hold(Duration),
+    /// Hold it until the client goes away.
+    Hang,
+    /// Answer at once with this status and `Retry-After: 0`.
+    Status(u16),
+}
 
-/// The metadata of an item named `identifier`: [`FILES`] small files, or one
-/// file `big.bin` of [`SIZE`] bytes when `big` is set.
-fn item_json(identifier: &str, big: bool) -> String {
-    let files: Vec<serde_json::Value> = if big {
-        vec![json!({
-            "name": "big.bin",
-            "source": "original",
-            "size": SIZE.to_string(),
-            "mtime": "1700000000"
-        })]
-    } else {
-        (0..FILES)
-            .map(|i| {
-                json!({
-                    "name": format!("f{i}.bin"),
-                    "source": "original",
-                    "size": FILE_BODY.len().to_string(),
-                    "mtime": "1700000000"
-                })
+/// The metadata of an item of [`FILES`] small files named `identifier`.
+fn item_json(identifier: &str) -> String {
+    let files: Vec<serde_json::Value> = (0..FILES)
+        .map(|i| {
+            json!({
+                "name": format!("f{i}.bin"),
+                "source": "original",
+                "size": FILE_BODY.len().to_string(),
+                "mtime": "1700000000"
             })
-            .collect()
-    };
+        })
+        .collect();
     json!({
         "metadata": {"identifier": identifier, "mediatype": "data"},
         "files": files
@@ -284,14 +285,11 @@ fn item_json(identifier: &str, big: bool) -> String {
 }
 
 /// A loopback server, one request per connection. `/metadata/<identifier>`
-/// answers at once: an item of one [`SIZE`]-byte file when `body` is the
-/// large body, else of [`FILES`] small files. A download is counted in the
-/// gauge and held for `hold(path)`, or until the client goes away when that
-/// is `None`; then it is served, as a 206 for a `Range` request.
-async fn holding_server(
-    body: Option<Arc<Vec<u8>>>,
-    hold: fn(&str) -> Option<Duration>,
-) -> (String, Arc<Gauge>) {
+/// answers at once with an item of [`FILES`] small files. A download is
+/// counted in the gauge and handled as `reply(path, n)` says, `n` counting
+/// the downloads before it. The count goes down before the answer, so it
+/// never exceeds the connections the client holds.
+async fn holding_server(reply: fn(&str, usize) -> Reply) -> (String, Arc<Gauge>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let host = listener.local_addr().unwrap().to_string();
     let gauge = Arc::new(Gauge::default());
@@ -301,7 +299,7 @@ async fn holding_server(
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
-            let (gauge, body) = (Arc::clone(&counted), body.clone());
+            let gauge = Arc::clone(&counted);
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -314,48 +312,45 @@ async fn holding_server(
                 let head = String::from_utf8_lossy(&head).to_string();
                 let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
                 if let Some(rest) = path.strip_prefix("/metadata/") {
-                    let identifier = rest.split('?').next().unwrap_or("");
-                    let json = item_json(identifier, body.is_some());
-                    let reply = format!(
+                    let json = item_json(rest.split('?').next().unwrap_or(""));
+                    let answer = format!(
                         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
                         json.len()
                     );
-                    let _ = stream.write_all(reply.as_bytes()).await;
+                    let _ = stream.write_all(answer.as_bytes()).await;
                     gauge.metadata.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
-                gauge.enter();
-                match hold(&path) {
-                    Some(hold) => tokio::time::sleep(hold).await,
-                    // Until the client hangs up.
-                    None => while !matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {},
+                if head.to_ascii_lowercase().contains("\r\nrange:") {
+                    gauge.ranged.fetch_add(1, Ordering::SeqCst);
                 }
-                // Counted down before the answer, so the client's next
-                // request is never counted alongside this one.
-                gauge.leave();
-                let range = head.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    if !name.trim().eq_ignore_ascii_case("range") {
-                        return None;
+                let nth = gauge.enter();
+                let answer = match reply(&path, nth) {
+                    Reply::Hold(hold) => {
+                        tokio::time::sleep(hold).await;
+                        None
                     }
-                    let (a, b) = value.trim().strip_prefix("bytes=")?.split_once('-')?;
-                    Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
-                });
-                let (status, extra, bytes): (&str, String, &[u8]) = match (&body, range) {
-                    (Some(body), Some((a, b))) => (
-                        "206 Partial Content",
-                        format!("content-range: bytes {a}-{b}/{}\r\n", body.len()),
-                        &body[a..=b],
-                    ),
-                    (Some(body), None) => ("200 OK", String::new(), &body[..]),
-                    (None, _) => ("200 OK", String::new(), FILE_BODY),
+                    Reply::Hang => {
+                        while !matches!(stream.read(&mut buf).await, Ok(0) | Err(_)) {}
+                        None
+                    }
+                    Reply::Status(status) => Some(status),
                 };
-                let reply = format!(
-                    "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
-                    bytes.len()
-                );
+                gauge.leave();
+                let reply = match answer {
+                    Some(status) => format!(
+                        "HTTP/1.1 {status} Busy\r\nretry-after: 0\r\ncontent-length: 0\r\n\
+                         connection: close\r\n\r\n"
+                    ),
+                    None => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        FILE_BODY.len()
+                    ),
+                };
                 let _ = stream.write_all(reply.as_bytes()).await;
-                let _ = stream.write_all(bytes).await;
+                if answer.is_none() {
+                    let _ = stream.write_all(FILE_BODY).await;
+                }
                 let _ = stream.flush().await;
             });
         }
@@ -379,7 +374,7 @@ fn spawn_ia(
         .args(["--insecure", "-H", host, "download", item, "--destdir"])
         .arg(dir.path())
         .args(extra)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -387,8 +382,8 @@ fn spawn_ia(
 }
 
 /// Wait for `child` to finish, at most `limit`, require success, and return
-/// its stderr.
-async fn finish(child: std::process::Child, limit: Duration) -> String {
+/// its stdout and stderr.
+async fn finish(child: std::process::Child, limit: Duration) -> (String, String) {
     let out = tokio::time::timeout(
         limit,
         tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
@@ -398,119 +393,80 @@ async fn finish(child: std::process::Child, limit: Duration) -> String {
     .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(out.status.success(), "{stderr}");
-    stderr
+    (String::from_utf8_lossy(&out.stdout).to_string(), stderr)
 }
 
 const LIMIT: Duration = Duration::from_secs(120);
 
-async fn download_small_item(extra: &[&str]) -> usize {
-    let (host, gauge) = holding_server(None, |_| Some(HOLD)).await;
-    let cache = TempDir::new().unwrap();
-    let (child, dir) = spawn_ia(&host, "small-item", cache.path(), extra);
-    finish(child, LIMIT).await;
+fn assert_item(dir: &TempDir, item: &str) {
     for i in 0..FILES {
-        let got = fs::read(dir.path().join("small-item").join(format!("f{i}.bin"))).unwrap();
-        assert_eq!(got, FILE_BODY);
+        let got = fs::read(dir.path().join(item).join(format!("f{i}.bin"))).unwrap();
+        assert_eq!(got, FILE_BODY, "{item}/f{i}.bin");
     }
-    gauge.most()
+}
+
+fn held(_: &str, _: usize) -> Reply {
+    Reply::Hold(Duration::from_millis(200))
 }
 
 #[tokio::test]
-async fn eight_jobs_on_one_stream_are_not_held_back_by_the_cap() {
-    assert_eq!(download_small_item(&["-j", "8"]).await, 8);
-}
-
-#[tokio::test]
-async fn a_cap_of_one_does_not_hold_back_jobs_on_one_stream() {
-    assert_eq!(
-        download_small_item(&["-j", "8", "--max-connections-per-server", "1"]).await,
-        8
-    );
-}
-
-// ─── Range connections, across processes ────────────────────────────────────
-
-fn assert_big(dir: &TempDir, item: &str, body: &[u8]) {
-    let got = fs::read(dir.path().join(item).join("big.bin")).unwrap();
-    assert!(got == body, "{item}/big.bin differs from the body");
-    assert!(!dir.path().join(item).join("big.bin.part.json").exists());
-}
-
-/// Two `ia download` processes at once, each of one 256 MiB file over 4
-/// connections, against one server with one cache; the most range requests
-/// the server held at once, and how many it saw.
-///
-/// The server counts a request only while it holds it, before answering,
-/// so its count never exceeds the slots held: a count above the cap means
-/// the cap failed, whatever the timing. A count below it proves nothing,
-/// since a stream keeps its slot while it reads its 64 MiB body, which the
-/// server does not count; how far requests overlap depends on how fast the
-/// runner moves those bytes.
-async fn two_processes(cap: &str, hold: fn(&str) -> Option<Duration>) -> (usize, usize) {
-    let body = Arc::new(big_body());
-    let (host, gauge) = holding_server(Some(Arc::clone(&body)), hold).await;
+async fn fifty_files_on_one_server_never_exceed_six_and_none_is_split() {
+    let (host, gauge) = holding_server(held).await;
     let cache = TempDir::new().unwrap();
-    let args = [
-        "--connections-per-file",
-        "4",
-        "--max-connections-per-server",
-        cap,
-    ];
-    let (a, dir_a) = spawn_ia(&host, "big-a", cache.path(), &args);
-    let (b, dir_b) = spawn_ia(&host, "big-b", cache.path(), &args);
+    let (child, dir) = spawn_ia(&host, "small-item", cache.path(), &["-j", "8"]);
+    finish(child, LIMIT).await;
+    assert_item(&dir, "small-item");
+    // The count never exceeds the slots held, so this bound is exact; a
+    // count below 6 would only mean the requests did not overlap.
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
+    assert!(gauge.most() >= 3, "{} open at once", gauge.most());
+    assert_eq!(gauge.ranged.load(Ordering::SeqCst), 0, "a range request");
+    assert_eq!(gauge.seen(), FILES);
+}
+
+// ─── The cap across processes ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn two_processes_on_one_server_never_exceed_six_together() {
+    let (host, gauge) = holding_server(held).await;
+    let cache = TempDir::new().unwrap();
+    let (a, dir_a) = spawn_ia(&host, "item-a", cache.path(), &["-j", "8"]);
+    let (b, dir_b) = spawn_ia(&host, "item-b", cache.path(), &["-j", "8"]);
     tokio::join!(finish(a, LIMIT), finish(b, LIMIT));
-    assert_big(&dir_a, "big-a", &body);
-    assert_big(&dir_b, "big-b", &body);
-    (gauge.most(), gauge.seen.load(Ordering::SeqCst))
+    assert_item(&dir_a, "item-a");
+    assert_item(&dir_b, "item-b");
+    // Without the slot files the two would hold up to 12.
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
+    assert_eq!(gauge.seen(), 2 * FILES);
 }
 
 #[tokio::test]
-async fn two_processes_never_open_more_range_connections_together_than_the_cap() {
-    // Each process wants 4 connections, so alone each stays at the cap of
-    // 3; without the slot files the two hold up to 6 together.
-    let (most, seen) = two_processes("3", |_| Some(HOLD)).await;
-    assert!(most <= 3, "{most} range requests open at once");
-    // Both processes fetched over ranges: four requests each, at least.
-    assert!(seen >= 8, "{seen} range requests");
-}
-
-#[tokio::test]
-async fn a_cap_of_one_across_two_processes_runs_one_range_connection_at_a_time() {
-    let (most, seen) = two_processes("1", |_| Some(Duration::from_millis(100))).await;
-    assert_eq!(most, 1);
-    assert!(seen >= 8, "{seen} range requests");
-}
-
-#[tokio::test]
-async fn a_process_killed_while_holding_the_only_slot_frees_it() {
-    let body = Arc::new(big_body());
-    // Every download of big-hang is held until its client goes away.
-    let (host, gauge) = holding_server(Some(Arc::clone(&body)), |path| {
-        (!path.contains("/big-hang/")).then_some(Duration::from_millis(100))
+async fn a_process_killed_while_holding_all_six_slots_frees_them() {
+    // Every download of item-hang is held until its client goes away.
+    let (host, gauge) = holding_server(|path, _| {
+        if path.contains("/item-hang/") {
+            Reply::Hang
+        } else {
+            Reply::Hold(Duration::from_millis(50))
+        }
     })
     .await;
     let cache = TempDir::new().unwrap();
-    let args = [
-        "--connections-per-file",
-        "4",
-        "--max-connections-per-server",
-        "1",
-    ];
 
-    let (mut first, _first_dir) = spawn_ia(&host, "big-hang", cache.path(), &args);
+    let (mut first, _first_dir) = spawn_ia(&host, "item-hang", cache.path(), &["-j", "8"]);
     let started = std::time::Instant::now();
-    while gauge.seen.load(Ordering::SeqCst) == 0 {
+    while gauge.seen() < 6 {
         assert!(
             started.elapsed() < Duration::from_secs(30),
-            "the first process never connected"
+            "the first process never held six"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let (second, second_dir) = spawn_ia(&host, "big-b", cache.path(), &args);
+    let (second, second_dir) = spawn_ia(&host, "item-b", cache.path(), &["-j", "8"]);
     // Once the second process has its metadata it is about to ask for a
-    // slot; give it two polls of the slot files (500 ms each, at most)
-    // and more, so a check that passed only because it had not started
-    // yet cannot happen.
+    // slot; give it two polls of the slot files (500 ms each, at most) and
+    // more, so a check that passed only because it had not started yet
+    // cannot happen.
     while gauge.metadata.load(Ordering::SeqCst) < 2 {
         assert!(
             started.elapsed() < Duration::from_secs(60),
@@ -520,50 +476,30 @@ async fn a_process_killed_while_holding_the_only_slot_frees_it() {
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
-        gauge.seen.load(Ordering::SeqCst),
-        1,
-        "the second process connected while the first held the only slot"
+        gauge.seen(),
+        6,
+        "the second process connected while the first held all six"
     );
 
     first.kill().unwrap();
     first.wait().unwrap();
 
     finish(second, LIMIT).await;
-    assert_big(&second_dir, "big-b", &body);
-    assert_eq!(gauge.most(), 1);
+    assert_item(&second_dir, "item-b");
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
 }
 
 #[tokio::test]
 async fn a_cache_that_cannot_hold_slot_files_falls_back_to_the_process_cap() {
-    let body = Arc::new(big_body());
-    let (host, gauge) = holding_server(Some(Arc::clone(&body)), |_| {
-        Some(Duration::from_millis(300))
-    })
-    .await;
+    let (host, gauge) = holding_server(held).await;
     let not_a_dir = tempfile::NamedTempFile::new().unwrap();
 
-    let (child, dir) = spawn_ia(
-        &host,
-        "big-a",
-        not_a_dir.path(),
-        &[
-            "--connections-per-file",
-            "4",
-            "--max-connections-per-server",
-            "2",
-        ],
-    );
-    let stderr = finish(child, LIMIT).await;
+    let (child, dir) = spawn_ia(&host, "small-item", not_a_dir.path(), &["-j", "8"]);
+    let (_, stderr) = finish(child, LIMIT).await;
 
-    assert_big(&dir, "big-a", &body);
-    // The cap still holds within the process: never more than 2 requests
-    // held at once (without it, the three streams after the first request
-    // would be held together), and the file did go over ranges. As in
-    // `two_processes`, a count below the cap depends on the runner's speed.
-    let most = gauge.most();
-    assert!(most <= 2, "{most} range requests open at once");
-    let seen = gauge.seen.load(Ordering::SeqCst);
-    assert!(seen >= 4, "{seen} range requests");
+    assert_item(&dir, "small-item");
+    // The cap still holds within the process.
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
     // One warning, naming the path.
     let warnings: Vec<&str> = stderr
         .lines()
@@ -574,4 +510,60 @@ async fn a_cache_that_cannot_hold_slot_files_falls_back_to_the_process_cap() {
         warnings[0].contains(&not_a_dir.path().display().to_string()),
         "{stderr}"
     );
+}
+
+// ─── The back-off notice ─────────────────────────────────────────────────────
+
+/// The first download request is answered 429; the rest are held a moment.
+fn first_is_429(_: &str, nth: usize) -> Reply {
+    if nth == 0 {
+        Reply::Status(429)
+    } else {
+        Reply::Hold(Duration::from_millis(100))
+    }
+}
+
+#[tokio::test]
+async fn a_429_prints_one_slow_down_line() {
+    let (host, _gauge) = holding_server(first_is_429).await;
+    let cache = TempDir::new().unwrap();
+    let (child, dir) = spawn_ia(&host, "small-item", cache.path(), &["-j", "8"]);
+    let (_, stderr) = finish(child, LIMIT).await;
+    assert_item(&dir, "small-item");
+    let server = host.clone();
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("asked us to slow down"))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![format!("server {server} asked us to slow down; using 3 connections").as_str()],
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_429_with_json_gives_one_slow_down_event() {
+    let (host, _gauge) = holding_server(first_is_429).await;
+    let cache = TempDir::new().unwrap();
+    let (child, dir) = spawn_ia(&host, "small-item", cache.path(), &["-j", "8", "--json"]);
+    let (stdout, stderr) = finish(child, LIMIT).await;
+    assert_item(&dir, "small-item");
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event"] == "slow_down")
+        .collect();
+    assert_eq!(
+        events,
+        vec![json!({
+            "event": "slow_down",
+            "server": host,
+            "status": 429,
+            "connections_before": 6,
+            "connections_after": 3,
+        })],
+        "{stdout}"
+    );
+    assert!(!stderr.contains("asked us to slow down"), "{stderr}");
 }

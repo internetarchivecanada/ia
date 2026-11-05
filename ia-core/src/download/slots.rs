@@ -1,31 +1,38 @@
-//! The cap on range connections (`--max-connections-per-server`).
+//! The connection budget per datanode (#16): at most
+//! [`MAX_CONNECTIONS_PER_SERVER`] connections to one server at once,
+//! counting every download connection, whole files and byte ranges alike.
 //!
-//! IA operations asked for a cap on the connections one client opens for
-//! parallel ranges (`--connections-per-file`). Every range request takes a
-//! slot before it is sent and keeps it until its response is dropped; a
-//! request that finds its server full waits for a slot. Files fetched on
-//! one stream take no slot.
-//!
-//! Within a process the slots are a semaphore per server. Across processes
+//! Every request a download sends takes a slot on the server it goes to
+//! before it is sent and keeps it until its response is dropped; a request
+//! that finds the server full waits for a slot. Within a process the slots
+//! are a semaphore per server whose permit count is that server's live
+//! budget: it halves on a 429 or 5xx from the server and grows back by one
+//! per calm minute (see [`ServerSlots::report`]). Across processes
 //! ([`ServerSlots::across_processes`]) each slot is also a file,
 //! `<dir>/<server>/slot-<i>`, held by an exclusive advisory lock for as long
 //! as the in-process slot is held; the kernel releases the lock when the
-//! file is closed or the process ends, however it ends. See "Per-server
-//! cap" and "Across processes" in
+//! file is closed or the process ends, however it ends. See "Contract",
+//! "Slots", "Back-off" and "Across processes" in
 //! `docs/plans/2026-11-03-parallel-range-downloads.md`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
-/// The cap unless the caller sets another: IA operations' limit for one
-/// client.
-pub const DEFAULT_MAX_CONNECTIONS_PER_SERVER: usize = 6;
+/// The most connections `ia` opens to one datanode at once, across every
+/// `ia` process on the machine: the limit agreed with IA operations on
+/// 2026-11-05.
+pub const MAX_CONNECTIONS_PER_SERVER: usize = 6;
+
+/// How long a server must answer without a 429 or 5xx before its budget
+/// grows back by one.
+const GROWTH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The first wait when every slot file is locked by another process.
 const FIRST_POLL: Duration = Duration::from_millis(50);
@@ -38,33 +45,62 @@ const LAST_POLL: Duration = Duration::from_millis(500);
 /// otherwise silent, and a suspended `ia` keeps its slots.
 const WAIT_WARNING: Duration = Duration::from_secs(10);
 
-/// A shared table of download slots, `max` per server.
+/// A shared table of download slots: for each server, a live budget of at
+/// most [`MAX_CONNECTIONS_PER_SERVER`] connections.
 ///
 /// Clones share the table, so every download that clones one
-/// [`DownloadOpts`](super::DownloadOpts) shares the cap; a new
-/// `ServerSlots` starts with every slot free. A server is a URL authority:
-/// its host, and its port when the URL gives one.
+/// [`DownloadOpts`](super::DownloadOpts) shares the budgets; a new
+/// `ServerSlots` starts every server at the full budget. A server is a URL
+/// authority: its host, and its port when the URL gives one.
 ///
-/// [`ServerSlots::new`] keeps the cap within the process.
+/// [`ServerSlots::default`] keeps the cap within the process.
 /// [`ServerSlots::across_processes`] also shares it with every other process
 /// that uses the same directory.
 ///
 /// ```
-/// use ia_core::download::{DownloadOpts, ServerSlots};
+/// use ia_core::download::{DownloadOpts, ServerSlots, MAX_CONNECTIONS_PER_SERVER};
 ///
-/// let mut opts = DownloadOpts::default();
-/// opts.server_slots = ServerSlots::new(2);
-/// assert_eq!(opts.clone().server_slots.max(), 2);
+/// let opts = DownloadOpts::default();
+/// assert_eq!(opts.server_slots.max(), MAX_CONNECTIONS_PER_SERVER);
 /// ```
 #[derive(Debug, Clone)]
 pub struct ServerSlots {
     inner: Arc<Table>,
 }
 
+/// A server's budget dropped after it answered 429 or a 5xx: the argument
+/// of the callback given to [`ServerSlots::with_notices`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BudgetDrop {
+    /// The server, as a URL authority (`ia800807.us.archive.org`).
+    pub server: String,
+    /// The status that caused the drop: 429, or 500 to 599.
+    pub status: u16,
+    /// The budget before the drop.
+    pub before: usize,
+    /// The budget after it.
+    pub after: usize,
+}
+
+/// The callback for [`BudgetDrop`]s.
+struct Notices(Arc<dyn Fn(&BudgetDrop) + Send + Sync>);
+
+impl std::fmt::Debug for Notices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Notices(..)")
+    }
+}
+
 #[derive(Debug)]
 struct Table {
     max: usize,
-    per_server: Mutex<HashMap<String, Arc<Semaphore>>>,
+    servers: Mutex<HashMap<String, Arc<Node>>>,
+    growth_interval: Duration,
+    /// Files this process has started that hold no slot yet, on any server
+    /// (their server is known only once their first request is answered).
+    starting: AtomicUsize,
+    notices: OnceLock<Notices>,
     /// The slot files' directory, when the cap is shared across processes.
     files: Option<PathBuf>,
     /// Set, with one warning, when the slot files cannot be used; the cap
@@ -74,12 +110,73 @@ struct Table {
     waits_reported: Mutex<std::collections::HashSet<String>>,
 }
 
+/// One server's slots in this process.
+#[derive(Debug)]
+struct Node {
+    /// Holds the live budget as permits: those free plus those in use,
+    /// less those owed.
+    semaphore: Arc<Semaphore>,
+    state: Mutex<NodeState>,
+}
+
+#[derive(Debug)]
+struct NodeState {
+    /// The live budget, 1 to `max`.
+    budget: usize,
+    /// Slots of this server held in this process.
+    in_use: usize,
+    /// Permits to forget as they come back, after a drop below the slots
+    /// in use.
+    owed: usize,
+    /// Counts the drops; a slot taken under an older one does not cause
+    /// another (one drop per round of answers).
+    epoch: u64,
+    /// The last drop or growth: the budget grows by one each time
+    /// `growth_interval` passes after it without a 429 or 5xx.
+    calm_since: Instant,
+    /// Range streams asked to stop because the budget fell below the slots
+    /// in use.
+    shed: usize,
+}
+
+impl Node {
+    fn state(&self) -> std::sync::MutexGuard<'_, NodeState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// A held slot: the in-process permit and, across processes, the locked
 /// slot file. Dropping it gives both back.
 #[derive(Debug)]
 pub(crate) struct SlotGuard {
+    server: String,
+    node: Arc<Node>,
+    /// The budget's epoch when the slot was taken.
+    epoch: u64,
     permit: Option<OwnedSemaphorePermit>,
     file: Option<std::fs::File>,
+}
+
+impl SlotGuard {
+    /// The server this slot is on.
+    pub(crate) fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// Whether the stream holding this slot should stop now, because the
+    /// server's budget fell below the slots in use. Counts the stop: it
+    /// answers `true` to as many callers as there are slots too many.
+    pub(crate) fn take_shed(&self) -> bool {
+        let mut state = self.node.state();
+        if state.shed > 0 {
+            state.shed -= 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for SlotGuard {
@@ -87,92 +184,274 @@ impl Drop for SlotGuard {
     /// next task of this process, woken by the permit, then finds the file
     /// free instead of waiting a poll for it; and on Windows the lock goes
     /// at once, where closing a handle releases its locks only when the
-    /// system gets to it.
+    /// system gets to it. A permit owed after a drop is forgotten instead
+    /// of returned.
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             // Through the trait, as `try_lock` is (see `try_lock_one`).
             let _ = fs4::FileExt::unlock(&file);
         }
-        drop(self.permit.take());
+        let mut state = self.node.state();
+        state.in_use = state.in_use.saturating_sub(1);
+        if let Some(permit) = self.permit.take() {
+            if state.owed > 0 {
+                state.owed -= 1;
+                permit.forget();
+            } else {
+                drop(permit);
+            }
+        }
+        state.shed = state.shed.min(state.in_use.saturating_sub(state.budget));
+    }
+}
+
+/// A file counted as about to start (see [`ServerSlots::starting`]); the
+/// count goes down when it is dropped.
+#[derive(Debug)]
+pub(crate) struct Starting(Arc<Table>);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        self.0.starting.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl ServerSlots {
-    /// At most `max` download connections to each server at once, within
-    /// this process. `0` is treated as `1`, and a value above tokio's
-    /// [`Semaphore::MAX_PERMITS`] (more than any client can open) as that.
-    #[must_use]
-    pub fn new(max: usize) -> Self {
+    fn build(max: usize, files: Option<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Table {
                 max: max.clamp(1, Semaphore::MAX_PERMITS),
-                per_server: Mutex::new(HashMap::new()),
-                files: None,
+                servers: Mutex::new(HashMap::new()),
+                growth_interval: GROWTH_INTERVAL,
+                starting: AtomicUsize::new(0),
+                notices: OnceLock::new(),
+                files,
                 files_failed: AtomicBool::new(false),
                 waits_reported: Mutex::default(),
             }),
         }
     }
 
-    /// At most `max` download connections to each server at once, counted
-    /// across every process that uses slot files under `dir`, such as the
-    /// one [`default_slot_dir`] names.
+    /// [`MAX_CONNECTIONS_PER_SERVER`] connections to each server at once,
+    /// counted across every process that uses slot files under `dir`, such
+    /// as the one [`default_slot_dir`] names.
     ///
-    /// Each slot is the file `<dir>/<server>/slot-<i>`, `i` below `max`,
-    /// held by an exclusive advisory lock (`flock` on Unix, `LockFileEx` on
-    /// Windows) for as long as the slot is held. The files are created when
-    /// first needed and never removed. Processes with different caps share
-    /// the files, and each tries only its own first `max`. If the files
-    /// cannot be used (the directory cannot be created, or the file system
-    /// does not lock), one warning is logged and the cap holds within this
-    /// process only; a download never fails because of them.
+    /// Each slot is the file `<dir>/<server>/slot-<i>`, held by an exclusive
+    /// advisory lock (`flock` on Unix, `LockFileEx` on Windows) for as long
+    /// as the slot is held. The files are created when first needed and
+    /// never removed. If they cannot be used (the directory cannot be
+    /// created, or the file system does not lock), one warning is logged
+    /// and the cap holds within this process only; a download never fails
+    /// because of them. Each process keeps its own live budget: a drop in
+    /// one does not lower another's.
     #[must_use]
-    pub fn across_processes(max: usize, dir: impl Into<PathBuf>) -> Self {
-        Self {
-            inner: Arc::new(Table {
-                max: max.clamp(1, Semaphore::MAX_PERMITS),
-                per_server: Mutex::new(HashMap::new()),
-                files: Some(dir.into()),
-                files_failed: AtomicBool::new(false),
-                waits_reported: Mutex::default(),
-            }),
-        }
+    pub fn across_processes(dir: impl Into<PathBuf>) -> Self {
+        Self::build(MAX_CONNECTIONS_PER_SERVER, Some(dir.into()))
     }
 
-    /// The most connections to one server at once.
+    /// Call `notice` once for every drop of a server's budget, with the
+    /// server, the status that caused it and the budget before and after.
+    /// Set it before the table is shared; a second call is ignored.
+    #[must_use]
+    pub fn with_notices(self, notice: impl Fn(&BudgetDrop) + Send + Sync + 'static) -> Self {
+        let _ = self.inner.notices.set(Notices(Arc::new(notice)));
+        self
+    }
+
+    /// A table with another cap than [`MAX_CONNECTIONS_PER_SERVER`], within
+    /// the process: tests only, where the cap is a parameter.
+    #[cfg(test)]
+    pub(crate) fn with_cap(max: usize) -> Self {
+        Self::build(max, None)
+    }
+
+    /// [`Self::with_cap`] with slot files under `dir`.
+    #[cfg(test)]
+    pub(crate) fn across_processes_with_cap(max: usize, dir: impl Into<PathBuf>) -> Self {
+        Self::build(max, Some(dir.into()))
+    }
+
+    /// The most connections to one server at once: the budget a server
+    /// starts with, and never exceeds.
     #[must_use]
     pub fn max(&self) -> usize {
         self.inner.max
     }
 
+    /// The live budget of `server` in this process.
+    #[cfg(test)]
+    pub(crate) fn budget(&self, server: &str) -> usize {
+        let node = self.node(server);
+        self.grow(&node);
+        let budget = node.state().budget;
+        budget
+    }
+
+    fn node(&self, server: &str) -> Arc<Node> {
+        let mut servers = self
+            .inner
+            .servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(servers.entry(server.to_string()).or_insert_with(|| {
+            Arc::new(Node {
+                semaphore: Arc::new(Semaphore::new(self.inner.max)),
+                state: Mutex::new(NodeState {
+                    budget: self.inner.max,
+                    in_use: 0,
+                    owed: 0,
+                    epoch: 0,
+                    calm_since: Instant::now(),
+                    shed: 0,
+                }),
+            })
+        }))
+    }
+
+    /// Add back one slot of budget for every `growth_interval` since the
+    /// last drop or growth, up to `max`: an owed permit is cancelled first,
+    /// else a permit is added. Returns when the next growth is due, if the
+    /// budget is below `max`.
+    fn grow(&self, node: &Node) -> Option<Instant> {
+        let interval = self.inner.growth_interval;
+        let now = Instant::now();
+        let mut state = node.state();
+        while state.budget < self.inner.max && now >= state.calm_since + interval {
+            state.budget += 1;
+            state.calm_since += interval;
+            if state.owed > 0 {
+                state.owed -= 1;
+            } else {
+                node.semaphore.add_permits(1);
+            }
+            tracing::debug!(budget = state.budget, "connection budget grew back by one");
+        }
+        state.shed = state.shed.min(state.in_use.saturating_sub(state.budget));
+        (state.budget < self.inner.max).then(|| state.calm_since + interval)
+    }
+
+    /// Count a file as about to start until the returned value is dropped:
+    /// it has its place under `-j` and holds no slot yet. A large file
+    /// leaves room for such files before it splits (see [`Self::room`]).
+    pub(crate) fn starting(&self) -> Starting {
+        self.inner.starting.fetch_add(1, Ordering::Relaxed);
+        Starting(Arc::clone(&self.inner))
+    }
+
+    /// The slots free on `server` now, after one for every file about to
+    /// start: free means a permit of this process's live budget is
+    /// available and, across processes, one of the slot files is unlocked
+    /// (counted without taking it). How many extra range streams a file
+    /// starting now may run.
+    pub(crate) async fn room(&self, server: &str) -> usize {
+        let node = self.node(server);
+        self.grow(&node);
+        let mut free = node.semaphore.available_permits();
+        if let Some(dir) = self.inner.files.as_deref() {
+            if !self.inner.files_failed.load(Ordering::Relaxed) {
+                let (dir, server, max) = (dir.to_path_buf(), server.to_string(), self.inner.max);
+                let unlocked =
+                    tokio::task::spawn_blocking(move || count_unlocked(&dir, &server, max)).await;
+                if let Ok(unlocked) = unlocked {
+                    free = free.min(unlocked);
+                }
+            }
+        }
+        free.saturating_sub(self.inner.starting.load(Ordering::Relaxed))
+    }
+
     /// Wait for a slot on `server` and hold it until the guard is dropped.
-    /// `None` only if the semaphore was closed, which this code never does.
+    /// The wait wakes when the budget grows, too. `None` only if the
+    /// semaphore was closed, which this code never does.
     pub(crate) async fn acquire(&self, server: &str) -> Option<SlotGuard> {
-        let semaphore = {
-            let mut per_server = self
-                .inner
-                .per_server
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(
-                per_server
-                    .entry(server.to_string())
-                    .or_insert_with(|| Arc::new(Semaphore::new(self.inner.max))),
-            )
-        };
-        if semaphore.available_permits() == 0 {
+        let node = self.node(server);
+        if node.semaphore.available_permits() == 0 {
             tracing::debug!(
                 server,
                 max = self.inner.max,
                 "waiting for a connection slot"
             );
         }
-        let permit = semaphore.acquire_owned().await.ok()?;
-        let file = self.lock_slot_file(server).await;
-        Some(SlotGuard {
+        let permit = loop {
+            let next_growth = self.grow(&node);
+            let acquire = Arc::clone(&node.semaphore).acquire_owned();
+            match next_growth {
+                Some(at) => {
+                    tokio::select! {
+                        biased;
+                        permit = acquire => break permit.ok()?,
+                        () = tokio::time::sleep_until(at) => {}
+                    }
+                }
+                None => break acquire.await.ok()?,
+            }
+        };
+        let epoch = {
+            let mut state = node.state();
+            state.in_use += 1;
+            state.epoch
+        };
+        // From here the guard owns the permit, so an early return gives it
+        // back.
+        let mut guard = SlotGuard {
+            server: server.to_string(),
+            node,
+            epoch,
             permit: Some(permit),
-            file,
-        })
+            file: None,
+        };
+        guard.file = self.lock_slot_file(server).await;
+        Some(guard)
+    }
+
+    /// Note the status a server answered on the slot `guard`. A 429 or a
+    /// 5xx halves the server's budget (rounded up, never below 1: 6, 3, 2, 1),
+    /// unless the slot was taken before the last drop, so one round of such
+    /// answers drops it once; either way the budget waits a full
+    /// `growth_interval` again before growing. Free permits are forgotten
+    /// at once and the rest owed, range streams over the new budget are
+    /// asked to stop, and the notice callback runs. Other statuses do
+    /// nothing.
+    pub(crate) fn report(&self, guard: &SlotGuard, status: u16) {
+        if !(status == 429 || (500..=599).contains(&status)) {
+            return;
+        }
+        let drop = {
+            let mut state = guard.node.state();
+            state.calm_since = Instant::now();
+            if guard.epoch != state.epoch {
+                return;
+            }
+            state.epoch += 1;
+            let before = state.budget;
+            // Rounded up: 6 → 3 → 2 → 1, the contract's sequence (integer
+            // division would go from 3 straight to 1).
+            let after = before.div_ceil(2).max(1);
+            if after == before {
+                return;
+            }
+            state.budget = after;
+            let lower = before - after;
+            let forgotten = guard.node.semaphore.forget_permits(lower);
+            state.owed += lower - forgotten;
+            state.shed = state.in_use.saturating_sub(after);
+            BudgetDrop {
+                server: guard.server.clone(),
+                status,
+                before,
+                after,
+            }
+        };
+        tracing::info!(
+            server = %drop.server,
+            status,
+            before = drop.before,
+            after = drop.after,
+            "server asked us to slow down; connection budget lowered"
+        );
+        if let Some(notices) = self.inner.notices.get() {
+            (notices.0)(&drop);
+        }
     }
 
     /// With slot files in use, wait until one of this process's first
@@ -188,7 +467,7 @@ impl ServerSlots {
     /// with it, which releases the lock.
     async fn lock_slot_file(&self, server: &str) -> Option<std::fs::File> {
         let dir = self.inner.files.as_deref()?;
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let mut wait = FIRST_POLL;
         loop {
             if self.inner.files_failed.load(Ordering::Relaxed) {
@@ -221,7 +500,7 @@ impl ServerSlots {
                     if !self.inner.files_failed.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             "cannot use the connection slot files at {}: {error}; \
-                             --max-connections-per-server holds within this process only",
+                             the per-server connection cap holds within this process only",
                             path.display()
                         );
                     }
@@ -239,6 +518,26 @@ impl ServerSlots {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(server.to_string())
     }
+}
+
+/// How many of the first `max` slot files of `server` under `dir` another
+/// open could lock now (a missing file counts as free). Each is locked and
+/// unlocked at once; an error counts the file as free, as the slot files
+/// are then given up anyway.
+fn count_unlocked(dir: &Path, server: &str, max: usize) -> usize {
+    (0..max)
+        .filter(|&i| match std::fs::File::open(slot_path(dir, server, i)) {
+            Ok(file) => match fs4::FileExt::try_lock(&file) {
+                Ok(()) => {
+                    let _ = fs4::FileExt::unlock(&file);
+                    true
+                }
+                Err(fs4::TryLockError::WouldBlock) => false,
+                Err(fs4::TryLockError::Error(_)) => true,
+            },
+            Err(_) => true,
+        })
+        .count()
 }
 
 /// Lock the first free one of the first `max` slot files of `server` under
@@ -281,8 +580,10 @@ fn try_lock_one(
 }
 
 impl Default for ServerSlots {
+    /// [`MAX_CONNECTIONS_PER_SERVER`] connections to each server at once,
+    /// within this process.
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONNECTIONS_PER_SERVER)
+        Self::build(MAX_CONNECTIONS_PER_SERVER, None)
     }
 }
 
@@ -386,21 +687,21 @@ mod tests {
     #[test]
     fn the_default_is_six_and_zero_means_one() {
         assert_eq!(ServerSlots::default().max(), 6);
-        assert_eq!(DEFAULT_MAX_CONNECTIONS_PER_SERVER, 6);
-        assert_eq!(ServerSlots::new(0).max(), 1);
-        assert_eq!(ServerSlots::new(9).max(), 9);
+        assert_eq!(MAX_CONNECTIONS_PER_SERVER, 6);
+        assert_eq!(ServerSlots::with_cap(0).max(), 1);
+        assert_eq!(ServerSlots::with_cap(9).max(), 9);
     }
 
     #[tokio::test]
     async fn a_cap_too_large_for_a_semaphore_is_held_at_the_largest() {
-        let slots = ServerSlots::new(usize::MAX);
+        let slots = ServerSlots::with_cap(usize::MAX);
         assert_eq!(slots.max(), Semaphore::MAX_PERMITS);
         assert!(free(&slots, "a.example").await.is_some());
     }
 
     #[tokio::test]
     async fn a_full_server_makes_the_next_request_wait_until_a_slot_is_given_back() {
-        let slots = ServerSlots::new(2);
+        let slots = ServerSlots::with_cap(2);
         let first = free(&slots, "a.example").await.expect("first slot");
         let _second = free(&slots, "a.example").await.expect("second slot");
         assert!(free(&slots, "a.example").await.is_none(), "a third slot");
@@ -410,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_server_has_its_own_slots() {
-        let slots = ServerSlots::new(1);
+        let slots = ServerSlots::with_cap(1);
         let _a = free(&slots, "a.example").await.expect("a");
         assert!(
             free(&slots, "b.example").await.is_some(),
@@ -424,13 +725,214 @@ mod tests {
 
     #[tokio::test]
     async fn clones_share_the_slots_and_new_tables_do_not() {
-        let slots = ServerSlots::new(1);
+        let slots = ServerSlots::with_cap(1);
         let _held = free(&slots, "a.example").await.expect("slot");
         assert!(free(&slots.clone(), "a.example").await.is_none(), "a clone");
         assert!(
-            free(&ServerSlots::new(1), "a.example").await.is_some(),
+            free(&ServerSlots::with_cap(1), "a.example").await.is_some(),
             "a new table"
         );
+    }
+
+    // -- the live budget: back-off and regrowth --
+
+    const S: &str = "s.example";
+
+    /// Take `n` slots on [`S`], each at once.
+    async fn take(slots: &ServerSlots, n: usize) -> Vec<SlotGuard> {
+        let mut held = Vec::new();
+        for i in 0..n {
+            held.push(free(slots, S).await.unwrap_or_else(|| panic!("slot {i}")));
+        }
+        held
+    }
+
+    /// How many more slots on [`S`] come at once (they are given back).
+    async fn available(slots: &ServerSlots) -> usize {
+        let mut held = Vec::new();
+        while let Some(g) = free(slots, S).await {
+            held.push(g);
+        }
+        held.len()
+    }
+
+    #[tokio::test]
+    async fn a_429_or_a_5xx_halves_the_budget_down_to_one() {
+        let slots = ServerSlots::default();
+        for (status, after) in [(429, 3), (503, 2), (500, 1), (429, 1), (599, 1)] {
+            let g = free(&slots, S).await.unwrap();
+            slots.report(&g, status);
+            drop(g);
+            assert_eq!(slots.budget(S), after, "after {status}");
+        }
+        assert_eq!(available(&slots).await, 1);
+    }
+
+    #[tokio::test]
+    async fn other_statuses_leave_the_budget_alone() {
+        let slots = ServerSlots::default();
+        let g = free(&slots, S).await.unwrap();
+        for status in [200, 206, 301, 404, 416, 428, 600] {
+            slots.report(&g, status);
+        }
+        drop(g);
+        assert_eq!(slots.budget(S), 6);
+        assert_eq!(available(&slots).await, 6);
+    }
+
+    #[tokio::test]
+    async fn one_round_of_answers_drops_the_budget_once() {
+        let slots = ServerSlots::default();
+        let held = take(&slots, 6).await;
+        // Six connections answered 429 together: one drop, not three.
+        for g in &held {
+            slots.report(g, 429);
+        }
+        assert_eq!(slots.budget(S), 3);
+        // A slot taken after the drop counts again.
+        drop(held);
+        let g = free(&slots, S).await.unwrap();
+        slots.report(&g, 429);
+        assert_eq!(slots.budget(S), 2);
+    }
+
+    #[tokio::test]
+    async fn slots_in_use_over_the_new_budget_are_forgotten_as_they_return() {
+        let slots = ServerSlots::default();
+        let held = take(&slots, 5).await;
+        slots.report(&held[0], 429);
+        // One permit was free and is forgotten now; two of the five in use
+        // are owed. The budget of 3 is full until those are back.
+        assert!(free(&slots, S).await.is_none(), "a slot over the budget");
+        drop(held);
+        assert_eq!(available(&slots).await, 3);
+    }
+
+    #[tokio::test]
+    async fn range_streams_over_the_budget_are_asked_to_stop() {
+        let slots = ServerSlots::default();
+        let held = take(&slots, 6).await;
+        slots.report(&held[0], 503);
+        let asked = held.iter().filter(|g| g.take_shed()).count();
+        assert_eq!(asked, 3, "6 in use over a budget of 3");
+        assert!(!held[0].take_shed(), "no more than that");
+
+        // Slots given back lower the count still to stop.
+        let held2 = take(&ServerSlots::default(), 0).await;
+        drop(held2);
+        let slots = ServerSlots::default();
+        let mut held = take(&slots, 6).await;
+        slots.report(&held[0], 503);
+        held.truncate(4); // two whole files ended
+        assert_eq!(held.iter().filter(|g| g.take_shed()).count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_grows_by_one_per_calm_interval_up_to_the_cap() {
+        let slots = ServerSlots::default();
+        let g = free(&slots, S).await.unwrap();
+        slots.report(&g, 429);
+        drop(g);
+        assert_eq!(slots.budget(S), 3);
+
+        tokio::time::advance(GROWTH_INTERVAL - Duration::from_secs(1)).await;
+        assert_eq!(slots.budget(S), 3, "before a full interval");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(slots.budget(S), 4);
+        assert_eq!(available(&slots).await, 4);
+
+        tokio::time::advance(GROWTH_INTERVAL * 10).await;
+        assert_eq!(slots.budget(S), 6, "never above the cap");
+        assert_eq!(available(&slots).await, 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_429_or_5xx_restarts_the_calm_interval() {
+        let slots = ServerSlots::default();
+        let g = free(&slots, S).await.unwrap();
+        slots.report(&g, 429); // 3
+        drop(g);
+        tokio::time::advance(GROWTH_INTERVAL / 2).await;
+        // A late answer from a slot of the old round does not drop the
+        // budget again, but the server is still in distress.
+        let stale = SlotGuard {
+            server: S.to_string(),
+            node: slots.node(S),
+            epoch: 0,
+            permit: None,
+            file: None,
+        };
+        slots.report(&stale, 503);
+        tokio::time::advance(GROWTH_INTERVAL / 2 + Duration::from_secs(1)).await;
+        assert_eq!(slots.budget(S), 3, "the interval started again at the 503");
+        tokio::time::advance(GROWTH_INTERVAL / 2).await;
+        assert_eq!(slots.budget(S), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waiting_for_a_slot_gets_one_when_the_budget_grows() {
+        let slots = ServerSlots::default();
+        let held = take(&slots, 6).await;
+        slots.report(&held[0], 429);
+        let one_left = held.into_iter().take(3).collect::<Vec<_>>();
+        drop(one_left); // 3 held over budget 3? no: all 6 returned or owed
+        assert_eq!(slots.budget(S), 3);
+        let held = take(&slots, 3).await;
+        let waiter = {
+            let slots = slots.clone();
+            tokio::spawn(async move { slots.acquire(S).await.is_some() })
+        };
+        tokio::time::advance(GROWTH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter got no slot when the budget grew")
+            .unwrap());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn every_drop_is_noticed_once() {
+        let seen: Arc<Mutex<Vec<BudgetDrop>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let slots =
+            ServerSlots::default().with_notices(move |d| sink.lock().unwrap().push(d.clone()));
+        let held = take(&slots, 6).await;
+        for g in &held {
+            slots.report(g, 429);
+        }
+        drop(held);
+        for status in [503, 500, 429] {
+            let g = free(&slots, S).await.unwrap();
+            slots.report(&g, status);
+        }
+        let seen = seen.lock().unwrap();
+        let drops: Vec<(u16, usize, usize)> =
+            seen.iter().map(|d| (d.status, d.before, d.after)).collect();
+        assert_eq!(drops, vec![(429, 6, 3), (503, 3, 2), (500, 2, 1)]);
+        assert!(seen.iter().all(|d| d.server == S));
+    }
+
+    #[tokio::test]
+    async fn room_is_the_free_slots_after_one_for_every_file_about_to_start() {
+        let slots = ServerSlots::default();
+        let _first = free(&slots, S).await.unwrap();
+        assert_eq!(slots.room(S).await, 5);
+        let a = slots.starting();
+        let _b = slots.starting();
+        assert_eq!(slots.room(S).await, 3);
+        drop(a);
+        assert_eq!(slots.room(S).await, 4);
+        let _more = take(&slots, 5).await;
+        assert_eq!(slots.room(S).await, 0);
+    }
+
+    #[tokio::test]
+    async fn room_counts_slot_files_other_processes_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = ServerSlots::across_processes_with_cap(6, dir.path());
+        let _theirs = take(&other, 4).await;
+        let ours = ServerSlots::across_processes_with_cap(6, dir.path());
+        assert_eq!(ours.room(S).await, 2);
     }
 
     // -- across processes --
@@ -536,8 +1038,8 @@ mod tests {
     #[tokio::test]
     async fn two_processes_never_hold_more_than_the_cap_together() {
         let dir = tempfile::tempdir().unwrap();
-        let a = ServerSlots::across_processes(2, dir.path());
-        let b = ServerSlots::across_processes(2, dir.path());
+        let a = ServerSlots::across_processes_with_cap(2, dir.path());
+        let b = ServerSlots::across_processes_with_cap(2, dir.path());
         let first = free(&a, "s.example").await.expect("a first");
         let _second = free(&a, "s.example").await.expect("a second");
 
@@ -563,8 +1065,8 @@ mod tests {
     #[tokio::test]
     async fn a_larger_cap_uses_files_beyond_a_smaller_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let small = ServerSlots::across_processes(2, dir.path());
-        let large = ServerSlots::across_processes(3, dir.path());
+        let small = ServerSlots::across_processes_with_cap(2, dir.path());
+        let large = ServerSlots::across_processes_with_cap(3, dir.path());
         let _s1 = free(&small, "s.example").await.expect("small 1");
         let _s2 = free(&small, "s.example").await.expect("small 2");
         let _l = free(&large, "s.example").await.expect("large takes slot-2");
@@ -587,7 +1089,7 @@ mod tests {
     async fn a_slot_file_is_locked_while_held_and_kept_after() {
         use fs4::{FileExt, TryLockError};
         let dir = tempfile::tempdir().unwrap();
-        let slots = ServerSlots::across_processes(1, dir.path());
+        let slots = ServerSlots::across_processes_with_cap(1, dir.path());
         let path = slot_path(dir.path(), "s.example", 0);
 
         let held = free(&slots, "s.example").await.expect("slot");
@@ -614,7 +1116,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let slots = ServerSlots::across_processes(1, dir.path());
+        let slots = ServerSlots::across_processes_with_cap(1, dir.path());
 
         let held = free(&slots, "s.example").await.expect("a slot");
 
@@ -630,7 +1132,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not-a-directory");
         std::fs::write(&file, "x").unwrap();
-        let slots = ServerSlots::across_processes(1, &file);
+        let slots = ServerSlots::across_processes_with_cap(1, &file);
 
         let held = free(&slots, "s.example")
             .await
