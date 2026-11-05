@@ -247,6 +247,11 @@ pub struct DownloadDisplay {
 }
 
 impl DownloadDisplay {
+    /// Print `line` on stderr above the bar, which is redrawn after it.
+    pub fn print_line(&self, line: &str) {
+        self.bar.suspend(|| eprintln!("{line}"));
+    }
+
     pub fn new(identifier: &str) -> Self {
         print_item_header(identifier);
         let bar = make_progress_bar(0);
@@ -408,6 +413,13 @@ struct ItemBars {
 }
 
 impl BatchDisplay {
+    /// Print `line` on stderr above the bars, which are redrawn after it.
+    /// Unlike `MultiProgress::println`, it prints when the bars are hidden
+    /// too.
+    pub fn print_line(&self, line: &str) {
+        self.multi.suspend(|| eprintln!("{line}"));
+    }
+
     pub fn new(items_total: usize) -> Self {
         let multi = MultiProgress::new();
 

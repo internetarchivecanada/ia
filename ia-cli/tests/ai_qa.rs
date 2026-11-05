@@ -9,6 +9,12 @@ use tempfile::NamedTempFile;
 
 fn ia() -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
+    // The connection slot files go to the test target
+    // directory, never to the user's cache.
+    cmd.env(
+        "IA_CACHE_DIR",
+        concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+    );
     // Remove env vars that might interfere
     cmd.env_remove("IA_ACCESS_KEY_ID")
         .env_remove("IA_SECRET_ACCESS_KEY")

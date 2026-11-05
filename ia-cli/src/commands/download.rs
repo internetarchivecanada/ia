@@ -13,8 +13,8 @@ use tracing::{info, warn};
 
 use ia_core::disk_pool::DiskPool;
 use ia_core::download::{
-    collect_batch_results, BatchDownloadResult, DownloadOpts, DownloadProgress, DownloadStatus,
-    FileDownloadResult, ItemDownloadResult,
+    collect_batch_results, BatchDownloadResult, BudgetDrop, DownloadOpts, DownloadProgress,
+    DownloadStatus, FileDownloadResult, ItemDownloadResult, ServerSlots,
 };
 use ia_core::error::{format_error_chain, IaError, Result as IaResult};
 use ia_core::files::FileFilter;
@@ -37,7 +37,13 @@ use crate::output::DownloadDisplay;
         given. A dropped connection, or a stream slower \
         than --min-speed, is resumed with a Range request from the bytes on disk; a failed attempt \
         is retried up to --retries times. A .part that is a symlink is removed and the file \
-        starts over.",
+        starts over.\n\n\
+        ia opens at most 6 connections to any one datanode, across every ia process on this \
+        machine, counting whole files and byte ranges alike. A file of 256 MiB or more is split \
+        into byte ranges fetched at once only when its datanode has connections to spare, with \
+        its progress kept in <name>.part.json so an interrupted download resumes per part. A \
+        datanode that answers 429 or a 5xx gets half as many connections for the rest of the run, \
+        growing back by one per minute without another; see docs/usage.md, \"Connections\".",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -126,7 +132,7 @@ pub struct DownloadArgs {
     #[arg(long)]
     no_verify: bool,
 
-    /// Max retries per file (also the number of stalls allowed, see --min-speed)
+    /// Max retries per file, or per stream of a large file (also the number of stalls allowed, see --min-speed)
     ///
     /// Each retry waits a random time, up to a cap that doubles from 1 s to
     /// 60 s. A Retry-After header on the failed response (a 429 or a 5xx,
@@ -153,6 +159,19 @@ pub struct DownloadArgs {
     /// stream, and a stream that trickles never ends.
     #[arg(long, value_name = "RATE", default_value = "10K", value_parser = super::rate::parse_rate)]
     min_speed: u64,
+
+    /// Pin the connections for one file of 256 MiB or more, 1 to 8 (1: never split)
+    ///
+    /// Hidden; for debugging and support. Without it the number is chosen
+    /// when the file starts, from the connections its datanode has to spare.
+    #[arg(
+        long,
+        value_name = "N",
+        hide = true,
+        value_parser = clap::value_parser!(u8)
+            .range(1..=ia_core::download::MAX_CONNECTIONS_PER_FILE as i64)
+    )]
+    connections_per_file: Option<u8>,
 
     /// Don't set file modification times
     #[arg(long)]
@@ -465,6 +484,9 @@ pub async fn run(
         bail!("{msg}");
     }
 
+    let json_mode = args.json;
+    let drop_lines = DropLines::default();
+    let server_slots = run_server_slots(json_mode, quiet, &drop_lines);
     let make_opts = |destdir: PathBuf| {
         let mut o = DownloadOpts::default();
         o.destdir = destdir;
@@ -477,6 +499,8 @@ pub async fn run(
         o.filter = filter.clone();
         o.count_views = args.count_views;
         o.min_speed = args.min_speed;
+        o.connections_per_file = args.connections_per_file.map(usize::from);
+        o.server_slots = server_slots.clone();
         o
     };
 
@@ -510,6 +534,7 @@ pub async fn run(
             let batch_display = if !json_mode && quiet == 0 {
                 let bd = Arc::new(crate::output::BatchDisplay::new(header_total));
                 bd.set_joblog_path(joblog_path.clone());
+                drop_lines.through_batch(&bd);
                 Some(bd)
             } else {
                 None
@@ -621,8 +646,12 @@ pub async fn run(
     // Dashboard mode
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore), jobs)
-            .await;
+        // The dashboard holds the terminal; its slow-down lines come after.
+        drop_lines.keep();
+        let run =
+            crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore), jobs).await;
+        drop_lines.release();
+        return run;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -645,7 +674,9 @@ pub async fn run(
         };
 
         let display = if !args.json && quiet == 0 {
-            Some(Arc::new(DownloadDisplay::new(identifier)))
+            let d = Arc::new(DownloadDisplay::new(identifier));
+            drop_lines.through_item(&d);
+            Some(d)
         } else {
             None
         };
@@ -719,6 +750,7 @@ pub async fn run(
     let batch_display = if !json_mode && quiet == 0 {
         let bd = Arc::new(crate::output::BatchDisplay::new(items_total));
         bd.set_joblog_path(joblog_path.clone());
+        drop_lines.through_batch(&bd);
         Some(bd)
     } else {
         None
@@ -1210,6 +1242,132 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
     }
 }
 
+/// One table of server slots for the whole run, shared by every item, disk,
+/// file and zip member, and through slot files in the user's cache
+/// directory with every other ia process, so the cap holds across all of
+/// them. It prints one line per server per budget drop through
+/// `drop_lines`; with `json_mode`, one event on stdout.
+fn run_server_slots(json_mode: bool, quiet: u8, drop_lines: &DropLines) -> ServerSlots {
+    let server_slots = match ia_core::download::default_slot_dir() {
+        Some(dir) => ServerSlots::across_processes(dir),
+        None => {
+            tracing::warn!(
+                "no cache directory for the connection slot files (set IA_CACHE_DIR); \
+                 the per-server connection cap holds within this process only"
+            );
+            ServerSlots::default()
+        }
+    };
+    let show_drops = json_mode || quiet < 2;
+    let drop_lines = drop_lines.clone();
+    server_slots.with_notices(move |drop| {
+        if !show_drops {
+            return;
+        }
+        if json_mode {
+            println!("{}", json_budget_drop(drop));
+        } else {
+            drop_lines.print(format!(
+                "server {} asked us to slow down; using {} connection{}",
+                short_server(&drop.server),
+                drop.after,
+                if drop.after == 1 { "" } else { "s" }
+            ));
+        }
+    })
+}
+
+/// A way to print one line on stderr.
+type LinePrinter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Where the slow-down lines go: straight to stderr; through the progress
+/// display that holds the terminal, so its next redraw does not cover them;
+/// or, while the dashboard holds the terminal, kept until it closes.
+#[derive(Clone, Default)]
+struct DropLines {
+    printer: Arc<std::sync::Mutex<Option<LinePrinter>>>,
+    kept: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+}
+
+impl DropLines {
+    fn print(&self, line: String) {
+        if let Ok(mut kept) = self.kept.lock() {
+            if let Some(kept) = kept.as_mut() {
+                kept.push(line);
+                return;
+            }
+        }
+        let printer = self.printer.lock().ok().and_then(|p| p.clone());
+        match printer {
+            Some(print) => print(&line),
+            None => eprintln!("{line}"),
+        }
+    }
+
+    /// Print through `printer` from now on.
+    fn through(&self, printer: LinePrinter) {
+        if let Ok(mut current) = self.printer.lock() {
+            *current = Some(printer);
+        }
+    }
+
+    /// Print through a batch display while it lives.
+    fn through_batch(&self, display: &Arc<crate::output::BatchDisplay>) {
+        let display = Arc::downgrade(display);
+        self.through(Arc::new(move |line| match display.upgrade() {
+            Some(d) => d.print_line(line),
+            None => eprintln!("{line}"),
+        }));
+    }
+
+    /// Print through a single item's display while it lives.
+    fn through_item(&self, display: &Arc<DownloadDisplay>) {
+        let display = Arc::downgrade(display);
+        self.through(Arc::new(move |line| match display.upgrade() {
+            Some(d) => d.print_line(line),
+            None => eprintln!("{line}"),
+        }));
+    }
+
+    /// Keep the lines instead of printing them, until [`Self::release`].
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    fn keep(&self) {
+        if let Ok(mut kept) = self.kept.lock() {
+            *kept = Some(Vec::new());
+        }
+    }
+
+    /// Print the kept lines and print the next ones at once.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    fn release(&self) {
+        let kept = self.kept.lock().ok().and_then(|mut k| k.take());
+        for line in kept.into_iter().flatten() {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// The JSON event for a server's connection budget dropping after it
+/// answered 429 or a 5xx.
+fn json_budget_drop(drop: &BudgetDrop) -> serde_json::Value {
+    serde_json::json!({
+        "event": "slow_down",
+        "server": drop.server,
+        "status": drop.status,
+        "connections_before": drop.before,
+        "connections_after": drop.after,
+    })
+}
+
+/// A server's name for a notice: the first label of an archive.org host
+/// (`ia800807` for `ia800807.us.archive.org`), else the whole authority.
+fn short_server(server: &str) -> &str {
+    match server.split_once('.') {
+        Some((first, rest)) if rest == "archive.org" || rest.ends_with(".archive.org") => first,
+        _ => server,
+    }
+}
+
 /// Build a JSON value for a single file download result.
 fn json_file_result(identifier: &str, r: &FileDownloadResult) -> Option<serde_json::Value> {
     match &r.status {
@@ -1373,11 +1531,30 @@ async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()
         .identifier
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("identifier required for zip operations"))?;
+    // A zip listing or member is a download like any other: it holds a slot
+    // of the item's datanode pair, shared with every ia process. Without the
+    // item's metadata the slot is keyed by the host that answers; a dry run
+    // fetches no metadata.
+    let zip_opts = || async {
+        let mut opts = DownloadOpts::default();
+        opts.server_slots = run_server_slots(args.json, quiet, &DropLines::default());
+        if args.dry_run {
+            return opts;
+        }
+        match client.get_item(identifier).await {
+            Ok(item) => opts.for_item(&item),
+            Err(e) => {
+                tracing::debug!(identifier, error = %e, "no item metadata; slots keyed by host");
+                opts
+            }
+        }
+    };
 
     if let Some(ref zip_filename) = args.zip_list {
         // List contents of a zip file
+        let opts = zip_opts().await;
         let all_entries =
-            ia_core::download::zip::list_zip_contents(client, identifier, zip_filename)
+            ia_core::download::zip::list_zip_contents_with(client, identifier, zip_filename, &opts)
                 .await
                 .context(format!(
                     "failed to list zip {zip_filename} for {identifier}"
@@ -1494,24 +1671,27 @@ async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()
             return Ok(());
         }
 
+        let opts = zip_opts().await;
         let data = if let Some(ref ext) = args.zip_convert {
-            ia_core::download::zip::download_zip_member_converted(
+            ia_core::download::zip::download_zip_member_converted_with(
                 client,
                 identifier,
                 &zip_filename,
                 &member_path,
                 ext,
+                &opts,
             )
             .await
             .context(format!(
                 "failed to download {member_path} as {ext} from {zip_filename}"
             ))?
         } else {
-            ia_core::download::zip::download_zip_member(
+            ia_core::download::zip::download_zip_member_with(
                 client,
                 identifier,
                 &zip_filename,
                 &member_path,
+                &opts,
             )
             .await
             .context(format!(

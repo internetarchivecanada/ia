@@ -31,6 +31,7 @@ Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive
 - Upload: `md-5`; `quick-xml` (decoding XML character references in IA-S3 answers)
 - Update checksum: `aws-lc-rs` (SHA-256; already in the binary as rustls's crypto provider)
 - Auth: `rpassword`
+- Download: `fs4` (advisory locks on the per-server slot files that share the cap of 6 connections per datanode between processes)
 - Testing: `wiremock` + `assert_cmd` + `tempfile`
 
 Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't add crates without asking. Prefer `std`, existing deps, or small focused code. When a new crate is approved, update this list.

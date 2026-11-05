@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use color_print::cstr;
 use std::path::PathBuf;
 
@@ -157,6 +157,31 @@ enum Commands {
     Update(commands::update::UpdateArgs),
 }
 
+/// What `-j` means for `ia download`, in its help only: the other commands
+/// keep the global text.
+const DOWNLOAD_JOBS_HELP: &str = "Files downloaded at once across all servers (default 8). \
+     Any one server gets at most 6 connections, so files on the same server may wait.";
+
+/// The CLI's clap command, derived from its argument struct, with `ia download`'s own help for `-j`.
+///
+/// A global argument has one help text, copied to every subcommand when the
+/// command is built, except one that already has an argument of that id.
+/// So `download` gets its own copy of `-j`, the global one with download's
+/// help, before the build; a value given after `download` still reaches
+/// `Cli::jobs`, as for any global.
+pub fn command() -> clap::Command {
+    let cmd = Cli::command();
+    let jobs = cmd
+        .get_arguments()
+        .find(|a| a.get_id() == "jobs")
+        .cloned()
+        .map(|a| a.help(DOWNLOAD_JOBS_HELP).long_help(DOWNLOAD_JOBS_HELP));
+    match jobs {
+        Some(jobs) => cmd.mut_subcommand("download", |download| download.arg(jobs)),
+        None => cmd,
+    }
+}
+
 /// Derive the list of global flags that consume the next argv element as a value
 /// directly from clap's parser. This keeps the compound-args pre-scanner in sync
 /// with Cli's actual global options — no hardcoded list to maintain.
@@ -215,19 +240,21 @@ pub async fn run() -> Result<()> {
     let compound_continuations =
         commands::metadata::extract_compound_from_argv(&raw_args, &value_flags)?;
     let cli = if let Some(ref split) = compound_continuations {
-        Cli::try_parse_from(&split.filtered_argv)?
+        let matches = command().try_get_matches_from(&split.filtered_argv)?;
+        Cli::from_arg_matches(&matches)?
     } else {
-        Cli::parse()
+        let matches = command().get_matches();
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.format(&mut command()).exit())
     };
 
     // Handle commands that don't need IA config/client
     match cli.command {
         Commands::Completions(args) => {
-            let mut cmd = Cli::command();
+            let mut cmd = command();
             return commands::completions::run(args, &mut cmd);
         }
         Commands::Man(args) => {
-            let cmd = Cli::command();
+            let cmd = command();
             return commands::man::run(args, &cmd);
         }
         Commands::Update(args) => {
@@ -343,4 +370,62 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jobs_of(argv: &[&str]) -> Result<Option<usize>, clap::Error> {
+        let matches = command().try_get_matches_from(argv)?;
+        Ok(Cli::from_arg_matches(&matches)?.jobs)
+    }
+
+    #[test]
+    fn download_jobs_reach_the_global_value_wherever_given() {
+        assert_eq!(
+            jobs_of(&["ia", "download", "-j", "3", "x"]).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            jobs_of(&["ia", "-j", "3", "download", "x"]).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            jobs_of(&["ia", "download", "x", "--jobs", "5"]).unwrap(),
+            Some(5)
+        );
+        assert_eq!(jobs_of(&["ia", "download", "x"]).unwrap(), None);
+        assert_eq!(
+            jobs_of(&["ia", "upload", "x", "f", "-j", "2"]).unwrap(),
+            Some(2)
+        );
+        assert!(jobs_of(&["ia", "download", "-j", "0", "x"]).is_err());
+    }
+
+    #[test]
+    fn only_download_has_its_own_jobs_help() {
+        let cmd = command();
+        let help_of = |sub: &str| {
+            cmd.find_subcommand(sub)
+                .and_then(|c| c.get_arguments().find(|a| a.get_id() == "jobs"))
+                .and_then(|a| a.get_help())
+                .map(ToString::to_string)
+        };
+        assert_eq!(help_of("download").as_deref(), Some(DOWNLOAD_JOBS_HELP));
+        assert_eq!(help_of("upload"), None, "global, copied in at build");
+        let mut built = command();
+        built.build();
+        let upload_help = built
+            .find_subcommand("upload")
+            .and_then(|c| c.get_arguments().find(|a| a.get_id() == "jobs"))
+            .and_then(|a| a.get_help())
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            upload_help.starts_with("Concurrent operations"),
+            "{upload_help}"
+        );
+        command().debug_assert();
+    }
 }

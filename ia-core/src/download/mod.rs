@@ -1,5 +1,10 @@
 use crate::stall;
+mod parallel;
+mod slots;
 pub mod zip;
+
+pub use parallel::MAX_CONNECTIONS_PER_FILE;
+pub use slots::{default_slot_dir, BudgetDrop, ServerSlots, MAX_CONNECTIONS_PER_SERVER};
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -177,6 +182,44 @@ pub struct DownloadOpts {
     /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
+    /// How many connections fetch one large file at once (#16), each
+    /// carrying one stream of `Range` requests over HTTP/1.1.
+    ///
+    /// A file of 256 MiB or more is cut into 64 MiB parts, which the streams
+    /// take in turn, each with one `Range` request. The first request goes
+    /// alone: unless it is answered with a 206 for the range asked for, the
+    /// file is fetched on one stream. With `None` (the default) the number
+    /// of streams is chosen when the file starts: `min(8, parts still to
+    /// fetch, 1 + room)`, where room is the slots free on its datanode after
+    /// one for every other file about to start, so a file splits only into
+    /// connections the budget already allows and files go before ranges.
+    /// `Some(1)` (or `Some(0)`) never splits; `Some(n)` pins `n` streams,
+    /// a value above [`MAX_CONNECTIONS_PER_FILE`] being treated as that, each
+    /// waiting for its slot. Progress is kept beside the `.part` file in
+    /// `<name>.part.json`, so an interrupted download resumes per part.
+    /// [`min_speed`](Self::min_speed) and [`retries`](Self::retries) apply
+    /// to each stream; a stream whose retries are spent fails the file with
+    /// [`IaError::RangeFailed`]. The md5 is checked in one pass over the
+    /// assembled file.
+    pub connections_per_file: Option<usize>,
+    /// The connection budget per datanode, shared by every download that
+    /// clones these options (see [`ServerSlots`]): at most
+    /// [`MAX_CONNECTIONS_PER_SERVER`] connections to one server at once,
+    /// counting every connection, whole files and byte ranges alike, halved
+    /// for the rest of the run when the server answers 429 or a 5xx and
+    /// grown back by one per calm minute.
+    ///
+    /// Every request takes a slot on the server it lands on (the datanode
+    /// after the `/download/` redirect, or the request's own host) and keeps
+    /// it until its response is dropped; a request that finds its server
+    /// full waits for a slot, and nothing is refused. The default keeps the
+    /// budget within the process; [`ServerSlots::across_processes`] shares
+    /// it with every other process using the same slot files.
+    pub server_slots: ServerSlots,
+    /// The datanode pair of the item being downloaded, set per item by
+    /// [`download_item_with_metadata`] from its metadata: requests to either
+    /// host take slots on the pair (see `slots::Datanodes`).
+    pub(crate) datanodes: Option<Arc<slots::Datanodes>>,
 }
 
 impl Default for DownloadOpts {
@@ -192,7 +235,25 @@ impl Default for DownloadOpts {
             filter: FileFilter::default(),
             count_views: false,
             min_speed: 10 * 1024,
+            connections_per_file: None,
+            server_slots: ServerSlots::default(),
+            datanodes: None,
         }
+    }
+}
+
+impl DownloadOpts {
+    /// These options for requests to `item`: when its metadata names both
+    /// of its datanodes (`d1`, `d2`), a request that lands on either takes
+    /// its slot from the pair's one budget of
+    /// [`MAX_CONNECTIONS_PER_SERVER`]. The item functions do this
+    /// themselves; it is for callers that request an item's files by other
+    /// means, such as the zip functions in [`zip`].
+    #[must_use]
+    pub fn for_item(&self, item: &crate::types::ItemMetadata) -> Self {
+        let mut opts = self.clone();
+        opts.datanodes = slots::Datanodes::of(item).map(Arc::new);
+        opts
     }
 }
 
@@ -275,6 +336,61 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
     }
     let (_range, total) = range_and_total.trim().rsplit_once('/')?;
     total.trim().parse().ok()
+}
+
+/// Extract the first and last byte from a `Content-Range` header value of
+/// the form `bytes <first>-<last>/<complete-length>`, whatever the complete
+/// length. `None` for the `bytes */<complete-length>` form, another unit,
+/// or a value that does not parse.
+///
+/// ```text
+/// "bytes 13-21/22"  -> Some((13, 21))
+/// "bytes 13-21/*"   -> Some((13, 21))
+/// "bytes */22"      -> None
+/// ```
+#[must_use]
+fn parse_content_range_span(value: &str) -> Option<(u64, u64)> {
+    let (unit, range_and_total) = value.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, _total) = range_and_total.trim().rsplit_once('/')?;
+    let (first, last) = range.trim().split_once('-')?;
+    let (first, last) = (first.trim().parse().ok()?, last.trim().parse().ok()?);
+    (first <= last).then_some((first, last))
+}
+
+/// How many times a download re-requests after a body-stream error before
+/// the error ends the attempt: per call of [`download_file`] on one stream,
+/// per stream on parallel ranges.
+///
+/// Real-world incident (us-supreme-court, 2026-04-22): 39 body-stream
+/// decode errors bypassed the retry middleware entirely, dropping items the
+/// server would have happily served a few seconds later.
+const MAX_STREAM_RETRIES: usize = 3;
+
+/// The wait before body-stream re-request `attempt` (counted from 1):
+/// 0.5 s, 1.5 s, 4.5 s.
+fn stream_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(500 * 3u64.saturating_pow(attempt.saturating_sub(1) as u32))
+}
+
+/// The `Range` header a download request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteRange {
+    /// `bytes=N-`: from byte N to the end, to resume a `.part`.
+    From(u64),
+    /// `bytes=first-last`: one part of a parallel download.
+    Span { first: u64, last: u64 },
+}
+
+impl ByteRange {
+    fn header_value(self) -> String {
+        match self {
+            ByteRange::From(offset) => format!("bytes={offset}-"),
+            ByteRange::Span { first, last } => format!("bytes={first}-{last}"),
+        }
+    }
 }
 
 /// Whether a file's metadata `size` cannot be trusted by construction.
@@ -375,6 +491,42 @@ pub(crate) async fn fetch_response(
     resume_from: Option<u64>,
     count_views: bool,
 ) -> Result<reqwest::Response> {
+    fetch_response_via(
+        client.no_redirect_http(),
+        client,
+        url,
+        resume_from.map(ByteRange::From),
+        count_views,
+        None,
+        None,
+    )
+    .await
+    .map(|(response, _slot)| response)
+}
+
+/// A download's slot on the server its response came from (see
+/// [`ServerSlots`]), held for as long as the response or its body is read.
+pub(crate) type Slot = Option<slots::SlotGuard>;
+
+/// [`fetch_response`] over the transport `http` (which must not follow
+/// redirects), with any [`ByteRange`]. A 416 answering a `range` is
+/// returned as a response, as in [`fetch_response`].
+///
+/// With `slots`, every hop first waits for a slot on its server (the URL's
+/// authority). A redirect gives its slot back before the next hop takes
+/// one, so the request never holds two and never waits while holding one;
+/// the slot of the hop that answered is returned with the response, and the
+/// caller keeps it until the response is dropped. Without `slots`, the slot
+/// is `None`.
+pub(crate) async fn fetch_response_via(
+    http: &reqwest::Client,
+    client: &IaClient,
+    url: &str,
+    range: Option<ByteRange>,
+    count_views: bool,
+    download: Option<&DownloadOpts>,
+    mut starting: Option<slots::Starting>,
+) -> Result<(reqwest::Response, Slot)> {
     // Build auth header if credentials are available.
     let auth_value = client
         .config()
@@ -401,12 +553,36 @@ pub(crate) async fn fetch_response(
     let mut resp = None;
 
     for _ in 0..=max_redirects {
-        let mut req = client.no_redirect_http().get(&current_url);
+        let server = server_of(&current_url);
+        let slot = match download {
+            Some(opts) => {
+                let key = opts
+                    .datanodes
+                    .as_deref()
+                    .and_then(|pair| pair.key_for(&server))
+                    .unwrap_or(&server);
+                opts.server_slots.acquire(key).await
+            }
+            None => None,
+        };
+        let mut slot = slot;
+        // The file's first request, while it holds this slot, is no longer
+        // a file to come on this server (see `ServerSlots::room`).
+        if let (Some(held), Some(s)) = (slot.as_mut(), starting.take()) {
+            held.carry(s);
+        }
+        let mut req = http.get(&current_url);
+        if download.is_some() {
+            // A download's connection lives only as long as its slot: it is
+            // closed when the response ends, so the sockets open to a server
+            // never outnumber the slots held there (see `IaClient::range_http`).
+            req = req.header("Connection", "close");
+        }
         if let Some(ref auth) = auth_value {
             req = req.header("Authorization", auth);
         }
-        if let Some(offset) = resume_from {
-            req = req.header("Range", format!("bytes={offset}-"));
+        if let Some(range) = range {
+            req = req.header("Range", range.header_value());
         }
 
         let r = req
@@ -438,10 +614,19 @@ pub(crate) async fn fetch_response(
                 Some(host)
                     if host == "archive.org"
                         || host.ends_with(".archive.org")
-                        || new_url.authority() == config_host =>
+                        || new_url.authority() == config_host
+                        // This crate's own tests redirect between loopback
+                        // servers on different ports, standing for an item's
+                        // two datanodes. Never in a build that ships.
+                        || (cfg!(test) && host == "127.0.0.1") =>
                 {
                     debug!(location = %new_url, "following redirect");
                     current_url = new_url.to_string();
+                    // This hop's answer and its slot go back before the
+                    // next hop takes one.
+                    drop(r);
+                    starting = slot.as_mut().and_then(slots::SlotGuard::put_down);
+                    drop(slot);
                     continue;
                 }
                 _ => {
@@ -454,15 +639,17 @@ pub(crate) async fn fetch_response(
             }
         }
 
-        resp = Some(r);
+        resp = Some((r, slot, server));
         break;
     }
 
-    let response = resp.ok_or_else(|| IaError::Http {
+    let (response, mut slot, server) = resp.ok_or_else(|| IaError::Http {
         status: 0,
         message: "too many redirects".to_string(),
         retry_after: None,
     })?;
+    // Answered: the file is no longer about to start.
+    drop(slot.as_mut().and_then(slots::SlotGuard::put_down));
 
     let status = response.status();
     // A 416 answers the Range header we sent: the resume offset is at or
@@ -471,15 +658,29 @@ pub(crate) async fn fetch_response(
     // the caller instead of being collapsed into `IaError::Http` here.
     // Callers that send no Range keep seeing a 416 as the plain HTTP error.
     let range_not_satisfiable =
-        resume_from.is_some() && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+        range.is_some() && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
     if !status.is_success()
         && status != reqwest::StatusCode::PARTIAL_CONTENT
         && !range_not_satisfiable
     {
+        // A 429 or 5xx lowers the server's connection budget (see
+        // `ServerSlots::report`); the caller still retries as before.
+        if let (Some(opts), Some(guard)) = (download, slot.as_ref()) {
+            opts.server_slots.report(guard, &server, status.as_u16());
+        }
         return Err(http_error_from(response).await);
     }
 
-    Ok(response)
+    Ok((response, slot))
+}
+
+/// The server a download URL goes to, for [`ServerSlots`]: its authority
+/// (the host, and the port when the URL gives one), or the URL itself if it
+/// does not parse.
+fn server_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .map(|url| url.authority().to_string())
+        .unwrap_or_else(|_| url.to_string())
 }
 
 /// Turn a non-success response into [`IaError::Http`], consuming the body
@@ -927,6 +1128,46 @@ pub async fn download_file(
     // Download URL
     let encoded_name = urlencoding::encode(&file.name);
     let url = client.url(&format!("/download/{identifier}/{encoded_name}"));
+    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
+
+    // Whether this download's requests may count a view (see
+    // `DownloadOpts::count_views`).
+    let mut count_views = opts.count_views;
+
+    // The file holds no slot yet; until its first request is answered, a
+    // large file starting now leaves it room before it splits.
+    let mut starting = Some(opts.server_slots.starting());
+
+    // A large file goes over parallel ranges (#16) unless the server does
+    // not answer the first range request with the range it asked for.
+    if parallel::applies(opts, identifier, file) {
+        match parallel::download(
+            client,
+            identifier,
+            file,
+            &file_path,
+            &part_path,
+            &url,
+            opts,
+            progress,
+            start,
+            starting.take(),
+        )
+        .await?
+        {
+            parallel::Outcome::Done(result) => return Ok(result),
+            parallel::Outcome::Unsupported => {
+                debug!(
+                    file = %file.name,
+                    "no 206 for the range asked for; downloading on one stream"
+                );
+                // That request already counted the view, if one was to be
+                // counted.
+                count_views = false;
+            }
+            parallel::Outcome::JournalPathTaken => {}
+        }
+    }
 
     // Check for partial file (.part) for resume.
     //
@@ -935,13 +1176,16 @@ pub async fn download_file(
     // request; the 206 tail would then land at offset 0 of a fresh .part,
     // and a later run could resume that tail into a wrong file of the
     // right length. Remove the link now, so no Range is ever shaped by it.
-    let part_path = PathBuf::from(format!("{}.part", file_path.display()));
     if let Ok(meta) = fs::symlink_metadata(&part_path).await {
         if meta.file_type().is_symlink() {
             warn!(file = %file.name, "removing symlink .part file before resume");
             fs::remove_file(&part_path).await?;
         }
     }
+    // A part journal beside the .part (#16) means the .part may have holes
+    // and its length is not a resume offset. Cut it back to the bytes on
+    // disk from byte 0, or discard it, before the length is read.
+    parallel::settle_for_single_stream(file, &part_path).await?;
     // Open first, then stat the fd, so the length is of the file actually
     // opened and a directory or other non-regular file is never resumed.
     // (The fd metadata cannot tell a link planted after the check above;
@@ -969,7 +1213,23 @@ pub async fn download_file(
         });
     }
 
-    let response = fetch_response(client, &url, resume_from, opts.count_views).await?;
+    // Every request of the download holds a slot on its server (see
+    // `DownloadOpts::server_slots`) for as long as its response is read.
+    let first = fetch_response_via(
+        client.range_http(),
+        client,
+        &url,
+        resume_from.map(ByteRange::From),
+        count_views,
+        Some(opts),
+        // Carried with the request's slot until it is answered.
+        starting.take(),
+    )
+    .await;
+    let (response, mut slot) = first?;
+    // Only the first request may count a view: every re-request below (after
+    // a body error, a stall or a shed) sends `cnt=0`, as range streams do.
+    count_views = false;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
     if let (Some(offset), reqwest::StatusCode::RANGE_NOT_SATISFIABLE) =
@@ -977,6 +1237,9 @@ pub async fn download_file(
     {
         let last_modified = last_modified_of(&response);
         range_not_satisfiable(response, identifier, file, offset, &part_path).await?;
+        // The response is consumed: no connection is open any more, so the
+        // slot goes back before the .part is hashed from disk.
+        drop(slot);
         // The .part is the whole file, but never finish it through a
         // symlink: renaming the link into place would leave a Complete
         // download pointing outside dest_dir and the mtime write would go
@@ -1079,11 +1342,8 @@ pub async fn download_file(
     let mut last_progress_at = bytes_downloaded;
 
     // Stream-level retry budget. `reqwest-retry` only sees the initial
-    // response status; once we start reading the body it's on us.
-    // Real-world incident (us-supreme-court, 2026-04-22): 39 body-stream
-    // decode errors bypassed the middleware entirely, dropping items the
-    // server would have happily served a few seconds later.
-    const MAX_STREAM_RETRIES: usize = 3;
+    // response status; once we start reading the body it's on us (see
+    // MAX_STREAM_RETRIES).
     let mut stream_attempt: usize = 0;
     // Stall budget, separate from the stream-error budget and capped at
     // `opts.retries` (#11). A stall is not a failure of the connection but
@@ -1102,9 +1362,22 @@ pub async fn download_file(
         Error(reqwest_middleware::Error),
         /// The stall detector judged the stream too slow.
         Stalled { observed: u64, window_secs: u64 },
+        /// The server's budget fell below the connections in use, and the
+        /// range streams of split files have had their turn to stop (see
+        /// `SlotGuard::take_whole_file_shed`).
+        Shed,
     }
 
     loop {
+        // Only a connection the server would resume with Range can be
+        // given back under a drop and picked up again; one that ignores
+        // Range runs to its end.
+        let sheddable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            || response
+                .headers()
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("bytes"));
         let mut stream = response.bytes_stream();
         // Every stream is judged on its own clock: a re-request is a new
         // connection, possibly to a different backend, and gets the full
@@ -1175,7 +1448,7 @@ pub async fn download_file(
                     }
                     None => break StreamEnd::Done,
                 },
-                _ = ticker.tick(), if detector.is_some() => {
+                _ = ticker.tick() => {
                     if let Some(d) = detector.as_mut() {
                         if let Some(observed) = d.check(tokio::time::Instant::now()) {
                             break StreamEnd::Stalled {
@@ -1184,14 +1457,34 @@ pub async fn download_file(
                             };
                         }
                     }
+                    if sheddable
+                        && slot.as_ref().is_some_and(slots::SlotGuard::take_whole_file_shed)
+                    {
+                        break StreamEnd::Shed;
+                    }
                 }
             }
         };
-        // Close the abandoned connection before opening the next one.
+        // Close the abandoned connection before opening the next one, and
+        // give its slot back now: a body error waits before re-requesting,
+        // and the server's slot must not sit idle through that wait.
         drop(stream);
+        drop(slot.take());
 
         match end {
             StreamEnd::Done => break,
+            StreamEnd::Shed => {
+                // Its slot is already given back (and forgotten, as the
+                // budget is lower); the re-request below waits for one
+                // under the new budget and resumes from the bytes on disk.
+                // Not a failure: no budget is spent.
+                output.flush().await?;
+                debug!(
+                    file = %file.name,
+                    bytes_downloaded,
+                    "server's connection budget fell; closing this connection and resuming later"
+                );
+            }
             StreamEnd::Error(m_err) => {
                 // Any error after successful response headers is a
                 // body-phase failure — connection drop, incomplete
@@ -1205,9 +1498,7 @@ pub async fn download_file(
                     return Err(IaError::Network(m_err));
                 }
                 stream_attempt += 1;
-                let backoff = std::time::Duration::from_millis(
-                    500 * 3u64.saturating_pow(stream_attempt as u32 - 1),
-                );
+                let backoff = stream_retry_backoff(stream_attempt);
                 warn!(
                     file = %file.name,
                     attempt = stream_attempt,
@@ -1263,15 +1554,25 @@ pub async fn download_file(
             }
         }
 
-        // Re-request from the bytes on disk. Shared by the stream-error
-        // and stall paths.
-        let new_resp =
-            fetch_response(client, &url, Some(bytes_downloaded), opts.count_views).await?;
+        // Re-request from the bytes on disk. Shared by the stream-error,
+        // stall and shed paths.
+        let (new_resp, new_slot) = fetch_response_via(
+            client.range_http(),
+            client,
+            &url,
+            Some(ByteRange::From(bytes_downloaded)),
+            count_views,
+            Some(opts),
+            None,
+        )
+        .await?;
+        slot = new_slot;
         if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // Close the writer first: the mapping may remove .part.
             drop(output);
             let last_modified = last_modified_of(&new_resp).or(last_modified);
             range_not_satisfiable(new_resp, identifier, file, bytes_downloaded, &part_path).await?;
+            drop(slot.take());
             // The .part is the whole file: the stream ended after its last
             // byte. The hasher already covers every byte written, so
             // finish in place.
@@ -1304,6 +1605,8 @@ pub async fn download_file(
 
     output.flush().await?;
     drop(output);
+    // The body has ended; the slot goes back before the checks and rename.
+    drop(slot.take());
 
     // The stream ended. Refuse to rename a file whose byte count differs
     // from the item metadata. This runs before the md5 comparison because
@@ -1523,11 +1826,14 @@ pub async fn download_item_with_metadata(
     // Concurrent download with shared semaphore
     let mut handles = Vec::new();
 
+    // Requests to either of the item's datanodes count against one budget.
+    let item_opts = opts.for_item(item);
+
     for file in files_owned {
         let client = client.clone();
         let identifier = identifier.to_string();
         let dest_dir = dest_dir.clone();
-        let opts = opts.clone();
+        let opts = item_opts.clone();
         let sem = Arc::clone(&semaphore);
         let progress = progress.clone();
         let disk_full = Arc::clone(&disk_full);
@@ -6417,6 +6723,35 @@ mod tests {
         assert_eq!(parse_content_range_total("bytes 1-2/abc"), None);
         assert_eq!(parse_content_range_total("bytes 1-2/"), None);
         assert_eq!(parse_content_range_total("bytes */*"), None);
+    }
+
+    #[test]
+    fn content_range_span_parses_the_range() {
+        assert_eq!(parse_content_range_span("bytes 13-21/22"), Some((13, 21)));
+        assert_eq!(parse_content_range_span("bytes 13-21/*"), Some((13, 21)));
+        assert_eq!(parse_content_range_span("BYTES 0-0/1"), Some((0, 0)));
+    }
+
+    #[test]
+    fn content_range_span_rejects_the_unsatisfied_form_and_garbage() {
+        assert_eq!(parse_content_range_span("bytes */22"), None);
+        assert_eq!(parse_content_range_span("items 1-2/3"), None);
+        assert_eq!(parse_content_range_span("bytes 21-13/22"), None);
+        assert_eq!(parse_content_range_span("bytes 1-x/22"), None);
+        assert_eq!(parse_content_range_span(""), None);
+    }
+
+    #[test]
+    fn stream_retry_backoff_is_half_a_second_tripled() {
+        let waits: Vec<_> = (1..=MAX_STREAM_RETRIES).map(stream_retry_backoff).collect();
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1500),
+                Duration::from_millis(4500)
+            ]
+        );
     }
 
     #[test]
