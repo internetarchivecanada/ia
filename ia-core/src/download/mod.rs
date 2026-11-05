@@ -242,6 +242,21 @@ impl Default for DownloadOpts {
     }
 }
 
+impl DownloadOpts {
+    /// These options for requests to `item`: when its metadata names both
+    /// of its datanodes (`d1`, `d2`), a request that lands on either takes
+    /// its slot from the pair's one budget of
+    /// [`MAX_CONNECTIONS_PER_SERVER`]. The item functions do this
+    /// themselves; it is for callers that request an item's files by other
+    /// means, such as the zip functions in [`zip`].
+    #[must_use]
+    pub fn for_item(&self, item: &crate::types::ItemMetadata) -> Self {
+        let mut opts = self.clone();
+        opts.datanodes = slots::Datanodes::of(item).map(Arc::new);
+        opts
+    }
+}
+
 /// Progress information for a single file download.
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -1812,8 +1827,7 @@ pub async fn download_item_with_metadata(
     let mut handles = Vec::new();
 
     // Requests to either of the item's datanodes count against one budget.
-    let mut item_opts = opts.clone();
-    item_opts.datanodes = slots::Datanodes::of(item).map(Arc::new);
+    let item_opts = opts.for_item(item);
 
     for file in files_owned {
         let client = client.clone();

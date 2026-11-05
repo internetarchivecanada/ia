@@ -596,3 +596,26 @@ async fn a_429_with_json_gives_one_slow_down_event() {
     );
     assert!(!stderr.contains("asked us to slow down"), "{stderr}");
 }
+
+#[tokio::test]
+async fn zip_members_share_the_six_with_whole_files_across_processes() {
+    let (host, gauge) = holding_server(held).await;
+    let cache = TempDir::new().unwrap();
+    let (item, item_dir) = spawn_ia(&host, "small-item", cache.path(), &["-j", "8"]);
+    let members: Vec<_> = (0..4)
+        .map(|i| {
+            let spec = format!("pages.zip/p{i}.jp2");
+            spawn_ia(&host, "small-item", cache.path(), &["--zip-member", &spec])
+        })
+        .collect();
+    finish(item, LIMIT).await;
+    for (i, (child, dir)) in members.into_iter().enumerate() {
+        finish(child, LIMIT).await;
+        let got = fs::read(dir.path().join(format!("p{i}.jp2"))).unwrap();
+        assert_eq!(got, FILE_BODY, "p{i}.jp2");
+    }
+    assert_item(&item_dir, "small-item");
+    // Without slots for the zip members, up to 10 would be open.
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
+    assert_eq!(gauge.seen(), FILES + 4);
+}

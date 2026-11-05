@@ -21,6 +21,10 @@ struct QaSingleOpts<'a> {
     image_quality: ia_core::ai::image::ImageQuality,
     /// When true, suppress per-item verbose stderr (progress bar mode).
     compact: bool,
+    /// The connection slots page images are downloaded under: one table
+    /// for the run, shared with every other ia process (see
+    /// `ia_core::download::ServerSlots`).
+    download_opts: &'a ia_core::download::DownloadOpts,
 }
 
 /// `--print-prompt` output: mirrors the exact JSON request body sent to the
@@ -848,6 +852,15 @@ async fn run_qa(
     let image_quality = args.image_quality;
     let has_outputs = !args.outputs.is_empty();
 
+    // Page images are downloads like any other: at most 6 connections to an
+    // item's datanodes, across every ia process.
+    let mut download_opts = ia_core::download::DownloadOpts::default();
+    download_opts.server_slots = match ia_core::download::default_slot_dir() {
+        Some(dir) => ia_core::download::ServerSlots::across_processes(dir),
+        None => ia_core::download::ServerSlots::default(),
+    };
+    let download_opts = &download_opts;
+
     // Compact mode: suppress per-item verbose stderr when -o is active
     let compact = has_outputs && !args.json && quiet == 0;
 
@@ -861,6 +874,7 @@ async fn run_qa(
         image_urls: args.image_urls,
         image_quality,
         compact,
+        download_opts,
     };
 
     use futures::StreamExt;
@@ -935,6 +949,7 @@ async fn run_qa(
                 image_urls,
                 image_quality,
                 compact,
+                download_opts,
             };
 
             async move {
@@ -1440,19 +1455,23 @@ async fn run_qa_single(
             .collect();
         ia_core::ai::qa::PageImages::Urls(urls)
     } else {
-        // Download + process each page
+        // Download + process each page, each download holding a slot of the
+        // item's datanode pair.
+        let page_opts = opts.download_opts.for_item(&item);
+        let page_opts = &page_opts;
         let futs: Vec<_> = selected
             .iter()
             .map(|(zip_path, _sd_page)| {
                 let zip_path = zip_path.clone();
                 let zip_filename = zip_filename.clone();
                 async move {
-                    let raw_data = ia_core::ai::zip::download_zip_member_converted(
+                    let raw_data = ia_core::ai::zip::download_zip_member_converted_with(
                         client,
                         identifier,
                         &zip_filename,
                         &zip_path,
                         "jpg",
+                        page_opts,
                     )
                     .await
                     .context(format!("failed to download page image {zip_path}"))?;

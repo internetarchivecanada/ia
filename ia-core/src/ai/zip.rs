@@ -6,7 +6,8 @@
 
 // Re-export the core zip types and functions for convenience.
 pub use crate::download::zip::{
-    download_zip_member, download_zip_member_converted, find_jp2_zip, list_zip_contents, ZipEntry,
+    download_zip_member, download_zip_member_converted, download_zip_member_converted_with,
+    find_jp2_zip, list_zip_contents, ZipEntry,
 };
 
 use crate::ai::ia_config::{PageInfo, PageType};

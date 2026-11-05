@@ -484,41 +484,9 @@ pub async fn run(
         bail!("{msg}");
     }
 
-    // One table of server slots for the whole run, shared by every item,
-    // disk and file, and through slot files in the user's cache directory
-    // with every other ia process, so the cap holds across all of them.
-    let server_slots = match ia_core::download::default_slot_dir() {
-        Some(dir) => ServerSlots::across_processes(dir),
-        None => {
-            tracing::warn!(
-                "no cache directory for the connection slot files (set IA_CACHE_DIR); \
-                 the per-server connection cap holds within this process only"
-            );
-            ServerSlots::default()
-        }
-    };
-    // One line per server per budget drop; with --json, one event.
     let json_mode = args.json;
-    let show_drops = json_mode || quiet < 2;
     let drop_lines = DropLines::default();
-    let server_slots = server_slots.with_notices({
-        let drop_lines = drop_lines.clone();
-        move |drop| {
-            if !show_drops {
-                return;
-            }
-            if json_mode {
-                println!("{}", json_budget_drop(drop));
-            } else {
-                drop_lines.print(format!(
-                    "server {} asked us to slow down; using {} connection{}",
-                    short_server(&drop.server),
-                    drop.after,
-                    if drop.after == 1 { "" } else { "s" }
-                ));
-            }
-        }
-    });
+    let server_slots = run_server_slots(json_mode, quiet, &drop_lines);
     let make_opts = |destdir: PathBuf| {
         let mut o = DownloadOpts::default();
         o.destdir = destdir;
@@ -1274,6 +1242,41 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
     }
 }
 
+/// One table of server slots for the whole run, shared by every item, disk,
+/// file and zip member, and through slot files in the user's cache
+/// directory with every other ia process, so the cap holds across all of
+/// them. It prints one line per server per budget drop through
+/// `drop_lines`; with `json_mode`, one event on stdout.
+fn run_server_slots(json_mode: bool, quiet: u8, drop_lines: &DropLines) -> ServerSlots {
+    let server_slots = match ia_core::download::default_slot_dir() {
+        Some(dir) => ServerSlots::across_processes(dir),
+        None => {
+            tracing::warn!(
+                "no cache directory for the connection slot files (set IA_CACHE_DIR); \
+                 the per-server connection cap holds within this process only"
+            );
+            ServerSlots::default()
+        }
+    };
+    let show_drops = json_mode || quiet < 2;
+    let drop_lines = drop_lines.clone();
+    server_slots.with_notices(move |drop| {
+        if !show_drops {
+            return;
+        }
+        if json_mode {
+            println!("{}", json_budget_drop(drop));
+        } else {
+            drop_lines.print(format!(
+                "server {} asked us to slow down; using {} connection{}",
+                short_server(&drop.server),
+                drop.after,
+                if drop.after == 1 { "" } else { "s" }
+            ));
+        }
+    })
+}
+
 /// A way to print one line on stderr.
 type LinePrinter = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -1528,11 +1531,26 @@ async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()
         .identifier
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("identifier required for zip operations"))?;
+    // A zip listing or member is a download like any other: it holds a slot
+    // of the item's datanode pair, shared with every ia process. Without the
+    // item's metadata the slot is keyed by the host that answers.
+    let zip_opts = || async {
+        let mut opts = DownloadOpts::default();
+        opts.server_slots = run_server_slots(args.json, quiet, &DropLines::default());
+        match client.get_item(identifier).await {
+            Ok(item) => opts.for_item(&item),
+            Err(e) => {
+                tracing::debug!(identifier, error = %e, "no item metadata; slots keyed by host");
+                opts
+            }
+        }
+    };
 
     if let Some(ref zip_filename) = args.zip_list {
         // List contents of a zip file
+        let opts = zip_opts().await;
         let all_entries =
-            ia_core::download::zip::list_zip_contents(client, identifier, zip_filename)
+            ia_core::download::zip::list_zip_contents_with(client, identifier, zip_filename, &opts)
                 .await
                 .context(format!(
                     "failed to list zip {zip_filename} for {identifier}"
@@ -1649,24 +1667,27 @@ async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()
             return Ok(());
         }
 
+        let opts = zip_opts().await;
         let data = if let Some(ref ext) = args.zip_convert {
-            ia_core::download::zip::download_zip_member_converted(
+            ia_core::download::zip::download_zip_member_converted_with(
                 client,
                 identifier,
                 &zip_filename,
                 &member_path,
                 ext,
+                &opts,
             )
             .await
             .context(format!(
                 "failed to download {member_path} as {ext} from {zip_filename}"
             ))?
         } else {
-            ia_core::download::zip::download_zip_member(
+            ia_core::download::zip::download_zip_member_with(
                 client,
                 identifier,
                 &zip_filename,
                 &member_path,
+                &opts,
             )
             .await
             .context(format!(

@@ -4132,6 +4132,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn twelve_zip_members_on_one_pair_open_six_connections_and_keep_none() {
+        let body = body_of(2048);
+        let both = Arc::new(Gauge::default());
+        let nodes = [
+            keep_alive_node(&body, Arc::clone(&both)).await,
+            keep_alive_node(&body, Arc::clone(&both)).await,
+        ];
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let to = nodes.clone();
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let node = to[turn.fetch_add(1, Ordering::SeqCst) % 2].clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://{node}{}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n",
+                            conn.path
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            })
+        });
+        let (front, _) = spawn_raw(&body, handler).await;
+        let item: crate::types::ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "zip-item"},
+            "files": [],
+            "d1": nodes[0],
+            "d2": nodes[1],
+        }))
+        .unwrap();
+        let o = DownloadOpts::default().for_item(&item);
+
+        let members = (0..12).map(|i| {
+            let (front, o) = (&front, &o);
+            async move {
+                super::super::zip::download_zip_member_with(
+                    front,
+                    "zip-item",
+                    "pages.zip",
+                    &format!("p{i}.jp2"),
+                    o,
+                )
+                .await
+            }
+        });
+        let got = futures::future::try_join_all(members).await.unwrap();
+
+        assert!(got.iter().all(|b| *b == body));
+        // Like any download: six at once on the pair, each on its own TCP
+        // connection, and none kept open afterwards.
+        assert_eq!(both.most(), 6, "TCP connections open on the pair at once");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while both.open.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            both.open.load(Ordering::SeqCst),
+            0,
+            "idle connections kept open"
+        );
+    }
+
+    #[tokio::test]
     async fn every_download_connection_carries_one_request_and_asks_to_close() {
         let _layout = small_layout();
         let big = body_of(12 * PART as usize);
