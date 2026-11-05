@@ -1533,10 +1533,14 @@ async fn run_zip(client: &IaClient, args: &DownloadArgs, quiet: u8) -> Result<()
         .ok_or_else(|| anyhow::anyhow!("identifier required for zip operations"))?;
     // A zip listing or member is a download like any other: it holds a slot
     // of the item's datanode pair, shared with every ia process. Without the
-    // item's metadata the slot is keyed by the host that answers.
+    // item's metadata the slot is keyed by the host that answers; a dry run
+    // fetches no metadata.
     let zip_opts = || async {
         let mut opts = DownloadOpts::default();
         opts.server_slots = run_server_slots(args.json, quiet, &DropLines::default());
+        if args.dry_run {
+            return opts;
+        }
         match client.get_item(identifier).await {
             Ok(item) => opts.for_item(&item),
             Err(e) => {

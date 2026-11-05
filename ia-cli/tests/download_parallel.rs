@@ -599,7 +599,16 @@ async fn a_429_with_json_gives_one_slow_down_event() {
 
 #[tokio::test]
 async fn zip_members_share_the_six_with_whole_files_across_processes() {
-    let (host, gauge) = holding_server(held).await;
+    // Members are held 1 s, files 200 ms: the item's 50 files take about
+    // 2 s at 6 at once, so the four members overlap them.
+    fn zip_held(path: &str, _: usize) -> Reply {
+        if path.contains("/pages.zip/") {
+            Reply::Hold(Duration::from_secs(1))
+        } else {
+            Reply::Hold(Duration::from_millis(200))
+        }
+    }
+    let (host, gauge) = holding_server(zip_held).await;
     let cache = TempDir::new().unwrap();
     let (item, item_dir) = spawn_ia(&host, "small-item", cache.path(), &["-j", "8"]);
     let members: Vec<_> = (0..4)

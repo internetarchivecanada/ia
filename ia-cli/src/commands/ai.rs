@@ -1224,9 +1224,14 @@ async fn run_qa_single(
     let zip_filename = ia_core::ai::zip::find_jp2_zip(identifier, &item.files)
         .ok_or_else(|| anyhow::anyhow!("no JP2 zip found for {identifier}"))?;
 
-    let entries = ia_core::ai::zip::list_zip_contents(client, identifier, &zip_filename)
-        .await
-        .context(format!("failed to list zip contents for {identifier}"))?;
+    // The listing, like every page image, holds a slot of the item's
+    // datanode pair while it runs.
+    let page_opts = opts.download_opts.for_item(&item);
+    let page_opts = &page_opts;
+    let entries =
+        ia_core::ai::zip::list_zip_contents_with(client, identifier, &zip_filename, page_opts)
+            .await
+            .context(format!("failed to list zip contents for {identifier}"))?;
 
     let zip_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
 
@@ -1457,8 +1462,6 @@ async fn run_qa_single(
     } else {
         // Download + process each page, each download holding a slot of the
         // item's datanode pair.
-        let page_opts = opts.download_opts.for_item(&item);
-        let page_opts = &page_opts;
         let futs: Vec<_> = selected
             .iter()
             .map(|(zip_path, _sd_page)| {
