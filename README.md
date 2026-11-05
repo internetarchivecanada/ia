@@ -47,7 +47,7 @@ The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install
 
 | Command | What it does |
 |---|---|
-| `download` | Concurrent downloads that resume a partial file from where it stopped, large files over parallel `Range` requests (`--connections-per-file`), at most 6 connections to any one server, md5 verification by default, glob/format filters, multi-disk pool, ZIP-member extraction, TUI dashboard |
+| `download` | Concurrent downloads that resume a partial file from where it stopped, large files over parallel `Range` requests (`--connections-per-file`, at most 6 to one server across all `ia` processes), md5 verification by default, glob/format filters, multi-disk pool, ZIP-member extraction, TUI dashboard |
 | `upload` | Single file or batch from a spreadsheet; multipart by flag, or on its own once a single PUT of a file over 2 MiB dies, resumed on a rerun from the parts already on IA, every part checked by md5 at completion; a joblog skips files already done |
 | `metadata` | Read and write, compound `+` operations in one request, bulk import/export, schema lookup and audit |
 | `search` | Three backends: scrape (cursor), advanced (paged), full-text (scroll) |
@@ -63,7 +63,7 @@ The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install
 
 `--json` works on every command. Output is JSONL, one object per line, with errors as structured JSON on stderr. Exit codes are meaningful.
 
-`--dry-run` previews any write. `--joblog <file>` records each operation, and re-running the same command skips what the log records as done. `-j N` sets the concurrency (default 8; `ia metadata export` adapts to the server when it is omitted; `ia download` also opens at most `--max-connections-per-server`, default 6, connections to one server).
+`--dry-run` previews any write. `--joblog <file>` records each operation, and re-running the same command skips what the log records as done. `-j N` sets the concurrency (default 8; `ia metadata export` adapts to the server when it is omitted).
 
 Flags and their behavior are documented in `--help` at every level, so there is no need to read these docs to drive the tool.
 

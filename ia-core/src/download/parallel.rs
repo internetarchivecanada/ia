@@ -3260,7 +3260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_servers_with_a_cap_of_six_reach_six_each_or_six_in_all() {
+    async fn two_servers_with_a_cap_of_six_reach_six_each_and_twelve_in_all() {
         let _layout = small_layout();
         let body = body_of(12 * PART as usize);
         let all = Arc::new(Gauge::default());
@@ -3281,12 +3281,8 @@ mod tests {
 
         assert_finished(dir_a.path(), &body);
         assert_finished(dir_b.path(), &body);
-        if crate::download::slots::ONE_POOL_FOR_ALL_SERVERS {
-            assert_eq!(all.most(), 6);
-        } else {
-            assert_eq!((gauge_a.most(), gauge_b.most()), (6, 6));
-            assert_eq!(all.most(), 12);
-        }
+        assert_eq!((gauge_a.most(), gauge_b.most()), (6, 6));
+        assert_eq!(all.most(), 12);
     }
 
     #[tokio::test]

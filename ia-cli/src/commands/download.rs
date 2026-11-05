@@ -40,9 +40,9 @@ use crate::output::DownloadDisplay;
         starts over.\n\n\
         With --connections-per-file above 1, a file of 256 MiB or more is fetched over that many \
         Range requests at once, each on its own connection, with its progress kept in \
-        <name>.part.json so an interrupted download resumes per part. Download connections to one \
-        server are capped by --max-connections-per-server (default 6), counting every job and \
-        every connection per file.",
+        <name>.part.json so an interrupted download resumes per part. Those range connections to \
+        one server are capped by --max-connections-per-server (default 6), across every ia process \
+        on this machine.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Download all files from an item</dim>\n  <bold>$ ia download nasa</bold>\
@@ -196,16 +196,16 @@ pub struct DownloadArgs {
     )]
     connections_per_file: u8,
 
-    /// Open connections to one server at once, counting every job and every connection per file (default 6).
+    /// Range connections (--connections-per-file) open to one server at once, across every ia process on this machine (default 6).
     ///
-    /// A server is the host a download request lands on: the datanode after
-    /// archive.org's /download/ redirect. Every file downloading under -j and
-    /// every connection of a file under --connections-per-file holds a slot
-    /// on its server from its request until its response ends; a request
-    /// that finds its server full waits for a slot. Nothing is refused or
-    /// reduced: -j 8 runs at most 6 files at once on one server, and the
-    /// others start as slots come free. The default follows IA operations'
-    /// request that one client open at most 6 connections to one server.
+    /// A server is the host a range request lands on: the datanode after
+    /// archive.org's /download/ redirect. Each range request holds a slot
+    /// from the moment it is sent until its response ends; one that finds
+    /// its server full waits for a slot, and nothing is refused. Files
+    /// fetched on one stream, as -j downloads them by default, take no slot.
+    /// The slots are shared with every other ia process of this user on this
+    /// machine through slot files in the cache directory (IA_CACHE_DIR to
+    /// choose it); see docs/usage.md, "Connections per server".
     #[arg(
         long,
         value_name = "N",
@@ -533,7 +533,7 @@ pub async fn run(
         Some(dir) => ServerSlots::across_processes(max_per_server, dir),
         None => {
             tracing::warn!(
-                "no cache directory for the connection slot files (set IA_CACHE_DIR, or HOME); \
+                "no cache directory for the connection slot files (set IA_CACHE_DIR); \
                  --max-connections-per-server holds within this process only"
             );
             ServerSlots::new(max_per_server)

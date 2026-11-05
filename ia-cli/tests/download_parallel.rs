@@ -146,10 +146,9 @@ fn download_help_describes_both_flags_and_their_defaults() {
         "Connections used for one file of 256 MiB or more, 1 to 8 (default 1). Counts against \
          --max-connections-per-server.",
         "--max-connections-per-server <N>",
-        "Open connections to one server at once, counting every job and every connection per \
-         file (default 6).",
-        "Files downloaded at once, at most N (default 8). Connections to any one server are also \
-         capped by --max-connections-per-server, so jobs on the same server may wait for a slot.",
+        "Range connections (--connections-per-file) open to one server at once, across every ia \
+         process on this machine (default 6).",
+        "IA_CACHE_DIR",
     ] {
         assert!(
             help.split_whitespace()
@@ -222,13 +221,14 @@ async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per
 
 // ─── Files on one stream are not held back by the cap ────────────────────────
 
-/// Open download connections, now and at most, and every download request
-/// seen.
+/// Open download connections, now and at most, every download request seen,
+/// and every metadata request answered.
 #[derive(Default)]
 struct Gauge {
     open: AtomicUsize,
     most: AtomicUsize,
     seen: AtomicUsize,
+    metadata: AtomicUsize,
 }
 
 impl Gauge {
@@ -321,6 +321,7 @@ async fn holding_server(
                         json.len()
                     );
                     let _ = stream.write_all(reply.as_bytes()).await;
+                    gauge.metadata.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
                 gauge.enter();
@@ -497,6 +498,17 @@ async fn a_process_killed_while_holding_the_only_slot_frees_it() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let (second, second_dir) = spawn_ia(&host, "big-b", cache.path(), &args);
+    // Once the second process has its metadata it is about to ask for a
+    // slot; give it two polls of the slot files (500 ms each, at most)
+    // and more, so a check that passed only because it had not started
+    // yet cannot happen.
+    while gauge.metadata.load(Ordering::SeqCst) < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the second process never asked for its metadata"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         gauge.seen.load(Ordering::SeqCst),

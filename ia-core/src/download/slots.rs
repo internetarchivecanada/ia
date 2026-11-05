@@ -3,9 +3,8 @@
 //! IA operations asked for a cap on the connections one client opens for
 //! parallel ranges (`--connections-per-file`). Every range request takes a
 //! slot before it is sent and keeps it until its response is dropped; a
-//! request that finds its pool full waits for a slot. Files fetched on one
-//! stream take no slot. The pool is per server, or one for all servers,
-//! as [`ONE_POOL_FOR_ALL_SERVERS`] says.
+//! request that finds its server full waits for a slot. Files fetched on
+//! one stream take no slot.
 //!
 //! Within a process the slots are a semaphore per server. Across processes
 //! ([`ServerSlots::across_processes`]) each slot is also a file,
@@ -28,26 +27,16 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// client.
 pub const DEFAULT_MAX_CONNECTIONS_PER_SERVER: usize = 6;
 
-/// Whether the cap is one pool shared by every server, a machine-wide
-/// total, instead of one pool per server. The choice between the two is
-/// this line: [`pool_key`] follows it everywhere.
-pub(crate) const ONE_POOL_FOR_ALL_SERVERS: bool = false;
-
-/// The pool a connection to `server` draws its slot from: the server
-/// itself, or the single shared pool (see [`ONE_POOL_FOR_ALL_SERVERS`]).
-fn pool_key(server: &str) -> &str {
-    if ONE_POOL_FOR_ALL_SERVERS {
-        "all-servers"
-    } else {
-        server
-    }
-}
-
 /// The first wait when every slot file is locked by another process.
 const FIRST_POLL: Duration = Duration::from_millis(50);
 
 /// The longest wait between two looks at the slot files.
 const LAST_POLL: Duration = Duration::from_millis(500);
+
+/// How long a request waits on other processes' slot files before one
+/// warning says so, once per server: at the default log level a wait is
+/// otherwise silent, and a suspended `ia` keeps its slots.
+const WAIT_WARNING: Duration = Duration::from_secs(10);
 
 /// A shared table of download slots, `max` per server.
 ///
@@ -81,15 +70,31 @@ struct Table {
     /// Set, with one warning, when the slot files cannot be used; the cap
     /// is then per process for the rest of the run.
     files_failed: AtomicBool,
+    /// The servers a long wait on other processes has been reported for.
+    waits_reported: Mutex<std::collections::HashSet<String>>,
 }
 
 /// A held slot: the in-process permit and, across processes, the locked
-/// slot file. Dropping it gives both back; closing the file releases its
-/// lock.
+/// slot file. Dropping it gives both back.
 #[derive(Debug)]
 pub(crate) struct SlotGuard {
-    _permit: OwnedSemaphorePermit,
-    _file: Option<std::fs::File>,
+    permit: Option<OwnedSemaphorePermit>,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for SlotGuard {
+    /// The file is unlocked and closed before the permit goes back. The
+    /// next task of this process, woken by the permit, then finds the file
+    /// free instead of waiting a poll for it; and on Windows the lock goes
+    /// at once, where closing a handle releases its locks only when the
+    /// system gets to it.
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            // Through the trait, as `try_lock` is (see `try_lock_one`).
+            let _ = fs4::FileExt::unlock(&file);
+        }
+        drop(self.permit.take());
+    }
 }
 
 impl ServerSlots {
@@ -104,6 +109,7 @@ impl ServerSlots {
                 per_server: Mutex::new(HashMap::new()),
                 files: None,
                 files_failed: AtomicBool::new(false),
+                waits_reported: Mutex::default(),
             }),
         }
     }
@@ -128,6 +134,7 @@ impl ServerSlots {
                 per_server: Mutex::new(HashMap::new()),
                 files: Some(dir.into()),
                 files_failed: AtomicBool::new(false),
+                waits_reported: Mutex::default(),
             }),
         }
     }
@@ -141,7 +148,6 @@ impl ServerSlots {
     /// Wait for a slot on `server` and hold it until the guard is dropped.
     /// `None` only if the semaphore was closed, which this code never does.
     pub(crate) async fn acquire(&self, server: &str) -> Option<SlotGuard> {
-        let key = pool_key(server);
         let semaphore = {
             let mut per_server = self
                 .inner
@@ -150,7 +156,7 @@ impl ServerSlots {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
                 per_server
-                    .entry(key.to_string())
+                    .entry(server.to_string())
                     .or_insert_with(|| Arc::new(Semaphore::new(self.inner.max))),
             )
         };
@@ -162,10 +168,10 @@ impl ServerSlots {
             );
         }
         let permit = semaphore.acquire_owned().await.ok()?;
-        let file = self.lock_slot_file(key).await;
+        let file = self.lock_slot_file(server).await;
         Some(SlotGuard {
-            _permit: permit,
-            _file: file,
+            permit: Some(permit),
+            file,
         })
     }
 
@@ -174,17 +180,26 @@ impl ServerSlots {
     /// the cap is per process, or once the files have failed.
     ///
     /// The in-process permit is already held, so this process is under its
-    /// own cap and only other processes can hold its files. The look at the
-    /// files is a handful of non-blocking opens and locks, so it runs on
-    /// the async thread.
+    /// own cap and only other processes can hold its files. Each look at
+    /// the files runs on the blocking pool: on a local disk it is a few
+    /// non-blocking opens and locks, but on NFS each lock is a round trip,
+    /// and a hung mount must not stall the async workers. A look abandoned
+    /// with its request still finishes there, and a file it locked is closed
+    /// with it, which releases the lock.
     async fn lock_slot_file(&self, server: &str) -> Option<std::fs::File> {
         let dir = self.inner.files.as_deref()?;
+        let started = tokio::time::Instant::now();
         let mut wait = FIRST_POLL;
         loop {
             if self.inner.files_failed.load(Ordering::Relaxed) {
                 return None;
             }
-            match try_lock_one(dir, server, self.inner.max) {
+            let look = {
+                let (dir, server, max) = (dir.to_path_buf(), server.to_string(), self.inner.max);
+                tokio::task::spawn_blocking(move || try_lock_one(&dir, &server, max)).await
+            };
+            let look = look.unwrap_or_else(|e| Err((dir.to_path_buf(), std::io::Error::other(e))));
+            match look {
                 Ok(Some(file)) => return Some(file),
                 Ok(None) => {
                     tracing::debug!(
@@ -192,6 +207,13 @@ impl ServerSlots {
                         max = self.inner.max,
                         "every connection slot file is held by another process; waiting"
                     );
+                    if started.elapsed() >= WAIT_WARNING && self.first_long_wait(server) {
+                        tracing::warn!(
+                            "waiting for a connection slot on {server}: all {} are held by \
+                             other ia processes (a suspended one keeps its slots)",
+                            self.inner.max
+                        );
+                    }
                     tokio::time::sleep(wait).await;
                     wait = (wait * 2).min(LAST_POLL);
                 }
@@ -208,6 +230,15 @@ impl ServerSlots {
             }
         }
     }
+
+    /// Whether this is the first long wait reported for `server`.
+    fn first_long_wait(&self, server: &str) -> bool {
+        self.inner
+            .waits_reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server.to_string())
+    }
 }
 
 /// Lock the first free one of the first `max` slot files of `server` under
@@ -223,13 +254,21 @@ fn try_lock_one(
     std::fs::create_dir_all(&server_dir).map_err(|e| (server_dir.clone(), e))?;
     for i in 0..max {
         let path = slot_path(dir, server, i);
-        let file = std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)
-            .map_err(|e| (path.clone(), e))?;
+            .open(&path);
+        let file = match opened {
+            Ok(file) => file,
+            // A slot file another user created (in a shared IA_CACHE_DIR)
+            // may not be writable here; a lock needs only read access.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::File::open(&path).map_err(|_| (path.clone(), e))?
+            }
+            Err(e) => return Err((path, e)),
+        };
         // Called through the trait: from Rust 1.89 `File` has an inherent
         // `try_lock` with another error type, which would win otherwise.
         match fs4::FileExt::try_lock(&file) {
@@ -251,11 +290,20 @@ impl Default for ServerSlots {
 /// `connections` under the per-user cache directory of `ia`. That is
 /// `$IA_CACHE_DIR` when it is set, otherwise `ia` under the platform's cache
 /// directory: `$XDG_CACHE_HOME` or `~/.cache` on Linux and other Unix
-/// systems, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. `None`
-/// when none of them is set.
+/// systems, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. An
+/// empty variable counts as unset, and a relative `IA_CACHE_DIR` is taken
+/// from the current directory, once, so that processes started in
+/// different directories still name the same files. `None` when none of
+/// them is set.
 #[must_use]
 pub fn default_slot_dir() -> Option<PathBuf> {
-    cache_root_from(|name| std::env::var_os(name)).map(|root| root.join("connections"))
+    let root = cache_root_from(|name| std::env::var_os(name))?;
+    let root = if root.is_relative() {
+        std::env::current_dir().ok()?.join(root)
+    } else {
+        root
+    };
+    Some(root.join("connections"))
 }
 
 /// The cache root, reading environment variables through `var`.
@@ -361,18 +409,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_server_has_its_own_slots_unless_one_pool_serves_all() {
+    async fn each_server_has_its_own_slots() {
         let slots = ServerSlots::new(1);
         let _a = free(&slots, "a.example").await.expect("a");
-        let per_server = !ONE_POOL_FOR_ALL_SERVERS;
-        assert_eq!(
+        assert!(
             free(&slots, "b.example").await.is_some(),
-            per_server,
             "b is another server"
         );
-        assert_eq!(
+        assert!(
             free(&slots, "a.example:8080").await.is_some(),
-            per_server,
             "another port is another server"
         );
     }
@@ -439,10 +484,13 @@ mod tests {
             cache_root_from(vars(&[("IA_CACHE_DIR", "/x"), ("HOME", "/h")])),
             Some(PathBuf::from("/x"))
         );
-        assert_ne!(
-            cache_root_from(vars(&[("IA_CACHE_DIR", ""), ("HOME", "/h")])),
-            Some(PathBuf::from(""))
-        );
+        let unset = cache_root_from(vars(&[("IA_CACHE_DIR", ""), ("HOME", "/h")]));
+        #[cfg(target_os = "macos")]
+        assert_eq!(unset, Some(PathBuf::from("/h/Library/Caches/ia")));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(unset, Some(PathBuf::from("/h/.cache/ia")));
+        #[cfg(windows)]
+        assert_eq!(unset, None);
         assert_eq!(cache_root_from(vars(&[])), None);
     }
 
@@ -506,12 +554,10 @@ mod tests {
                 .is_some(),
             "b never took the slot a gave back"
         );
-        if !ONE_POOL_FOR_ALL_SERVERS {
-            assert!(
-                free(&b, "t.example").await.is_some(),
-                "another server has its own files"
-            );
-        }
+        assert!(
+            free(&b, "t.example").await.is_some(),
+            "another server has its own files"
+        );
     }
 
     #[tokio::test]
@@ -528,12 +574,11 @@ mod tests {
                 .is_none(),
             "large holds 3 together with small"
         );
-        let names: Vec<String> =
-            std::fs::read_dir(dir.path().join(server_dir_name(pool_key("s.example"))))
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir.path().join(server_dir_name("s.example")))
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
-        let mut names = names;
         names.sort();
         assert_eq!(names, vec!["slot-0", "slot-1", "slot-2"]);
     }
@@ -543,7 +588,7 @@ mod tests {
         use fs4::{FileExt, TryLockError};
         let dir = tempfile::tempdir().unwrap();
         let slots = ServerSlots::across_processes(1, dir.path());
-        let path = slot_path(dir.path(), pool_key("s.example"), 0);
+        let path = slot_path(dir.path(), "s.example", 0);
 
         let held = free(&slots, "s.example").await.expect("slot");
         let probe = std::fs::File::open(&path).unwrap();
@@ -558,6 +603,26 @@ mod tests {
         );
         FileExt::unlock(&probe).unwrap();
         assert!(path.exists(), "slot files are never removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slot_file_this_user_may_not_write_is_locked_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = slot_path(dir.path(), "s.example", 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let slots = ServerSlots::across_processes(1, dir.path());
+
+        let held = free(&slots, "s.example").await.expect("a slot");
+
+        assert!(
+            !slots.inner.files_failed.load(Ordering::SeqCst),
+            "the read-only file was given up"
+        );
+        assert!(held.file.is_some(), "no slot file is locked");
     }
 
     #[tokio::test]
@@ -583,15 +648,5 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the files are given up for the rest of the run"
         );
-    }
-
-    #[test]
-    fn the_default_slot_dir_is_connections_under_the_cache_root() {
-        if let (Some(dir), Some(root)) = (
-            default_slot_dir(),
-            cache_root_from(|name| std::env::var_os(name)),
-        ) {
-            assert_eq!(dir, root.join("connections"));
-        }
     }
 }

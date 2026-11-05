@@ -49,7 +49,7 @@ ia download [IDENTIFIER] [FILES]... [OPTIONS]
 | `-R, --retries <N>` | Max retries per file, or per stream of a file fetched over parallel ranges, and the number of stalls allowed (default: 5; see "Retries") |
 | `--min-speed <RATE>` | Abandon and resume a stream averaging below RATE over the last 60 s, after a 30 s grace (default: `10K`; `0` disables) |
 | `--connections-per-file <N>` | Connections used for one file of 256 MiB or more, 1 to 8 (default: 1, one stream); counts against `--max-connections-per-server` (see "Large files over parallel ranges") |
-| `--max-connections-per-server <N>` | Open connections to one server at once, counting every job and every connection per file (default: 6; see "Connections per server") |
+| `--max-connections-per-server <N>` | Range connections (`--connections-per-file`) open to one server at once, across every `ia` process on this machine (default: 6; see "Connections per server") |
 | `--no-timestamps` | Don't set file modification times |
 | `--dry-run` | Show what would be downloaded without downloading |
 | `--count-views` | Increment archive.org's public view counter (off by default) |
@@ -109,18 +109,19 @@ ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --conn
 
 #### Connections per server
 
-`ia download` opens at most `--max-connections-per-server` connections (default 6) to any one server at once, as IA operations asked of each client. The cap holds across every `ia` process you run on the machine at the same time, not only within one (see below). Every file downloading under `-j, --jobs` (default 8) and every connection of a file under `--connections-per-file` counts. The server is the one a request lands on: the datanode after archive.org's `/download/` redirect. The redirect itself is a short request to archive.org, which is a server too, so at most 6 such redirects run at once. A request holds its slot from the moment it is sent until its response has been read or abandoned (a request that waits before trying again gives its slot back while it waits), and a request that finds its server full waits for a slot; nothing is refused or cut short. So `-j 8` runs at most 6 files at once from one datanode; the other two keep their place among the 8 and start as slots come free, even if files on other datanodes are waiting for a place. `--connections-per-file 8` with the default cap runs one file at 6 connections. `--max-connections-per-server 1` fetches one thing at a time from each server. Other commands, and `--zip-list` and `--zip-member`, are not counted.
+The range connections of `--connections-per-file` are capped at `--max-connections-per-server` (default 6) open to any one server at once, counted across every `ia` process you run on this machine. Files fetched on one stream, which is how `-j, --jobs` downloads them by default, take no slot and are never held back. The server is the one a range request lands on: the datanode after archive.org's `/download/` redirect, whose own short request takes a slot on archive.org while it runs. A range request holds its slot from the moment it is sent until its response has been read or abandoned (a stream that waits before trying again gives its slot back while it waits); one that finds its server full waits for a slot, and nothing is refused. So `--connections-per-file 8` with the default cap runs one file at 6 connections, and two `ia` processes each fetching a large file from the same datanode share those 6.
 
 ```bash
-# Open at most 2 connections to any one server
-ia download nasa --max-connections-per-server 2
+# At most 2 range connections to any one server
+ia download ubuntu-18.04.5-desktop-amd64 ubuntu-18.04.5-desktop-amd64.iso --connections-per-file 4 --max-connections-per-server 2
 ```
 
-Several `ia` processes share the cap through slot files: for each server, `--max-connections-per-server` empty files named `slot-0`, `slot-1`, and so on, in `connections/<server>/` under the cache directory, which is `$IA_CACHE_DIR` when it is set and otherwise `ia` under the per-user cache directory (`$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows). A connection holds one file locked (`flock` on Unix, `LockFileEx` on Windows) for as long as it holds its slot; the operating system releases the lock when the connection ends or the process exits, even if it is killed, so nothing needs cleaning up. A process that finds all of its slot files locked by other processes looks again after 50 ms, then less often, up to every 500 ms. The files are created when first needed and never removed; deleting the directory while no `ia` is running is harmless.
+Processes share the cap through slot files: `slot-0`, `slot-1`, and so on, in `connections/<server>/` under the cache directory. That is `$IA_CACHE_DIR` when it is set (a relative path is taken from the directory `ia` starts in; an empty value counts as unset), and otherwise `ia` under the per-user cache directory: `$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. A range connection holds one file locked (`flock` on Unix, `LockFileEx` on Windows) for as long as it holds its slot; the lock is released when the connection ends, and by the operating system when the process exits, even if it is killed, so nothing needs cleaning up. The files are created as they are first needed, so a server has as many as were ever held at once (at most the largest cap used), and they are never removed; deleting the directory while no `ia` is running is harmless. Keep the directory private: anyone who can write to it can hold the slots.
 
-- Processes with different caps share the files, and each uses only its own first N, where N is its cap. A smaller cap therefore limits the process that set it, not the others: with one process at `--max-connections-per-server 6` and another at 2, the first may still open 6.
-- Only `ia` processes that use the slot files count. Other programs, older versions of `ia`, and other users (each user has their own cache directory) are not seen.
-- If the slot files cannot be used, `ia` prints one warning naming the path, `cannot use the connection slot files at <path>: <error>; --max-connections-per-server holds within this process only`, and carries on with the cap applied within the process. That happens on a read-only file system, or a home directory on NFS without lock support; setting `IA_CACHE_DIR` to a directory on a local disk avoids it. A download never fails because of the slot files.
+- **Waiting on other processes.** A process that finds every one of its slot files locked by other processes looks again after 50 ms, then less often, up to every 500 ms. Within a process a freed slot goes straight to that process's next waiting stream, so a second process may wait until the first has no more range connections queued for that server. After 10 s of such waiting it prints `waiting for a connection slot on <server>: all N are held by other ia processes (a suspended one keeps its slots)` once for that server. A process suspended with Ctrl-Z keeps its slots until it resumes or ends.
+- **Different caps.** Processes with different caps share the files, and each uses only its own first N, where N is its cap. A smaller cap limits the process that set it, not the others: with one process at `--max-connections-per-server 6` and another at 2, the first may still open 6.
+- **What is seen.** Only `ia` processes that use the slot files count. Other programs, older versions of `ia`, and other users (each user has their own cache directory) are not seen. On a home directory on NFS whose locks work, every machine using that home shares one cap; set `IA_CACHE_DIR` to a local disk to keep it per machine.
+- **When the files cannot be used.** `ia` prints one warning naming the path, `cannot use the connection slot files at <path>: <error>; --max-connections-per-server holds within this process only`, and carries on with the cap applied within the process for the rest of the run. That happens on a read-only file system, on NFS without lock support, or when the process runs out of file handles (each held slot keeps one file open). Setting `IA_CACHE_DIR` to a directory on a local disk avoids the first two. A download never fails because of the slot files.
 
 #### Verification
 
@@ -159,7 +160,7 @@ ia download nasa --source original --format "MPEG4"
 # Download several items (one identifier per line on stdin)
 printf 'item1\nitem2\nitem3\n' | ia download
 
-# Batch download from a search query, 16 files at once (still at most 6 per server)
+# Batch download from a search query with 16 parallel downloads
 ia download --search "collection:nasa AND mediatype:image" --jobs 16
 
 # Batch download from a file of identifiers
@@ -1296,7 +1297,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10). For `ia download`, files downloaded at once; connections to any one server are also capped by `--max-connections-per-server`, so jobs on the same server may wait for a slot |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
