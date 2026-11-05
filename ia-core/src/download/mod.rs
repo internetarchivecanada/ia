@@ -483,6 +483,7 @@ pub(crate) async fn fetch_response(
         resume_from.map(ByteRange::From),
         count_views,
         None,
+        None,
     )
     .await
     .map(|(response, _slot)| response)
@@ -509,6 +510,7 @@ pub(crate) async fn fetch_response_via(
     range: Option<ByteRange>,
     count_views: bool,
     download: Option<&DownloadOpts>,
+    mut starting: Option<slots::Starting>,
 ) -> Result<(reqwest::Response, Slot)> {
     // Build auth header if credentials are available.
     let auth_value = client
@@ -548,6 +550,12 @@ pub(crate) async fn fetch_response_via(
             }
             None => None,
         };
+        let mut slot = slot;
+        // The file's first request, while it holds this slot, is no longer
+        // a file to come on this server (see `ServerSlots::room`).
+        if let (Some(held), Some(s)) = (slot.as_mut(), starting.take()) {
+            held.carry(s);
+        }
         let mut req = http.get(&current_url);
         if download.is_some() {
             // A download's connection lives only as long as its slot: it is
@@ -602,6 +610,7 @@ pub(crate) async fn fetch_response_via(
                     // This hop's answer and its slot go back before the
                     // next hop takes one.
                     drop(r);
+                    starting = slot.as_mut().and_then(slots::SlotGuard::put_down);
                     drop(slot);
                     continue;
                 }
@@ -619,11 +628,13 @@ pub(crate) async fn fetch_response_via(
         break;
     }
 
-    let (response, slot, server) = resp.ok_or_else(|| IaError::Http {
+    let (response, mut slot, server) = resp.ok_or_else(|| IaError::Http {
         status: 0,
         message: "too many redirects".to_string(),
         retry_after: None,
     })?;
+    // Answered: the file is no longer about to start.
+    drop(slot.as_mut().and_then(slots::SlotGuard::put_down));
 
     let status = response.status();
     // A 416 answers the Range header we sent: the resume offset is at or
@@ -1196,9 +1207,10 @@ pub async fn download_file(
         resume_from.map(ByteRange::From),
         count_views,
         Some(opts),
+        // Carried with the request's slot until it is answered.
+        starting.take(),
     )
     .await;
-    drop(starting);
     let (response, mut slot) = first?;
     // A 416 only comes back when a Range header was sent, so the resume
     // offset is always present alongside it.
@@ -1332,9 +1344,22 @@ pub async fn download_file(
         Error(reqwest_middleware::Error),
         /// The stall detector judged the stream too slow.
         Stalled { observed: u64, window_secs: u64 },
+        /// The server's budget fell below the connections in use, and the
+        /// range streams of split files have had their turn to stop (see
+        /// `SlotGuard::take_whole_file_shed`).
+        Shed,
     }
 
     loop {
+        // Only a connection the server would resume with Range can be
+        // given back under a drop and picked up again; one that ignores
+        // Range runs to its end.
+        let sheddable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            || response
+                .headers()
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("bytes"));
         let mut stream = response.bytes_stream();
         // Every stream is judged on its own clock: a re-request is a new
         // connection, possibly to a different backend, and gets the full
@@ -1405,7 +1430,7 @@ pub async fn download_file(
                     }
                     None => break StreamEnd::Done,
                 },
-                _ = ticker.tick(), if detector.is_some() => {
+                _ = ticker.tick() => {
                     if let Some(d) = detector.as_mut() {
                         if let Some(observed) = d.check(tokio::time::Instant::now()) {
                             break StreamEnd::Stalled {
@@ -1413,6 +1438,11 @@ pub async fn download_file(
                                 window_secs: d.window_secs(),
                             };
                         }
+                    }
+                    if sheddable
+                        && slot.as_ref().is_some_and(slots::SlotGuard::take_whole_file_shed)
+                    {
+                        break StreamEnd::Shed;
                     }
                 }
             }
@@ -1425,6 +1455,18 @@ pub async fn download_file(
 
         match end {
             StreamEnd::Done => break,
+            StreamEnd::Shed => {
+                // Its slot is already given back (and forgotten, as the
+                // budget is lower); the re-request below waits for one
+                // under the new budget and resumes from the bytes on disk.
+                // Not a failure: no budget is spent.
+                output.flush().await?;
+                debug!(
+                    file = %file.name,
+                    bytes_downloaded,
+                    "server's connection budget fell; closing this connection and resuming later"
+                );
+            }
             StreamEnd::Error(m_err) => {
                 // Any error after successful response headers is a
                 // body-phase failure — connection drop, incomplete
@@ -1494,8 +1536,8 @@ pub async fn download_file(
             }
         }
 
-        // Re-request from the bytes on disk. Shared by the stream-error
-        // and stall paths.
+        // Re-request from the bytes on disk. Shared by the stream-error,
+        // stall and shed paths.
         let (new_resp, new_slot) = fetch_response_via(
             client.range_http(),
             client,
@@ -1503,6 +1545,7 @@ pub async fn download_file(
             Some(ByteRange::From(bytes_downloaded)),
             count_views,
             Some(opts),
+            None,
         )
         .await?;
         slot = new_slot;

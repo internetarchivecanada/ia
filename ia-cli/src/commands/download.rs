@@ -499,20 +499,24 @@ pub async fn run(
     };
     // One line per server per budget drop; with --json, one event.
     let json_mode = args.json;
-    let show_drops = !args.dashboard && (json_mode || quiet < 2);
-    let server_slots = server_slots.with_notices(move |drop| {
-        if !show_drops {
-            return;
-        }
-        if json_mode {
-            println!("{}", json_budget_drop(drop));
-        } else {
-            eprintln!(
-                "server {} asked us to slow down; using {} connection{}",
-                short_server(&drop.server),
-                drop.after,
-                if drop.after == 1 { "" } else { "s" }
-            );
+    let show_drops = json_mode || quiet < 2;
+    let drop_lines = DropLines::default();
+    let server_slots = server_slots.with_notices({
+        let drop_lines = drop_lines.clone();
+        move |drop| {
+            if !show_drops {
+                return;
+            }
+            if json_mode {
+                println!("{}", json_budget_drop(drop));
+            } else {
+                drop_lines.print(format!(
+                    "server {} asked us to slow down; using {} connection{}",
+                    short_server(&drop.server),
+                    drop.after,
+                    if drop.after == 1 { "" } else { "s" }
+                ));
+            }
         }
     });
     let make_opts = |destdir: PathBuf| {
@@ -562,6 +566,7 @@ pub async fn run(
             let batch_display = if !json_mode && quiet == 0 {
                 let bd = Arc::new(crate::output::BatchDisplay::new(header_total));
                 bd.set_joblog_path(joblog_path.clone());
+                drop_lines.through_batch(&bd);
                 Some(bd)
             } else {
                 None
@@ -673,8 +678,12 @@ pub async fn run(
     // Dashboard mode
     #[cfg(feature = "tui")]
     if args.dashboard {
-        return crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore), jobs)
-            .await;
+        // The dashboard holds the terminal; its slow-down lines come after.
+        drop_lines.keep();
+        let run =
+            crate::tui::run_tui(client, &identifiers, &opts, Arc::clone(&semaphore), jobs).await;
+        drop_lines.release();
+        return run;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -697,7 +706,9 @@ pub async fn run(
         };
 
         let display = if !args.json && quiet == 0 {
-            Some(Arc::new(DownloadDisplay::new(identifier)))
+            let d = Arc::new(DownloadDisplay::new(identifier));
+            drop_lines.through_item(&d);
+            Some(d)
         } else {
             None
         };
@@ -771,6 +782,7 @@ pub async fn run(
     let batch_display = if !json_mode && quiet == 0 {
         let bd = Arc::new(crate::output::BatchDisplay::new(items_total));
         bd.set_joblog_path(joblog_path.clone());
+        drop_lines.through_batch(&bd);
         Some(bd)
     } else {
         None
@@ -1264,6 +1276,76 @@ fn write_item_results(jl: &JoblogWriter, identifier: &str, results: &[FileDownlo
 
 /// The JSON event for a server's connection budget dropping after it
 /// answered 429 or a 5xx.
+/// A way to print one line on stderr.
+type LinePrinter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Where the slow-down lines go: straight to stderr; through the progress
+/// display that holds the terminal, so its next redraw does not cover them;
+/// or, while the dashboard holds the terminal, kept until it closes.
+#[derive(Clone, Default)]
+struct DropLines {
+    printer: Arc<std::sync::Mutex<Option<LinePrinter>>>,
+    kept: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+}
+
+impl DropLines {
+    fn print(&self, line: String) {
+        if let Ok(mut kept) = self.kept.lock() {
+            if let Some(kept) = kept.as_mut() {
+                kept.push(line);
+                return;
+            }
+        }
+        let printer = self.printer.lock().ok().and_then(|p| p.clone());
+        match printer {
+            Some(print) => print(&line),
+            None => eprintln!("{line}"),
+        }
+    }
+
+    /// Print through `printer` from now on.
+    fn through(&self, printer: LinePrinter) {
+        if let Ok(mut current) = self.printer.lock() {
+            *current = Some(printer);
+        }
+    }
+
+    /// Print through a batch display while it lives.
+    fn through_batch(&self, display: &Arc<crate::output::BatchDisplay>) {
+        let display = Arc::downgrade(display);
+        self.through(Arc::new(move |line| match display.upgrade() {
+            Some(d) => d.print_line(line),
+            None => eprintln!("{line}"),
+        }));
+    }
+
+    /// Print through a single item's display while it lives.
+    fn through_item(&self, display: &Arc<DownloadDisplay>) {
+        let display = Arc::downgrade(display);
+        self.through(Arc::new(move |line| match display.upgrade() {
+            Some(d) => d.print_line(line),
+            None => eprintln!("{line}"),
+        }));
+    }
+
+    /// Keep the lines instead of printing them, until [`Self::release`].
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    fn keep(&self) {
+        if let Ok(mut kept) = self.kept.lock() {
+            *kept = Some(Vec::new());
+        }
+    }
+
+    /// Print the kept lines and print the next ones at once.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    fn release(&self) {
+        let kept = self.kept.lock().ok().and_then(|mut k| k.take());
+        for line in kept.into_iter().flatten() {
+            eprintln!("{line}");
+        }
+    }
+}
+
 fn json_budget_drop(drop: &BudgetDrop) -> serde_json::Value {
     serde_json::json!({
         "event": "slow_down",

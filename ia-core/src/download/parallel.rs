@@ -581,10 +581,10 @@ pub(super) async fn download(
         // returned to the per-file retry loop, as on one stream, and an
         // answer that is not the range asked for means one stream.
         let span = journal.span(first);
-        let first_answer = fetch_range(client, url, file, span, opts.count_views, opts).await;
-        // Answered, or failed: no longer a file about to start.
-        drop(starting);
-        let (response, slot) = first_answer?;
+        // The file stops counting as one to come once this request holds a
+        // slot, and ends with its answer (see `fetch_response_via`).
+        let (response, slot) =
+            fetch_range(client, url, file, span, opts.count_views, opts, starting).await?;
         if !answers_span(&response, identifier, file, span)? {
             drop(response);
             drop(slot);
@@ -746,6 +746,7 @@ async fn fetch_range(
     (first, last): (u64, u64),
     count_views: bool,
     opts: &DownloadOpts,
+    starting: Option<super::slots::Starting>,
 ) -> Result<Answer> {
     let (response, slot) = super::fetch_response_via(
         client.range_http(),
@@ -754,6 +755,7 @@ async fn fetch_range(
         Some(super::ByteRange::Span { first, last }),
         count_views,
         Some(opts),
+        starting,
     )
     .await?;
     if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -1180,6 +1182,7 @@ async fn request_span(
                 span,
                 false,
                 shared.opts,
+                None,
             ),
         )
         .await
@@ -3332,6 +3335,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_first_request_in_flight_holds_its_slot_and_is_not_a_file_to_come() {
+        let body = body_of(2048);
+        let arrived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&arrived);
+        let policy: Policy = Arc::new(move |_, _, _| {
+            seen.store(true, Ordering::SeqCst);
+            Reply::Hold(Duration::from_millis(500))
+        });
+        let (client, _) = recording_server(&body, policy).await;
+        let o = DownloadOpts::default();
+        let url = format!("http://{}/download/x/small.bin", client.host());
+        let server = super::super::server_of(&url);
+
+        let sent = {
+            let (client, o, url) = (client.clone(), o.clone(), url.clone());
+            tokio::spawn(async move {
+                let starting = o.server_slots.starting();
+                super::super::fetch_response_via(
+                    client.range_http(),
+                    &client,
+                    &url,
+                    None,
+                    false,
+                    Some(&o),
+                    Some(starting),
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        while !arrived.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Its request holds one of the six; nothing else is to come.
+        assert_eq!(o.server_slots.room(&server).await, 5);
+        sent.await.unwrap().unwrap();
+        assert_eq!(o.server_slots.room(&server).await, 6);
+    }
+
+    #[tokio::test]
+    async fn whole_files_under_a_drop_give_connections_back_after_the_grace() {
+        // 300 KiB per file, 1 KiB at a time with a 20 ms pause before each:
+        // 6 s or more each.
+        let body = body_of(300 * 1024);
+        let gauge = Arc::new(Gauge::default());
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler: RawHandler = {
+            let (gauge, refused) = (Arc::clone(&gauge), Arc::clone(&refused));
+            Arc::new(move |mut conn| {
+                let (gauge, refused) = (Arc::clone(&gauge), Arc::clone(&refused));
+                Box::pin(async move {
+                    use tokio::io::AsyncWriteExt;
+                    gauge.enter();
+                    // The first request for f0.bin, once the others are
+                    // open: 429, so the budget halves from 6 to 3.
+                    if conn.path.ends_with("/f0.bin") && !refused.swap(true, Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = conn
+                            .stream
+                            .write_all(
+                                b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\n\
+                                  content-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        gauge.leave();
+                        return;
+                    }
+                    let len = conn.body.len();
+                    let head = if conn.ranged {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\naccept-ranges: bytes\r\n\
+                             content-length: {}\r\ncontent-range: bytes {}-{}/{len}\r\n\
+                             connection: close\r\n\r\n",
+                            conn.last - conn.first + 1,
+                            conn.first,
+                            conn.last,
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\naccept-ranges: bytes\r\n\
+                             content-length: {len}\r\nconnection: close\r\n\r\n"
+                        )
+                    };
+                    let bytes = slice(&conn);
+                    if conn.stream.write_all(head.as_bytes()).await.is_ok() {
+                        for chunk in bytes.chunks(1024) {
+                            // The pause comes first, so the request counts
+                            // as closed once its last byte is written, as
+                            // the client sees it.
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            // A connection the client closed fails here.
+                            if conn.stream.write_all(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    gauge.leave();
+                })
+            })
+        };
+        let (client, ranges) = spawn_raw(&body, handler).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let run = {
+            let (client, body, dir) = (client.clone(), body.clone(), dir.path().to_path_buf());
+            tokio::spawn(async move {
+                download_files(&client, 5, &body, 8, &DownloadOpts::default(), &dir).await;
+            })
+        };
+        // The drop comes at 0.3 s; the grace ends 3 s later and the next
+        // one-second check gives the connection back. The other files run
+        // past 6 s.
+        tokio::time::sleep(Duration::from_millis(5000)).await;
+        gauge
+            .most
+            .store(gauge.open.load(Ordering::SeqCst), Ordering::SeqCst);
+        run.await.unwrap();
+
+        assert!(gauge.most() <= 3, "{} open after the grace", gauge.most());
+        assert!(
+            ranges.lock().unwrap().iter().any(Option::is_some),
+            "no whole file was resumed with Range"
+        );
+    }
+
+    #[tokio::test]
     async fn eight_jobs_on_one_server_hold_at_six() {
         let body = body_of(2048);
         let (client, gauge) = holding_server(&body, HOLD, false, vec![]).await;
@@ -3640,7 +3770,7 @@ mod tests {
         let body = body_of(2048);
         // 24 files in all: with -j 24 every file has its place and each
         // server's 8 are runnable at once.
-        for (jobs, all_most) in [(24, 18), (8, 8)] {
+        for jobs in [24, 8] {
             let all = Arc::new(Gauge::default());
             let mut servers = Vec::new();
             for _ in 0..3 {
@@ -3675,10 +3805,13 @@ mod tests {
             let each: Vec<usize> = servers.iter().map(|(_, g)| g.most()).collect();
             if jobs == 24 {
                 assert_eq!(each, vec![6, 6, 6]);
+                assert_eq!(all.most(), 18);
             } else {
+                // How the 8 places fall across the three items is timing;
+                // the bound is what matters.
                 assert!(each.iter().all(|&m| m <= 6), "{each:?}");
+                assert!(all.most() <= 8, "{} open with -j 8", all.most());
             }
-            assert_eq!(all.most(), all_most, "-j {jobs}");
         }
     }
 

@@ -30,6 +30,11 @@ use tokio::time::Instant;
 /// 2026-11-05.
 pub const MAX_CONNECTIONS_PER_SERVER: usize = 6;
 
+/// How long the budget of a server must have been below its slots in use
+/// before whole-file connections are asked to stop: three of the range
+/// streams' one-second checks, so byte-range splits are dropped first.
+pub(crate) const WHOLE_FILE_SHED_GRACE: Duration = Duration::from_secs(3);
+
 /// How long a server must answer without a 429 or 5xx before its budget
 /// grows back by one.
 const GROWTH_INTERVAL: Duration = Duration::from_secs(60);
@@ -139,6 +144,14 @@ struct NodeState {
     /// Range streams asked to stop because the budget fell below the slots
     /// in use.
     shed: usize,
+    /// When the budget last fell below the slots in use: whole-file
+    /// connections are asked to stop only [`WHOLE_FILE_SHED_GRACE`] after
+    /// it, so range streams go first.
+    shed_since: Instant,
+    /// Files about to start (see [`ServerSlots::starting`]) whose first
+    /// request holds a slot here: they are already out of the free
+    /// permits, so [`ServerSlots::room`] does not count them again.
+    starting_held: usize,
 }
 
 impl Node {
@@ -198,6 +211,8 @@ pub(crate) struct SlotGuard {
     epoch: u64,
     permit: Option<OwnedSemaphorePermit>,
     file: Option<std::fs::File>,
+    /// The file about to start whose first request this slot carries.
+    starting: Option<Starting>,
 }
 
 impl SlotGuard {
@@ -206,12 +221,48 @@ impl SlotGuard {
         &self.server
     }
 
+    /// Carry the first request of a file about to start: until the slot is
+    /// dropped or [`Self::put_down`] is called, the file counts as holding
+    /// its slot on this server and not as one still to come.
+    pub(crate) fn carry(&mut self, starting: Starting) {
+        self.node.state().starting_held += 1;
+        if let Some(old) = self.starting.replace(starting) {
+            // Never two on one slot; the older one ends here.
+            self.node.state().starting_held -= 1;
+            drop(old);
+        }
+    }
+
+    /// Stop carrying a file about to start, giving it back: on a redirect,
+    /// before this slot goes, it is again a file with no slot; once its
+    /// request is answered, the caller drops it.
+    pub(crate) fn put_down(&mut self) -> Option<Starting> {
+        let starting = self.starting.take()?;
+        let mut state = self.node.state();
+        state.starting_held = state.starting_held.saturating_sub(1);
+        Some(starting)
+    }
+
     /// Whether the stream holding this slot should stop now, because the
     /// server's budget fell below the slots in use. Counts the stop: it
     /// answers `true` to as many callers as there are slots too many.
     pub(crate) fn take_shed(&self) -> bool {
         let mut state = self.node.state();
         if state.shed > 0 {
+            state.shed -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// [`Self::take_shed`] for a whole-file connection: only once the
+    /// budget has been below the slots in use for
+    /// [`WHOLE_FILE_SHED_GRACE`], time for the range streams of split files,
+    /// which check every second, to stop first.
+    pub(crate) fn take_whole_file_shed(&self) -> bool {
+        let mut state = self.node.state();
+        if state.shed > 0 && state.shed_since.elapsed() >= WHOLE_FILE_SHED_GRACE {
             state.shed -= 1;
             true
         } else {
@@ -234,6 +285,11 @@ impl Drop for SlotGuard {
         }
         let mut state = self.node.state();
         state.in_use = state.in_use.saturating_sub(1);
+        if self.starting.is_some() {
+            // The `Starting` itself goes with the guard's fields, after
+            // this: answered or failed, it is no longer about to start.
+            state.starting_held = state.starting_held.saturating_sub(1);
+        }
         if let Some(permit) = self.permit.take() {
             if state.owed > 0 {
                 state.owed -= 1;
@@ -344,6 +400,8 @@ impl ServerSlots {
                     epoch: 0,
                     calm_since: Instant::now(),
                     shed: 0,
+                    shed_since: Instant::now(),
+                    starting_held: 0,
                 }),
             })
         }))
@@ -380,7 +438,8 @@ impl ServerSlots {
     }
 
     /// The slots free on `server` now, after one for every file about to
-    /// start: free means a permit of this process's live budget is
+    /// start that holds no slot here yet (one whose first request holds a
+    /// slot here is already out of the free ones): free means a permit of this process's live budget is
     /// available and, across processes, one of the slot files is unlocked
     /// (counted without taking it). How many extra range streams a file
     /// starting now may run.
@@ -398,7 +457,13 @@ impl ServerSlots {
                 }
             }
         }
-        free.saturating_sub(self.inner.starting.load(Ordering::Relaxed))
+        let held_here = node.state().starting_held;
+        let to_come = self
+            .inner
+            .starting
+            .load(Ordering::Relaxed)
+            .saturating_sub(held_here);
+        free.saturating_sub(to_come)
     }
 
     /// Wait for a slot on `server` and hold it until the guard is dropped.
@@ -427,21 +492,22 @@ impl ServerSlots {
                 None => break acquire.await.ok()?,
             }
         };
-        let epoch = {
-            let mut state = node.state();
-            state.in_use += 1;
-            state.epoch
-        };
+        node.state().in_use += 1;
         // From here the guard owns the permit, so an early return gives it
         // back.
         let mut guard = SlotGuard {
             server: server.to_string(),
             node,
-            epoch,
+            epoch: 0,
             permit: Some(permit),
             file: None,
+            starting: None,
         };
         guard.file = self.lock_slot_file(server).await;
+        // The round is read once the slot is held, after any wait on other
+        // processes' slot files: a drop during that wait came before this
+        // request was sent, so a 429 to it is part of a new round.
+        guard.epoch = guard.node.state().epoch;
         Some(guard)
     }
 
@@ -476,6 +542,7 @@ impl ServerSlots {
             let forgotten = guard.node.semaphore.forget_permits(lower);
             state.owed += lower - forgotten;
             state.shed = state.in_use.saturating_sub(after);
+            state.shed_since = Instant::now();
             BudgetDrop {
                 server: host.to_string(),
                 status,
@@ -859,13 +926,26 @@ mod tests {
         assert!(!held[0].take_shed(), "no more than that");
 
         // Slots given back lower the count still to stop.
-        let held2 = take(&ServerSlots::default(), 0).await;
-        drop(held2);
         let slots = ServerSlots::default();
         let mut held = take(&slots, 6).await;
         slots.report(&held[0], S, 503);
         held.truncate(4); // two whole files ended
         assert_eq!(held.iter().filter(|g| g.take_shed()).count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn whole_file_connections_are_asked_to_stop_only_after_the_grace() {
+        let slots = ServerSlots::default();
+        let held = take(&slots, 6).await;
+        slots.report(&held[0], S, 503);
+        assert!(!held[0].take_whole_file_shed(), "range streams go first");
+        tokio::time::advance(WHOLE_FILE_SHED_GRACE - Duration::from_millis(1)).await;
+        assert!(!held[0].take_whole_file_shed());
+        // One range stream stopped meanwhile.
+        assert!(held[1].take_shed());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let asked = held.iter().filter(|g| g.take_whole_file_shed()).count();
+        assert_eq!(asked, 2, "the rest of the 3 over the budget");
     }
 
     #[tokio::test(start_paused = true)]
@@ -902,6 +982,7 @@ mod tests {
             epoch: 0,
             permit: None,
             file: None,
+            starting: None,
         };
         slots.report(&stale, S, 503);
         tokio::time::advance(GROWTH_INTERVAL / 2 + Duration::from_secs(1)).await;
@@ -915,8 +996,8 @@ mod tests {
         let slots = ServerSlots::default();
         let held = take(&slots, 6).await;
         slots.report(&held[0], S, 429);
-        let one_left = held.into_iter().take(3).collect::<Vec<_>>();
-        drop(one_left); // 3 held over budget 3? no: all 6 returned or owed
+        // All six come back: three are forgotten (owed), three are free.
+        drop(held);
         assert_eq!(slots.budget(S), 3);
         let held = take(&slots, 3).await;
         let waiter = {
@@ -965,6 +1046,31 @@ mod tests {
         assert_eq!(slots.room(S).await, 4);
         let _more = take(&slots, 5).await;
         assert_eq!(slots.room(S).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_starting_file_whose_request_holds_a_slot_is_not_counted_twice() {
+        let slots = ServerSlots::default();
+        // A large file, answered, holding its first slot.
+        let _large = free(&slots, S).await.unwrap();
+        let small = slots.starting();
+        assert_eq!(slots.room(S).await, 4, "5 free, one file to come");
+        // The small file's request now holds a slot here: 4 free, and no
+        // file still to come.
+        let mut carrier = free(&slots, S).await.unwrap();
+        carrier.carry(small);
+        assert_eq!(slots.room(S).await, 4);
+        // On another server it is still a file to come.
+        assert_eq!(slots.room("other.example:80").await, 5);
+        // Redirected away: no slot here, about to start again.
+        let small = carrier.put_down().unwrap();
+        drop(carrier);
+        assert_eq!(slots.room(S).await, 4);
+        // Answered: dropped with its slot.
+        let mut carrier = free(&slots, S).await.unwrap();
+        carrier.carry(small);
+        drop(carrier);
+        assert_eq!(slots.room(S).await, 5);
     }
 
     #[tokio::test]

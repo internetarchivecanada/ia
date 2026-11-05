@@ -150,6 +150,17 @@ fn download_help_states_the_jobs_rule_and_shows_no_connection_flags() {
         ),
         "{help}"
     );
+    // The short help says the same.
+    let short = ia_cmd().args(["download", "-h"]).output().unwrap();
+    let short = String::from_utf8_lossy(&short.stdout);
+    assert!(
+        short
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Any one server gets at most 6 connections"),
+        "{short}"
+    );
     for hidden in [
         "--connections-per-file",
         "--max-connections-per-server",
@@ -158,6 +169,24 @@ fn download_help_states_the_jobs_rule_and_shows_no_connection_flags() {
         assert!(
             !help.contains(hidden),
             "{hidden} in download --help\n{help}"
+        );
+    }
+}
+
+#[test]
+fn other_commands_keep_the_global_jobs_help() {
+    for command in ["upload", "search", "metadata"] {
+        let out = ia_cmd().args([command, "--help"]).output().unwrap();
+        assert!(out.status.success(), "{command}");
+        let help = String::from_utf8_lossy(&out.stdout);
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Concurrent operations (default 8;"),
+            "{command}\n{help}"
+        );
+        assert!(
+            !flat.contains("Files downloaded at once"),
+            "{command}\n{help}"
         );
     }
 }

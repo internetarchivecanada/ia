@@ -3,7 +3,7 @@ use predicates::prelude::*;
 
 fn ia_cmd() -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
-    // Slot files for --max-connections-per-server go to the test target
+    // The connection slot files go to the test target
     // directory, never to the user's cache.
     cmd.env(
         "IA_CACHE_DIR",
