@@ -3984,6 +3984,130 @@ mod tests {
         assert!(most > 1, "the file was not split");
     }
 
+    /// A node that keeps every connection open for more requests until the
+    /// client closes it, as a datanode may, and counts open TCP connections
+    /// in `gauge`, from accept to close: idle ones too. Each request is
+    /// held 300 ms, then answered with the whole of `body`.
+    async fn keep_alive_node(body: &[u8], gauge: Arc<Gauge>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let body = Arc::new(body.to_vec());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (gauge, body) = (Arc::clone(&gauge), Arc::clone(&body));
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    gauge.enter();
+                    loop {
+                        if read_head(&mut stream).await.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(HOLD).await;
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                        if stream.write_all(head.as_bytes()).await.is_err()
+                            || stream.write_all(&body).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    gauge.leave();
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn eight_whole_files_on_one_pair_open_six_connections_and_keep_none() {
+        let body = body_of(2048);
+        // The pair's two nodes, counted together, behind a front server
+        // whose /download/ redirect alternates between them.
+        let both = Arc::new(Gauge::default());
+        let nodes = [
+            keep_alive_node(&body, Arc::clone(&both)).await,
+            keep_alive_node(&body, Arc::clone(&both)).await,
+        ];
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let to = nodes.clone();
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let node = to[turn.fetch_add(1, Ordering::SeqCst) % 2].clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://{node}{}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n",
+                            conn.path
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            })
+        });
+        let (front, _) = spawn_raw(&body, handler).await;
+        let files: Vec<serde_json::Value> = (0..8)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}.bin"),
+                    "source": "original",
+                    "size": body.len().to_string(),
+                    "md5": md5_hex(&body),
+                    "mtime": "1700000000",
+                })
+            })
+            .collect();
+        let item: crate::types::ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "big-item"},
+            "files": files,
+            "d1": nodes[0],
+            "d2": nodes[1],
+        }))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let o = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            no_directories: true,
+            ..Default::default()
+        };
+
+        let done = download_item_with_metadata(
+            &front,
+            "big-item",
+            &item,
+            &o,
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(done.files_downloaded, 8, "{:?}", done.results);
+        for i in 0..8 {
+            assert_eq!(
+                std::fs::read(dir.path().join(format!("f{i}.bin"))).unwrap(),
+                body
+            );
+        }
+        // Six transfers at once, each on a TCP connection of its own.
+        assert_eq!(both.most(), 6, "TCP connections open on the pair at once");
+        // And none kept open once the download is done.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while both.open.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            both.open.load(Ordering::SeqCst),
+            0,
+            "idle connections kept open"
+        );
+    }
+
     #[tokio::test]
     async fn every_download_connection_carries_one_request_and_asks_to_close() {
         let _layout = small_layout();
