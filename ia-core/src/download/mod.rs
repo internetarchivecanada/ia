@@ -182,8 +182,8 @@ pub struct DownloadOpts {
     /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
-    /// How many connections, each a stream on its own HTTP/1.1 connection,
-    /// fetch one large file at once (#16); default
+    /// How many connections fetch one large file at once (#16), each
+    /// carrying one stream of `Range` requests over HTTP/1.1; default
     /// [`DEFAULT_CONNECTIONS_PER_FILE`], one.
     ///
     /// A file of 256 MiB or more is cut into 64 MiB parts, which the streams
@@ -569,7 +569,9 @@ pub(crate) async fn fetch_response_via(
                 {
                     debug!(location = %new_url, "following redirect");
                     current_url = new_url.to_string();
-                    // This hop's slot goes back before the next is taken.
+                    // This hop's answer and its slot go back before the
+                    // next hop takes one.
+                    drop(r);
                     drop(slot);
                     continue;
                 }
@@ -1155,6 +1157,9 @@ pub async fn download_file(
     {
         let last_modified = last_modified_of(&response);
         range_not_satisfiable(response, identifier, file, offset, &part_path).await?;
+        // The response is consumed: no connection is open any more, so the
+        // slot goes back before the .part is hashed from disk.
+        drop(slot);
         // The .part is the whole file, but never finish it through a
         // symlink: renaming the link into place would leave a Complete
         // download pointing outside dest_dir and the mtime write would go
@@ -1362,8 +1367,11 @@ pub async fn download_file(
                 }
             }
         };
-        // Close the abandoned connection before opening the next one.
+        // Close the abandoned connection before opening the next one, and
+        // give its slot back now: a body error waits before re-requesting,
+        // and the server's slot must not sit idle through that wait.
         drop(stream);
+        drop(slot.take());
 
         match end {
             StreamEnd::Done => break,
@@ -1438,9 +1446,6 @@ pub async fn download_file(
 
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
-        // The abandoned response's slot goes back first: with a cap of one,
-        // the re-request would otherwise wait for it forever.
-        drop(slot.take());
         let (new_resp, new_slot) = fetch_response_via(
             client.no_redirect_http(),
             client,
@@ -1456,6 +1461,7 @@ pub async fn download_file(
             drop(output);
             let last_modified = last_modified_of(&new_resp).or(last_modified);
             range_not_satisfiable(new_resp, identifier, file, bytes_downloaded, &part_path).await?;
+            drop(slot.take());
             // The .part is the whole file: the stream ended after its last
             // byte. The hasher already covers every byte written, so
             // finish in place.
@@ -1488,6 +1494,8 @@ pub async fn download_file(
 
     output.flush().await?;
     drop(output);
+    // The body has ended; the slot goes back before the checks and rename.
+    drop(slot.take());
 
     // The stream ended. Refuse to rename a file whose byte count differs
     // from the item metadata. This runs before the md5 comparison because

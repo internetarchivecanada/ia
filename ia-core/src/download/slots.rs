@@ -41,13 +41,14 @@ struct Table {
 }
 
 impl ServerSlots {
-    /// At most `max` download connections to each server at once; `0` is
-    /// treated as `1`.
+    /// At most `max` download connections to each server at once. `0` is
+    /// treated as `1`, and a value above tokio's
+    /// [`Semaphore::MAX_PERMITS`] (more than any client can open) as that.
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
             inner: Arc::new(Table {
-                max: max.max(1),
+                max: max.clamp(1, Semaphore::MAX_PERMITS),
                 per_server: Mutex::new(HashMap::new()),
             }),
         }
@@ -110,6 +111,13 @@ mod tests {
         assert_eq!(DEFAULT_MAX_CONNECTIONS_PER_SERVER, 6);
         assert_eq!(ServerSlots::new(0).max(), 1);
         assert_eq!(ServerSlots::new(9).max(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_cap_too_large_for_a_semaphore_is_held_at_the_largest() {
+        let slots = ServerSlots::new(usize::MAX);
+        assert_eq!(slots.max(), Semaphore::MAX_PERMITS);
+        assert!(free(&slots, "a.example").await.is_some());
     }
 
     #[tokio::test]

@@ -5,10 +5,10 @@
 //! streams, each on its own HTTP/1.1 connection, take the next unfetched
 //! part from a shared queue and fetch it with one closed `Range` request,
 //! writing it at its offset in the `.part` file. Each request holds a slot
-//! in [`DownloadOpts::server_slots`] (see the `slots` module). Measured on 2026-10-30, four such
-//! connections ran 2.41 times as fast as one, and eight 3.50 times; four
-//! ranges multiplexed on one HTTP/2 connection gained nothing
-//! (`docs/plans/parallel-transfer-measurement-2026-10-30.md`).
+//! in [`DownloadOpts::server_slots`] (see the `slots` module). Measured
+//! on 2026-10-30, four such connections ran 2.41 times as fast as one, and
+//! eight 3.50 times; four ranges multiplexed on one HTTP/2 connection
+//! gained nothing (`docs/plans/parallel-transfer-measurement-2026-10-30.md`).
 //!
 //! Progress is kept in a journal beside the `.part` file
 //! (`<name>.part.json`, see [`Journal`]), so an interrupted download resumes
@@ -593,6 +593,8 @@ pub(super) async fn download(
         )
         .await?;
         if !answers_span(&response, identifier, file, span)? {
+            drop(response);
+            drop(slot);
             return Ok(Outcome::Unsupported);
         }
         last_modified = super::last_modified_of(&response);
@@ -3117,6 +3119,9 @@ mod tests {
                 use tokio::io::AsyncWriteExt;
                 gauges.iter().for_each(|g| g.enter());
                 tokio::time::sleep(hold).await;
+                // Counted down before the answer goes out, so the client's
+                // next request can never be counted alongside this one.
+                gauges.iter().for_each(|g| g.leave());
                 if redirect && conn.path.starts_with("/download/") {
                     let to = conn.path.replacen("/download/", "/data/", 1);
                     let _ = conn
@@ -3132,7 +3137,6 @@ mod tests {
                 } else {
                     serve_whole(conn).await;
                 }
-                gauges.iter().for_each(|g| g.leave());
             })
         });
         let (client, _seen) = spawn_raw(body, handler).await;
@@ -3284,6 +3288,103 @@ mod tests {
         assert_eq!(gauge.most(), 1);
     }
 
+    #[tokio::test]
+    async fn one_stream_gives_its_slot_back_before_waiting_to_re_request() {
+        let body = body_of(2048);
+        // The first request the server sees drops after 10 bytes; its file
+        // then waits 0.5 s before re-requesting. With a cap of 1, the other
+        // file can only be served in that wait if the slot was given back.
+        let arrivals: Arc<Mutex<Vec<(String, bool, std::time::Instant)>>> = Arc::default();
+        let log = Arc::clone(&arrivals);
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let first_seen = {
+                    let mut log = log.lock().unwrap();
+                    log.push((conn.path.clone(), conn.ranged, std::time::Instant::now()));
+                    log.len() == 1
+                };
+                if first_seen {
+                    send_head(&mut conn).await;
+                    let bytes = slice(&conn);
+                    let _ = conn.stream.write_all(&bytes[..10]).await;
+                    let _ = conn.stream.flush().await;
+                    return;
+                }
+                serve_whole(conn).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
+        let dir = tempfile::tempdir().unwrap();
+        let o = DownloadOpts {
+            server_slots: ServerSlots::new(1),
+            ..Default::default()
+        };
+
+        download_files(&client, 2, &body, 2, &o, dir.path()).await;
+
+        let arrivals = arrivals.lock().unwrap();
+        assert_eq!(arrivals.len(), 3, "{arrivals:?}");
+        let (dropped, other) = (&arrivals[0], &arrivals[1]);
+        assert_ne!(
+            dropped.0, other.0,
+            "the other file came second: {arrivals:?}"
+        );
+        assert!(!other.1, "a fresh request, not the re-request");
+        let gap = other.2 - dropped.2;
+        assert!(
+            gap < Duration::from_millis(400),
+            "the other file waited {gap:?}, through the 0.5 s backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_waiting_for_a_slot_stops_when_another_fails_the_file() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        // A cap of 1: the streams take turns. The third part fails for good;
+        // every stream still waiting for the slot must give up instead of
+        // sending its request.
+        let order: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let log = Arc::clone(&order);
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                log.lock().unwrap().push(conn.first);
+                if conn.first == 2048 {
+                    let _ = conn
+                        .stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                serve_whole(conn).await;
+            })
+        });
+        let (client, _seen) = spawn_raw(&body, handler).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = file_meta("big.bin", &body);
+        let mut o = opts(4);
+        o.server_slots = ServerSlots::new(1);
+
+        let err = fetch(&client, &file, dir.path(), &o).await.unwrap_err();
+
+        assert!(matches!(err, IaError::Http { status: 404, .. }), "{err:?}");
+        // Give a stream that did not stop the time to send its request.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let order = order.lock().unwrap();
+        assert_eq!(
+            order.last(),
+            Some(&2048),
+            "a request after the failure: {order:?}"
+        );
+    }
+
     /// A raw server whose first answer for a request starting at `first`
     /// promises the rest of the range, sends 100 bytes and hangs up.
     async fn dropping_once_at(body: &[u8], first: u64) -> IaClient {
@@ -3338,8 +3439,10 @@ mod tests {
         let body = body_of(2048);
         let (client, gauge) = holding_server(&body, Duration::from_millis(20), true, vec![]).await;
         let dir = tempfile::tempdir().unwrap();
-        let mut o = DownloadOpts::default();
-        o.server_slots = ServerSlots::new(1);
+        let o = DownloadOpts {
+            server_slots: ServerSlots::new(1),
+            ..Default::default()
+        };
 
         download_files(&client, 4, &body, 8, &o, dir.path()).await;
 

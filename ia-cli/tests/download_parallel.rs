@@ -185,14 +185,32 @@ async fn a_large_file_is_one_get_by_default_and_four_ranges_with_connections_per
     assert_eq!(ranges, vec![None]);
 
     mount_big_item(&server, &body).await;
-    let mut ranges = download_ranges(&server, &body, &["--connections-per-file", "4"]).await;
-    ranges.sort();
+    let ranges = download_ranges(&server, &body, &["--connections-per-file", "4"]).await;
+    // Each of the four 64 MiB parts is asked for whole. Under load a stream
+    // may also re-request the rest of its part after a dropped body; such a
+    // request starts inside the part and ends where the part ends.
     let part = 64 * MIB;
-    let mut expected: Vec<Option<String>> = (0..4)
-        .map(|k| Some(format!("bytes={}-{}", k * part, (k + 1) * part - 1)))
+    let spans: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|r| {
+            let r = r.as_deref().expect("every request carried Range");
+            let (a, b) = r.strip_prefix("bytes=").unwrap().split_once('-').unwrap();
+            (a.parse().unwrap(), b.parse().unwrap())
+        })
         .collect();
-    expected.sort();
-    assert_eq!(ranges, expected);
+    for k in 0..4 {
+        let whole = (k * part, (k + 1) * part - 1);
+        assert!(
+            spans.contains(&whole),
+            "part {k} never asked for whole: {ranges:?}"
+        );
+    }
+    assert!(
+        spans
+            .iter()
+            .all(|&(a, b)| (b + 1) % part == 0 && a <= b && a >= b + 1 - part),
+        "a request outside one part: {ranges:?}"
+    );
 }
 
 // ─── The per-server cap, counted on a loopback server ──────────────────────
@@ -207,13 +225,12 @@ struct Gauge {
 const FILES: usize = 8;
 const FILE_BODY: &[u8] = b"sixteen bytes!!!";
 
-/// A loopback server, one request per connection: `/metadata/small-item`
-/// answers at once with an item of [`FILES`] files; every other request is a
-/// download, held open for a moment, counted in the gauge, then served.
-async fn holding_server() -> (String, Arc<Gauge>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let host = listener.local_addr().unwrap().to_string();
-    let gauge = Arc::new(Gauge::default());
+/// How long the server holds each download open. Long enough that every
+/// request a run sends at once arrives inside it, even on a loaded runner.
+const HOLD: Duration = Duration::from_millis(1000);
+
+/// The metadata of an item of [`FILES`] files named `identifier`.
+fn small_item(identifier: &str) -> String {
     let files: Vec<serde_json::Value> = (0..FILES)
         .map(|i| {
             json!({
@@ -224,18 +241,27 @@ async fn holding_server() -> (String, Arc<Gauge>) {
             })
         })
         .collect();
-    let metadata = json!({
-        "metadata": {"identifier": "small-item", "mediatype": "data"},
+    json!({
+        "metadata": {"identifier": identifier, "mediatype": "data"},
         "files": files
     })
-    .to_string();
+    .to_string()
+}
+
+/// A loopback server, one request per connection: `/metadata/<identifier>`
+/// answers at once with an item of [`FILES`] files; every other request is a
+/// download, held open for [`HOLD`], counted in the gauge, then served.
+async fn holding_server() -> (String, Arc<Gauge>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    let gauge = Arc::new(Gauge::default());
     let counted = Arc::clone(&gauge);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
-            let (gauge, metadata) = (Arc::clone(&counted), metadata.clone());
+            let gauge = Arc::clone(&counted);
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -246,21 +272,25 @@ async fn holding_server() -> (String, Arc<Gauge>) {
                     }
                 }
                 let head = String::from_utf8_lossy(&head);
-                let body: &[u8] = if head.starts_with("GET /metadata/") {
-                    metadata.as_bytes()
-                } else {
-                    let now = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
-                    gauge.most.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    gauge.open.fetch_sub(1, Ordering::SeqCst);
-                    FILE_BODY
+                let body: Vec<u8> = match head.strip_prefix("GET /metadata/") {
+                    Some(rest) => {
+                        let identifier = rest.split(['?', ' ']).next().unwrap_or("");
+                        small_item(identifier).into_bytes()
+                    }
+                    None => {
+                        let now = gauge.open.fetch_add(1, Ordering::SeqCst) + 1;
+                        gauge.most.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(HOLD).await;
+                        gauge.open.fetch_sub(1, Ordering::SeqCst);
+                        FILE_BODY.to_vec()
+                    }
                 };
                 let reply = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(reply.as_bytes()).await;
-                let _ = stream.write_all(body).await;
+                let _ = stream.write_all(&body).await;
                 let _ = stream.flush().await;
             });
         }
@@ -268,18 +298,24 @@ async fn holding_server() -> (String, Arc<Gauge>) {
     (host, gauge)
 }
 
-async fn download_small_item(extra: &[&str]) -> usize {
+/// Run `ia download` with `source` (an identifier, or `--itemlist <file>`)
+/// and `extra` against a holding server, into `disks` destination
+/// directories (more than one makes a disk pool), check every file of
+/// `items` arrived on one of them, and return the most download connections
+/// the server saw at once.
+async fn download_from_holding_server(
+    source: &[&str],
+    items: &[&str],
+    disks: usize,
+    extra: &[&str],
+) -> usize {
     let (host, gauge) = holding_server().await;
-    let dir = TempDir::new().unwrap();
-    let mut args = vec![
-        "--insecure",
-        "-H",
-        &host,
-        "download",
-        "small-item",
-        "--destdir",
-        dir.path().to_str().unwrap(),
-    ];
+    let dirs: Vec<TempDir> = (0..disks).map(|_| TempDir::new().unwrap()).collect();
+    let mut args = vec!["--insecure", "-H", &host, "download"];
+    args.extend_from_slice(source);
+    for dir in &dirs {
+        args.extend_from_slice(&["--destdir", dir.path().to_str().unwrap()]);
+    }
     args.extend_from_slice(extra);
     let out = tokio::task::spawn_blocking({
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -292,11 +328,44 @@ async fn download_small_item(extra: &[&str]) -> usize {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    for i in 0..FILES {
-        let got = fs::read(dir.path().join("small-item").join(format!("f{i}.bin"))).unwrap();
-        assert_eq!(got, FILE_BODY);
+    for item in items {
+        for i in 0..FILES {
+            let got = dirs
+                .iter()
+                .find_map(|dir| fs::read(dir.path().join(item).join(format!("f{i}.bin"))).ok())
+                .unwrap_or_else(|| panic!("{item}/f{i}.bin is on no disk"));
+            assert_eq!(got, FILE_BODY);
+        }
     }
     gauge.most.load(Ordering::SeqCst)
+}
+
+async fn download_small_item(extra: &[&str]) -> usize {
+    download_from_holding_server(&["small-item"], &["small-item"], 1, extra).await
+}
+
+async fn download_two_items(disks: usize) -> usize {
+    let list = tempfile::NamedTempFile::new().unwrap();
+    fs::write(list.path(), "item-a\nitem-b\n").unwrap();
+    download_from_holding_server(
+        &["--itemlist", list.path().to_str().unwrap()],
+        &["item-a", "item-b"],
+        disks,
+        &["-j", "8"],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_batch_of_two_items_on_one_server_shares_one_cap() {
+    assert_eq!(download_two_items(1).await, 6);
+}
+
+#[tokio::test]
+async fn a_batch_across_a_disk_pool_shares_one_cap() {
+    // With several --destdir, each item gets its own options for its disk;
+    // they must still share one table of server slots.
+    assert_eq!(download_two_items(2).await, 6);
 }
 
 #[tokio::test]
