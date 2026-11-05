@@ -1064,13 +1064,21 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 }
 
 /// `work`, unless the stream is told to stop first.
+///
+/// The stop is checked before `work` on every poll (`biased`). A stream
+/// that fails the file gives its server slot back before the stop goes out,
+/// which wakes a stream waiting for that slot; polled in random order, that
+/// stream could take the slot and open a connection before it saw the stop.
+/// Checked first, the stop wins and `work` is dropped without being polled
+/// again, so no stream opens a connection once the file has failed.
 async fn or_stopped<F: std::future::Future>(
     stop: &mut watch::Receiver<bool>,
     work: F,
 ) -> Option<F::Output> {
     tokio::select! {
-        output = work => Some(output),
+        biased;
         _ = stopped(stop) => None,
+        output = work => Some(output),
     }
 }
 
@@ -3340,19 +3348,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn once_stopped_the_work_is_never_polled() {
+        // A stream's request must not even start (take a slot, connect)
+        // once the stop is out, however the two branches would be ordered.
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        let polled = std::sync::atomic::AtomicUsize::new(0);
+        for _ in 0..64 {
+            let work = async {
+                polled.fetch_add(1, Ordering::SeqCst);
+            };
+            assert!(or_stopped(&mut rx, work).await.is_none());
+        }
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+
+        // Not stopped: the work runs.
+        let (_tx, mut rx) = watch::channel(false);
+        assert_eq!(or_stopped(&mut rx, async { 7 }).await, Some(7));
+    }
+
+    #[tokio::test]
     async fn a_stream_waiting_for_a_slot_stops_when_another_fails_the_file() {
         let _layout = small_layout();
         let body = body_of(LEN);
         // A cap of 1: the streams take turns. The third part fails for good;
-        // every stream still waiting for the slot must give up instead of
-        // sending its request.
-        let order: Arc<Mutex<Vec<u64>>> = Arc::default();
+        // every stream still waiting for the slot must give up without
+        // opening a connection. Each connection is logged, as `None` when it
+        // closes before sending a request.
+        let order: Arc<Mutex<Vec<Option<u64>>>> = Arc::default();
         let log = Arc::clone(&order);
         let handler: RawHandler = Arc::new(move |mut conn| {
             let log = Arc::clone(&log);
             Box::pin(async move {
                 use tokio::io::AsyncWriteExt;
-                log.lock().unwrap().push(conn.first);
+                log.lock()
+                    .unwrap()
+                    .push((!conn.path.is_empty()).then_some(conn.first));
                 if conn.first == 2048 {
                     let _ = conn
                         .stream
@@ -3375,13 +3406,17 @@ mod tests {
         let err = fetch(&client, &file, dir.path(), &o).await.unwrap_err();
 
         assert!(matches!(err, IaError::Http { status: 404, .. }), "{err:?}");
-        // Give a stream that did not stop the time to send its request.
+        // Give a stream that did not stop the time to connect.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let order = order.lock().unwrap();
+        assert!(
+            order.iter().all(Option::is_some),
+            "a connection without a request: {order:?}"
+        );
         assert_eq!(
             order.last(),
-            Some(&2048),
-            "a request after the failure: {order:?}"
+            Some(&Some(2048)),
+            "a connection after the failure: {order:?}"
         );
     }
 
