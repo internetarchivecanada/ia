@@ -201,13 +201,8 @@ pub async fn fts_num_found(
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
     let resp = send_page(req, client).await?;
-
-    if !resp.status().is_success() {
-        return Err(http_error(resp).await);
-    }
-
-    let body: FtsResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
-    Ok(body.hits.and_then(|h| h.total).unwrap_or(0))
+    let body = read_fts_response(resp).await?;
+    Ok(body.hits.and_then(|h| h.total).map_or(0, |t| t.value()))
 }
 
 /// Search using the scrape API (cursor-based pagination).
@@ -396,27 +391,191 @@ pub fn advanced<'a>(
 
 // ─── Full-Text Search ─────────────────────────────────────────────────────────
 
-/// Response from the FTS API.
+/// Results per FTS request when the caller sets no `size`.
+const FTS_DEFAULT_SIZE: u64 = 1000;
+
+/// Longest part of an unexpected response body quoted in an error, in
+/// characters.
+const BODY_SNIPPET_CHARS: usize = 200;
+
+/// Response from the FTS API: a page of hits, or one of the wrapper's error
+/// envelopes.
 #[derive(Debug, Deserialize)]
 struct FtsResponse {
     hits: Option<FtsHits>,
     #[serde(rename = "_scroll_id")]
     scroll_id: Option<String>,
+    /// `{"msg_type": "ERROR", "text": "the parameter q is required"}` when
+    /// the API rejects the request (served with HTTP 200).
+    user_message: Option<FtsUserMessage>,
+    /// `"UPSTREAM_ERROR"` and the like, with a human-readable `message`.
+    error: Option<serde_json::Value>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FtsUserMessage {
+    msg_type: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FtsHits {
-    total: Option<u64>,
+    total: Option<FtsTotal>,
+    #[serde(default)]
     hits: Vec<FtsHit>,
+}
+
+/// `hits.total`: a number, or `{"value": N, "relation": ...}` as
+/// Elasticsearch 7 and later return it unless told otherwise.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FtsTotal {
+    Count(u64),
+    Object { value: u64 },
+}
+
+impl FtsTotal {
+    fn value(&self) -> u64 {
+        match self {
+            FtsTotal::Count(n) | FtsTotal::Object { value: n } => *n,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct FtsHit {
+    /// `identifier|sha1` of the matching file.
     #[serde(rename = "_id")]
     id: Option<String>,
     #[serde(rename = "_source")]
     source: Option<serde_json::Value>,
     fields: Option<serde_json::Value>,
+    /// The matching text, with matches marked.
+    highlight: Option<serde_json::Value>,
+}
+
+/// The start of `text`, at most [`BODY_SNIPPET_CHARS`] characters.
+fn body_snippet(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(BODY_SNIPPET_CHARS) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// Read one FTS response.
+///
+/// A non-success status is [`IaError::Http`] with the body text, as for the
+/// other search backends. A success status whose body is not JSON, or that
+/// carries one of the wrapper's error envelopes (`user_message`, or `error`
+/// with `message`), is [`IaError::SearchFailed`]: the API answers a request
+/// it rejects with HTTP 200, so the status alone does not tell a rejection
+/// from an empty result.
+async fn read_fts_response(resp: reqwest::Response) -> Result<FtsResponse> {
+    if !resp.status().is_success() {
+        return Err(http_error(resp).await);
+    }
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(reqwest_middleware::Error::from)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| IaError::SearchFailed {
+            status,
+            message: format!("response is not JSON ({e}): {}", body_snippet(&text)),
+        })?;
+    let body: FtsResponse = serde_json::from_value(value).map_err(|e| IaError::SearchFailed {
+        status,
+        message: format!("unexpected response ({e}): {}", body_snippet(&text)),
+    })?;
+
+    if let Some(um) = &body.user_message {
+        let message = um
+            .text
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| um.msg_type.clone())
+            .unwrap_or_else(|| body_snippet(&text));
+        return Err(IaError::SearchFailed { status, message });
+    }
+    if let Some(error) = body.error.as_ref().filter(|e| !e.is_null()) {
+        let message = body.message.clone().unwrap_or_else(|| match error {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        return Err(IaError::SearchFailed { status, message });
+    }
+    Ok(body)
+}
+
+/// A `--parameters`-style value as the JSON type the FTS API expects:
+/// `size` and `from` as numbers and `scroll` as a boolean when they parse,
+/// everything else as a string.
+fn fts_param_value(key: &str, value: &str) -> serde_json::Value {
+    match key {
+        "size" | "from" => value
+            .parse::<u64>()
+            .map_or_else(|_| value.into(), serde_json::Value::from),
+        "scroll" => match value {
+            "true" => true.into(),
+            "false" => false.into(),
+            _ => value.into(),
+        },
+        _ => value.into(),
+    }
+}
+
+/// The body of the first FTS request: `q`, `size` and `scroll`, then the
+/// extra parameters. `from` turns scroll off: the API rejects `from` with
+/// `scroll: true` (a 502) and honours it without.
+fn fts_first_body(query: &str, params: &[(String, String)]) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("q".into(), query.into());
+    body.insert("size".into(), FTS_DEFAULT_SIZE.into());
+    body.insert("scroll".into(), true.into());
+    for (k, v) in params {
+        body.insert(k.clone(), fts_param_value(k, v));
+    }
+    if body.contains_key("from") {
+        body.insert("scroll".into(), false.into());
+    }
+    serde_json::Value::Object(body)
+}
+
+/// Turn one hit into a [`SearchResult`], or `None` when it names no item.
+///
+/// The identifier is `fields.identifier` (the first element of the list the
+/// API sends), else the part of `_id` before `|`. `_source` and `fields`
+/// become the result's fields, without `identifier`, plus `highlight`.
+fn fts_hit_to_result(hit: FtsHit) -> Option<SearchResult> {
+    let mut fields = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(src)) = hit.source {
+        fields.extend(src);
+    }
+    if let Some(serde_json::Value::Object(f)) = hit.fields {
+        fields.extend(f);
+    }
+    let from_fields = match fields.remove("identifier") {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Array(values)) => values.into_iter().find_map(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        }),
+        _ => None,
+    };
+    let identifier = from_fields
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            hit.id.as_deref().map(|id| {
+                id.split_once('|')
+                    .map_or(id, |(ident, _)| ident)
+                    .to_string()
+            })
+        })
+        .filter(|s| !s.is_empty())?;
+    if let Some(highlight) = hit.highlight {
+        fields.insert("highlight".into(), highlight);
+    }
+    Some(SearchResult { identifier, fields })
 }
 
 /// Search using the full-text search API (scroll-based pagination).
@@ -424,6 +583,22 @@ struct FtsHit {
 /// By default, prepends `!L` to the query for literal text matching
 /// (matching Python `internetarchive` behavior). Set `opts.dsl = true`
 /// to skip the prefix for raw Elasticsearch DSL queries.
+///
+/// The first request is a POST with the JSON body
+/// `{"q": ..., "size": 1000, "scroll": true}` plus `opts.params` (`size` and
+/// `from` sent as numbers). Each `_scroll_id` is followed with
+/// `POST ?scroll=true` and `{"scroll_id": ...}` until a page has no hits or
+/// no `_scroll_id`. A `from` parameter turns scroll off: one page is fetched.
+///
+/// Each hit is one matching file or page, so an item can appear more than
+/// once. [`SearchResult::identifier`] is the item identifier.
+///
+/// # Errors
+///
+/// The stream yields [`IaError::SearchFailed`] when the API reports an error
+/// in a success response (it answers a rejected request with HTTP 200) or
+/// sends a body that is not JSON, and [`IaError::Http`] for a non-success
+/// status.
 pub fn fts<'a>(
     client: &'a IaClient,
     query: &str,
@@ -436,7 +611,8 @@ pub fn fts<'a>(
     } else {
         format!("!L {query}")
     };
-    let extra_params = opts.params.clone();
+    let first_body = fts_first_body(&query, &opts.params);
+    let scroll = first_body["scroll"] == serde_json::Value::Bool(true);
 
     // FTS uses a different host — configurable for testability
     let base_url = client.fts_base_url();
@@ -456,18 +632,7 @@ pub fn fts<'a>(
                     .header("content-type", "application/json")
                     .body(body)
             } else {
-                // Initial request
-                let mut json_body = serde_json::json!({
-                    "query": query,
-                    "size": 1000,
-                    "scroll": true,
-                });
-
-                for (k, v) in &extra_params {
-                    json_body[k.as_str()] = serde_json::Value::String(v.clone());
-                }
-
-                let body = serde_json::to_vec(&json_body).map_err(IaError::Json)?;
+                let body = serde_json::to_vec(&first_body).map_err(IaError::Json)?;
                 client
                     .http()
                     .post(&base_url)
@@ -475,45 +640,32 @@ pub fn fts<'a>(
                     .body(body)
             };
             let resp: reqwest::Response = send_page(req, client).await?;
+            let body = read_fts_response(resp).await?;
+            let FtsHits { total, hits } = body.hits.unwrap_or(FtsHits { total: None, hits: vec![] });
 
-            if !resp.status().is_success() {
-                Err(http_error(resp).await)?;
-                return;
-            }
-
-            let body: FtsResponse = resp.json().await.map_err(reqwest_middleware::Error::from)?;
-            let hits = body.hits.unwrap_or(FtsHits { total: None, hits: vec![] });
-
-            if hits.hits.is_empty() {
+            if hits.is_empty() {
                 break;
             }
 
-            debug!(hits = hits.hits.len(), total = ?hits.total, "FTS page");
+            debug!(hits = hits.len(), total = ?total.map(|t| t.value()), "FTS page");
 
-            for hit in hits.hits {
-                let identifier = hit.id.unwrap_or_default();
-                if identifier.is_empty() {
-                    warn!("FTS hit missing _id, skipping");
+            for hit in hits {
+                let Some(result) = fts_hit_to_result(hit) else {
+                    warn!("FTS hit names no identifier, skipping");
                     continue;
-                }
-
-                // Merge _source and fields into a single map
-                let mut fields = serde_json::Map::new();
-                if let Some(serde_json::Value::Object(src)) = hit.source {
-                    fields.extend(src);
-                }
-                if let Some(serde_json::Value::Object(f)) = hit.fields {
-                    fields.extend(f);
-                }
+                };
 
                 yielded += 1;
-                yield SearchResult { identifier, fields };
+                yield result;
 
                 if count > 0 && yielded >= count {
                     return;
                 }
             }
 
+            if !scroll {
+                break;
+            }
             match body.scroll_id {
                 Some(sid) if !sid.is_empty() => scroll_id = Some(sid),
                 _ => break,
@@ -546,7 +698,7 @@ fn parse_search_result(value: serde_json::Value) -> Result<SearchResult> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_ACCESS: &str = "test_access";
@@ -827,64 +979,79 @@ mod tests {
         assert_eq!(count, 42);
     }
 
-    #[tokio::test]
-    async fn fts_prepends_literal_prefix() {
-        let mock_server = MockServer::start().await;
+    /// One FTS page with the given `_id`s (each hit's `fields.identifier` is
+    /// the part before `|`) and `_scroll_id`.
+    fn fts_page(ids: &[&str], scroll_id: &str) -> serde_json::Value {
+        let hits: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                let ident = id.split('|').next().unwrap();
+                serde_json::json!({
+                    "_index": "fts_main_v2",
+                    "_id": id,
+                    "fields": {"identifier": [ident]}
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "hits": {"total": ids.len(), "hits": hits},
+            "_scroll_id": scroll_id
+        })
+    }
 
+    /// The API's answer to a request it rejects, as served live on
+    /// 2026-11-05 for a body without `q`.
+    fn fts_user_message_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "user_message": {"msg_type": "ERROR", "text": "the parameter q is required"},
+            "ia-pub-fts-api-wrapper": true
+        })
+    }
+
+    /// The JSON body of the `n`th request the mock server received.
+    async fn request_body(mock_server: &MockServer, n: usize) -> serde_json::Value {
+        let requests = mock_server.received_requests().await.unwrap();
+        serde_json::from_slice(&requests[n].body).unwrap()
+    }
+
+    async fn collect_fts(
+        client: &IaClient,
+        query: &str,
+        opts: &SearchOpts,
+    ) -> Vec<Result<SearchResult>> {
+        fts(client, query, opts).collect().await
+    }
+
+    /// The first request carries the query under `q` (the API answers
+    /// `query` with "the parameter q is required"), `size` as a number and
+    /// `scroll` as a boolean.
+    #[tokio::test]
+    async fn fts_first_request_body_has_q_numeric_size_boolean_scroll() {
+        let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ia-pub-fts-api"))
-            .and(body_string_contains("!L test query"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "hits": {
-                    "total": 1,
-                    "hits": [
-                        {
-                            "_id": "item1|abc123",
-                            "_source": {},
-                            "fields": {"identifier": ["item1"]}
-                        }
-                    ]
-                },
-                "_scroll_id": ""
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&["item1|abc123"], "")))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
-        let results: Vec<Result<SearchResult>> = fts(&client, "test query", &SearchOpts::default())
-            .collect()
-            .await;
-
+        let results = collect_fts(&client, "test query", &SearchOpts::default()).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
+
+        let body = request_body(&mock_server, 0).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"q": "!L test query", "size": 1000, "scroll": true})
+        );
     }
 
     #[tokio::test]
     async fn fts_dsl_mode_skips_prefix() {
         let mock_server = MockServer::start().await;
-
-        // Mock that matches the raw query WITHOUT !L prefix.
-        // body_string_contains("raw dsl") matches the query in the JSON body.
-        // We also verify !L is NOT present by using a strict mock: if the
-        // code incorrectly prepends !L, the query field would be "!L raw dsl"
-        // which still contains "raw dsl", so we add an explicit assertion
-        // via a second mock that would catch the !L prefix.
         Mock::given(method("POST"))
             .and(path("/ia-pub-fts-api"))
-            .and(body_string_contains("\"query\":\"raw dsl\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "hits": {
-                    "total": 1,
-                    "hits": [
-                        {
-                            "_id": "item1|abc123",
-                            "_source": {},
-                            "fields": {"identifier": ["item1"]}
-                        }
-                    ]
-                },
-                "_scroll_id": ""
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&["item1|abc123"], "")))
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -894,10 +1061,351 @@ mod tests {
             dsl: true,
             ..Default::default()
         };
-        let results: Vec<Result<SearchResult>> = fts(&client, "raw dsl", &opts).collect().await;
-
+        let results = collect_fts(&client, "raw dsl", &opts).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc123");
+
+        let body = request_body(&mock_server, 0).await;
+        assert_eq!(body["q"], "raw dsl");
+        assert!(body.get("query").is_none(), "{body}");
+    }
+
+    /// A 200 carrying `user_message` and no hits is the server rejecting the
+    /// request, not an empty result.
+    #[tokio::test]
+    async fn fts_user_message_on_200_is_an_error_with_the_server_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_user_message_envelope()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(e @ IaError::SearchFailed { status: 200, .. }) => {
+                assert!(e.to_string().contains("the parameter q is required"), "{e}");
+            }
+            other => panic!("expected SearchFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fts_user_message_on_400_is_an_http_error_with_the_server_text() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(fts_user_message_envelope()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(IaError::Http {
+                status: 400,
+                message,
+                ..
+            }) => assert!(message.contains("the parameter q is required"), "{message}"),
+            other => panic!("expected Http 400, got {other:?}"),
+        }
+    }
+
+    /// The wrapper's other error shape (served live with a 502 on
+    /// 2026-11-05) is an error on a 2xx too.
+    #[tokio::test]
+    async fn fts_error_key_on_200_is_an_error_with_the_server_message() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "UPSTREAM_ERROR",
+                "message": "The search service is temporarily unavailable, please try again later.",
+                "ia-pub-fts-api-wrapper": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        let err = results[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, IaError::SearchFailed { status: 200, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("temporarily unavailable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fts_non_json_body_is_an_error_naming_the_body() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>maintenance</html>"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        let err = results[0].as_ref().unwrap_err();
+        assert!(
+            matches!(err, IaError::SearchFailed { status: 200, .. }),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("not JSON"), "{msg}");
+        assert!(msg.contains("<html>maintenance</html>"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn fts_connection_error_is_one_error() {
+        let mut config = crate::IaConfig::default();
+        config.general.fts_host = Some("127.0.0.1:1".to_string()); // nothing listening
+        config.general.secure = false;
+        let client = IaClient::from_config_no_retry(config).unwrap();
+
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+    }
+
+    /// No hits and no `user_message` is a genuine empty result.
+    #[tokio::test]
+    async fn fts_no_hits_is_a_clean_empty_stream() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&[], "sid-unused")))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "zzzznomatch", &SearchOpts::default()).await;
+        assert!(results.is_empty(), "{results:?}");
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn fts_empty_scroll_id_yields_hits_and_ends() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&["a|1", "b|2"], "")))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().identifier.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn fts_missing_scroll_id_yields_hits_and_ends() {
+        let mock_server = MockServer::start().await;
+        let mut page = fts_page(&["a|1"], "");
+        page.as_object_mut().unwrap().remove("_scroll_id");
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().identifier, "a");
+        mock_server.verify().await;
+    }
+
+    /// A `_scroll_id` continues at `?scroll=true` with `{"scroll_id": ...}`,
+    /// and both pages come out in order.
+    #[tokio::test]
+    async fn fts_scroll_continuation_yields_both_pages_in_order() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("scroll", "true"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"scroll_id": "sid-1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&["c|3", "d|4"], "")))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"q": "!L computer"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fts_page(&["a|1", "b|2"], "sid-1")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().identifier.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b", "c", "d"]);
+        mock_server.verify().await;
+    }
+
+    /// `size` and `from` go out as numbers and `scroll` as a boolean even
+    /// though they arrive as strings; other parameters stay strings.
+    #[tokio::test]
+    async fn fts_params_are_sent_with_json_types() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_page(&["a|1"], "")))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            params: vec![("size".into(), "5".into()), ("scope".into(), "all".into())],
+            ..Default::default()
+        };
+        collect_fts(&client, "computer", &opts).await;
+
+        let body = request_body(&mock_server, 0).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"q": "!L computer", "size": 5, "scroll": true, "scope": "all"})
+        );
+    }
+
+    /// The API rejects `from` together with `scroll: true` (a 502 live) and
+    /// honours it without, so `from` fetches one page and stops, even if the
+    /// answer carries a `_scroll_id`.
+    #[tokio::test]
+    async fn fts_from_turns_scroll_off_and_fetches_one_page() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fts_page(&["a|1", "b|2"], "sid-1")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let opts = SearchOpts {
+            params: vec![("size".into(), "2".into()), ("from".into(), "10".into())],
+            ..Default::default()
+        };
+        let results = collect_fts(&client, "computer", &opts).await;
+        assert_eq!(results.len(), 2);
+
+        let body = request_body(&mock_server, 0).await;
+        assert_eq!(
+            body,
+            serde_json::json!({"q": "!L computer", "size": 2, "from": 10, "scroll": false})
+        );
+        mock_server.verify().await;
+    }
+
+    /// The identifier is `fields.identifier`, not `_id` (which is
+    /// `identifier|sha1` of the matching file); without `fields.identifier`
+    /// it is the part of `_id` before `|`. `highlight` is kept.
+    #[tokio::test]
+    async fn fts_identifier_comes_from_fields_and_highlight_is_kept() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {"total": 2, "hits": [
+                    {
+                        "_id": "comingofageinlan0000your|1319f8442aca0dbe3c25322fea16539a99ce3f94",
+                        "highlight": {"text": ["{{{computer}}} literacy"]},
+                        "fields": {"identifier": ["comingofageinlan0000your"], "page_num": [12]}
+                    },
+                    {
+                        "_id": "otheritem|ec3f975d49670f9c1751f0da47f7e57ba2b486ca",
+                        "fields": {"page_num": [3]}
+                    }
+                ]},
+                "_scroll_id": ""
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let results = collect_fts(&client, "computer", &SearchOpts::default()).await;
+        let first = results[0].as_ref().unwrap();
+        assert_eq!(first.identifier, "comingofageinlan0000your");
+        assert!(
+            !first.fields.contains_key("identifier"),
+            "{:?}",
+            first.fields
+        );
+        assert_eq!(
+            first.fields["highlight"],
+            serde_json::json!({"text": ["{{{computer}}} literacy"]})
+        );
+        assert_eq!(first.fields["page_num"], serde_json::json!([12]));
+        assert_eq!(results[1].as_ref().unwrap().identifier, "otheritem");
+    }
+
+    /// Elasticsearch 7 and later report `hits.total` as `{"value": N}`
+    /// unless told otherwise; the API sends a number today.
+    #[tokio::test]
+    async fn fts_num_found_reads_total_as_an_object() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .and(query_param("q", "!L test query"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": {"total": {"value": 6524253, "relation": "eq"}, "hits": []}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let count = fts_num_found(&client, "test query", false, &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 6524253);
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_user_message_is_an_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ia-pub-fts-api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fts_user_message_envelope()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let err = fts_num_found(&client, "test", false, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IaError::SearchFailed { status: 200, .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("the parameter q is required"),
+            "{err}"
+        );
     }
 
     // ─── advanced_num_found ──────────────────────────────────────────────────
@@ -1258,7 +1766,7 @@ mod tests {
             .collect()
             .await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().identifier, "item1|abc");
+        assert_eq!(results[0].as_ref().unwrap().identifier, "item1");
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
         mock_server.verify().await;
     }
