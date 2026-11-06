@@ -179,6 +179,10 @@ pub enum IaError {
     /// API answers a request it rejects (for example one without `q`) with
     /// HTTP 200 and `{"user_message": {"msg_type": "ERROR", "text": ...}}`;
     /// `message` is that text. A non-success status is [`IaError::Http`].
+    /// Not retryable: a rejected request fails the same way again. That
+    /// includes a non-JSON 200 such as a proxy's maintenance page, which
+    /// may clear on its own; the caller decides whether to run the search
+    /// again.
     #[error("search failed: {message}")]
     SearchFailed { status: u16, message: String },
 

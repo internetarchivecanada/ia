@@ -26,6 +26,12 @@ The client checks only the status code, finds no hits, and ends the stream with 
 | `... "size": 2, "from": 1, "scroll": false` | 200; hits 2 and 3 of the first request; no `_scroll_id` |
 | `... "scope": "all"` or `"scope": "nasa_index"` | 200; same total; response reports `fts-api.auth.context_scope: "standard"` |
 | `{"q": "{\"match\": {\"text\": \"moon landing\"}}", ...}` and the same wrapped in `{"query": ...}` | 200; `hits.total` 0 |
+| `{"q": "{\"match\": {", ...}` (invalid JSON) or `{"q": "", ...}` | 200; no hits, no `user_message` |
+| `GET ?q=!L computer` | 200; `hits.total` 6524059, 10 hits |
+
+The same GET sent with an S3 `Authorization` header for a staff account reported `hits.total` 10497800: credentials widen the scope. The Python library sends the same header, so the two clients agree; nothing changes here.
+
+Scroll continuation pages carry `fields` values as plain strings (`"filename": "x_hocr_searchtext.txt.gz"`) where the first page sends one-element lists.
 
 Each hit looks like
 
@@ -59,7 +65,7 @@ One helper reads every FTS response (`fts` pages and `fts_num_found`):
 
 1. A non-2xx status is `IaError::Http` with the body text as the message, as now.
 2. A 2xx body that is not JSON is the new `IaError::SearchFailed { status, message }`, the message naming the problem and the start of the body.
-3. A 2xx body with `user_message` is `SearchFailed` with the message's `text`. A 2xx body with a string `error` (the shape of the 502 above) is `SearchFailed` with its `message`, else the `error` value.
+3. A 2xx body with `user_message` is `SearchFailed` with the message's `text`. A 2xx body with a string or object `error` (the shape of the 502 above) is `SearchFailed` with its `message`, else the `error` value.
 4. Otherwise the body is a page. No hits, or an empty or missing `_scroll_id`, ends the stream cleanly, as now.
 
 `hits.total` is read as a number or as `{"value": N}` (Elasticsearch 7 and later return the object unless told otherwise; the API returns a number today).
@@ -69,7 +75,7 @@ One helper reads every FTS response (`fts` pages and `fts_num_found`):
 ### Result shape
 
 - `SearchResult::identifier` is the hit's `fields.identifier` (first element when it is a list), else the part of `_id` before `|`, else `_id`. The old value was `_id` itself, which is not an identifier, so `ia search fts --itemlist | ia download` could not work. `identifier` is removed from `fields`, as the scrape and advanced backends do.
-- The hit's `highlight` (the matching text) is kept in `fields` as `highlight`. The Python library prints the whole hit in JSON mode; `ia-cli` dropped it.
+- The hit's `_id` (unique per hit; the identifier was its only carrier before) and `highlight` (the matching text) are kept in `fields`. The Python library prints the whole hit in JSON mode; `ia-cli` dropped it.
 
 ### CLI
 

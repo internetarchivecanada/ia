@@ -200,7 +200,7 @@ Every backend handles throttling the same way: a `429` on any request is retried
 
 `fts` sends a POST to `https://be-api.us.archive.org/ia-pub-fts-api` with the JSON body `{"q": "!L <QUERY>", "size": 1000, "scroll": true}` and follows each `_scroll_id` until a page has no hits. The API rejects `from` together with scroll, so `--from` sends `"scroll": false` and stops after one page. `--num-found` sends a GET with `q` (and `scope`) and prints `hits.total`.
 
-Each result is one matching file or page, so an item can appear more than once. The identifier printed (and the one `--itemlist` prints) is the item's identifier, taken from the hit's `fields.identifier`. `--json` output also carries the hit's `highlight`, the matching text with each match marked `{{{like this}}}`.
+Each result is one matching file or page, so an item can appear more than once. The identifier printed (and the one `--itemlist` prints) is the item's identifier, taken from the hit's `fields.identifier`. `--json` output also carries the hit's `_id` (`identifier|sha1` of the matching file, unique per hit) and `highlight`, the matching text with each match marked `{{{like this}}}`.
 
 The API answers a request it rejects with HTTP 200 and an error message in the body (for example `the parameter q is required`). `fts` prints that message on stderr as `search failed: ...` and exits 1, as it does for a body that is not JSON.
 
