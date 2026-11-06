@@ -35,6 +35,7 @@ pub struct JsonErrorBody {
 ///         IaError::NotFound(_) => (),
 ///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
+///         IaError::SearchFailed { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
 ///         IaError::SourceChecksumMismatch { .. } => (),
@@ -93,6 +94,7 @@ pub struct JsonErrorBody {
 ///         IaError::NotFound(_) => (),
 ///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
+///         IaError::SearchFailed { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
 ///         IaError::SourceChecksumMismatch { .. } => (),
@@ -171,6 +173,18 @@ pub enum IaError {
         message: String,
         retry_after: Option<u64>,
     },
+
+    /// A search API answered with a success status but reported an error
+    /// in its body, or sent a body that is not JSON. The full-text search
+    /// API answers a request it rejects (for example one without `q`) with
+    /// HTTP 200 and `{"user_message": {"msg_type": "ERROR", "text": ...}}`;
+    /// `message` is that text. A non-success status is [`IaError::Http`].
+    /// Not retryable: a rejected request fails the same way again. That
+    /// includes a non-JSON 200 such as a proxy's maintenance page, which
+    /// may clear on its own; the caller decides whether to run the search
+    /// again.
+    #[error("search failed: {message}")]
+    SearchFailed { status: u16, message: String },
 
     #[error("rate limited (retry after {retry_after}s)")]
     RateLimited { retry_after: u64 },
@@ -519,6 +533,8 @@ impl IaError {
         match self {
             // HTTP 4xx client errors are permanent (except 429 rate-limit)
             IaError::Http { status, .. } => *status == 429 || *status >= 500,
+            // The server rejected the request; the same request fails again.
+            IaError::SearchFailed { .. } => false,
             // Transient — may succeed on retry
             IaError::RateLimited { .. } => true,
             IaError::Network(_) => true,
@@ -641,6 +657,10 @@ impl IaError {
                     extra.insert("retry_after".into(), (*secs).into());
                 }
                 "http_error"
+            }
+            IaError::SearchFailed { status, .. } => {
+                extra.insert("status".into(), (*status).into());
+                "search_failed"
             }
             IaError::RateLimited { retry_after } => {
                 extra.insert("retry_after".into(), (*retry_after).into());
@@ -1173,6 +1193,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "item unavailable: some-item: something went wrong"
+        );
+    }
+
+    #[test]
+    fn search_failed_display_json_and_not_retryable() {
+        let err = IaError::SearchFailed {
+            status: 200,
+            message: "the parameter q is required".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "search failed: the parameter q is required"
+        );
+        assert!(!err.is_retryable());
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "search_failed");
+        assert_eq!(v["error"]["status"], 200);
+        assert_eq!(
+            v["error"]["message"],
+            "search failed: the parameter q is required"
         );
     }
 

@@ -97,14 +97,17 @@ pub enum SearchCommand {
     /// Full-text search (scroll-based, auto-paginates)
     #[command(
         long_about = "Search the Internet Archive using the full-text search backend. Searches \
-            inside file contents, not just item metadata. Uses scroll-based pagination. A 429 (rate limited) on any request is retried up to three times, waiting \
+            inside file contents, not just item metadata. Uses scroll-based pagination, except \
+            with --from, which fetches one page. Each result is one matching file or page, so an \
+            item can appear more than once; the identifier printed is the item's. An error the \
+            API reports is printed and the command fails. A 429 (rate limited) on any request is retried up to three times, waiting \
             what the server's Retry-After header says (or a random wait up to a cap that doubles \
             from 1 s to 60 s), then the page fails with a rate-limit error.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Full-text search</dim>\n  <bold>$ ia search fts \"apollo 11 landing\"</bold>\
-             \n\n  <dim># With Elasticsearch DSL</dim>\n  <bold>$ ia search fts --dsl '{\"match\": {\"text\": \"moon landing\"}}'</bold>\
-             \n\n  <dim># Scoped to an index</dim>\n  <bold>$ ia search fts \"nasa\" --scope nasa_index</bold>\n"
+             \n\n  <dim># Identifiers only</dim>\n  <bold>$ ia search fts \"apollo 11 landing\" --itemlist</bold>\
+             \n\n  <dim># Results 21 to 30, one request</dim>\n  <bold>$ ia search fts \"apollo 11 landing\" --from 20 --size 10</bold>\n"
         ),
     )]
     Fts(FtsArgs),
@@ -153,19 +156,19 @@ pub struct FtsArgs {
     /// Search query
     pub query: String,
 
-    /// Use raw Elasticsearch DSL (skip !L prefix)
+    /// Send the query as is, without the `!L` prefix (for Elasticsearch DSL)
     #[arg(long)]
     pub dsl: bool,
 
-    /// Index/scope filter
+    /// Value for the API's `scope` parameter (also sent with --num-found)
     #[arg(long)]
     pub scope: Option<String>,
 
-    /// Results per scroll batch (default: 1000)
+    /// Results per request (default: 1000)
     #[arg(long)]
     pub size: Option<usize>,
 
-    /// Starting offset
+    /// Start at this offset and fetch one page of --size results, without scrolling
     #[arg(long)]
     pub from: Option<usize>,
 
@@ -321,24 +324,24 @@ async fn run_advanced(
 }
 
 async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
-    let extra_params = parse_extra_params(&args.shared.parameters)?;
+    let mut params = parse_extra_params(&args.shared.parameters)?;
+    // `--scope` narrows the count as well as the results.
+    if let Some(ref scope) = args.scope {
+        params.push(("scope".to_string(), scope.clone()));
+    }
 
     if args.shared.num_found {
         return handle_num_found(
             client,
             &args.query,
             NumFoundBackend::Fts { dsl: args.dsl },
-            &extra_params,
+            &params,
             args.shared.json,
         )
         .await;
     }
 
-    // Add FTS-specific params
-    let mut params = extra_params;
-    if let Some(ref scope) = args.scope {
-        params.push(("scope".to_string(), scope.clone()));
-    }
+    // ia-core sends these as JSON numbers; `--from` turns scroll off.
     if let Some(size) = args.size {
         params.push(("size".to_string(), size.to_string()));
     }
