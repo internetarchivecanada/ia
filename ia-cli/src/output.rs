@@ -194,8 +194,11 @@ pub fn print_batch_summary(
 /// Print a one-line HTTP diagnostics summary to stderr.
 ///
 /// Shows request count, retries (429/5xx breakdown), and p50/p95 latency.
-/// Silent when the client made no requests. Useful for diagnosing whether
-/// "slow" is archive.org rate-limiting, bad data-nodes, or something else.
+/// The count includes the download transport's requests (each `/download/`
+/// request, each redirect hop to a data node, each resend), recorded
+/// through `RetryStats::record_exchange`. Silent when the client made no
+/// requests. Useful for diagnosing whether "slow" is archive.org
+/// rate-limiting, bad data-nodes, or something else.
 pub fn print_http_diagnostics(stats: &ia_core::retry::RetryStats) {
     let summary = stats.summary();
     if summary.requests_total == 0 {
@@ -1399,7 +1402,7 @@ pub fn disk_space_free(path: &std::path::Path) -> Option<u64> {
 
 // ─── Retry summary ─────────────────────────────────────────────────────────
 
-/// Print HTTP retry summary to stderr if any retries occurred.
+/// Print HTTP retry summary to stderr if any retry, 429 or 5xx occurred.
 ///
 /// Shows retry count, 429/5xx breakdown, total server-requested wait time,
 /// and latency percentiles. Called at end of batch operations.
@@ -1409,7 +1412,7 @@ pub fn print_retry_summary(stats: &ia_core::RetryStats) {
     }
     let s = stats.summary();
     eprintln!(
-        "  {} {} requests retried ({} rate-limited, {} server errors), {:.0}s total wait",
+        "  {} {} retries ({} rate-limited, {} server errors), {:.0}s total wait",
         style("⚠").yellow(),
         s.retries_total,
         s.status_429_count,
