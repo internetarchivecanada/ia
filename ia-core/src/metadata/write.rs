@@ -556,6 +556,14 @@ pub async fn modify_compound(
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(IaError::NotFound(identifier.to_string()));
     }
+    // A 429 on this read is reported like a 429 on the POST below (and on
+    // `metadata::get`), so batch callers pause for Retry-After and retry.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
+        return Err(IaError::RateLimited {
+            retry_after: retry_after.unwrap_or(30),
+        });
+    }
     if !status.is_success() {
         let retry_after = crate::retry::extract_retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
@@ -1747,6 +1755,63 @@ mod tests {
                 assert_eq!(retry_after, 60);
             }
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    /// Run `modify_compound` with a `title` set against a server whose
+    /// metadata read answers `read_response`; the patch POST must not be
+    /// sent.
+    async fn modify_compound_with_read_response(
+        read_response: ResponseTemplate,
+    ) -> Result<ModifyResponse> {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/metadata/test-item"))
+            .respond_with(read_response)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/metadata/test-item"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let client = crate::client::IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let req = CompoundModifyRequest {
+            identifier: "test-item".to_string(),
+            groups: vec![ChangeGroup {
+                op: MetadataOp::Set,
+                changes: vec![("title".to_string(), serde_json::json!("New"))],
+            }],
+            target: "metadata".to_string(),
+            expect: None,
+            priority: None,
+            reduced_priority: false,
+        };
+        modify_compound(&client, &req).await
+    }
+
+    #[tokio::test]
+    async fn modify_compound_read_429_returns_rate_limited_with_retry_after() {
+        let result = modify_compound_with_read_response(
+            ResponseTemplate::new(429).insert_header("Retry-After", "7"),
+        )
+        .await;
+        match result {
+            Err(IaError::RateLimited { retry_after }) => assert_eq!(retry_after, 7),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_compound_read_429_without_retry_after_waits_default() {
+        let result = modify_compound_with_read_response(ResponseTemplate::new(429)).await;
+        match result {
+            // The same fallback as a 429 on the POST and on `metadata::get`.
+            Err(IaError::RateLimited { retry_after }) => assert_eq!(retry_after, 30),
+            other => panic!("expected RateLimited, got {other:?}"),
         }
     }
 
