@@ -23,7 +23,7 @@ Option 1. A refused file is a failure, not a skip: the user asked for it and it 
 
 ## Tasks
 - [x] Plan committed first.
-- [ ] Red: an item with `Photo.txt` and `photo.txt` of different bytes: the first `Complete` with its own bytes on disk, the second `Failed` with an error naming both, `files_failed == 1`, `files_downloaded == 1`, and no request for the second file; the same with `Dir/a.txt` and `dir/A.txt`; distinct names (`Photo.txt`, `photo2.txt`) both download; three names in one fold group fail the second and third; a CLI test that the summary counts the refused file as failed and the exit code is 1.
-- [ ] Green: the check in `download_item_with_metadata`, docs/usage.md.
-- [ ] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
+- [x] Red: an item with `Photo.txt` and `photo.txt` of different bytes: the first `Complete` with its own bytes on disk, the second `Failed` with an error naming both, `files_failed == 1`, `files_downloaded == 1`, and no request for the second file; the same with `Dir/a.txt` and `dir/A.txt`; distinct names (`Photo.txt`, `photo2.txt`) both download; three names in one fold group fail the second and third; a CLI test that the summary counts the refused file as failed and the exit code is 1.
+- [x] Green: the check in `download_item_with_metadata`, docs/usage.md.
+- [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code-review pass; PR.

@@ -1442,6 +1442,44 @@ pub struct ItemDownloadResult {
     pub results: Vec<FileDownloadResult>,
 }
 
+/// For each file in `files`, the name of an earlier file whose name differs
+/// from it only in letter case, if there is one.
+///
+/// Such names are one file on a case-insensitive filesystem (the default
+/// on macOS and Windows): downloading both would replace the first with
+/// the second while reporting both present. Names are compared, not the
+/// destination probed, so every platform refuses the same files. The
+/// comparison is full Unicode lowercase of the whole path, so a
+/// difference in a directory name counts too. The first file in the
+/// item's order is the one kept.
+#[must_use]
+fn case_only_collisions(files: &[crate::types::FileMetadata]) -> Vec<Option<String>> {
+    use std::collections::hash_map::{Entry, HashMap};
+    let mut first_by_folded: HashMap<String, &str> = HashMap::new();
+    files
+        .iter()
+        .map(
+            |file| match first_by_folded.entry(file.name.to_lowercase()) {
+                Entry::Occupied(kept) => Some((*kept.get()).to_string()),
+                Entry::Vacant(slot) => {
+                    slot.insert(&file.name);
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// The failure message for `file`, refused because its name differs from
+/// `kept` only in letter case.
+#[must_use]
+fn case_collision_message(file: &str, kept: &str) -> String {
+    format!(
+        "{file} not downloaded: its name differs from {kept} only in letter case, \
+         so both would be written to the same path on a case-insensitive filesystem"
+    )
+}
+
 /// Download all matching files from an item, using a shared semaphore for concurrency.
 pub async fn download_item(
     client: &IaClient,
@@ -1527,10 +1565,36 @@ pub async fn download_item_with_metadata(
     // abort early instead of hammering a full disk.
     let disk_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Names that differ only in case are one file on a case-insensitive
+    // filesystem; every later one is refused before any request (#115).
+    let collisions = case_only_collisions(&files_owned);
+
     // Concurrent download with shared semaphore
     let mut handles = Vec::new();
 
-    for file in files_owned {
+    for (file, collides_with) in files_owned.into_iter().zip(collisions) {
+        if let Some(kept) = collides_with {
+            let message = case_collision_message(&file.name, &kept);
+            debug!(file = %file.name, kept = %kept, "refused: name differs only in case");
+            let status = DownloadStatus::Failed(message);
+            if let Some(ref p) = progress {
+                p(DownloadProgress {
+                    identifier: identifier.to_string(),
+                    file_name: file.name.clone(),
+                    bytes_downloaded: 0,
+                    total_bytes: file.size,
+                    status: status.clone(),
+                });
+            }
+            // A finished task keeps the results in the item's file order.
+            handles.push(tokio::spawn(std::future::ready(FileDownloadResult {
+                file_name: file.name,
+                bytes: 0,
+                status,
+                elapsed: start.elapsed(),
+            })));
+            continue;
+        }
         let client = client.clone();
         let identifier = identifier.to_string();
         let dest_dir = dest_dir.clone();
@@ -7337,6 +7401,182 @@ mod tests {
         );
         assert!(!dir.path().join("test-item_meta.xml.part").exists());
         assert!(!dir.path().join("test-item_meta.xml").exists());
+    }
+
+    // -- Names that differ only in case (#115) --
+
+    /// Mount `case-item` whose files are `files` (name, body, number of
+    /// download requests expected) in that order, all with the same mtime,
+    /// and download it. Returns the item result, the destination
+    /// directory, and the progress events.
+    async fn download_case_item(
+        files: &[(&str, &[u8], u64)],
+    ) -> (ItemDownloadResult, tempfile::TempDir, Vec<DownloadProgress>) {
+        let mock_server = MockServer::start().await;
+        let listed: Vec<_> = files
+            .iter()
+            .map(|(name, body, _)| {
+                serde_json::json!({
+                    "name": name,
+                    "size": body.len().to_string(),
+                    "mtime": "1700000000",
+                    "source": "original",
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/metadata/case-item"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": "case-item"},
+                "files": listed,
+            })))
+            .mount(&mock_server)
+            .await;
+        for (name, body, expect) in files {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/download/case-item/{}",
+                    urlencoding::encode(name)
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .expect(*expect)
+                .mount(&mock_server)
+                .await;
+        }
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let progress: Arc<dyn Fn(DownloadProgress) + Send + Sync> =
+            Arc::new(move |p| sink.lock().unwrap().push(p));
+        let result = download_item(
+            &client,
+            "case-item",
+            &opts,
+            Arc::new(Semaphore::new(4)),
+            Some(progress),
+        )
+        .await
+        .unwrap();
+        // Verifies each mock's `expect`.
+        drop(mock_server);
+        let events = events.lock().unwrap().clone();
+        (result, dir, events)
+    }
+
+    fn status_of<'a>(result: &'a ItemDownloadResult, name: &str) -> &'a DownloadStatus {
+        &result
+            .results
+            .iter()
+            .find(|r| r.file_name == name)
+            .unwrap_or_else(|| panic!("no result for {name}"))
+            .status
+    }
+
+    fn assert_refused(result: &ItemDownloadResult, name: &str, kept: &str) {
+        match status_of(result, name) {
+            DownloadStatus::Failed(msg) => {
+                assert!(msg.contains(name) && msg.contains(kept), "{msg}");
+                assert!(msg.contains("case"), "{msg}");
+            }
+            other => panic!("{name}: expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The later of two names that differ only in case is refused without
+    /// a request, the earlier downloads with its own bytes, and the
+    /// summary counts one failure.
+    #[tokio::test]
+    async fn case_only_collision_refuses_the_later_file() {
+        let (result, dir, events) =
+            download_case_item(&[("Photo.txt", b"AAAA", 1), ("photo.txt", b"bbbbb", 0)]).await;
+
+        assert_eq!(*status_of(&result, "Photo.txt"), DownloadStatus::Complete);
+        assert_refused(&result, "photo.txt", "Photo.txt");
+        assert_eq!(result.files_total, 2);
+        assert_eq!(result.files_downloaded, 1);
+        assert_eq!(result.files_skipped, 0);
+        assert_eq!(result.files_failed, 1);
+
+        let item_dir = dir.path().join("case-item");
+        let names: Vec<_> = std::fs::read_dir(&item_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["Photo.txt"]);
+        assert_eq!(std::fs::read(item_dir.join("Photo.txt")).unwrap(), b"AAAA");
+
+        assert!(
+            events.iter().any(
+                |e| e.file_name == "photo.txt" && matches!(e.status, DownloadStatus::Failed(_))
+            ),
+            "no Failed progress event for photo.txt: {events:?}"
+        );
+    }
+
+    /// Equal size and mtime: the later file used to be reported skipped
+    /// against the earlier file's bytes; it is refused instead.
+    #[tokio::test]
+    async fn case_only_collision_with_equal_size_is_refused_not_skipped() {
+        let (result, dir, _) =
+            download_case_item(&[("Photo.txt", b"AAAA", 1), ("photo.txt", b"bbbb", 0)]).await;
+        assert_eq!(*status_of(&result, "Photo.txt"), DownloadStatus::Complete);
+        assert_refused(&result, "photo.txt", "Photo.txt");
+        assert_eq!(result.files_failed, 1);
+        let item_dir = dir.path().join("case-item");
+        assert_eq!(std::fs::read(item_dir.join("Photo.txt")).unwrap(), b"AAAA");
+    }
+
+    /// A collision anywhere in the path counts, not only in the last part.
+    #[tokio::test]
+    async fn case_only_collision_in_a_directory_name_is_refused() {
+        let (result, _dir, _) =
+            download_case_item(&[("Dir/a.txt", b"AAAA", 1), ("dir/A.txt", b"bbbbb", 0)]).await;
+        assert_eq!(*status_of(&result, "Dir/a.txt"), DownloadStatus::Complete);
+        assert_refused(&result, "dir/A.txt", "Dir/a.txt");
+        assert_eq!(result.files_failed, 1);
+    }
+
+    /// Every later name in a group is refused, each naming the file that
+    /// was kept.
+    #[tokio::test]
+    async fn case_only_collision_refuses_every_later_name() {
+        let (result, _dir, _) = download_case_item(&[
+            ("a.txt", b"one", 1),
+            ("A.txt", b"two!", 0),
+            ("a.TXT", b"three", 0),
+        ])
+        .await;
+        assert_eq!(*status_of(&result, "a.txt"), DownloadStatus::Complete);
+        assert_refused(&result, "A.txt", "a.txt");
+        assert_refused(&result, "a.TXT", "a.txt");
+        assert_eq!(result.files_downloaded, 1);
+        assert_eq!(result.files_failed, 2);
+    }
+
+    /// Names that differ by more than case all download; similar names in
+    /// different directories do not collide.
+    #[tokio::test]
+    async fn distinct_names_all_download() {
+        let (result, dir, _) = download_case_item(&[
+            ("Photo.txt", b"AAAA", 1),
+            ("photo2.txt", b"bbbbb", 1),
+            ("x/Photo.txt", b"cc", 1),
+        ])
+        .await;
+        assert_eq!(result.files_downloaded, 3);
+        assert_eq!(result.files_failed, 0);
+        let item_dir = dir.path().join("case-item");
+        assert_eq!(std::fs::read(item_dir.join("Photo.txt")).unwrap(), b"AAAA");
+        assert_eq!(
+            std::fs::read(item_dir.join("photo2.txt")).unwrap(),
+            b"bbbbb"
+        );
+        assert_eq!(std::fs::read(item_dir.join("x/Photo.txt")).unwrap(), b"cc");
     }
 
     // -- Retry-After on the per-file retry loop --

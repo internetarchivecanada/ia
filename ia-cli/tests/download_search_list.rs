@@ -1278,6 +1278,93 @@ async fn multi_disk_resume_skips_existing_items() {
     );
 }
 
+/// Mount `case-item` with `Photo.txt` (4 bytes) and `photo.txt` (5 bytes);
+/// only `Photo.txt` may be requested.
+async fn mount_case_only_item(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/metadata/case-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"identifier": "case-item"},
+            "files": [
+                {"name": "Photo.txt", "source": "original", "size": "4", "mtime": "1700000000"},
+                {"name": "photo.txt", "source": "original", "size": "5", "mtime": "1700000000"}
+            ]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/case-item/Photo.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AAAA"))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/case-item/photo.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bbbbb"))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+/// #115: of two names that differ only in case, the later is refused with
+/// an error naming both, the run exits non-zero, and the summary counts
+/// it as failed.
+#[tokio::test]
+async fn download_refuses_case_only_name_collision() {
+    let server = MockServer::start().await;
+    mount_case_only_item(&server).await;
+    let host = server.uri().replace("http://", "");
+
+    let dir = TempDir::new().unwrap();
+    let output = ia_cmd()
+        .args(["--insecure", "-H", &host, "download", "case-item", "--json"])
+        .arg("--destdir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let line_for = |name: &str| {
+        lines
+            .iter()
+            .find(|v| v["file"] == name)
+            .unwrap_or_else(|| panic!("no line for {name}: {lines:?}"))
+    };
+    assert_eq!(line_for("Photo.txt")["status"], "ok");
+    let refused = line_for("photo.txt");
+    assert_eq!(refused["status"], "error");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("photo.txt") && message.contains("Photo.txt"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("case-item/Photo.txt")).unwrap(),
+        b"AAAA"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let output = ia_cmd()
+        .args(["--insecure", "-H", &host, "download", "case-item"])
+        .arg("--destdir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("1 downloaded · 0 skipped · 1 errors"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("photo.txt not downloaded").count(),
+        1,
+        "{stderr}"
+    );
+}
+
 /// A download whose md5 does not match the item metadata fails by default
 /// (#13) and is accepted with --no-verify.
 #[tokio::test]
