@@ -13,7 +13,7 @@
 
 Option 1. A refused file is a failure, not a skip: the user asked for it and it is not on disk, so the run exits non-zero and the job log records it like any other failure.
 
-**Detection is by name, not by filesystem.** Before any download starts, the selected files are compared by their names folded to lowercase (`str::to_lowercase`, full Unicode lowercase of the whole path). Two names that fold to the same text collide. The comparison runs on every platform, so the same item gives the same result on Linux, macOS and Windows; on a case-sensitive filesystem this refuses a file that could have been stored, which is the cost of identical behaviour. The comparison covers the files selected for this run, not every file in the item: downloading `photo.txt` alone writes one file and replaces nothing from the same run.
+**Detection is by name, not by filesystem.** Before any download starts, the selected files are compared by their names folded over the whole path: empty and `.` path parts are dropped, and each part is lowercased, uppercased and lowercased again (`str::to_lowercase` alone misses pairs that APFS and NTFS treat as one name, such as `ſ` and `s`, `µ` and `μ`, and final and medial sigma; the round trip also joins `ß` and `ss`, which those filesystems keep apart, and refusing one of those is accepted). Two names that fold to the same text collide. The comparison runs on every platform, so the same item gives the same result on Linux, macOS and Windows; on a case-sensitive filesystem this refuses a file that could have been stored, which is the cost of identical behaviour. The comparison covers the files selected for this run, not every file in the item: downloading `photo.txt` alone writes one file and replaces nothing from the same run.
 
 **Which file wins.** The first in the order the item's metadata lists the selected files. That order is stable for a given item, so a rerun refuses the same file.
 
@@ -26,4 +26,10 @@ Option 1. A refused file is a failure, not a skip: the user asked for it and it 
 - [x] Red: an item with `Photo.txt` and `photo.txt` of different bytes: the first `Complete` with its own bytes on disk, the second `Failed` with an error naming both, `files_failed == 1`, `files_downloaded == 1`, and no request for the second file; the same with `Dir/a.txt` and `dir/A.txt`; distinct names (`Photo.txt`, `photo2.txt`) both download; three names in one fold group fail the second and third; a CLI test that the summary counts the refused file as failed and the exit code is 1.
 - [x] Green: the check in `download_item_with_metadata`, docs/usage.md.
 - [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
-- [ ] Code-review pass; PR.
+- [x] Code-review pass; PR.
+
+## Review (2026-11-09), closed before the PR
+
+Taken: the comparison key folds by lowercase, uppercase, lowercase rather than a single lowercase, and drops empty and `.` path parts (tests for `ſ`/`s`, `µ`/`μ`, `ϐ`/`β`, final sigma, `./Photo.txt`, `Dir//a.txt`); docs/usage.md says where the message appears in batch `--json` output and that normalization differences are not detected; the test assertion on the message checks `only in letter case`.
+
+Not changed: a later run that selects only the other name, into the same `--destdir`, can still replace the kept file, because the check covers the files of one run; usage.md says to use a different `--destdir`. With `--dry-run` a refused file is reported failed and the run exits 1, as the real run would.

@@ -1442,6 +1442,28 @@ pub struct ItemDownloadResult {
     pub results: Vec<FileDownloadResult>,
 }
 
+/// The text two file names share when they name one file on a
+/// case-insensitive filesystem.
+///
+/// Empty and `.` path parts are dropped (`./Photo.txt` and `Dir//a.txt`
+/// resolve to `Photo.txt` and `Dir/a.txt`), and each part is folded by
+/// lowercasing, uppercasing and lowercasing again. A single lowercase
+/// misses pairs that APFS and NTFS treat as one name, such as `ſ` (long s)
+/// and `s`, `µ` (micro sign) and `μ`, or a word ending in capital sigma
+/// and the same word with a medial `σ`; the round trip maps each pair to
+/// one text. It also joins a few names those filesystems keep apart (`ß`
+/// and `ss`); refusing one of those is the cost of comparing names rather
+/// than probing the destination. Names that differ only in Unicode
+/// normalization are not joined.
+#[must_use]
+fn collision_key(name: &str) -> String {
+    name.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| part.to_lowercase().to_uppercase().to_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// For each file in `files`, the name of an earlier file whose name differs
 /// from it only in letter case, if there is one.
 ///
@@ -1449,24 +1471,22 @@ pub struct ItemDownloadResult {
 /// on macOS and Windows): downloading both would replace the first with
 /// the second while reporting both present. Names are compared, not the
 /// destination probed, so every platform refuses the same files. The
-/// comparison is full Unicode lowercase of the whole path, so a
-/// difference in a directory name counts too. The first file in the
-/// item's order is the one kept.
+/// whole path is compared through [`collision_key`], so a difference in a
+/// directory name counts too. The first file in the item's order is the
+/// one kept.
 #[must_use]
 fn case_only_collisions(files: &[crate::types::FileMetadata]) -> Vec<Option<String>> {
     use std::collections::hash_map::{Entry, HashMap};
-    let mut first_by_folded: HashMap<String, &str> = HashMap::new();
+    let mut first_by_key: HashMap<String, &str> = HashMap::new();
     files
         .iter()
-        .map(
-            |file| match first_by_folded.entry(file.name.to_lowercase()) {
-                Entry::Occupied(kept) => Some((*kept.get()).to_string()),
-                Entry::Vacant(slot) => {
-                    slot.insert(&file.name);
-                    None
-                }
-            },
-        )
+        .map(|file| match first_by_key.entry(collision_key(&file.name)) {
+            Entry::Occupied(kept) => Some((*kept.get()).to_string()),
+            Entry::Vacant(slot) => {
+                slot.insert(&file.name);
+                None
+            }
+        })
         .collect()
 }
 
@@ -7481,10 +7501,64 @@ mod tests {
         match status_of(result, name) {
             DownloadStatus::Failed(msg) => {
                 assert!(msg.contains(name) && msg.contains(kept), "{msg}");
-                assert!(msg.contains("case"), "{msg}");
+                assert!(msg.contains("only in letter case"), "{msg}");
             }
             other => panic!("{name}: expected Failed, got {other:?}"),
         }
+    }
+
+    /// The names `case_only_collisions` pairs: for each of `names`, the
+    /// earlier name it collides with.
+    fn collisions_of(names: &[&str]) -> Vec<Option<String>> {
+        let files: Vec<_> = names.iter().map(|n| test_file_meta(n, 1)).collect();
+        case_only_collisions(&files)
+    }
+
+    #[test]
+    fn collision_key_folds_case_beyond_plain_lowercase() {
+        // Pairs that lowercase differently but are one name on APFS and NTFS.
+        for (a, b) in [
+            ("\u{17f}.txt", "s.txt"),        // long s
+            ("\u{b5}m.txt", "\u{3bc}m.txt"), // micro sign, Greek mu
+            ("\u{3d0}.txt", "\u{3b2}.txt"),  // beta symbol, beta
+            (
+                "\u{39f}\u{394}\u{39f}\u{3a3} 1.txt",
+                "\u{3bf}\u{3b4}\u{3bf}\u{3c3} 1.txt",
+            ), // final sigma
+        ] {
+            assert_eq!(
+                collisions_of(&[a, b]),
+                [None, Some(a.to_string())],
+                "{a} {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn collision_key_ignores_empty_and_dot_path_parts() {
+        assert_eq!(
+            collisions_of(&["./Photo.txt", "photo.txt"]),
+            [None, Some("./Photo.txt".to_string())]
+        );
+        assert_eq!(
+            collisions_of(&["Dir//a.txt", "dir/a.txt"]),
+            [None, Some("Dir//a.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn collision_key_keeps_distinct_names_apart() {
+        assert_eq!(
+            collisions_of(&[
+                "a.txt",
+                "a.txt.bak",
+                "b/a.txt",
+                "a/b.txt",
+                "\u{e9}.txt",
+                "e.txt"
+            ]),
+            [None, None, None, None, None, None]
+        );
     }
 
     /// The later of two names that differ only in case is refused without
