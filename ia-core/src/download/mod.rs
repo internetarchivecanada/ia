@@ -409,8 +409,9 @@ pub(crate) async fn fetch_response(
             req = req.header("Range", format!("bytes={offset}-"));
         }
 
-        let r = req
-            .send()
+        // Recorded here, per hop, because this transport bypasses the
+        // client's middleware (see `retry::send_recorded`).
+        let r = crate::retry::send_recorded(client.retry_stats(), req)
             .await
             .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
 
@@ -1270,6 +1271,7 @@ pub async fn download_file(
 
         // Re-request from the bytes on disk. Shared by the stream-error
         // and stall paths.
+        client.retry_stats().record_retry();
         let new_resp =
             fetch_response(client, &url, Some(bytes_downloaded), opts.count_views).await?;
         if new_resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -1591,6 +1593,7 @@ pub async fn download_item_with_metadata(
                         "retrying after {:?}",
                         delay
                     );
+                    client.retry_stats().record_retry();
                     tokio::time::sleep(delay).await;
                 }
 

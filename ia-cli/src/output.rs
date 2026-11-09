@@ -194,8 +194,11 @@ pub fn print_batch_summary(
 /// Print a one-line HTTP diagnostics summary to stderr.
 ///
 /// Shows request count, retries (429/5xx breakdown), and p50/p95 latency.
-/// Silent when the client made no requests. Useful for diagnosing whether
-/// "slow" is archive.org rate-limiting, bad data-nodes, or something else.
+/// The count includes the download transport's requests (each `/download/`
+/// request, each redirect hop to a data node, each resend), recorded
+/// through `RetryStats::record_exchange`. Silent when the client made no
+/// requests. Useful for diagnosing whether "slow" is archive.org
+/// rate-limiting, bad data-nodes, or something else.
 pub fn print_http_diagnostics(stats: &ia_core::retry::RetryStats) {
     let summary = stats.summary();
     if summary.requests_total == 0 {

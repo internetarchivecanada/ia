@@ -107,11 +107,15 @@ pub(crate) fn wait_before_retry(
 /// `Arc`) to middleware so every request and retry is recorded.
 #[derive(Debug)]
 pub struct RetryStats {
-    /// Total HTTP requests attempted (including retried ones).
+    /// HTTP requests sent: one per attempt through the client's middleware
+    /// ([`TimingMiddleware`] sits inside the retry loop), and one per
+    /// exchange recorded with [`RetryStats::record_exchange`] (each
+    /// `/download/` request, redirect hop and resend).
     requests_total: AtomicU64,
-    /// Total retries made across all requests: resends by
-    /// [`RetryMiddleware`], whatever the cause (a 5xx or a connect failure).
-    /// An answer that was not resent is not a retry.
+    /// Total retries made: resends by [`RetryMiddleware`], whatever the
+    /// cause (a 5xx or a connect failure), and the download loops' resends
+    /// (recorded with [`RetryStats::record_retry`]). An answer that was not
+    /// resent is not a retry.
     retries_total: AtomicU64,
     /// Number of 429 responses received.
     status_429_count: AtomicU64,
@@ -233,6 +237,28 @@ impl RetryStats {
         tracing::info!(status, url_path, "server error");
     }
 
+    /// Record one HTTP exchange sent outside the [`crate::IaClient`]
+    /// middleware stack, such as a `/download/` request or one hop of its
+    /// redirect chain.
+    ///
+    /// Counts the request and its latency (to the response headers, or to
+    /// the failure) like [`TimingMiddleware`] does, and a 429 or 5xx answer
+    /// like the retry strategy does. Whether the request is resent is the
+    /// caller's decision; record that with [`RetryStats::record_retry`].
+    pub fn record_exchange(&self, latency: Duration, response: Option<&reqwest::Response>) {
+        self.record_request(latency);
+        let Some(response) = response else {
+            return;
+        };
+        let status = response.status().as_u16();
+        let url_path = response.url().path();
+        if status == 429 {
+            self.record_rate_limit(status, extract_retry_after(response.headers()), url_path);
+        } else if status >= 500 {
+            self.record_server_error(status, url_path);
+        }
+    }
+
     /// Record one retry: a request that is about to be resent.
     ///
     /// Called by [`RetryMiddleware`] once it has decided to resend, so
@@ -287,6 +313,22 @@ impl RetryStats {
             p99_ms: guard[idx(99.0)],
         })
     }
+}
+
+/// Send `req` once and record the exchange in `stats`
+/// ([`RetryStats::record_exchange`]).
+///
+/// For transports outside the [`crate::IaClient`] middleware stack (the
+/// download transport), so that their requests appear in the same
+/// diagnostics as the client's.
+pub(crate) async fn send_recorded(
+    stats: &RetryStats,
+    req: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let started = Instant::now();
+    let sent = req.send().await;
+    stats.record_exchange(started.elapsed(), sent.as_ref().ok());
+    sent
 }
 
 /// Whether this `reqwest::Error` represents a transient body-read / decode
@@ -415,10 +457,11 @@ impl RetryableStrategy for ConnectOnlyRetryStrategy {
     }
 }
 
-/// Middleware that measures wall-clock time per logical request (including retries).
+/// Middleware that records each HTTP request and its latency.
 ///
-/// Sits outside the retry middleware in the stack, so it captures the total
-/// time from request start to final response (including any retry waits).
+/// [`crate::IaClient`] places it inside the retry middleware, so every
+/// attempt is one request, timed from send to response headers (no retry
+/// waits included).
 pub struct TimingMiddleware {
     stats: Arc<RetryStats>,
 }
@@ -663,6 +706,37 @@ mod tests {
         assert_eq!(s.status_429_count, 0);
         assert_eq!(s.status_5xx_count, 1);
         assert!(stats.had_retries(), "had_retries includes server errors");
+    }
+
+    #[tokio::test]
+    async fn record_exchange_classifies_the_answer() {
+        let server = wiremock::MockServer::start().await;
+        for (route, status) in [("/ok", 200), ("/busy", 429), ("/down", 502)] {
+            wiremock::Mock::given(wiremock::matchers::path(route))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status).insert_header("retry-after", "7"),
+                )
+                .mount(&server)
+                .await;
+        }
+        let stats = RetryStats::new(0);
+        let http = reqwest::Client::new();
+        for route in ["/ok", "/busy", "/down"] {
+            let resp = send_recorded(&stats, http.get(format!("{}{route}", server.uri())))
+                .await
+                .unwrap();
+            assert_eq!(resp.url().path(), route);
+        }
+        let failed = send_recorded(&stats, http.get("http://127.0.0.1:1/")).await;
+        assert!(failed.is_err());
+
+        let s = stats.summary();
+        assert_eq!(s.requests_total, 4, "a failed send is a request too");
+        assert_eq!(s.status_429_count, 1);
+        assert_eq!(s.status_5xx_count, 1);
+        assert_eq!(s.total_retry_wait, Duration::from_secs(7), "only the 429's");
+        assert_eq!(s.retries_total, 0, "resends are the caller's to record");
+        assert_eq!(stats.percentiles().map(|_| ()), Some(()));
     }
 
     #[test]
