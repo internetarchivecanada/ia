@@ -107,15 +107,15 @@ pub(crate) fn wait_before_retry(
 /// `Arc`) to middleware so every request and retry is recorded.
 #[derive(Debug)]
 pub struct RetryStats {
-    /// HTTP requests recorded: one per call through the client's
-    /// middleware ([`TimingMiddleware`] sits outside the retry loop, so a
-    /// call's resends are not separate requests here), and one per
+    /// HTTP requests sent: one per attempt through the client's middleware
+    /// ([`TimingMiddleware`] sits inside the retry loop), and one per
     /// exchange recorded with [`RetryStats::record_exchange`] (each
     /// `/download/` request, redirect hop and resend).
     requests_total: AtomicU64,
-    /// Total retries made across all requests: resends by
-    /// [`RetryMiddleware`], whatever the cause (a 5xx or a connect failure).
-    /// An answer that was not resent is not a retry.
+    /// Total retries made: resends by [`RetryMiddleware`], whatever the
+    /// cause (a 5xx or a connect failure), and the download loops' resends
+    /// (recorded with [`RetryStats::record_retry`]). An answer that was not
+    /// resent is not a retry.
     retries_total: AtomicU64,
     /// Number of 429 responses received.
     status_429_count: AtomicU64,
@@ -457,10 +457,11 @@ impl RetryableStrategy for ConnectOnlyRetryStrategy {
     }
 }
 
-/// Middleware that measures wall-clock time per logical request (including retries).
+/// Middleware that records each HTTP request and its latency.
 ///
-/// Sits outside the retry middleware in the stack, so it captures the total
-/// time from request start to final response (including any retry waits).
+/// [`crate::IaClient`] places it inside the retry middleware, so every
+/// attempt is one request, timed from send to response headers (no retry
+/// waits included).
 pub struct TimingMiddleware {
     stats: Arc<RetryStats>,
 }

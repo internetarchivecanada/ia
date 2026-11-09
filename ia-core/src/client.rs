@@ -235,12 +235,15 @@ impl IaClient {
         let raw_http = transports.upload.clone();
         let api_for_writes = transports.api.clone();
 
+        // Timing sits inside the retry middleware, so each attempt is one
+        // request with its own latency, as on the download transport
+        // (`retry::send_recorded`).
         let http = ClientBuilder::new(transports.api)
-            .with(TimingMiddleware::new(stats.clone()))
             .with(
                 RetryMiddleware::new(retry_policy, LoggingRetryStrategy::new(stats.clone()))
                     .with_stats(stats.clone()),
             )
+            .with(TimingMiddleware::new(stats.clone()))
             .build();
 
         // Writes must not be replayed on a 5xx, but a connection that was
@@ -248,7 +251,6 @@ impl IaClient {
         // safe and dropping it would be a regression against the retrying
         // client. Timing is kept so writes still appear in -v diagnostics.
         let api_no_retry = ClientBuilder::new(api_for_writes)
-            .with(TimingMiddleware::new(stats.clone()))
             .with(
                 RetryMiddleware::new(
                     retry_policy,
@@ -256,6 +258,7 @@ impl IaClient {
                 )
                 .with_stats(stats.clone()),
             )
+            .with(TimingMiddleware::new(stats.clone()))
             .build();
 
         // Upload transport: timing only, no retry layer.
@@ -403,8 +406,9 @@ impl IaClient {
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
         let transports = Self::build_transports(&config, CONNECT_TIMEOUT, READ_TIMEOUT)?;
-        // Stats are required by the struct but will always be zeros — no
-        // TimingMiddleware or LoggingRetryStrategy is wired in this path.
+        // No TimingMiddleware or retry strategy is wired in this path, so
+        // the stats see only the download transport's requests
+        // (`retry::send_recorded`).
         let stats = Arc::new(RetryStats::new(0));
         let raw_http = transports.upload.clone();
         let api_for_writes = transports.api.clone();
