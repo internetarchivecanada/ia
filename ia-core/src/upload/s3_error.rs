@@ -49,7 +49,11 @@ pub(crate) fn extract_xml_field(body: &str, tag: &str) -> Option<String> {
 /// with a local name or put in a URL. Text with a malformed or unknown
 /// reference (a bare `&`, `&foo;`, `&#0;`) is returned as sent: a server
 /// that left a bare `&` unescaped most likely sent the real text.
-fn unescape_xml_text(raw: &str) -> String {
+///
+/// Also decodes the member names in the archive.org zip view
+/// (`download::zip::parse_zip_listing_html`), whose HTML escapes the same
+/// characters the same way.
+pub(crate) fn unescape_xml_text(raw: &str) -> String {
     // `resolve_xml_entity` names only XML's five entities, whatever
     // features other crates enable on quick-xml (`escape-html` would widen
     // plain `unescape` to every HTML5 entity name).

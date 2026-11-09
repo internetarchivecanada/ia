@@ -9,6 +9,7 @@ use tracing::debug;
 
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
+use crate::upload::s3_error::unescape_xml_text;
 
 /// A single entry within a ZIP file on archive.org.
 #[derive(Debug, Clone)]
@@ -181,6 +182,11 @@ pub(crate) fn build_zip_member_url(
 ///
 /// We only match lines starting with `<tr>` to avoid picking up navigation
 /// links (`#maincontent`, external URLs) that appear elsewhere in the page.
+///
+/// The link text is the member's path with HTML character references
+/// (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#039;`) that are decoded here, so
+/// [`ZipEntry::path`] is the real name and can be passed to
+/// [`download_zip_member`].
 pub(crate) fn parse_zip_listing_html(html: &str) -> Vec<ZipEntry> {
     let mut entries = Vec::new();
 
@@ -211,7 +217,9 @@ pub(crate) fn parse_zip_listing_html(html: &str) -> Vec<ZipEntry> {
                         if !display_name.is_empty() {
                             let (size, modified) = parse_table_cells(after_tag);
                             entries.push(ZipEntry {
-                                path: display_name.to_string(),
+                                // The link text is HTML: `a&b.jp2` is sent
+                                // as `a&amp;b.jp2`.
+                                path: unescape_xml_text(display_name),
                                 size,
                                 modified,
                             });
@@ -363,6 +371,91 @@ mod tests {
         assert_eq!(entries[0].path, "file.jp2");
         assert_eq!(entries[0].size, Some(12345));
         assert_eq!(entries[0].modified, Some("2024-01-01".to_string()));
+    }
+
+    /// One listing row for `name_html` (the link text as the zip view
+    /// sends it), parsed; returns the single entry's path.
+    fn parse_one_name(name_html: &str) -> String {
+        let html = format!(
+            r#"<tr><td><a href="//archive.org/download/item/item.zip/x">{name_html}</a><td>2026-01-01 00:00<td id="size">5</tr>"#
+        );
+        let entries = parse_zip_listing_html(&html);
+        assert_eq!(entries.len(), 1, "{html}");
+        assert_eq!(entries[0].size, Some(5));
+        entries[0].path.clone()
+    }
+
+    /// #117: the link text is HTML; its character references are decoded so
+    /// the path is the member's real name.
+    #[test]
+    fn parse_zip_listing_decodes_ampersand_and_angle_brackets() {
+        assert_eq!(parse_one_name("a&amp;b &lt;c&gt;.jp2"), "a&b <c>.jp2");
+    }
+
+    #[test]
+    fn parse_zip_listing_decodes_quotes() {
+        assert_eq!(
+            parse_one_name("&quot;q&quot; it&#039;s &apos;x&apos; &#39;y&#x27;.jp2"),
+            "\"q\" it's 'x' 'y'.jp2"
+        );
+    }
+
+    #[test]
+    fn parse_zip_listing_decodes_once() {
+        // A member literally named `a&amp;b.jp2` is sent as `a&amp;amp;b.jp2`.
+        assert_eq!(parse_one_name("a&amp;amp;b.jp2"), "a&amp;b.jp2");
+    }
+
+    #[test]
+    fn parse_zip_listing_plain_name_unchanged() {
+        assert_eq!(
+            parse_one_name("dir/plain name_01 (v2).jp2"),
+            "dir/plain name_01 (v2).jp2"
+        );
+    }
+
+    /// #117: a listed name with escaped characters downloads the member it
+    /// names: the request path is the real name, percent-encoded.
+    #[tokio::test]
+    async fn listed_name_with_entities_downloads_that_member() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/item/item.zip/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<tr><td><a href="//archive.org/download/item/item.zip/a%26b%20%3Cc%3E.jp2">a&amp;b &lt;c&gt;.jp2</a><td>2026-01-01 00:00<td id="size">5</tr>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = crate::IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let entries = list_zip_contents(&client, "item", "item.zip")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a&b <c>.jp2");
+
+        let bytes = download_zip_member(&client, "item", "item.zip", &entries[0].path)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+
+        let requests = server.received_requests().await.unwrap();
+        let member_paths: Vec<&str> = requests
+            .iter()
+            .map(|r| r.url.path())
+            .filter(|p| !p.ends_with('/'))
+            .collect();
+        assert_eq!(
+            member_paths,
+            ["/download/item/item.zip/a%26b%20%3Cc%3E.jp2"]
+        );
     }
 
     #[test]
