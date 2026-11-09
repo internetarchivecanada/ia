@@ -340,3 +340,112 @@ async fn http_error_after_the_budget_carries_retry_after() {
     assert_eq!(err.retry_after(), Some(0), "got {err:?}");
     server.verify().await;
 }
+
+// ── retries_total counts retries made, not 5xx answers (#132) ──────────────
+
+/// A read whose every attempt answers 5xx is retried three times (the
+/// standard budget) and then handed back: four attempts, three retries.
+#[tokio::test]
+async fn exhausted_read_counts_only_the_retries_made() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/down"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let resp = client
+        .http()
+        .get(format!("{}/metadata/down", server.uri()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+
+    let s = client.retry_stats().summary();
+    assert_eq!(s.status_5xx_count, 4, "every 5xx answer is counted");
+    assert_eq!(s.retries_total, 3, "the last 5xx was not retried");
+    server.verify().await;
+}
+
+/// A read that gets one 5xx and then succeeds made exactly one retry.
+#[tokio::test]
+async fn successful_retry_counts_one_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/flaky"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/flaky"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let resp = client
+        .http()
+        .get(format!("{}/metadata/flaky", server.uri()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let s = client.retry_stats().summary();
+    assert_eq!(s.status_5xx_count, 1);
+    assert_eq!(s.retries_total, 1);
+    server.verify().await;
+}
+
+/// A metadata write is never replayed on a 5xx, so a 5xx answer to it is a
+/// server error and not a retry.
+#[tokio::test]
+async fn unretried_write_5xx_is_not_counted_as_a_retry() {
+    use ia_core::metadata::write::{modify, MetadataOp, ModifyRequest};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/write-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "write-item", "title": "old"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/metadata/write-item"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = mock_config(&server.uri());
+    config.s3_access = Some("test_access".to_string());
+    config.s3_secret = Some("test_secret".to_string());
+    let client = IaClient::from_config(config).unwrap();
+    let req = ModifyRequest {
+        identifier: "write-item".to_string(),
+        changes: vec![("title".to_string(), serde_json::json!("new"))],
+        op: MetadataOp::Set,
+        target: "metadata".to_string(),
+        expect: None,
+        priority: None,
+        reduced_priority: false,
+    };
+    assert!(modify(&client, &req).await.is_err(), "the 503 surfaces");
+
+    let s = client.retry_stats().summary();
+    assert_eq!(s.status_5xx_count, 1);
+    assert_eq!(s.retries_total, 0, "a write is not retried on a 5xx");
+    assert!(
+        client.retry_stats().had_retries(),
+        "a server error is still reported in the batch summary"
+    );
+    server.verify().await;
+}

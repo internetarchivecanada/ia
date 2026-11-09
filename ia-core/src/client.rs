@@ -237,10 +237,10 @@ impl IaClient {
 
         let http = ClientBuilder::new(transports.api)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryMiddleware::new(
-                retry_policy,
-                LoggingRetryStrategy::new(stats.clone()),
-            ))
+            .with(
+                RetryMiddleware::new(retry_policy, LoggingRetryStrategy::new(stats.clone()))
+                    .with_stats(stats.clone()),
+            )
             .build();
 
         // Writes must not be replayed on a 5xx, but a connection that was
@@ -249,10 +249,13 @@ impl IaClient {
         // client. Timing is kept so writes still appear in -v diagnostics.
         let api_no_retry = ClientBuilder::new(api_for_writes)
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryMiddleware::new(
-                retry_policy,
-                crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
-            ))
+            .with(
+                RetryMiddleware::new(
+                    retry_policy,
+                    crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
+                )
+                .with_stats(stats.clone()),
+            )
             .build();
 
         // Upload transport: timing only, no retry layer.
