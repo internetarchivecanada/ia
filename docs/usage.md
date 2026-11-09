@@ -1064,7 +1064,7 @@ ia config <SUBCOMMAND>
 |------|------------|-------------|
 | `-u, --username <EMAIL>` | `login` | Email address (prompts if omitted) |
 | `-p, --password <PASS>` | `login` | Password (prompts if omitted) |
-| `--netrc` | `login` | Read credentials from `~/.netrc` |
+| `--netrc` | `login` | Read credentials from the `machine archive.org` entry in `~/.netrc`. A `default` entry is not used, and a malformed file is an error. |
 | `--show-secrets` | `show` | Show secret values instead of redacting them |
 | `--json` | all | Output as JSON |
 
