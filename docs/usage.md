@@ -432,7 +432,7 @@ ia search "collection:nasa" -f identifier | ia metadata export
 
 #### `ia metadata audit`
 
-Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations.
+Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations. Every metadata field of the item is checked against its schema entry.
 
 | Flag | Description |
 |------|-------------|
@@ -1068,7 +1068,7 @@ ia config <SUBCOMMAND>
 |------|------------|-------------|
 | `-u, --username <EMAIL>` | `login` | Email address (prompts if omitted) |
 | `-p, --password <PASS>` | `login` | Password (prompts if omitted) |
-| `--netrc` | `login` | Read credentials from `~/.netrc` |
+| `--netrc` | `login` | Read credentials from the `machine archive.org` entry in `~/.netrc`. A `default` entry is not used, and a malformed file is an error. |
 | `--show-secrets` | `show` | Show secret values instead of redacting them |
 | `--json` | all | Output as JSON |
 

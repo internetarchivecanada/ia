@@ -252,7 +252,8 @@ pub enum MetadataCommand {
             Reports type mismatches, missing required fields, deprecated fields, \
             and repeatability violations.\n\n\
             Fetches the live schema from archive.org and compares each item's \
-            metadata against it.",
+            metadata against it. Every metadata field of the item is checked \
+            against its schema entry.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Audit a single item</dim>\n  <bold>$ ia metadata audit myitem</bold>\
