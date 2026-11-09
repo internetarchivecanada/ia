@@ -141,7 +141,8 @@ pub struct LoginArgs {
     #[arg(short, long)]
     pub password: Option<String>,
 
-    /// Read credentials from ~/.netrc
+    /// Read credentials from the `machine archive.org` entry in ~/.netrc
+    /// (a `default` entry is not used)
     #[arg(short, long)]
     pub netrc: bool,
 
