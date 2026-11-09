@@ -109,7 +109,9 @@ pub(crate) fn wait_before_retry(
 pub struct RetryStats {
     /// Total HTTP requests attempted (including retried ones).
     requests_total: AtomicU64,
-    /// Total retry attempts across all requests.
+    /// Total retries made across all requests: resends by
+    /// [`RetryMiddleware`], whatever the cause (a 5xx or a connect failure).
+    /// An answer that was not resent is not a retry.
     retries_total: AtomicU64,
     /// Number of 429 responses received.
     status_429_count: AtomicU64,
@@ -218,21 +220,33 @@ impl RetryStats {
         }
     }
 
-    /// Record a 5xx server error retry event.
+    /// Record a 5xx answer.
     ///
-    /// Increments `retries_total` and `status_5xx_count`, and emits
-    /// `tracing::info!` regardless of verbosity level.
+    /// Increments `status_5xx_count` and emits `tracing::info!` regardless
+    /// of verbosity level. Whether the request is resent is decided later,
+    /// by [`RetryMiddleware`] (the budget may be spent, and the write client
+    /// never resends a 5xx), so this does not count a retry; see
+    /// [`RetryStats::record_retry`].
     pub fn record_server_error(&self, status: u16, url_path: &str) {
-        self.retries_total.fetch_add(1, Ordering::Relaxed);
         self.status_5xx_count.fetch_add(1, Ordering::Relaxed);
 
-        tracing::info!(status, url_path, "server error, retrying");
+        tracing::info!(status, url_path, "server error");
     }
 
-    /// Returns `true` if any retry or rate-limit event has been recorded.
+    /// Record one retry: a request that is about to be resent.
+    ///
+    /// Called by [`RetryMiddleware`] once it has decided to resend, so
+    /// `retries_total` counts resends made, not failures seen.
+    pub fn record_retry(&self) {
+        self.retries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns `true` if any retry, rate-limit or server-error event has
+    /// been recorded.
     pub fn had_retries(&self) -> bool {
         self.retries_total.load(Ordering::Relaxed) > 0
             || self.status_429_count.load(Ordering::Relaxed) > 0
+            || self.status_5xx_count.load(Ordering::Relaxed) > 0
     }
 
     /// Return a point-in-time snapshot of all counters.
@@ -450,9 +464,13 @@ impl reqwest_middleware::Middleware for TimingMiddleware {
 ///
 /// A request whose body cannot be cloned (a streaming body) is sent once;
 /// there is nothing to resend.
+///
+/// With [`RetryMiddleware::with_stats`], each resend is counted in
+/// [`RetryStats::record_retry`].
 pub struct RetryMiddleware<S> {
     policy: ExponentialBackoff,
     strategy: S,
+    stats: Option<Arc<RetryStats>>,
 }
 
 impl<S> std::fmt::Debug for RetryMiddleware<S> {
@@ -468,7 +486,18 @@ impl<S> RetryMiddleware<S> {
     /// A middleware retrying what `strategy` classifies as transient, on
     /// `policy`'s schedule and budget, honoring `Retry-After`.
     pub fn new(policy: ExponentialBackoff, strategy: S) -> Self {
-        Self { policy, strategy }
+        Self {
+            policy,
+            strategy,
+            stats: None,
+        }
+    }
+
+    /// Count every resend this middleware makes in `stats`.
+    #[must_use]
+    pub fn with_stats(mut self, stats: Arc<RetryStats>) -> Self {
+        self.stats = Some(stats);
+        self
     }
 }
 
@@ -526,6 +555,9 @@ where
                 retry_after = retry_after.is_some(),
                 "transient failure, retrying"
             );
+            if let Some(stats) = &self.stats {
+                stats.record_retry();
+            }
             tokio::time::sleep(wait).await;
             n_past_retries += 1;
         }
@@ -627,9 +659,20 @@ mod tests {
         let stats = RetryStats::new(0);
         stats.record_server_error(503, "/metadata/test");
         let s = stats.summary();
-        assert_eq!(s.retries_total, 1);
+        assert_eq!(s.retries_total, 0, "a 5xx answer is not itself a retry");
         assert_eq!(s.status_429_count, 0);
         assert_eq!(s.status_5xx_count, 1);
+        assert!(stats.had_retries(), "had_retries includes server errors");
+    }
+
+    #[test]
+    fn record_retry_increments_retries_total() {
+        let stats = RetryStats::new(0);
+        stats.record_retry();
+        let s = stats.summary();
+        assert_eq!(s.retries_total, 1);
+        assert_eq!(s.status_5xx_count, 0);
+        assert!(stats.had_retries());
     }
 
     #[test]
@@ -648,8 +691,9 @@ mod tests {
         stats.record_rate_limit(429, Some(10), "/metadata/a");
         stats.record_rate_limit(429, Some(20), "/metadata/b");
         stats.record_server_error(500, "/metadata/c");
+        stats.record_retry();
         let s = stats.summary();
-        assert_eq!(s.retries_total, 1, "only 5xx counts as retry");
+        assert_eq!(s.retries_total, 1, "only resends count as retries");
         assert_eq!(s.status_429_count, 2);
         assert_eq!(s.status_5xx_count, 1);
         assert_eq!(s.total_retry_wait, Duration::from_secs(30));
