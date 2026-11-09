@@ -1142,7 +1142,12 @@ pub async fn download_file(
                         // min 1 KB) so a runaway response cannot fill the
                         // disk. Any smaller discrepancy is caught by the
                         // exact count check after the stream ends.
-                        if let Some(expected) = file.size {
+                        // `{identifier}_files.xml` is exempt, as it is
+                        // from that check (see `is_size_unknowable`).
+                        if let Some(expected) = file
+                            .size
+                            .filter(|_| !is_size_unknowable(identifier, &file.name))
+                        {
                             let max_allowed = expected + (expected / 10).max(1024);
                             if bytes_downloaded > max_allowed {
                                 drop(output);
@@ -7268,6 +7273,67 @@ mod tests {
 
         assert_eq!(result.status, DownloadStatus::Complete);
         assert_eq!(result.bytes, 20);
+    }
+
+    /// Serve `body_len` bytes for `name` in `test-item`, whose metadata
+    /// records a size of 100, and return the download result and the
+    /// destination directory.
+    async fn download_oversized(
+        name: &str,
+        body_len: usize,
+    ) -> (Result<FileDownloadResult>, tempfile::TempDir) {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/test-item/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'<'; body_len]))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta(name, 100);
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await;
+        (result, dir)
+    }
+
+    /// #116: the item's own file list is exempt from the mid-stream
+    /// oversize check as well as the end-of-stream one, so a body far past
+    /// its recorded size completes.
+    #[tokio::test]
+    async fn files_xml_longer_than_metadata_size_completes() {
+        let (result, dir) = download_oversized("test-item_files.xml", 2000).await;
+        let result = result.expect("_files.xml is exempt from the size check");
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(result.bytes, 2000);
+        let on_disk = std::fs::read(dir.path().join("test-item_files.xml")).unwrap();
+        assert_eq!(on_disk.len(), 2000);
+    }
+
+    /// #116: the exemption is by name; any other file with the same sizes
+    /// is still abandoned mid-stream and its `.part` removed.
+    #[tokio::test]
+    async fn other_xml_longer_than_metadata_size_is_rejected() {
+        let (result, dir) = download_oversized("test-item_meta.xml", 2000).await;
+        assert!(
+            matches!(
+                result,
+                Err(IaError::DownloadTooLarge {
+                    expected: 100,
+                    received,
+                    ..
+                }) if received > 1124
+            ),
+            "{result:?}"
+        );
+        assert!(!dir.path().join("test-item_meta.xml.part").exists());
+        assert!(!dir.path().join("test-item_meta.xml").exists());
     }
 
     // -- Retry-After on the per-file retry loop --
