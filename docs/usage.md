@@ -428,7 +428,7 @@ ia search "collection:nasa" -f identifier | ia metadata export
 
 #### `ia metadata audit`
 
-Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations.
+Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations. Every metadata field of the item is checked against its schema entry.
 
 | Flag | Description |
 |------|-------------|
