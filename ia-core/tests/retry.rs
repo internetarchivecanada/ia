@@ -449,3 +449,70 @@ async fn unretried_write_5xx_is_not_counted_as_a_retry() {
     );
     server.verify().await;
 }
+
+// ── /download/ requests reach the same stats (#122) ────────────────────────
+
+/// The download transport bypasses the client's middleware; its requests,
+/// their 429 and 5xx answers and the download loop's resends are recorded
+/// in the same `RetryStats` as the metadata request.
+#[tokio::test]
+async fn download_requests_and_retries_are_recorded() {
+    use ia_core::download::{download_item, DownloadOpts};
+    use std::sync::Arc;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/dl-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "dl-item"},
+            "files": [{"name": "f.txt", "source": "original", "size": "5"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/dl-item/f.txt"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/dl-item/f.txt"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/download/dl-item/f.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut opts = DownloadOpts::default();
+    opts.destdir = dir.path().to_path_buf();
+    let result = download_item(
+        &client,
+        "dl-item",
+        &opts,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.files_downloaded, 1);
+
+    let s = client.retry_stats().summary();
+    assert_eq!(
+        s.requests_total, 4,
+        "1 metadata request + 3 download attempts"
+    );
+    assert_eq!(s.status_5xx_count, 1);
+    assert_eq!(s.status_429_count, 1);
+    assert_eq!(s.retries_total, 2, "the 503 and the 429 were each resent");
+    server.verify().await;
+}
