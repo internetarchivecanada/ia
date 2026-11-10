@@ -1039,7 +1039,7 @@ Every answer is checked to be the account asked for, ignoring letter case: an em
 
 Requests carry the `logged-in-user` and `logged-in-sig` cookies from the `[cookies]` section of the config file, which `ia config login` writes. S3 keys are not sent. Without both cookies the command stops before any request.
 
-The cookies are sent only when the host is `archive.org`, a subdomain of it, or a loopback address (`localhost`, `127.0.0.1`, `[::1]`, any port). With any other `-H` host the command stops before any request.
+The cookies are sent only over https to `archive.org` or a subdomain of it, or to a loopback address (`localhost`, `127.0.0.1`, `[::1]`, any port, http allowed). With any other `-H` host, with `--insecure` on a non-loopback host, or with a user name or password in the host, the command stops before any request. A 429 pauses for its Retry-After, at least 1 second, or 30 seconds when it has none.
 
 #### Requests
 
