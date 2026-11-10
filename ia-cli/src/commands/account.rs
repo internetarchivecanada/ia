@@ -55,8 +55,8 @@ const UNLOCK_OP: &str = "account-unlock";
         input) or from piped standard input. Lines are trimmed; blank lines, lines starting \
         with # and repeated lines are skipped. Accounts run --jobs at a time (default 2) and \
         each result line starts with its input line. Lines that name the same account (the \
-        same item name, ignoring case) get one lock or unlock request between them. A 429 \
-        pauses every worker for the server's Retry-After (30 s when absent).\n\n\
+        same item name) get one lock or unlock request between them. A 429 pauses every \
+        worker for the server's Retry-After (at least 1 s; 30 s when absent).\n\n\
         --dry-run prints how each line would be looked up and sends nothing. With --lock or \
         --unlock, --joblog records each line, and a rerun with the same job log skips the lines \
         it records as done with the same action (--no-resume runs them all). Read actions \
@@ -279,7 +279,7 @@ struct SentLock {
 
 /// What every account in one run shares: the client, the action and its
 /// comment, the rate limiter, and the lock or unlock requests already sent,
-/// keyed by item name in lower case.
+/// keyed by item name.
 pub struct Batch<'a> {
     client: &'a IaClient,
     action: Action,
@@ -360,10 +360,12 @@ async fn perform(
     }
 }
 
-/// Send the batch's lock or unlock for `itemname`, once per item name
-/// (ignoring case) in the batch. The first line to get here sends it;
-/// lines that get here later, or while it is in flight, wait for it and
-/// report its result as their own.
+/// Send the batch's lock or unlock for `itemname`, once per item name in
+/// the batch. The key is the item name exactly as the server returned it:
+/// every spelling of one account looks up to the same string, and two
+/// item names that differ only in case may be two accounts. The first line
+/// to get here sends it; lines that get here later, or while it is in
+/// flight, wait for it and report its result as their own.
 async fn lock_once(
     batch: &Batch<'_>,
     input: &str,
@@ -389,7 +391,7 @@ async fn lock_once(
 
     let cell = {
         let mut locks = batch.locks.lock().await;
-        Arc::clone(locks.entry(itemname.to_lowercase()).or_default())
+        Arc::clone(locks.entry(itemname.to_string()).or_default())
     };
     let sent = cell
         .get_or_init(|| async {
@@ -501,12 +503,14 @@ fn read_stdin() -> std::result::Result<String, IaError> {
     Ok(text)
 }
 
-/// The accounts in a list: each line trimmed; blank lines and lines
-/// starting with `#` skipped; repeated lines dropped, the first kept. Lines
-/// are not validated as item identifiers, since email addresses and screen
-/// names are not identifiers.
+/// The accounts in a list: a leading byte-order mark (U+FEFF, which some
+/// editors write and `trim` keeps) removed; each line trimmed; blank lines
+/// and lines starting with `#` skipped; repeated lines dropped, the first
+/// kept. Lines are not validated as item identifiers, since email
+/// addresses and screen names are not identifiers.
 fn parse_list(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -521,7 +525,7 @@ fn read_accounts(args: &AccountArgs) -> std::result::Result<Accounts, IaError> {
     if let Some(user) = &args.user {
         let user = user.trim();
         if user.is_empty() {
-            return Err(no_account_given());
+            return Err(IaError::InvalidArgument("USER is empty".into()));
         }
         return Ok(Accounts {
             lines: vec![user.to_string()],
@@ -702,7 +706,9 @@ pub fn print_result(result: &AccountResult, json: bool, quiet: u8, list: bool) -
 }
 
 /// Print what a dry run would do for one account. A comment is shown for a
-/// lock or unlock when it is not empty, since an empty one is not sent.
+/// lock or unlock when it is not empty, since an empty one is not sent; the
+/// human line shows it quoted and escaped (`{:?}`), so quotes and newlines
+/// in it cannot break the line.
 fn print_dry_run(input: &str, action: Action, comment: Option<&str>, json: bool) -> Result<()> {
     let lookup = LookupType::detect(input).field();
     let comment = comment.filter(|c| !c.is_empty() && action.joblog_op().is_some());
@@ -718,7 +724,7 @@ fn print_dry_run(input: &str, action: Action, comment: Option<&str>, json: bool)
         println!("{}", serde_json::to_string(&record)?);
     } else {
         let shown = comment
-            .map(|c| format!(", comment \"{c}\""))
+            .map(|c| format!(", comment {c:?}"))
             .unwrap_or_default();
         println!(
             "dry-run {input}: {} (lookup by {lookup}){shown}",
@@ -813,8 +819,12 @@ pub async fn run(
         .map(|line| run_one(&batch, line))
         .buffer_unordered(jobs.unwrap_or(DEFAULT_JOBS));
     let (mut succeeded, mut failed) = (0usize, 0usize);
+    let mut print_error = None;
     while let Some(result) = results.next().await {
-        print_result(&result, args.json, quiet, list)?;
+        // The entry is written before the result is printed, so a lock the
+        // server accepted is recorded even when printing fails or a closed
+        // stdout ends the process (SIGPIPE has its default action; see
+        // `reset_sigpipe` in lib.rs).
         if let Some((op, writer)) = &writer {
             writer.write(&joblog_entry(op, &result));
         }
@@ -823,6 +833,15 @@ pub async fn run(
         } else {
             failed += 1;
         }
+        // A print error does not stop the run: the requests still in
+        // flight finish and get their entries, and the error is returned
+        // afterwards.
+        if print_error.is_none() {
+            print_error = print_result(&result, args.json, quiet, list).err();
+        }
+    }
+    if let Some(e) = print_error {
+        return Err(e);
     }
 
     if list && lines.len() > 1 && !args.json && quiet < 2 {
@@ -842,6 +861,12 @@ mod tests {
     fn parse_list_trims_skips_and_dedups() {
         let text = "# heading\n  a  \n\n  # note\nb\na\n#c\nB\n";
         assert_eq!(parse_list(text), ["a", "b", "B"]);
+    }
+
+    #[test]
+    fn parse_list_strips_a_leading_byte_order_mark() {
+        assert_eq!(parse_list("\u{feff}# note\n@a\n"), ["@a"]);
+        assert_eq!(parse_list("\u{feff}@a\nb\n"), ["@a", "b"]);
     }
 
     fn entry(op: &str, item: &str, ok: bool) -> String {

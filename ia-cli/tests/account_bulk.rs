@@ -14,6 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
@@ -753,6 +754,94 @@ async fn user_with_itemlist_is_a_usage_error() {
     assert!(stderr.contains("--itemlist"), "stderr: {stderr}");
 }
 
+/// An empty or whitespace-only `USER` is its own error, not the
+/// no-source error.
+#[tokio::test]
+async fn empty_user_is_an_error() {
+    for user in ["", "   "] {
+        let server = MockServer::start().await;
+        mount_nothing(&server).await;
+        let host = host_of(&server);
+        let cfg = config_with_cookies(&host);
+
+        let output = run_account(cfg.path(), &host, &[user, "--lock"]);
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{user:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("USER is empty"),
+            "{user:?}: stderr: {stderr}"
+        );
+        assert!(!stderr.contains("no account given"), "{user:?}: {stderr}");
+        assert_eq!(stdout_of(&output), "", "{user:?}");
+
+        let output = run_account(cfg.path(), &host, &[user, "--lock", "--json"]);
+        assert_eq!(output.status.code(), Some(1), "{user:?}");
+        let err = stderr_json_error(&output);
+        assert_eq!(err["error"]["code"], "invalid_argument", "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("USER is empty"),
+            "{err}"
+        );
+    }
+}
+
+/// A byte-order mark at the start of a list is not part of the first line:
+/// before a `#` line the line is still a comment, and before an `@` line
+/// the line is still an item name.
+#[tokio::test]
+async fn leading_byte_order_mark_is_stripped() {
+    for (list, expected) in [
+        (
+            "\u{feff}# moderation list\n@example-user-3\n",
+            vec!["@example-user-3: example-user-3".to_string()],
+        ),
+        (
+            "\u{feff}@example-user-3\nexample-user-1\n",
+            vec![
+                "@example-user-3: example-user-3".to_string(),
+                "example-user-1: example-user-1".to_string(),
+            ],
+        ),
+    ] {
+        for from_file in [true, false] {
+            let server = MockServer::start().await;
+            mount_found(&server, "@example-user-3", account(3)).await;
+            if expected.len() == 2 {
+                mount_found(&server, "example-user-1", account(1)).await;
+            }
+            mount_unexpected(&server).await;
+            let host = host_of(&server);
+            let cfg = config_with_cookies(&host);
+            let dir = TempDir::new().unwrap();
+            let path = write_list(&dir, "accounts.txt", list);
+
+            let output = if from_file {
+                run_account(
+                    cfg.path(),
+                    &host,
+                    &["--itemlist", path_str(&path), "--get-screenname"],
+                )
+            } else {
+                run_account_stdin(cfg.path(), &host, &["--get-screenname"], list)
+            };
+            let stderr = stderr_of(&output);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{list:?} file={from_file}: stderr: {stderr}"
+            );
+            assert_eq!(
+                sorted_lines(&stdout_of(&output)),
+                sorted(&expected),
+                "{list:?} file={from_file}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn missing_itemlist_file_exits_1_with_no_request() {
     let server = MockServer::start().await;
@@ -1255,7 +1344,119 @@ async fn read_actions_look_up_every_spelling() {
     }
 }
 
+/// With four jobs and a slow lock answer, all four spellings reach the lock
+/// step while the first request is in flight: still one request, every
+/// line ok, three naming the line that sent it.
+#[tokio::test]
+async fn one_account_named_four_ways_concurrently_is_locked_once() {
+    let server = MockServer::start().await;
+    mount_spellings(&server).await;
+    mount_lock_for(
+        &server,
+        "@example-user-1",
+        true,
+        None,
+        lock_ok().set_delay(Duration::from_millis(500)),
+        1,
+    )
+    .await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+
+    let output = run_account_stdin(
+        cfg.path(),
+        &host,
+        &["-j", "4", "--lock", "--json"],
+        &spellings_list(),
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let records = json_records(&output);
+    assert_eq!(records.len(), 4, "{records:?}");
+    for record in &records {
+        assert_eq!(record["status"], "ok", "{record}");
+    }
+    let firsts: Vec<&Value> = records
+        .iter()
+        .filter(|r| r.get("same_as").is_none())
+        .collect();
+    assert_eq!(firsts.len(), 1, "{records:?}");
+    let first = firsts[0]["account"].as_str().unwrap_or_default();
+    let followers: Vec<&Value> = records
+        .iter()
+        .filter(|r| r.get("same_as").is_some())
+        .collect();
+    assert_eq!(followers.len(), 3, "{records:?}");
+    for record in followers {
+        assert_eq!(record["same_as"], first, "{record}");
+    }
+    assert_eq!(requests_with_op(&server, "lock_unlock").await.len(), 1);
+}
+
+/// Item names that differ only in letter case are two accounts: each gets
+/// its own lock request, and neither line is reported as the other.
+#[tokio::test]
+async fn item_names_differing_in_case_are_locked_separately() {
+    let server = MockServer::start().await;
+    let mut first = account(1);
+    first["itemname"] = json!("@Example-X");
+    let mut second = account(2);
+    second["itemname"] = json!("@example-x");
+    mount_found(&server, "example-user-1", first).await;
+    mount_found(&server, "example-user-2", second).await;
+    mount_lock_for(&server, "@Example-X", true, None, lock_ok(), 1).await;
+    mount_lock_for(&server, "@example-x", true, None, lock_ok(), 1).await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+
+    let output = run_account_stdin(
+        cfg.path(),
+        &host,
+        &["-j", "1", "--lock"],
+        "example-user-1\nexample-user-2\n",
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        sorted_lines(&stdout_of(&output)),
+        sorted(&[
+            "example-user-1: locked".to_string(),
+            "example-user-2: locked".to_string(),
+        ]),
+    );
+    assert_eq!(requests_with_op(&server, "lock_unlock").await.len(), 2);
+}
+
 // ─── --dry-run ───────────────────────────────────────────────────────────────
+
+/// With valid cookies and a loopback host, where a real run would send
+/// requests, a dry run still sends none.
+#[tokio::test]
+async fn dry_run_with_valid_cookies_sends_nothing() {
+    let server = MockServer::start().await;
+    mount_nothing(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+
+    for extra in [vec![], vec!["--json"], vec!["-j", "4"]] {
+        let mut args = vec!["--dry-run", "--lock", "--comment", "example note"];
+        args.extend(extra.iter().copied());
+        let output = run_account_stdin(cfg.path(), &host, &args, LIST3);
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: stderr: {stderr}");
+        assert_eq!(
+            sorted_lines(&stdout_of(&output)).len(),
+            3,
+            "{args:?}: one line per account"
+        );
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a dry run sent a request"
+    );
+}
 
 /// Sends nothing, needs no cookies, and prints one line per account and a
 /// footer on stderr; a non-empty comment is shown.
@@ -1268,6 +1469,11 @@ async fn dry_run_sends_nothing_and_prints_each_line() {
         ),
         (vec![], ""),
         (vec!["--comment", ""], ""),
+        // Quotes and a newline are escaped, so the line stays one line.
+        (
+            vec!["--comment", "say \"hi\"\nnext"],
+            ", comment \"say \\\"hi\\\"\\nnext\"",
+        ),
     ] {
         let server = MockServer::start().await;
         mount_nothing(&server).await;
