@@ -3,8 +3,8 @@
 //! The account API (`/services/xauthn/`) is admin-only. Requests carry the
 //! `logged-in-user` and `logged-in-sig` cookies from the `[cookies]` config
 //! section, as the Python client sends them, and no `Authorization` header.
-//! The cookies are sent only to `archive.org`, its subdomains and loopback
-//! hosts; see [`cookie_header`].
+//! The cookies are sent only over `https` to `archive.org` and its
+//! subdomains, or to loopback hosts; see [`cookie_header`].
 //!
 //! A lookup answers with the account's `values` object, kept whole in
 //! [`Account::values`]. A lock or unlock is sent with the item name a lookup
@@ -290,8 +290,9 @@ pub async fn unlock(client: &IaClient, itemname: &str, comment: Option<&str>) ->
 /// first `;` and trimmed.
 ///
 /// Fails with [`crate::IaError::Auth`] when either cookie is missing or
-/// empty, or when the configured host is not `archive.org`, a subdomain of
-/// it, or a loopback host (`localhost`, `127.0.0.1`, `::1`, any port).
+/// empty, or when the request URL would not be `https` to `archive.org` or
+/// a subdomain of it, or any scheme to a loopback host (`localhost`,
+/// `127.0.0.1`, `[::1]`, any port), or would carry a user name or password.
 pub fn cookie_header(client: &IaClient) -> Result<String> {
     let cookie = |name: &str| {
         client
@@ -307,30 +308,51 @@ pub fn cookie_header(client: &IaClient) -> Result<String> {
                 .into(),
         ));
     };
-    if !cookie_host_allowed(client) {
-        return Err(IaError::Auth(format!(
-            "ia account sends login cookies only to archive.org; host is {}",
-            client.host()
-        )));
-    }
+    check_cookie_target(client)?;
     Ok(format!("logged-in-user={user}; logged-in-sig={sig}"))
 }
 
-/// Whether the host of the account API URL is `archive.org`, a subdomain of
-/// it, or a loopback host. The URL is parsed, so a configured host string
-/// that carries a path or other parts is judged by the host it really
-/// names.
-fn cookie_host_allowed(client: &IaClient) -> bool {
+/// Check that the account API URL may receive the login cookies: `https`
+/// to `archive.org` or a subdomain of it, or any scheme to a loopback host,
+/// with no user name or password.
+///
+/// The URL is parsed, so a configured host string that carries a path,
+/// user information or other parts is judged by the host it really names.
+/// The Python client always sends these cookies over `https`; plain `http`
+/// is allowed only to loopback hosts, for tests and local servers. User
+/// information is refused because reqwest would turn it into an
+/// `Authorization: Basic` header.
+fn check_cookie_target(client: &IaClient) -> Result<()> {
+    let refuse = |reason: String| {
+        Err(IaError::Auth(format!(
+            "ia account sends login cookies only to archive.org over https, \
+             or to a loopback host; {reason}"
+        )))
+    };
+    let host_is = || format!("host is {}", client.host());
     let Ok(url) = reqwest::Url::parse(&client.url(XAUTHN_PATH)) else {
-        return false;
+        return refuse(host_is());
     };
+    // Checked first, and the host string not echoed: it holds the password.
+    if !url.username().is_empty() || url.password().is_some_and(|p| !p.is_empty()) {
+        return refuse("the host names a user or password".into());
+    }
     let Some(host) = url.host_str() else {
-        return false;
+        return refuse(host_is());
     };
+    // A trailing dot names the same host (a fully qualified domain name).
     let host = host.to_ascii_lowercase();
-    host == "archive.org"
-        || host.ends_with(".archive.org")
-        || matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        return Ok(());
+    }
+    if host != "archive.org" && !host.ends_with(".archive.org") {
+        return refuse(host_is());
+    }
+    if url.scheme() != "https" {
+        return refuse(format!("{} uses {}", client.host(), url.scheme()));
+    }
+    Ok(())
 }
 
 /// POST a form to `/services/xauthn/?op=<op>` with the login cookies,
@@ -356,7 +378,9 @@ async fn post(
     if status == StatusCode::TOO_MANY_REQUESTS {
         let retry_after = crate::retry::extract_retry_after(response.headers());
         return Err(IaError::RateLimited {
-            retry_after: retry_after.unwrap_or(DEFAULT_RETRY_AFTER_SECS),
+            // At least one second: a `Retry-After` of 0 or a past date would
+            // have callers that resend on a 429 do so with no wait at all.
+            retry_after: retry_after.unwrap_or(DEFAULT_RETRY_AFTER_SECS).max(1),
         });
     }
     if status.is_redirection() {
@@ -751,6 +775,8 @@ mod tests {
     /// Checked on `cookie_header` alone, which sends nothing.
     #[test]
     fn cookie_host_check() {
+        // Over https, so only the host decides; the scheme rule has its own
+        // test below.
         for host in [
             "archive.org",
             "www.archive.org",
@@ -761,7 +787,7 @@ mod tests {
             "127.0.0.1:8080",
             "[::1]:8080",
         ] {
-            let client = IaClient::from_config(config_for(host)).unwrap();
+            let client = IaClient::from_config(https_config_for(host)).unwrap();
             assert_eq!(cookie_header(&client).unwrap(), COOKIE, "{host}");
         }
         for host in [
@@ -771,11 +797,84 @@ mod tests {
             "archive.org.example.org",
             "0.0.0.0:8080",
         ] {
-            let client = IaClient::from_config(config_for(host)).unwrap();
+            let client = IaClient::from_config(https_config_for(host)).unwrap();
             assert_auth(
                 &cookie_header(&client).unwrap_err(),
                 "sends login cookies only to archive.org",
             );
+        }
+    }
+
+    /// A config for `host` over https with test cookies.
+    fn https_config_for(host: &str) -> IaConfig {
+        let mut config = config_for(host);
+        config.general.secure = true;
+        config
+    }
+
+    /// Plain http carries the cookies only to loopback hosts.
+    #[test]
+    fn cookie_header_needs_https_except_on_loopback() {
+        for host in ["archive.org", "www.archive.org"] {
+            let client = IaClient::from_config(config_for(host)).unwrap();
+            let err = cookie_header(&client).unwrap_err();
+            assert_auth(&err, "sends login cookies only to archive.org over https");
+            assert_auth(&err, "uses http");
+        }
+        for host in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "[::1]:8080",
+            "127.0.0.1",
+        ] {
+            let client = IaClient::from_config(config_for(host)).unwrap();
+            assert_eq!(cookie_header(&client).unwrap(), COOKIE, "{host}");
+        }
+    }
+
+    /// A host string with a user name or password would make reqwest send
+    /// `Authorization: Basic`; it is refused, without echoing the password.
+    #[test]
+    fn cookie_header_refuses_user_information() {
+        for host in [
+            "user:example-password@archive.org",
+            "user@archive.org",
+            ":example-password@archive.org",
+            "user:example-password@127.0.0.1:8080",
+        ] {
+            let client = IaClient::from_config(https_config_for(host)).unwrap();
+            let err = cookie_header(&client).unwrap_err();
+            assert_auth(&err, "the host names a user or password");
+            assert!(
+                !err.to_string().contains("example-password"),
+                "{host}: the password must not be echoed: {err}"
+            );
+        }
+    }
+
+    /// Host strings that only look like archive.org are judged by the host
+    /// the URL really names. Letter case does not matter, and a trailing
+    /// dot (a fully qualified name for the same host) is allowed.
+    #[test]
+    fn cookie_header_judges_the_parsed_host() {
+        for host in [
+            "archive.org@example.org",
+            "example.org#.archive.org",
+            "example.org\\.archive.org",
+            "example.org/.archive.org",
+            "example.org?.archive.org",
+        ] {
+            let client = IaClient::from_config(https_config_for(host)).unwrap();
+            assert!(cookie_header(&client).is_err(), "{host} must be refused");
+        }
+        for host in [
+            "ARCHIVE.ORG",
+            "Www.Archive.Org",
+            "archive.org.",
+            "www.archive.org.",
+        ] {
+            let client = IaClient::from_config(https_config_for(host)).unwrap();
+            assert_eq!(cookie_header(&client).unwrap(), COOKIE, "{host}");
         }
     }
 
@@ -925,6 +1024,39 @@ mod tests {
             match lookup(&client, "example-user-1").await.unwrap_err() {
                 IaError::RateLimited { retry_after } => assert_eq!(retry_after, wants),
                 other => panic!("expected RateLimited, got {other:?}"),
+            }
+        }
+    }
+
+    /// A `Retry-After` of zero or a past date still waits one second, so a
+    /// caller that resends on every 429 never resends with no wait.
+    #[tokio::test]
+    async fn retry_after_zero_or_past_waits_one_second() {
+        for value in ["0", "Thu, 01 Jan 1970 00:00:00 GMT"] {
+            let server = MockServer::start().await;
+            mount_info(
+                &server,
+                ResponseTemplate::new(429).insert_header("Retry-After", value),
+                1,
+            )
+            .await;
+            mount_lock(
+                &server,
+                ResponseTemplate::new(429).insert_header("Retry-After", value),
+                1,
+            )
+            .await;
+            let client = client_for(&server);
+            match lookup(&client, "example-user-1").await.unwrap_err() {
+                IaError::RateLimited { retry_after } => assert_eq!(retry_after, 1, "{value}"),
+                other => panic!("{value}: expected RateLimited, got {other:?}"),
+            }
+            match set_locked(&client, "@example-user-1", true, None)
+                .await
+                .unwrap_err()
+            {
+                IaError::RateLimited { retry_after } => assert_eq!(retry_after, 1, "{value}"),
+                other => panic!("{value}: expected RateLimited, got {other:?}"),
             }
         }
     }

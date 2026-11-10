@@ -571,6 +571,51 @@ async fn unknown_account_json_is_an_error_record() {
     assert!(record["elapsed_ms"].is_u64(), "{record}");
 }
 
+/// A lookup that answers with another account, or with an account that has
+/// no item name, fails before the lock step: no lock request is sent.
+#[tokio::test]
+async fn lock_after_a_bad_lookup_sends_no_lock_request() {
+    let mut other = values();
+    other["screenname"] = json!("example-user-2");
+    other["itemname"] = json!("@example-user-2");
+    let mut no_itemname = values();
+    no_itemname.as_object_mut().unwrap().remove("itemname");
+    for (answer, cause) in [
+        (other, "lookup answered with a different account"),
+        (no_itemname, "lookup returned no usable itemname"),
+    ] {
+        let server = MockServer::start().await;
+        mount_info(
+            &server,
+            ResponseTemplate::new(200).set_body_json(ok_body(answer)),
+            1,
+        )
+        .await;
+        mount_lock(&server, ResponseTemplate::new(200), 0).await;
+        let host = host_of(&server);
+        let cfg = config_with_cookies(&host);
+
+        let output = run_account(
+            cfg.path(),
+            &host,
+            &["example-user-1", "--lock", "--comment", "example note"],
+        );
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "{cause}: stderr: {stderr}");
+        assert!(
+            stderr.contains("error: example-user-1: "),
+            "{cause}: stderr: {stderr}"
+        );
+        assert!(stderr.contains(cause), "{cause}: stderr: {stderr}");
+        assert_eq!(stdout_of(&output), "", "{cause}: nothing on stdout");
+        assert_eq!(
+            requests_with_op(&server, "lock_unlock").await.len(),
+            0,
+            "{cause}"
+        );
+    }
+}
+
 /// Usage errors exit 2 and send nothing. Each names its cause: two action
 /// flags conflict; `--comment` needs `--lock` or `--unlock`.
 #[tokio::test]
