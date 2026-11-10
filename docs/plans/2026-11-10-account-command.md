@@ -217,6 +217,14 @@ Decided by the Python client or this repository rather than left open: cookies g
 
 Kept, with reason: the wider email rule (the Python pattern sends valid addresses to the screen-name lookup, where they cannot be found); the JSON key `account` (the value is not an item identifier).
 
+## Code review (2026-11-10), closed before the PRs
+
+Taken in the single-account part: the cookies go only over https unless the host is loopback (the Python client always uses https for these calls; `--insecure` would otherwise send the admin session in clear text); a host naming a user or password is refused (reqwest would turn it into an `Authorization: Basic` header); host strings that could be misread (`archive.org@example.org`, `example.org#.archive.org`, a trailing dot, upper case) are pinned by tests; a 429 waits at least one second, so `Retry-After: 0` cannot make an unbounded loop with no wait; a CLI test that a lookup answering another account, or no item name, sends no lock.
+
+Taken in the bulk part: the job log entry is written before the result is printed, so a closed stdout cannot lose the entry of a lock the server accepted; locks are shared by the exact item name the server returns rather than ignoring case, which could only merge two different accounts; the docs say resume works per input line while sharing works per account within a run; a leading byte-order mark is stripped from a list; the dry-run comment is printed escaped; an empty `USER` has its own error; tests for concurrent sharing with a delayed lock answer and for a dry run with valid cookies on a loopback host.
+
+Not changed: `IaError::Http` keeps the whole response body as its message, the convention elsewhere in ia-core.
+
 ## Tasks
 - [x] Plan committed first.
 - [x] Plan review; findings taken or answered above.
@@ -224,4 +232,4 @@ Kept, with reason: the wider email rule (the Python pattern sends valid addresse
 - [x] Green: `ia_core::account`, `IaError::AccountApi`, `ia account`.
 - [x] `--help`, docs/usage.md, README.md.
 - [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
-- [ ] Code review; PR.
+- [x] Code review; PR.
