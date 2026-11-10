@@ -402,10 +402,7 @@ pub async fn run(
         .filter(|u| !u.is_empty())
     else {
         return command_error(
-            IaError::InvalidArgument(
-                "no account given: pass USER, --itemlist <FILE>, or pipe accounts on standard input"
-                    .into(),
-            ),
+            IaError::InvalidArgument("no account given: pass USER".into()),
             args.json,
         );
     };
