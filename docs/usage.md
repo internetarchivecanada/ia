@@ -995,6 +995,109 @@ ia tasks rate-limit make_dark
 ia tasks rate-limit --json
 ```
 
+### `ia account`
+
+Look up, lock or unlock archive.org accounts. The account API is admin-only. Alias: `ia ac`.
+
+```sh
+ia account [OPTIONS] <USER>
+```
+
+`USER` is an email address, a screen name, or an item name (which starts with `@`).
+
+#### Flags
+
+At most one action flag may be given. With none, the command prints the whole account.
+
+| Flag | Description |
+|------|-------------|
+| `<USER>` | Account: an email address, a screen name, or an `@`item name |
+| `-g, --get-email` | Print the account's canonical email address (`canonical_email`) |
+| `-s, --get-screenname` | Print the account's screen name |
+| `--get-itemname` | Print the account's item name |
+| `--is-locked` | Print `true` or `false` |
+| `-L, --lock` | Lock the account |
+| `-u, --unlock` | Unlock the account |
+| `--comment <TEXT>` | Comment recorded with the lock or unlock; requires `--lock` or `--unlock`. An empty comment is not sent |
+| `--json` | Output one JSON object per account on stdout |
+
+`--get-itemname`, `--is-locked` and `--comment` have no short form: `-i`, `-l` and `-c` are the global `--insecure`, `--log` and `--config-file`.
+
+#### Lookup type
+
+The lookup field is chosen from the form of `USER`:
+
+1. A value that starts with `@` is an item name.
+2. Otherwise, a value shaped like an email address is an email address: a local part of letters, digits and `_ . + -`, one `@`, then two or more dot-separated labels of letters, digits and `-` (not starting or ending with `-`), the last two or more letters.
+3. Anything else is a screen name.
+
+There is no flag to force a lookup type. A screen name shaped like an email address is looked up as an email address; its `@`item name reaches the same account.
+
+Every answer is checked to be the account asked for, ignoring letter case: an email lookup must match the account's `email` or `canonical_email`, a screen-name lookup its `screenname`, an item-name lookup its `itemname`. A mismatch fails with `lookup answered with a different account`.
+
+#### Credentials and host
+
+Requests carry the `logged-in-user` and `logged-in-sig` cookies from the `[cookies]` section of the config file, which `ia config login` writes. S3 keys are not sent. Without both cookies the command stops before any request.
+
+The cookies are sent only when the host is `archive.org`, a subdomain of it, or a loopback address (`localhost`, `127.0.0.1`, `[::1]`, any port). With any other `-H` host the command stops before any request.
+
+#### Requests
+
+- A lookup is one `POST /services/xauthn/?op=info`.
+- `--lock` and `--unlock` look the account up first, then send `POST /services/xauthn/?op=lock_unlock` with the item name the lookup returned: two requests per account. The lock or unlock is sent whatever the account's current state.
+- Redirects are not followed; a 3xx answer is an error.
+- A 429 waits for the server's `Retry-After` (30 seconds when absent), printing `Rate limited. Pausing all workers for <n>s...` on stderr, and sends the same request again. A 429 on the lock repeats only the lock.
+- A 5xx is not retried. A lock answered with a 5xx may still have been applied; look the account up with `--is-locked` before sending it again.
+
+#### Output
+
+| Action | Human output (stdout) |
+|--------|-----------------------|
+| none | the account's `values` object as indented JSON |
+| `--get-email`, `--get-screenname`, `--get-itemname` | the value |
+| `--is-locked` | `true` or `false` |
+| `--lock`, `--unlock` | `<USER>: locked` or `<USER>: unlocked` |
+
+Errors print `error: <USER>: <message>` on stderr and exit 1. `-q` drops the lock and unlock line; `-qq` also drops error lines. Read values print at every quiet level, since they are the output. The exit status is the same at every level.
+
+With `--json`, stdout carries one compact object per account:
+
+```json
+{"account":"person@example.com","lookup":"email","action":"get-email","status":"ok","canonical_email":"person@example.com","elapsed_ms":12}
+{"account":"@example-user","lookup":"itemname","action":"lookup","status":"ok","values":{"…":"…"},"elapsed_ms":9}
+{"account":"example-user-1","lookup":"screenname","action":"is-locked","status":"ok","locked":false,"elapsed_ms":8}
+{"account":"example-user-1","lookup":"screenname","action":"lock","status":"ok","itemname":"@example-user-1","response":{"…":"…"},"elapsed_ms":20}
+{"account":"nobody@example.org","lookup":"email","action":"lock","status":"error","error":{"code":"account_api_error","message":"account API error for nobody@example.org: account not found","account":"nobody@example.org"},"elapsed_ms":7}
+```
+
+`action` is one of `lookup`, `get-email`, `get-screenname`, `get-itemname`, `is-locked`, `lock`, `unlock`. `response` is the server's answer to the lock or unlock, as JSON, or as a JSON string when the answer is not JSON. A failed account exits 1 after its `"status":"error"` object. Errors that stop the command before any account (missing cookies, a host the cookies may not go to, no `USER`) print `{"error": {"code": "...", "message": "..."}}` on stderr and exit 1.
+
+| Error code | Cause |
+|------------|-------|
+| `auth_error` | cookies missing; host not archive.org or loopback |
+| `http_error` | a redirect, or another non-2xx answer (the message is the response body) |
+| `account_api_error` | account not found, an answer that is not JSON, a different account in the answer, a field the action needs missing, no usable item name, or a refused lock or unlock |
+| `network` | connection failure |
+
+#### Examples
+
+```sh
+# Print an account as JSON
+ia account person@example.com
+
+# Print the item name of a screen name
+ia account example-user --get-itemname
+
+# Check whether an account is locked
+ia account @example-user --is-locked
+
+# Lock an account with a comment
+ia account person@example.com --lock --comment "spam"
+
+# Unlock an account, one JSON object on stdout
+ia account @example-user --unlock --json
+```
+
 ### `ia collection`
 
 Manage Internet Archive collections.

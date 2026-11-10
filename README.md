@@ -55,6 +55,7 @@ The binary installs as `ia-cli`. These examples use `ia`; see [Install](#install
 | `verify` | Confirm local files exist remotely with matching checksums (MD5/SHA-1/CRC32) |
 | `tasks` | List, submit, rerun and monitor catalog tasks; logs and rate limits |
 | `collection` | Create collection items with metadata and cover images |
+| `account` | Look up, lock and unlock archive.org accounts (admin-only) |
 | `config` | Login, credential checks, cookie and auth-header export |
 | `status` | Summarize a joblog: what succeeded, what failed |
 | `update` | Check for, list, and install releases |

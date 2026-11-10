@@ -103,6 +103,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on AccountArgs. Both live on the struct.
+    #[command(visible_alias = "ac")]
+    Account(commands::account::AccountArgs),
+    // No doc comment here: clap would turn it into `about` and clear the
     // `long_about` set on AiArgs. Both live on the struct.
     #[cfg(feature = "alpha")]
     Ai(commands::ai::AiArgs),
@@ -304,6 +308,9 @@ pub async fn run() -> Result<()> {
     let jobs = cli.jobs.unwrap_or(8);
 
     match cli.command {
+        Commands::Account(args) => {
+            commands::account::run(&client, args, cli.quiet, cli.jobs).await?
+        }
         #[cfg(feature = "alpha")]
         Commands::Ai(args) => {
             commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?

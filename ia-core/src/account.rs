@@ -13,10 +13,19 @@
 
 use std::fmt;
 
+use reqwest::header::{COOKIE, LOCATION};
+use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::client::IaClient;
-use crate::error::Result;
+use crate::error::{IaError, Result};
+
+/// The account API path on the configured host.
+const XAUTHN_PATH: &str = "/services/xauthn/";
+
+/// The wait used when a 429 carries no usable `Retry-After`, as for
+/// metadata writes.
+const DEFAULT_RETRY_AFTER_SECS: u64 = 30;
 
 /// Which form field a lookup sends: the account's email address, screen
 /// name or item name.
@@ -43,32 +52,68 @@ impl LookupType {
     /// ```
     #[must_use]
     pub fn detect(value: &str) -> Self {
-        let _ = value;
-        todo!()
+        if value.starts_with('@') {
+            Self::Itemname
+        } else if is_email(value) {
+            Self::Email
+        } else {
+            Self::Screenname
+        }
     }
 
     /// The form field name the lookup sends: `email`, `screenname` or
     /// `itemname`.
     #[must_use]
     pub fn field(self) -> &'static str {
-        todo!()
+        match self {
+            Self::Email => "email",
+            Self::Screenname => "screenname",
+            Self::Itemname => "itemname",
+        }
     }
 }
 
 impl fmt::Display for LookupType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!()
+        f.write_str(self.field())
     }
 }
 
 /// Whether a value is an email address: a local part of one or more of
 /// `A-Z a-z 0-9 _ . + -`, one `@`, then two or more dot-separated labels of
-/// `A-Z a-z 0-9 -`, the last two or more ASCII letters.
+/// `A-Z a-z 0-9 -` that neither start nor end with `-`, the last two or
+/// more ASCII letters.
+///
+/// ```
+/// use ia_core::account::is_email;
+/// assert!(is_email("First.Last+tag@mail.example.org"));
+/// assert!(!is_email("person@localhost"));
+/// assert!(!is_email("a@-b.example.com"));
+/// ```
 #[must_use]
 pub fn is_email(value: &str) -> bool {
-    let _ = value;
-    todo!()
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    let local_ok = !local.is_empty()
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'));
+    let labels: Vec<&str> = domain.split('.').collect();
+    let Some((last, rest)) = labels.split_last() else {
+        return false;
+    };
+    let label_ok = |label: &&str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    local_ok
+        && !rest.is_empty()
+        && rest.iter().all(label_ok)
+        && last.len() >= 2
+        && last.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// An account as a lookup returned it.
@@ -81,73 +126,163 @@ pub struct Account {
 }
 
 impl Account {
+    /// A field of [`Self::values`], when it is a string.
+    fn str_field(&self, name: &str) -> Option<&str> {
+        self.values.get(name).and_then(Value::as_str)
+    }
+
     /// The `email` field, when it is a string.
     #[must_use]
     pub fn email(&self) -> Option<&str> {
-        todo!()
+        self.str_field("email")
     }
 
     /// The `canonical_email` field, when it is a string.
     #[must_use]
     pub fn canonical_email(&self) -> Option<&str> {
-        todo!()
+        self.str_field("canonical_email")
     }
 
     /// The `screenname` field, when it is a string.
     #[must_use]
     pub fn screenname(&self) -> Option<&str> {
-        todo!()
+        self.str_field("screenname")
     }
 
     /// The `itemname` field, when it is a string.
     #[must_use]
     pub fn itemname(&self) -> Option<&str> {
-        todo!()
+        self.str_field("itemname")
     }
 
     /// The `locked` field, when it is a boolean.
     #[must_use]
     pub fn locked(&self) -> Option<bool> {
-        todo!()
+        self.values.get("locked").and_then(Value::as_bool)
+    }
+
+    /// Whether this answer is the account `value` was looked up by,
+    /// ignoring letter case: an email lookup matches `email` or
+    /// `canonical_email`, a screen-name lookup `screenname`, an item-name
+    /// lookup `itemname`.
+    fn answers(&self, value: &str) -> bool {
+        let wanted = value.to_lowercase();
+        let matches = |field: Option<&str>| field.is_some_and(|f| f.to_lowercase() == wanted);
+        match self.lookup {
+            LookupType::Email => matches(self.email()) || matches(self.canonical_email()),
+            LookupType::Screenname => matches(self.screenname()),
+            LookupType::Itemname => matches(self.itemname()),
+        }
     }
 }
 
 /// Look an account up, with the lookup type detected from `user` (see
 /// [`LookupType::detect`]).
+///
+/// Fails with [`IaError::AccountApi`] when the account is not found, the
+/// answer is not JSON, or the answer is for a different account;
+/// [`IaError::RateLimited`] on a 429; [`IaError::Http`] on a redirect or
+/// another non-2xx status; [`IaError::Auth`] before any request when
+/// [`cookie_header`] fails.
 pub async fn lookup(client: &IaClient, user: &str) -> Result<Account> {
-    let _ = (client, user);
-    todo!()
+    lookup_by(client, LookupType::detect(user), user).await
 }
 
-/// Look an account up by the given field.
+/// Look an account up by the given field. Errors as for [`lookup`].
 pub async fn lookup_by(client: &IaClient, lookup: LookupType, value: &str) -> Result<Account> {
-    let _ = (client, lookup, value);
-    todo!()
+    let cookie = cookie_header(client)?;
+    let response = post(client, "info", &cookie, &[(lookup.field(), value)]).await?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
+    let api_error = |message: String| IaError::AccountApi {
+        account: value.to_string(),
+        message,
+    };
+
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|_| api_error(format!("response is not JSON: {body}")))?;
+    if let Some(message) = error_text(&parsed) {
+        return Err(api_error(message));
+    }
+    let values = match parsed.get("values") {
+        Some(Value::Object(values)) if !values.is_empty() && !is_success_false(&parsed) => {
+            values.clone()
+        }
+        _ => return Err(api_error("account not found".into())),
+    };
+
+    let account = Account { lookup, values };
+    if !account.answers(value) {
+        return Err(api_error("lookup answered with a different account".into()));
+    }
+    Ok(account)
 }
 
 /// Lock (`locked = true`) or unlock an account by its item name, recording
 /// `comment` when it is non-empty. Returns the answer parsed as JSON, or a
 /// JSON string holding the body when it is not JSON.
+///
+/// The item name must start with `@` and have at least one more character,
+/// else [`IaError::AccountApi`] with no request. A 2xx JSON answer with
+/// `"success": false` or a truthy `error` is [`IaError::AccountApi`]; any
+/// other 2xx answer is success. A 5xx is returned as [`IaError::Http`]
+/// after one request and is never replayed: the server may already have
+/// acted. Errors in `AccountApi` name `itemname` as the account.
 pub async fn set_locked(
     client: &IaClient,
     itemname: &str,
     locked: bool,
     comment: Option<&str>,
 ) -> Result<Value> {
-    let _ = (client, itemname, locked, comment);
-    todo!()
+    let cookie = cookie_header(client)?;
+    let api_error = |message: String| IaError::AccountApi {
+        account: itemname.to_string(),
+        message,
+    };
+    if !itemname.starts_with('@') || itemname.len() < 2 {
+        return Err(api_error("lookup returned no usable itemname".into()));
+    }
+
+    let mut form = vec![
+        ("itemname", itemname),
+        ("is_lock", if locked { "1" } else { "0" }),
+    ];
+    if let Some(comment) = comment.filter(|c| !c.is_empty()) {
+        form.push(("comments", comment));
+    }
+    let response = post(client, "lock_unlock", &cookie, &form).await?;
+    let body = response
+        .text()
+        .await
+        .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
+
+    let Ok(parsed) = serde_json::from_str::<Value>(&body) else {
+        return Ok(Value::String(body));
+    };
+    if let Some(message) = error_text(&parsed) {
+        return Err(api_error(message));
+    }
+    if is_success_false(&parsed) {
+        let refused = if locked {
+            "lock refused"
+        } else {
+            "unlock refused"
+        };
+        return Err(api_error(refused.into()));
+    }
+    Ok(parsed)
 }
 
 /// Lock an account; see [`set_locked`].
 pub async fn lock(client: &IaClient, itemname: &str, comment: Option<&str>) -> Result<Value> {
-    let _ = (client, itemname, comment);
-    todo!()
+    set_locked(client, itemname, true, comment).await
 }
 
 /// Unlock an account; see [`set_locked`].
 pub async fn unlock(client: &IaClient, itemname: &str, comment: Option<&str>) -> Result<Value> {
-    let _ = (client, itemname, comment);
-    todo!()
+    set_locked(client, itemname, false, comment).await
 }
 
 /// The `Cookie` header value for account requests:
@@ -158,8 +293,113 @@ pub async fn unlock(client: &IaClient, itemname: &str, comment: Option<&str>) ->
 /// empty, or when the configured host is not `archive.org`, a subdomain of
 /// it, or a loopback host (`localhost`, `127.0.0.1`, `::1`, any port).
 pub fn cookie_header(client: &IaClient) -> Result<String> {
-    let _ = client;
-    todo!()
+    let cookie = |name: &str| {
+        client
+            .config()
+            .cookies
+            .get(name)
+            .map(|v| v.split(';').next().unwrap_or_default().trim())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(user), Some(sig)) = (cookie("logged-in-user"), cookie("logged-in-sig")) else {
+        return Err(IaError::Auth(
+            "ia account needs the logged-in-user and logged-in-sig cookies; run `ia config login`"
+                .into(),
+        ));
+    };
+    if !cookie_host_allowed(client) {
+        return Err(IaError::Auth(format!(
+            "ia account sends login cookies only to archive.org; host is {}",
+            client.host()
+        )));
+    }
+    Ok(format!("logged-in-user={user}; logged-in-sig={sig}"))
+}
+
+/// Whether the host of the account API URL is `archive.org`, a subdomain of
+/// it, or a loopback host. The URL is parsed, so a configured host string
+/// that carries a path or other parts is judged by the host it really
+/// names.
+fn cookie_host_allowed(client: &IaClient) -> bool {
+    let Ok(url) = reqwest::Url::parse(&client.url(XAUTHN_PATH)) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    host == "archive.org"
+        || host.ends_with(".archive.org")
+        || matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// POST a form to `/services/xauthn/?op=<op>` with the login cookies,
+/// without following redirects and without a retry layer, and map a 429,
+/// a redirect and any other non-2xx status to errors.
+async fn post(
+    client: &IaClient,
+    op: &str,
+    cookie: &str,
+    form: &[(&str, &str)],
+) -> Result<reqwest::Response> {
+    let url = client.url(&format!("{XAUTHN_PATH}?op={op}"));
+    let request = client
+        .no_redirect_http()
+        .post(&url)
+        .header(COOKIE, cookie)
+        .form(form);
+    let response = crate::retry::send_recorded(client.retry_stats(), request)
+        .await
+        .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
+
+    let status = response.status();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
+        return Err(IaError::RateLimited {
+            retry_after: retry_after.unwrap_or(DEFAULT_RETRY_AFTER_SECS),
+        });
+    }
+    if status.is_redirection() {
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(no Location header)");
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message: format!("redirected to {location}; not followed"),
+            retry_after: None,
+        });
+    }
+    if !status.is_success() {
+        let retry_after = crate::retry::extract_retry_after(response.headers());
+        let body = response.text().await.unwrap_or_default();
+        return Err(IaError::Http {
+            status: status.as_u16(),
+            message: body,
+            retry_after,
+        });
+    }
+    Ok(response)
+}
+
+/// The text of a truthy `error` field of a JSON object answer: the string
+/// itself, or the JSON text of any other truthy value.
+fn error_text(answer: &Value) -> Option<String> {
+    match answer.get("error")? {
+        Value::Null | Value::Bool(false) => None,
+        Value::String(s) if s.is_empty() => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) if n.as_f64() == Some(0.0) => None,
+        Value::Array(a) if a.is_empty() => None,
+        Value::Object(o) if o.is_empty() => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Whether a JSON answer has `"success": false`.
+fn is_success_false(answer: &Value) -> bool {
+    answer.get("success") == Some(&Value::Bool(false))
 }
 
 #[cfg(test)]
