@@ -79,6 +79,7 @@ pub struct JsonErrorBody {
 ///         IaError::TaskRerunFailed { .. } => (),
 ///         IaError::TaskNotFound { .. } => (),
 ///         IaError::TaskTimeout { .. } => (),
+///         IaError::AccountApi { .. } => (),
 ///         IaError::Network(_) => (),
 ///         IaError::Io(_) => (),
 ///         IaError::Json(_) => (),
@@ -138,6 +139,7 @@ pub struct JsonErrorBody {
 ///         IaError::TaskRerunFailed { .. } => (),
 ///         IaError::TaskNotFound { .. } => (),
 ///         IaError::TaskTimeout { .. } => (),
+///         IaError::AccountApi { .. } => (),
 ///         IaError::Network(_) => (),
 ///         IaError::Io(_) => (),
 ///         IaError::Json(_) => (),
@@ -422,6 +424,14 @@ pub enum IaError {
     #[error("timed out waiting for task {task_id} after {elapsed}s")]
     TaskTimeout { task_id: u64, elapsed: u64 },
 
+    /// The account API (`/services/xauthn/`) answered, but not with what was
+    /// asked: an error body, an empty or missing `values` object, a body that
+    /// is not JSON, an account other than the one looked up, a missing field
+    /// the action needs, or a refused lock or unlock. `account` is the value
+    /// the caller passed. See [`crate::account`].
+    #[error("account API error for {account}: {message}")]
+    AccountApi { account: String, message: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -602,6 +612,8 @@ impl IaError {
             IaError::TaskRerunFailed { .. } => false,
             IaError::TaskNotFound { .. } => false,
             IaError::TaskTimeout { .. } => false,
+            // The account API answered; the same request gets the same answer.
+            IaError::AccountApi { .. } => false,
             // 102: data node offline or not responding. 101 (creation
             // pending), 104 (deleted) and the rest will not change within a
             // retry budget.
@@ -913,6 +925,10 @@ impl IaError {
                 extra.insert("task_id".into(), (*task_id).into());
                 extra.insert("elapsed_secs".into(), (*elapsed).into());
                 "task_timeout"
+            }
+            IaError::AccountApi { account, .. } => {
+                extra.insert("account".into(), account.clone().into());
+                "account_api_error"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",

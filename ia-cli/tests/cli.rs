@@ -2667,6 +2667,11 @@ fn cleanup_help_says_which_flags_abort() {
 fn every_command_renders_its_long_help() {
     let table: &[(&str, &str, &str)] = &[
         (
+            "account",
+            "logged-in-user and logged-in-sig cookies",
+            "Look up, lock or unlock archive.org accounts",
+        ),
+        (
             "collection",
             "Collections are items",
             "Create and manage collections",
