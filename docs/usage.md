@@ -1001,9 +1001,11 @@ Look up, lock or unlock archive.org accounts. The account API is admin-only. Ali
 
 ```sh
 ia account [OPTIONS] <USER>
+ia account [OPTIONS] --itemlist <FILE>
+... | ia account [OPTIONS]
 ```
 
-`USER` is an email address, a screen name, or an item name (which starts with `@`).
+`USER` is an email address, a screen name, or an item name (which starts with `@`). A list of accounts, one per line, comes from `--itemlist` or standard input (see "Bulk input").
 
 #### Flags
 
@@ -1019,7 +1021,11 @@ At most one action flag may be given. With none, the command prints the whole ac
 | `-L, --lock` | Lock the account |
 | `-u, --unlock` | Unlock the account |
 | `--comment <TEXT>` | Comment recorded with the lock or unlock; requires `--lock` or `--unlock`. An empty comment is not sent |
+| `--itemlist <FILE>` | Read accounts from `FILE`, one per line; `-` reads standard input. Cannot be combined with `USER` |
+| `--dry-run` | Print how each account would be looked up and what would be done; send nothing |
 | `--json` | Output one JSON object per account on stdout |
+
+The global `-j/--jobs` (default 2 for this command), `--joblog` and `--no-resume` apply; see "Bulk input" and "Job log".
 
 `--get-itemname`, `--is-locked` and `--comment` have no short form: `-i`, `-l` and `-c` are the global `--insecure`, `--log` and `--config-file`.
 
@@ -1046,7 +1052,7 @@ The cookies are sent only over https to `archive.org` or a subdomain of it, or t
 - A lookup is one `POST /services/xauthn/?op=info`.
 - `--lock` and `--unlock` look the account up first, then send `POST /services/xauthn/?op=lock_unlock` with the item name the lookup returned: two requests per account. The lock or unlock is sent whatever the account's current state.
 - Redirects are not followed; a 3xx answer is an error.
-- A 429 waits for the server's `Retry-After` (30 seconds when absent), printing `Rate limited. Pausing all workers for <n>s...` on stderr, and sends the same request again. A 429 on the lock repeats only the lock.
+- A 429 pauses every worker and sends the same request again (see "Rate limiting").
 - A 5xx is not retried. A lock answered with a 5xx may still have been applied; look the account up with `--is-locked` before sending it again.
 
 #### Output
@@ -1058,7 +1064,9 @@ The cookies are sent only over https to `archive.org` or a subdomain of it, or t
 | `--is-locked` | `true` or `false` |
 | `--lock`, `--unlock` | `<USER>: locked` or `<USER>: unlocked` |
 
-Errors print `error: <USER>: <message>` on stderr and exit 1. `-q` drops the lock and unlock line; `-qq` also drops error lines. Read values print at every quiet level, since they are the output. The exit status is the same at every level.
+With a list, each stdout line starts with its input line, so results match input: `<line>: <value>`, `<line>: true`, `<line>: locked`, `<line>: locked (same account as <other line>)`, and with no action flag `<line>: <values as one line of JSON>`. Results print as each account finishes, not in input order.
+
+Errors print `error: <line>: <message>` on stderr. `-q` drops the lock and unlock lines; `-qq` also drops error lines. Read values print at every quiet level, since they are the output. After a list of more than one account, `<n> succeeded, <m> failed` follows on stderr, except with `--json` or `-qq`. The command exits 1 when any account failed, else 0, at every quiet level.
 
 With `--json`, stdout carries one compact object per account:
 
@@ -1067,10 +1075,11 @@ With `--json`, stdout carries one compact object per account:
 {"account":"@example-user","lookup":"itemname","action":"lookup","status":"ok","values":{"…":"…"},"elapsed_ms":9}
 {"account":"example-user-1","lookup":"screenname","action":"is-locked","status":"ok","locked":false,"elapsed_ms":8}
 {"account":"example-user-1","lookup":"screenname","action":"lock","status":"ok","itemname":"@example-user-1","response":{"…":"…"},"elapsed_ms":20}
+{"account":"@example-user-1","lookup":"itemname","action":"lock","status":"ok","itemname":"@example-user-1","same_as":"example-user-1","elapsed_ms":20}
 {"account":"nobody@example.org","lookup":"email","action":"lock","status":"error","error":{"code":"account_api_error","message":"account API error for nobody@example.org: account not found","account":"nobody@example.org"},"elapsed_ms":7}
 ```
 
-`action` is one of `lookup`, `get-email`, `get-screenname`, `get-itemname`, `is-locked`, `lock`, `unlock`. `response` is the server's answer to the lock or unlock, as JSON, or as a JSON string when the answer is not JSON. A failed account exits 1 after its `"status":"error"` object. Errors that stop the command before any account (missing cookies, a host the cookies may not go to, no `USER`) print `{"error": {"code": "...", "message": "..."}}` on stderr and exit 1.
+`action` is one of `lookup`, `get-email`, `get-screenname`, `get-itemname`, `is-locked`, `lock`, `unlock`. `response` is the server's answer to the lock or unlock, as JSON, or as a JSON string when the answer is not JSON. `same_as` marks a line whose account another line already locked or unlocked in this run (see "Several lines for one account"); such a record has no `response`. The command exits 1 after the last object when any account has `"status":"error"`. Errors that stop the command before any account (missing cookies, a host the cookies may not go to, no account given, an unreadable or empty list) print `{"error": {"code": "...", "message": "..."}}` on stderr and exit 1.
 
 | Error code | Cause |
 |------------|-------|
@@ -1078,6 +1087,45 @@ With `--json`, stdout carries one compact object per account:
 | `http_error` | a redirect, or another non-2xx answer (the message is the response body) |
 | `account_api_error` | account not found, an answer that is not JSON, a different account in the answer, a field the action needs missing, no usable item name, or a refused lock or unlock |
 | `network` | connection failure |
+| `invalid_argument` | no account given, `--itemlist -` with a terminal on standard input, or a list with no accounts in it |
+| `io` | the `--itemlist` file, standard input or the job log could not be read |
+
+#### Bulk input
+
+Without `USER`, the accounts come from `--itemlist <FILE>`, or else from standard input when it is not a terminal. `--itemlist -` reads standard input too (as does `--itemlist /dev/stdin`, the form other commands document); with a terminal on standard input it fails with `--itemlist - needs standard input from a pipe or file`. With no source at all the command fails with `no account given: pass USER, --itemlist <FILE>, or pipe accounts on standard input`. As with other commands, a job runner that leaves standard input open as a pipe makes a command with no `USER` wait for it.
+
+Each line is trimmed. Blank lines and lines starting with `#` are skipped, and a line repeated exactly is run once. Lines are not checked as item identifiers, so email addresses with `+` and screen names with spaces are kept. A list that names no account fails with `no accounts found in <FILE>` (or `standard input`).
+
+Accounts run concurrently, `--jobs` at a time, default 2. Every form runs the same code for each account: a positional `USER` is a list of one, printed in the single-account form.
+
+#### Several lines for one account
+
+`Person@Example.com`, `person@example.com`, `example-user` and `@example-user` can all name one account. With `--lock` or `--unlock`, requests are shared within a run by the item name each lookup returns, ignoring letter case: the first line to reach the lock sends it, and later lines for the same item name wait for that result and report it as their own, with `(same account as <first line>)` in human output and `same_as` in JSON. One account gets one lock request and one comment per run. If that request fails, every line for the account fails with its error. Every line is still looked up. Read actions share nothing; each line gets its own lookup.
+
+#### Dry run
+
+`--dry-run` sends nothing, not even the lookup, and does not need the cookies or check the host. It works with every action, so a list can be checked for how each line will be looked up:
+
+```
+dry-run person@example.com: lock (lookup by email), comment "spam"
+dry-run @example-user: lock (lookup by itemname)
+```
+
+The comment is shown for a lock or unlock when it is not empty. Then, unless `-qq`, `dry-run: would lock 2 account(s), nothing sent` on stderr. With `--json`, each account is `{"account":"…","lookup":"…","action":"…","status":"dry_run","comment":"…","dry_run":true}` (`comment` only when shown) and there is no footer. A dry run writes nothing to the job log, but applies its resume skip first, so it shows what a resumed run would do.
+
+#### Job log
+
+Only `--lock` and `--unlock` use `--joblog`; with a read action it is ignored, neither read nor written. Each account is recorded as it finishes: `op` is `account-lock` or `account-unlock`, `item` the input line, `file` empty, and `status` `ok` (with `bytes` 0 and `elapsed_ms`) or `error` with the message. A line that shared another line's request gets its own entry with that request's status.
+
+A rerun with the same `--joblog` skips a line when its latest entry among `account-lock` and `account-unlock` is `ok` and has the op of this run, printing `resuming: skipping <n> account(s) already done in joblog` on stderr unless `-q`. Lines that failed run again. So a lock list rerun after the same accounts were unlocked through the same job log locks them again, and an unlock run is not skipped because of an earlier lock. When every line is already done, the command prints that line and exits 0. `--no-resume` runs every line.
+
+Keep one job log per action. `ia status --joblog <PATH> --failed-items` lists lines that never succeeded without looking at `op`, so a log that mixes locks and unlocks reports them together.
+
+An interruption can send a lock twice. A Ctrl-C while a lock request is in flight, or a failure after the server may already have acted (a `5xx`, a read timeout), leaves no `ok` entry, so a rerun sends that lock again, with its comment.
+
+#### Rate limiting
+
+A `429` on a lookup or a lock pauses every worker for the server's `Retry-After` (30 seconds when absent), printing `Rate limited. Pausing all workers for <n>s...` on stderr once per pause, then sends the same request again, with no cap. A `429` on the lock repeats only the lock, not the lookup. This is the rule `ia metadata modify` follows.
 
 #### Examples
 
@@ -1096,6 +1144,15 @@ ia account person@example.com --lock --comment "spam"
 
 # Unlock an account, one JSON object on stdout
 ia account @example-user --unlock --json
+
+# Check how each line of a list would be looked up, sending nothing
+ia account --itemlist accounts.txt --lock --dry-run
+
+# Lock every account in a list, recording each in a job log
+ia account --itemlist accounts.txt --lock --comment "spam" --joblog lock.jsonl
+
+# Print whether each piped account is locked, four at a time
+cat accounts.txt | ia account --is-locked -j 4
 ```
 
 ### `ia collection`
@@ -1378,7 +1435,7 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10) |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` and `ia account` use 2, `ia metadata audit` 10) |
 | `-i, --insecure` | Allow insecure (HTTP) connections |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
@@ -1410,11 +1467,11 @@ ia --config-file ~/my-ia.ini download nasa
 
 The retries that answer a failed request wait on one schedule: the per-file download retries, every IA-S3 request in an upload, a search page answered with `429`, the HTTP layer's own retries of a `5xx`, the LLM client, and the self-updater. The wait is random, up to a cap that doubles with each attempt from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. `ia update` is on the schedule with its cap at 30 s. How many retries each command makes, and what it retries, is in that command's section.
 
-Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit` and `ia metadata` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`).
+Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit`, `ia metadata` and `ia account` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`; `ia account` pauses every worker for the `Retry-After`, or 30 s when there is none).
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit` and `ai qa`. `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit` and `ai qa`; for `account --lock` and `account --unlock`, accounts whose latest lock or unlock entry is `ok` with the same action (read actions of `ia account` ignore `--joblog`). `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging
@@ -1463,7 +1520,12 @@ ia download nasa --json
 
 # Pipe search JSON into download
 ia search "collection:nasa" --json | ia download --itemlist /dev/stdin
+
+# One object per account, each with "status": "ok" or "error"
+ia account --itemlist accounts.txt --is-locked --json
 ```
+
+`ia account --json` prints one object per account with `account`, `lookup`, `action` and `status` (`ok`, `error`, or `dry_run` with `--dry-run`), and its command-level errors as `{"error": {...}}` on stderr (see "Output" under `ia account`).
 
 When `--json` is active:
 

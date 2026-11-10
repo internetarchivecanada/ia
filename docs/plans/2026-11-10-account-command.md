@@ -220,8 +220,8 @@ Kept, with reason: the wider email rule (the Python pattern sends valid addresse
 ## Tasks
 - [x] Plan committed first.
 - [x] Plan review; findings taken or answered above.
-- [ ] Red: ia-core and CLI tests above.
-- [ ] Green: `ia_core::account`, `IaError::AccountApi`, `ia account`.
-- [ ] `--help`, docs/usage.md, README.md.
-- [ ] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
+- [x] Red: ia-core and CLI tests above.
+- [x] Green: `ia_core::account`, `IaError::AccountApi`, `ia account`.
+- [x] `--help`, docs/usage.md, README.md.
+- [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code review; PR.

@@ -945,8 +945,17 @@ mod terminal_stdin {
             "stderr: {}",
             stderr_of(&output)
         );
+        // The JSON message is the error's display, which for an
+        // InvalidArgument starts with "invalid argument: ".
         let err = stderr_json_error(&output);
-        assert_eq!(err["error"]["message"], NO_ACCOUNT_GIVEN, "{err}");
+        assert_eq!(err["error"]["code"], "invalid_argument", "{err}");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(NO_ACCOUNT_GIVEN),
+            "{err}"
+        );
     }
 
     #[tokio::test]
