@@ -88,7 +88,7 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify uses 2)
+    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify and account use 2)
     #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 
@@ -309,7 +309,15 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Account(args) => {
-            commands::account::run(&client, args, cli.quiet, cli.jobs).await?
+            commands::account::run(
+                &client,
+                args,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog,
+                cli.no_resume,
+            )
+            .await?
         }
         #[cfg(feature = "alpha")]
         Commands::Ai(args) => {

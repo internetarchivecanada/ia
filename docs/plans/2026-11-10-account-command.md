@@ -113,7 +113,7 @@ Every form runs the same per-account code: a positional `USER` is a list of one.
 
 Per account: look up; for lock and unlock, then send the request with the looked-up item name. Shared `RateLimiter`: on `IaError::RateLimited` the first worker prints `Rate limited. Pausing all workers for {secs}s...` to stderr, every worker waits, and the request that got the 429 is sent again, with no cap, as in `metadata modify`. A 429 on the lock request repeats only the lock request. A lock is sent whatever the account's current state, as in the Python client.
 
-**Several lines for one account.** `Person@Example.com`, `person@example.com`, `example-user` and `@example-user` can all name one account. For lock and unlock, requests are de-duplicated within a run by the looked-up item name (ignoring case): the first line to reach the lock step sends it, later lines for the same item name wait for that result and report it as their own, with `same account as <first line>`. One account gets one lock request and one curate comment per run. Read actions are not de-duplicated; a second lookup is harmless.
+**Several lines for one account.** `Person@Example.com`, `person@example.com`, `example-user` and `@example-user` can all name one account. For lock and unlock, requests are de-duplicated within a run by the looked-up item name, compared exactly as the server returns it (every spelling of one account looks up to the same item name, and two item names that differ only in case may be two accounts): the first line to reach the lock step sends it, later lines for the same item name wait for that result and report it as their own, with `same account as <first line>`. One account gets one lock request and one curate comment per run. Read actions are not de-duplicated; a second lookup is harmless.
 
 ## Output
 
@@ -156,7 +156,7 @@ Only lock and unlock use `--joblog`, as only writes resume in other commands (`i
 
 `--joblog <PATH>` records one entry per account as it finishes: `op` `account-lock` or `account-unlock`, `item` the input line, `file` empty, `status` `ok` (bytes 0, `elapsed_ms`) or `error` with the message. A line resolved as the same account as another line gets that line's status.
 
-**Resume.** On a rerun with the same `--joblog` (and no `--no-resume`), a line is skipped when its latest entry among `account-lock` and `account-unlock` is `ok` and has this run's op. Taking the latest of both ops means a lock list rerun after the same accounts were unlocked through the same job log locks them again, and an unlock run is not skipped because of an earlier lock. The skip prints `resuming: skipping <n> account(s) already done in joblog` on stderr unless `-q`; lines that failed run again. When every line is already done the command prints that line and exits 0.
+**Resume.** On a rerun with the same `--joblog` (and no `--no-resume`), a line is skipped when its latest entry among `account-lock` and `account-unlock` is `ok` and has this run's op. Taking the latest of both ops means a lock list rerun after the same lines were unlocked through the same job log locks them again, and an unlock run is not skipped because of an earlier lock. Resume works per input line and de-duplication per account, so a rerun with a different spelling of an already-locked account sends another lock. The skip prints `resuming: skipping <n> account(s) already done in joblog` on stderr unless `-q`; lines that failed run again. When every line is already done the command prints that line and exits 0.
 
 `ia status --joblog <PATH> --failed-items` lists lines that never succeeded. It does not look at `op`, so docs/usage.md advises one job log per action.
 
@@ -217,11 +217,19 @@ Decided by the Python client or this repository rather than left open: cookies g
 
 Kept, with reason: the wider email rule (the Python pattern sends valid addresses to the screen-name lookup, where they cannot be found); the JSON key `account` (the value is not an item identifier).
 
+## Code review (2026-11-10), closed before the PRs
+
+Taken in the single-account part: the cookies go only over https unless the host is loopback (the Python client always uses https for these calls; `--insecure` would otherwise send the admin session in clear text); a host naming a user or password is refused (reqwest would turn it into an `Authorization: Basic` header); host strings that could be misread (`archive.org@example.org`, `example.org#.archive.org`, a trailing dot, upper case) are pinned by tests; a 429 waits at least one second, so `Retry-After: 0` cannot make an unbounded loop with no wait; a CLI test that a lookup answering another account, or no item name, sends no lock.
+
+Taken in the bulk part: the job log entry is written before the result is printed, so a closed stdout cannot lose the entry of a lock the server accepted; locks are shared by the exact item name the server returns rather than ignoring case, which could only merge two different accounts; the docs say resume works per input line while sharing works per account within a run; a leading byte-order mark is stripped from a list; the dry-run comment is printed escaped; an empty `USER` has its own error; tests for concurrent sharing with a delayed lock answer and for a dry run with valid cookies on a loopback host.
+
+Not changed: `IaError::Http` keeps the whole response body as its message, the convention elsewhere in ia-core.
+
 ## Tasks
 - [x] Plan committed first.
 - [x] Plan review; findings taken or answered above.
-- [ ] Red: ia-core and CLI tests above.
-- [ ] Green: `ia_core::account`, `IaError::AccountApi`, `ia account`.
-- [ ] `--help`, docs/usage.md, README.md.
-- [ ] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
-- [ ] Code review; PR.
+- [x] Red: ia-core and CLI tests above.
+- [x] Green: `ia_core::account`, `IaError::AccountApi`, `ia account`.
+- [x] `--help`, docs/usage.md, README.md.
+- [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
+- [x] Code review; PR.
