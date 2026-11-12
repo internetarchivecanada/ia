@@ -618,3 +618,162 @@ async fn every_row_already_created_exits_zero() {
     );
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
 }
+
+// ─── Review of PR 153 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dry_run_with_an_image_sends_no_request() {
+    let server = MockServer::start().await;
+    mount_unexpected(&server).await;
+    let cfg = config_with_keys(&host_of(&server));
+    let dir = TempDir::new().unwrap();
+    write_file(&dir, "logo.png", "\u{89}PNG fake");
+    write_file(
+        &dir,
+        "cols.csv",
+        "identifier,collection,image\nimg-dry,p,logo.png\nimg-dry-2,p,\n",
+    );
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &[
+            "--spreadsheet",
+            "cols.csv",
+            "--image",
+            "logo.png",
+            "--dry-run",
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+}
+
+#[test]
+fn dry_run_json_shows_every_value_of_a_repeated_field() {
+    let cfg = config_without_keys();
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir,
+        "cols.csv",
+        "identifier,collection,subject[0],subject[1]\nrep-row,p,first,second\n",
+    );
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &[
+            "--spreadsheet",
+            "cols.csv",
+            "-m",
+            "collection:q",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let records = json_lines(&stdout_of(&out));
+    assert_eq!(
+        records[0]["metadata"]["subject"],
+        serde_json::json!(["first", "second"])
+    );
+    // The row's collection replaces both command-line parents.
+    assert_eq!(records[0]["metadata"]["collection"], "p");
+    assert_eq!(records[0]["metadata"]["mediatype"], Value::Null);
+}
+
+#[test]
+fn single_form_dry_run_json_shows_every_value_of_a_repeated_field() {
+    let cfg = config_without_keys();
+    let dir = TempDir::new().unwrap();
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &[
+            "one-coll",
+            "--collection",
+            "p1",
+            "-m",
+            "collection:p2",
+            "-m",
+            "subject:a",
+            "--subject",
+            "s",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let records = json_lines(&stdout_of(&out));
+    assert_eq!(
+        records[0]["metadata"]["collection"],
+        serde_json::json!(["p1", "p2"])
+    );
+    assert_eq!(
+        records[0]["metadata"]["subject"],
+        serde_json::json!(["s", "a"])
+    );
+    assert_eq!(records[0]["metadata"]["title"], Value::Null);
+    // A user mediatype is dropped before sending, so it is not shown.
+    assert_eq!(records[0]["metadata"]["mediatype"], Value::Null);
+    assert_eq!(records[0]["mediatype"], "collection");
+}
+
+#[tokio::test]
+async fn csv_with_bom_quotes_newlines_non_ascii_and_indexed_columns() {
+    let server = MockServer::start().await;
+    mount_create(&server, "edge-row", 200, 1).await;
+    mount_unexpected(&server).await;
+    let cfg = config_with_keys(&host_of(&server));
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir,
+        "cols.csv",
+        "\u{feff}Identifier,Collection,Title,Description,subject[0],subject[1]\n\
+         edge-row,p,\"Café, Montréal\",\"line one\nline two\",first,second\n",
+    );
+    let out = run_create(cfg.path(), dir.path(), &["--spreadsheet", "cols.csv"]);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let h = |name: &'static str| header_of(&server, "edge-row", name);
+    assert_eq!(
+        h("x-archive-meta00-title").await.as_deref(),
+        Some("uri(Caf%C3%A9%2C%20Montr%C3%A9al)")
+    );
+    assert_eq!(
+        h("x-archive-meta00-description").await.as_deref(),
+        Some("uri(line%20one%0Aline%20two)")
+    );
+    assert_eq!(
+        h("x-archive-meta00-subject").await.as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        h("x-archive-meta01-subject").await.as_deref(),
+        Some("second")
+    );
+    assert_eq!(h("x-archive-meta00-collection").await.as_deref(), Some("p"));
+}
+
+#[tokio::test]
+async fn jsonl_null_uses_the_default_parent_and_arrays_repeat() {
+    let server = MockServer::start().await;
+    mount_create(&server, "series-1", 200, 1).await;
+    mount_unexpected(&server).await;
+    let cfg = config_with_keys(&host_of(&server));
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir,
+        "cols.jsonl",
+        "{\"identifier\":\"series-1\",\"collection\":null,\"subject\":[\"a\",\"b\"]}\n",
+    );
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &["--spreadsheet", "cols.jsonl", "--collection", "parent"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let h = |name: &'static str| header_of(&server, "series-1", name);
+    assert_eq!(
+        h("x-archive-meta00-collection").await.as_deref(),
+        Some("parent")
+    );
+    assert_eq!(h("x-archive-meta00-subject").await.as_deref(), Some("a"));
+    assert_eq!(h("x-archive-meta01-subject").await.as_deref(), Some("b"));
+}

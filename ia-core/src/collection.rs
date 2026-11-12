@@ -115,11 +115,22 @@ pub fn collection_rows(
     defaults: &[(String, String)],
     default_image: Option<&Path>,
 ) -> Result<Vec<CollectionRow>> {
-    if records.is_empty() {
+    rows_with_problems(records, Vec::new(), defaults, default_image)
+}
+
+/// [`collection_rows`], with `problems` the reader already found reported
+/// first, in the same error.
+fn rows_with_problems(
+    records: Vec<SpreadsheetRecord>,
+    problems: Vec<String>,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    if records.is_empty() && problems.is_empty() {
         return Err(IaError::Config("spreadsheet contains no records".into()));
     }
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = problems;
     // A bad default image is one problem, reported once, not once per row.
     let default_ok = match default_image.map(check_image) {
         Some(Err(message)) => {
@@ -188,11 +199,169 @@ pub fn collection_rows(
     }
 }
 
+/// Read a spreadsheet file and turn it into collections to create with
+/// [`collection_rows`], checking every row before any request is made.
+///
+/// CSV, TSV, XLSX and ODS files are read with
+/// [`crate::spreadsheet::read_spreadsheet`]. JSONL (`.jsonl`, `.ndjson`)
+/// is read here, by value type rather than as text: a `null` is no value,
+/// so a default applies; an array of strings gives one value per element,
+/// as indexed columns do; a string is the value. Any other value (a number,
+/// a boolean, an object, an array holding anything but strings) is refused,
+/// since its text would be sent as metadata. Keys are case-insensitive,
+/// `identifier` included, and a line with no string identifier is refused
+/// rather than skipped. Every such problem is reported with the other
+/// validation problems.
+///
+/// # Errors
+///
+/// As [`collection_rows`], plus the JSONL problems above, and the read
+/// errors of the file.
+pub fn read_collection_spreadsheet(
+    path: &Path,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "jsonl" || ext == "ndjson" {
+        let (records, problems) = read_jsonl_rows(path)?;
+        rows_with_problems(records, problems, defaults, default_image)
+    } else {
+        collection_rows(
+            crate::spreadsheet::read_spreadsheet(path)?,
+            defaults,
+            default_image,
+        )
+    }
+}
+
+/// Read a JSONL file into records by value type, with the problems found;
+/// see [`read_collection_spreadsheet`].
+fn read_jsonl_rows(path: &Path) -> Result<(Vec<SpreadsheetRecord>, Vec<String>)> {
+    let content = std::fs::read_to_string(path)?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let mut records = Vec::new();
+    let mut problems = Vec::new();
+
+    for (n, line) in content.lines().enumerate() {
+        let line_no = n + 1;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let object = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Object(object)) => object,
+            Ok(_) => {
+                problems.push(format!("line {line_no}: not a JSON object"));
+                continue;
+            }
+            Err(e) => {
+                problems.push(format!("line {line_no}: not valid JSON: {e}"));
+                continue;
+            }
+        };
+
+        let id_keys: Vec<&String> = object
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("identifier"))
+            .collect();
+        let identifier = match (id_keys.as_slice(), id_keys.first().map(|k| &object[*k])) {
+            ([_], Some(serde_json::Value::String(id))) if !id.trim().is_empty() => {
+                id.trim().to_string()
+            }
+            ([_], Some(serde_json::Value::String(_) | serde_json::Value::Null)) | ([], _) => {
+                problems.push(format!("line {line_no}: no identifier"));
+                continue;
+            }
+            ([_], Some(other)) => {
+                problems.push(format!(
+                    "line {line_no}: identifier must be a string (got {})",
+                    json_kind(other)
+                ));
+                continue;
+            }
+            _ => {
+                problems.push(format!(
+                    "line {line_no}: identifier is given more than once"
+                ));
+                continue;
+            }
+        };
+
+        let mut fields: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut keys_seen: HashSet<String> = HashSet::new();
+        for (key, value) in &object {
+            let key = key.to_lowercase();
+            if key == "identifier" {
+                continue;
+            }
+            if !keys_seen.insert(key.clone()) {
+                problems.push(format!(
+                    "{identifier}: {key} is given more than once (keys are case-insensitive)"
+                ));
+                continue;
+            }
+            let mut put = |k: String, v: String, problems: &mut Vec<String>| {
+                if fields.insert(k.clone(), v).is_some() {
+                    problems.push(format!("{identifier}: {k} is given more than once"));
+                }
+            };
+            match value {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(v) => put(key, v.clone(), &mut problems),
+                serde_json::Value::Array(items)
+                    if key != IMAGE_COLUMN
+                        && !key.contains('[')
+                        && items.iter().all(serde_json::Value::is_string) =>
+                {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Some(v) = item.as_str() {
+                            put(format!("{key}[{i}]"), v.to_string(), &mut problems);
+                        }
+                    }
+                }
+                other => problems.push(format!(
+                    "{identifier}: {key} must be {} (got {})",
+                    if key == IMAGE_COLUMN || key.contains('[') {
+                        "a string or null"
+                    } else {
+                        "a string, an array of strings, or null"
+                    },
+                    json_kind(other)
+                )),
+            }
+        }
+        records.push((identifier, fields));
+    }
+
+    Ok((records, problems))
+}
+
+/// A JSON value's kind, for an error message.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array that holds more than strings",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// Check that a cover image exists and has an extension, from which its
 /// content type is inferred. Returns the problem as text.
 fn check_image(img: &Path) -> std::result::Result<(), String> {
     if !img.exists() {
         return Err(format!("image file not found: {}", img.display()));
+    }
+    if !img.is_file() {
+        return Err(format!("image is not a file: {}", img.display()));
     }
     if img.extension().is_none() {
         return Err(format!(
@@ -251,11 +420,25 @@ async fn create_with_image(
     let key = format!("{identifier}_itemimage.{ext}");
     let content_type = infer_content_type(ext);
 
+    // A dry run returns before `upload_file`, which can send requests
+    // before its own dry-run check.
+    if dry_run {
+        return Ok(CreateCollectionResult {
+            identifier: identifier.to_string(),
+            status: 0,
+            url,
+        });
+    }
+
+    // `checksum: false`: the upload's skip check would send a metadata GET
+    // and, when the item already holds an identical image, skip the PUT,
+    // so no metadata would be applied while the create reported success.
+    // A create always sends its PUT and reports the server's answer.
     let opts = UploadOpts {
         metadata: metadata.to_vec(),
         no_derive: true,
         verify: false,
-        dry_run,
+        checksum: false,
         headers: vec![("Content-Type".to_string(), content_type.to_string())],
         no_collection_check: true,
         ..UploadOpts::default()
@@ -267,17 +450,18 @@ async fn create_with_image(
     .await?;
 
     match result.status {
-        UploadStatus::Uploaded | UploadStatus::Skipped | UploadStatus::Resumed => {
-            Ok(CreateCollectionResult {
-                identifier: identifier.to_string(),
-                status: 200,
-                url,
-            })
-        }
-        UploadStatus::DryRun => Ok(CreateCollectionResult {
+        UploadStatus::Uploaded | UploadStatus::Resumed => Ok(CreateCollectionResult {
             identifier: identifier.to_string(),
-            status: 0,
+            status: 200,
             url,
+        }),
+        // Neither is produced with `checksum: false` and `dry_run: false`;
+        // reporting either as created would claim a PUT that was not sent.
+        UploadStatus::Skipped | UploadStatus::DryRun => Err(IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key,
+            message: "the image upload was not sent".into(),
+            status: None,
         }),
         UploadStatus::Failed(msg) => Err(IaError::UploadFailed {
             identifier: identifier.to_string(),
@@ -859,5 +1043,147 @@ mod tests {
             .to_string();
         assert_eq!(msg.matches("image file not found").count(), 1, "{msg}");
         assert!(msg.contains("--image: image file not found"), "{msg}");
+    }
+
+    // -- review of PR 153 --
+
+    #[tokio::test]
+    async fn dry_run_with_image_sends_no_request() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(599))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = test_client(&server).await;
+        let img = temp_image_with_content("png", b"\x89PNG fake");
+        let result = create_collection(&client, "dry-img", &[], Some(img.path()), true)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_item_with_the_same_image_is_still_sent() {
+        let server = MockServer::start().await;
+        let img = temp_image_with_content("png", b"\x89PNG same bytes");
+        let md5 = crate::upload::checksum::compute_file_md5_async(img.path())
+            .await
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/metadata/existing-coll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": "existing-coll", "mediatype": "collection"},
+                "files": [{"name": "existing-coll_itemimage.png", "md5": md5, "size": "16"}],
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/existing-coll/existing-coll_itemimage.png"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server).await;
+        let result = create_collection(&client, "existing-coll", &[], Some(img.path()), false)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+    }
+
+    #[test]
+    fn an_image_that_is_a_directory_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let logo_dir = dir.path().join("logo.d");
+        std::fs::create_dir(&logo_dir).unwrap();
+        let logo = logo_dir.display().to_string();
+        let records = vec![rec("dir-image", &[("collection", "p"), ("image", &logo)])];
+        let msg = collection_rows(records, &[], None).unwrap_err().to_string();
+        assert!(msg.contains("dir-image: image is not a file"), "{msg}");
+    }
+
+    fn jsonl_file(contents: &str) -> NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn jsonl_null_is_no_value_and_the_default_applies() {
+        let f = jsonl_file(r#"{"identifier":"series-1","collection":null,"title":null}"#);
+        let defaults = kv(&[("collection", "parent")]);
+        let rows = read_collection_spreadsheet(f.path(), &defaults, None).unwrap();
+        assert_eq!(rows[0].metadata, kv(&[("collection", "parent")]));
+    }
+
+    #[test]
+    fn jsonl_array_of_strings_gives_repeated_values() {
+        let f = jsonl_file(r#"{"identifier":"series-1","collection":"p","subject":["a","b"]}"#);
+        let rows = read_collection_spreadsheet(f.path(), &[], None).unwrap();
+        assert_eq!(
+            rows[0].metadata,
+            kv(&[("collection", "p"), ("subject", "a"), ("subject", "b")])
+        );
+    }
+
+    #[test]
+    fn jsonl_values_that_cannot_be_sent_are_refused_with_every_other_problem() {
+        let f = jsonl_file(concat!(
+            r#"{"identifier":"num-row","collection":"p","year":1942}"#,
+            "\n",
+            r#"{"identifier":"bool-row","collection":"p","hidden":true}"#,
+            "\n",
+            r#"{"identifier":"obj-row","collection":"p","x":{"a":"b"}}"#,
+            "\n",
+            r#"{"identifier":"mixed-row","collection":"p","subject":["a",1]}"#,
+            "\n",
+            r#"{"identifier":"no-parent"}"#,
+            "\n",
+            r#"{"identifier":"good-row","collection":"p"}"#,
+            "\n",
+        ));
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "num-row: year",
+            "bool-row: hidden",
+            "obj-row: x",
+            "mixed-row: subject",
+            "no-parent: no parent collection",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+        assert!(!msg.contains("good-row"), "{msg}");
+    }
+
+    #[test]
+    fn jsonl_line_without_a_usable_identifier_is_reported() {
+        let f = jsonl_file(concat!(
+            r#"{"identifier":12345,"collection":"p"}"#,
+            "\n",
+            r#"{"Identifier":"upper-key","collection":"p"}"#,
+            "\n",
+            r#"{"title":"no identifier","collection":"p"}"#,
+            "\n",
+        ));
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("line 1: identifier must be a string (got a number)"),
+            "{msg}"
+        );
+        assert!(msg.contains("line 3: no identifier"), "{msg}");
+        // Keys are case-insensitive, `identifier` included: line 2 is a row.
+        assert!(
+            !msg.contains("line 2") && !msg.contains("upper-key"),
+            "{msg}"
+        );
     }
 }

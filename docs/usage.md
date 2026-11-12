@@ -1182,7 +1182,7 @@ ia collection create --spreadsheet <FILE> [OPTIONS]
 | `-I, --image <PATH>` | Path to collection cover image |
 | `-m, --metadata <K:V>` | Additional metadata (repeatable) |
 | `--spreadsheet <FILE>` | Create one collection per row of a file (CSV with a header row, TSV, XLSX, ODS, JSONL); conflicts with `<IDENTIFIER>` |
-| `--dry-run` | Validate and show full details without creating the collection |
+| `--dry-run` | Validate and show full details without sending any request; with `--json`, `metadata` shows a field given more than once as an array of its values |
 | `--json` | Output as JSON |
 
 ```sh
@@ -1209,9 +1209,22 @@ ia collection create my-collection \
     --collection opensource --dry-run
 ```
 
+A create always sends its request and reports the server's answer; it does not first check whether the identifier exists. With `--image`, the image is sent even when the item already holds an identical one.
+
 ##### Many collections from one file
 
-`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive (in JSONL, except `identifier`, which must be lower case), a blank cell is no value, and a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands. Standard input is not read.
+`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive and a blank cell is no value. In a CSV, TSV, XLSX or ODS file a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands; when a header appears twice, the last non-empty cell of the two is used. Standard input is not read.
+
+JSON lines are read by value type. JSON keys are case-insensitive, `identifier` included.
+
+| JSON value | Meaning |
+|------------|---------|
+| a string | the value (an empty string is no value) |
+| `null` | no value: the command-line value, if any, applies |
+| an array of strings | one value per element, as `subject[0]`, `subject[1]`, ... columns give; `[]` is no value |
+| a number, a boolean, an object, or an array holding anything but strings | refused |
+
+`image` and indexed keys (`subject[0]`) take a string or `null` only. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused. Refused lines and values are reported with the other problems below, before any request; write numbers and booleans as strings (`"1942"`, `"true"`).
 
 | Column | Meaning |
 |--------|---------|
@@ -1224,13 +1237,13 @@ Each row gets what a single `ia collection create` applies: `mediatype=collectio
 
 `--collection`, `--title`, `--description`, `--subject`, `--image` and `-m` apply to every row. A field a row fills in replaces every command-line value for that field, for that row only; a field the row leaves blank or does not have keeps the command-line values. So `--collection opensource` gives every row that parent, and a row with its own `collection` cell uses that one instead. This is the rule `ia upload --spreadsheet` applies between `-m` and a row.
 
-Every row is checked before the first request, and every problem is reported in one error that names the identifiers: an invalid identifier, an identifier on more than one row, a row with no parent collection, an image that does not exist or has no extension, and a column name that cannot be sent as metadata. Nothing is sent if any row fails these checks. S3 keys are checked once, before the first request.
+Every row is checked before the first request, and every problem is reported in one error that names the identifiers: an invalid identifier, an identifier on more than one row, a row with no parent collection, an image that does not exist, is not a file, or has no extension, and a column name that cannot be sent as metadata. Nothing is sent if any row fails these checks. S3 keys are checked once, before the first request.
 
 Rows run concurrently up to the global `-j/--jobs` (default 8). A failed row does not stop the others. Each created row prints `created: <url>` on stdout (dropped at `-q`), each failed row `error: <identifier>: <message>` on stderr (dropped at `-qq`), and, for more than one row, `<n> created, <m> failed` on stderr at the end. The exit status is 1 if any row failed.
 
 With `--json`, stdout has one object per row: a created row is the object a single create prints, `{"identifier", "status", "url"}`; a failed row is `{"identifier", "error": {"code", "message", ...}}`. An error that stops the whole command, such as a failed check, is `{"error": {...}}` on stderr.
 
-`--dry-run` checks every row the same way, sends nothing and needs no keys. It prints each row as a single dry run does, then `dry-run: would create <n> collection(s), nothing sent` on stderr.
+`--dry-run` checks every row the same way, sends nothing (not even for a row with an image) and needs no keys. It prints each row as a single dry run does, then `dry-run: would create <n> collection(s), nothing sent` on stderr.
 
 `--joblog <PATH>` records each row as it finishes: `op` is `collection-create`, `item` the identifier, `file` empty, and `status` `ok` or `error` with the message. A rerun with the same `--joblog` checks every row again, then skips the identifiers whose latest entry is `ok`, printing `resuming: skipping <n> collection(s) already created in joblog`; failed rows run again. `--no-resume` runs every row. `ia status --joblog <PATH> --failed-items` lists the identifiers that failed. A collection created without an image is one PUT that is not retried within the run; a row refused for load (`SlowDown`) or a dropped connection fails, and the rerun with the job log sends it again. The single form ignores `--joblog`.
 

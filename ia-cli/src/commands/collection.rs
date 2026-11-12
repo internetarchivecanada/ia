@@ -8,11 +8,10 @@ use console::style;
 use futures::stream::{self, StreamExt};
 
 use ia_core::collection::{
-    collection_rows, create_collection, CollectionRow, CreateCollectionResult,
+    create_collection, read_collection_spreadsheet, CollectionRow, CreateCollectionResult,
 };
 use ia_core::error::format_error_chain;
 use ia_core::joblog::{self, JoblogEntry, JoblogWriter};
-use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::{IaClient, IaError};
 
 /// The job log `op` of one created collection.
@@ -231,17 +230,17 @@ async fn run_spreadsheet(
             return command_error(IaError::InvalidArgument(format!("{e:#}")), args.json);
         }
     };
-    let records = match read_spreadsheet(path) {
-        Ok(records) => records,
-        Err(e) if args.json => return command_error(e, true),
+    let mut rows = match read_collection_spreadsheet(path, &defaults, args.image.as_deref()) {
+        Ok(rows) => rows,
+        // A validation problem (`Config`) names the rows; a read error
+        // (missing file, malformed CSV) is given the file's name.
+        Err(e) if args.json || matches!(e, IaError::Config(_)) => {
+            return command_error(e, args.json)
+        }
         Err(e) => {
             return Err(anyhow::Error::new(e)
                 .context(format!("failed to read spreadsheet: {}", path.display())))
         }
-    };
-    let mut rows = match collection_rows(records, &defaults, args.image.as_deref()) {
-        Ok(rows) => rows,
-        Err(e) => return command_error(e, args.json),
     };
 
     if let (Some(log), false) = (&joblog, no_resume) {
@@ -400,10 +399,7 @@ fn print_success(
         });
         if args.dry_run {
             // Include metadata in JSON dry-run output
-            let meta_obj: serde_json::Map<String, serde_json::Value> = metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
+            let meta_obj = metadata_json(metadata);
             json["mediatype"] = serde_json::Value::String("collection".into());
             json["metadata"] = serde_json::Value::Object(meta_obj);
             if let Some(img) = image {
@@ -417,7 +413,7 @@ fn print_success(
             println!();
             println!("  {:<14} {}", style("identifier:").dim(), result.identifier);
             println!("  {:<14} collection", style("mediatype:").dim());
-            for (key, value) in metadata {
+            for (key, value) in metadata.iter().filter(|(k, _)| k != "mediatype") {
                 println!("  {:<14} {}", style(format!("{key}:")).dim(), value);
             }
             if let Some(img) = image {
@@ -428,4 +424,26 @@ fn print_success(
         }
     }
     Ok(())
+}
+
+/// Metadata as a JSON object, as it will be sent: a key given once is a
+/// string, a key given more than once is an array of its values in order.
+/// A `mediatype` is left out: the create drops it and sends `collection`.
+fn metadata_json(metadata: &[(String, String)]) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+    let mut map = serde_json::Map::new();
+    for (key, value) in metadata.iter().filter(|(k, _)| k != "mediatype") {
+        let value = Value::String(value.clone());
+        match map.get_mut(key) {
+            None => {
+                map.insert(key.clone(), value);
+            }
+            Some(Value::Array(values)) => values.push(value),
+            Some(first) => {
+                let first = first.take();
+                map.insert(key.clone(), Value::Array(vec![first, value]));
+            }
+        }
+    }
+    map
 }
