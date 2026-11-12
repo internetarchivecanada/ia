@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use futures::Stream;
 use reqwest_middleware::RequestBuilder;
@@ -23,8 +24,16 @@ const THROTTLE_RETRIES: u32 = 3;
 /// budget the error is [`IaError::RateLimited`] with the last header's
 /// value, 0 when there was none (as the tasks API reports a 429; metadata
 /// reads use 30 there, a pause length rather than a report).
-async fn send_page(req: RequestBuilder, client: &IaClient) -> Result<reqwest::Response> {
+async fn send_page(
+    req: RequestBuilder,
+    client: &IaClient,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response> {
     let req = with_s3_auth(req, client);
+    let req = match timeout {
+        Some(t) => req.timeout(t),
+        None => req,
+    };
     let backoff = crate::retry::backoff_policy(
         crate::retry::STANDARD_MIN_DELAY,
         crate::retry::STANDARD_MAX_DELAY,
@@ -112,7 +121,11 @@ pub struct SearchOpts {
     pub count: usize,
     /// Page size for advanced search (0 = use [`DEFAULT_ADVANCED_ROWS`]).
     pub rows: usize,
-    /// Timeout per request in seconds.
+    /// Timeout per request in seconds, covering the whole request from
+    /// connect to the last byte of the response body. The client's own
+    /// connect and read timeouts stay in force, so this can only shorten
+    /// them; each retry of a request gets the same limit. `None` sets no
+    /// per-request limit.
     pub timeout: Option<u64>,
     /// Extra query parameters.
     pub params: Vec<(String, String)>,
@@ -134,6 +147,16 @@ struct ScrapeResponse {
 ///
 /// Uses POST (matching Python `internetarchive` behavior — GET returns wrong totals).
 pub async fn num_found(client: &IaClient, query: &str, params: &[(String, String)]) -> Result<u64> {
+    num_found_with_timeout(client, query, params, None).await
+}
+
+/// [`num_found`] with a per-request timeout.
+pub async fn num_found_with_timeout(
+    client: &IaClient,
+    query: &str,
+    params: &[(String, String)],
+    timeout: Option<Duration>,
+) -> Result<u64> {
     let url = client.url("/services/search/v1/scrape");
     let mut req = client
         .http()
@@ -142,7 +165,7 @@ pub async fn num_found(client: &IaClient, query: &str, params: &[(String, String
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = send_page(req, client).await?;
+    let resp = send_page(req, client, timeout).await?;
 
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
@@ -160,6 +183,16 @@ pub async fn advanced_num_found(
     query: &str,
     params: &[(String, String)],
 ) -> Result<u64> {
+    advanced_num_found_with_timeout(client, query, params, None).await
+}
+
+/// [`advanced_num_found`] with a per-request timeout.
+pub async fn advanced_num_found_with_timeout(
+    client: &IaClient,
+    query: &str,
+    params: &[(String, String)],
+    timeout: Option<Duration>,
+) -> Result<u64> {
     let url = client.url("/advancedsearch.php");
     let mut req = client
         .http()
@@ -168,7 +201,7 @@ pub async fn advanced_num_found(
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = send_page(req, client).await?;
+    let resp = send_page(req, client, timeout).await?;
 
     if !resp.status().is_success() {
         return Err(http_error(resp).await);
@@ -189,6 +222,17 @@ pub async fn fts_num_found(
     dsl: bool,
     params: &[(String, String)],
 ) -> Result<u64> {
+    fts_num_found_with_timeout(client, query, dsl, params, None).await
+}
+
+/// [`fts_num_found`] with a per-request timeout.
+pub async fn fts_num_found_with_timeout(
+    client: &IaClient,
+    query: &str,
+    dsl: bool,
+    params: &[(String, String)],
+    timeout: Option<Duration>,
+) -> Result<u64> {
     let base_url = client.fts_base_url();
     let q = if dsl {
         query.to_string()
@@ -200,7 +244,7 @@ pub async fn fts_num_found(
     for (k, v) in params {
         req = req.query(&[(k.as_str(), v.as_str())]);
     }
-    let resp = send_page(req, client).await?;
+    let resp = send_page(req, client, timeout).await?;
     let body = read_fts_response(resp).await?;
     Ok(body.hits.and_then(|h| h.total).map_or(0, |t| t.value()))
 }
@@ -222,6 +266,7 @@ pub fn scrape<'a>(
     let count = opts.count;
     let query = query.to_string();
     let extra_params = opts.params.clone();
+    let timeout = opts.timeout.map(Duration::from_secs);
 
     Box::pin(async_stream::try_stream! {
         let mut cursor: Option<String> = None;
@@ -245,7 +290,7 @@ pub fn scrape<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = send_page(req, client).await?;
+            let resp = send_page(req, client, timeout).await?;
 
             if !resp.status().is_success() {
                 Err(http_error(resp).await)?;
@@ -317,6 +362,7 @@ pub fn advanced<'a>(
         DEFAULT_ADVANCED_ROWS
     };
     let extra_params = opts.params.clone();
+    let timeout = opts.timeout.map(Duration::from_secs);
     // If extra_params already contains "rows", let it take precedence over the
     // default so that `--parameters 'rows=3'` works as expected.
     let has_extra_rows = extra_params.iter().any(|(k, _)| k == "rows");
@@ -348,7 +394,7 @@ pub fn advanced<'a>(
                 req = req.query(&[(k.as_str(), v.as_str())]);
             }
 
-            let resp = send_page(req, client).await?;
+            let resp = send_page(req, client, timeout).await?;
 
             if !resp.status().is_success() {
                 Err(http_error(resp).await)?;
@@ -615,6 +661,7 @@ pub fn fts<'a>(
     opts: &SearchOpts,
 ) -> Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + 'a>> {
     let count = opts.count;
+    let timeout = opts.timeout.map(Duration::from_secs);
     // Prepend !L for literal text search unless DSL mode is active
     let query = if opts.dsl {
         query.to_string()
@@ -649,7 +696,7 @@ pub fn fts<'a>(
                     .header("content-type", "application/json")
                     .body(body)
             };
-            let resp: reqwest::Response = send_page(req, client).await?;
+            let resp: reqwest::Response = send_page(req, client, timeout).await?;
             let body = read_fts_response(resp).await?;
             let FtsHits { total, hits } = body.hits.unwrap_or(FtsHits { total: None, hits: vec![] });
 
@@ -732,6 +779,141 @@ mod tests {
         config.s3_access = Some(TEST_ACCESS.to_string());
         config.s3_secret = Some(TEST_SECRET.to_string());
         config
+    }
+
+    // ─── --timeout ────────────────────────────────────────────────────────
+
+    const SLOW: Duration = Duration::from_millis(1500);
+
+    async fn slow_server() -> MockServer {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "items": [{"identifier": "a"}],
+            "cursor": "",
+            "total": 1,
+            "response": {"numFound": 1, "docs": [{"identifier": "a"}]},
+            "hits": {"total": 1, "hits": [{"fields": {"identifier": "a"}}]}
+        });
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(SLOW),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn timed_out(e: &IaError) -> bool {
+        matches!(e, IaError::Network(reqwest_middleware::Error::Reqwest(e)) if e.is_timeout())
+    }
+
+    fn short() -> Option<u64> {
+        Some(1)
+    }
+
+    async fn first_error(
+        mut s: Pin<Box<dyn Stream<Item = Result<SearchResult>> + Send + '_>>,
+    ) -> Option<IaError> {
+        match s.next().await {
+            Some(Err(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn scrape_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let opts = SearchOpts {
+            timeout: short(),
+            ..Default::default()
+        };
+        let e = first_error(scrape(&client, "q", &opts))
+            .await
+            .expect("timeout error");
+        assert!(timed_out(&e), "{e:?}");
+        let ok: Vec<_> = scrape(&client, "q", &SearchOpts::default()).collect().await;
+        assert!(ok.iter().all(Result::is_ok) && ok.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn advanced_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let opts = SearchOpts {
+            timeout: short(),
+            count: 1,
+            ..Default::default()
+        };
+        let e = first_error(advanced(&client, "q", &opts))
+            .await
+            .expect("timeout error");
+        assert!(timed_out(&e), "{e:?}");
+        let opts = SearchOpts {
+            count: 1,
+            ..Default::default()
+        };
+        let ok: Vec<_> = advanced(&client, "q", &opts).collect().await;
+        assert!(ok.iter().all(Result::is_ok) && ok.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn fts_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let opts = SearchOpts {
+            timeout: short(),
+            count: 1,
+            ..Default::default()
+        };
+        let e = first_error(fts(&client, "q", &opts))
+            .await
+            .expect("timeout error");
+        assert!(timed_out(&e), "{e:?}");
+        let opts = SearchOpts {
+            count: 1,
+            ..Default::default()
+        };
+        let ok: Vec<_> = fts(&client, "q", &opts).collect().await;
+        assert!(ok.iter().all(Result::is_ok) && ok.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn num_found_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let t = Some(Duration::from_millis(200));
+        let e = num_found_with_timeout(&client, "q", &[], t)
+            .await
+            .unwrap_err();
+        assert!(timed_out(&e), "{e:?}");
+        assert_eq!(num_found(&client, "q", &[]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn advanced_num_found_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let t = Some(Duration::from_millis(200));
+        let e = advanced_num_found_with_timeout(&client, "q", &[], t)
+            .await
+            .unwrap_err();
+        assert!(timed_out(&e), "{e:?}");
+        assert_eq!(advanced_num_found(&client, "q", &[]).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn fts_num_found_timeout_applies() {
+        let server = slow_server().await;
+        let client = IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let t = Some(Duration::from_millis(200));
+        let e = fts_num_found_with_timeout(&client, "q", false, &[], t)
+            .await
+            .unwrap_err();
+        assert!(timed_out(&e), "{e:?}");
+        assert_eq!(fts_num_found(&client, "q", false, &[]).await.unwrap(), 1);
     }
 
     #[tokio::test]
