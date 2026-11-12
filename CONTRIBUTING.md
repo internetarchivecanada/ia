@@ -70,8 +70,8 @@ Link any related issues with `Closes #N` in the PR body.
 - **Errors**: `thiserror` in `ia-core`, `anyhow` in `ia-cli`. No `unwrap()`/`expect()` outside tests.
 - **Tests**: hermetic — zero outbound network requests. Every HTTP call (read or write) must
   go through a `wiremock` mock.
-- **Dependencies**: Don't add crates without discussing first. See the crate stack in
-  [`AGENTS.md`](./AGENTS.md).
+- **Dependencies**: Don't add crates without discussing first. See the Dependencies
+  section of [`AGENTS.md`](./AGENTS.md).
 - **CLI help**: Every flag and subcommand needs accurate help text.
 - **JSON output**: Every command supports `--json` for structured output.
 
