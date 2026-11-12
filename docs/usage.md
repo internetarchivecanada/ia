@@ -1221,10 +1221,12 @@ ia config <SUBCOMMAND>
 |------------|-------------|
 | `login` | Log in to archive.org and save credentials |
 | `show` | Print current configuration as JSON |
-| `check` | Validate stored S3 credentials |
-| `whoami` | Show account information (screenname, email) |
+| `check` | Validate stored S3 credentials; exit 1 if archive.org rejects them or cannot be reached |
+| `whoami` | Show the account the S3 keys belong to (screenname, email, itemname) |
 | `print-cookies` | Print cookies in Netscape format |
 | `print-auth` | Print the Authorization header for S3 API requests |
+
+`check` and `whoami` send one `GET /services/user.php?op=whoami` authenticated with the S3 keys only (no cookies). Any valid key pair is accepted; no account privileges are needed. The email shown is the account's username as archive.org reports it, not the `logged-in-user` cookie. With `--json`, `check` prints `{"valid": true, "screenname", "email", "itemname"}` or `{"valid": false, "error"}`; `valid: false` and exit 1 are also given when archive.org cannot be reached or gives an unexpected answer, and the `error` text says which.
 
 #### Flags
 

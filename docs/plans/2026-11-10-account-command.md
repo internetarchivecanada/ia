@@ -22,7 +22,7 @@ The Python CLI always looks the account up first, then sends the lock or unlock 
 
 **Lookup type** (`ia_account.py`): a value that starts with `@` is an item name; otherwise a value that matches `^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$` is an email address; anything else is a screen name.
 
-**Related code in this repository.** `ia_core::auth::check_keys` already posts `op=info` to the same endpoint, with no lookup field and `Authorization: LOW`, and reads back the caller's own account (`auth::AccountInfo`). So the endpoint answers `op=info` without a lookup field with the caller's own record. The new module is separate because it acts on other people's accounts and authenticates as the Python client does.
+**Related code in this repository.** When this plan was written, `ia_core::auth::check_keys` posted `op=info` to the same endpoint with no lookup field and `Authorization: LOW`. That request fails for every account: `op=info` requires the `accounts-all-read` privilege and a named account (issue #144). `check_keys` now uses `GET /services/user.php?op=whoami`. The new module is separate because it acts on other people's accounts and authenticates as the Python client does.
 
 **Not known** (only a live request could tell; none is made):
 1. The body of a lock or unlock answer, and whether a refused lock answers 2xx.

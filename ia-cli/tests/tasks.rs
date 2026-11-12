@@ -25,15 +25,15 @@ async fn test_tasks_list_json() {
     )
     .unwrap();
 
-    // Mock whoami (POST /services/xauthn/?op=info)
-    Mock::given(method("POST"))
-        .and(path("/services/xauthn/"))
-        .and(query_param("op", "info"))
+    // Mock whoami (GET /services/user.php?op=whoami)
+    Mock::given(method("GET"))
+        .and(path("/services/user.php"))
+        .and(query_param("op", "whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
-            "values": {
+            "value": {
+                "username": "test@example.com",
                 "screenname": "testuser",
-                "email": "test@example.com",
                 "itemname": "@testuser"
             }
         })))
@@ -95,14 +95,14 @@ async fn test_tasks_completed_only_requires_identifier() {
     let mock_server = MockServer::start().await;
 
     // Mock whoami so it doesn't fail before our validation
-    Mock::given(method("POST"))
-        .and(path("/services/xauthn/"))
-        .and(query_param("op", "info"))
+    Mock::given(method("GET"))
+        .and(path("/services/user.php"))
+        .and(query_param("op", "whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
-            "values": {
+            "value": {
+                "username": "test@example.com",
                 "screenname": "testuser",
-                "email": "test@example.com",
                 "itemname": "@testuser"
             }
         })))
