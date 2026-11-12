@@ -1,7 +1,10 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
+use crate::spreadsheet::SpreadsheetRecord;
+use crate::upload::batch::row_metadata;
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::describe_s3_failure;
 use crate::upload::{build_s3_item_url, upload_file, UploadOpts, UploadStatus};
@@ -47,25 +50,16 @@ pub async fn create_collection(
 
     // Validate image path eagerly, before any network requests.
     if let Some(img) = image {
-        if !img.exists() {
-            return Err(IaError::UploadFailed {
-                identifier: identifier.to_string(),
-                key: img.display().to_string(),
-                message: format!("image file not found: {}", img.display()),
-                status: None,
-            });
-        }
-        if img.extension().is_none() {
-            return Err(IaError::UploadFailed {
-                identifier: identifier.to_string(),
-                key: "(image)".into(),
-                message: format!(
-                    "image file has no extension, cannot infer content type: {}",
-                    img.display()
-                ),
-                status: None,
-            });
-        }
+        check_image(img).map_err(|message| IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key: if img.exists() {
+                "(image)".into()
+            } else {
+                img.display().to_string()
+            },
+            message,
+            status: None,
+        })?;
     }
 
     let full_metadata = build_collection_metadata(metadata);
@@ -76,6 +70,128 @@ pub async fn create_collection(
     } else {
         create_without_image(client, identifier, &full_metadata, dry_run, url).await
     }
+}
+
+/// One collection to create, from a spreadsheet row merged with the
+/// command-line defaults by [`collection_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CollectionRow {
+    /// The new collection's identifier.
+    pub identifier: String,
+    /// Metadata to send, as `create_collection` takes it.
+    pub metadata: Vec<(String, String)>,
+    /// Cover image, from the row's `image` column or the default image.
+    pub image: Option<PathBuf>,
+}
+
+/// The spreadsheet column that names a row's cover image. It is never sent
+/// as metadata.
+pub const IMAGE_COLUMN: &str = "image";
+
+/// Turn spreadsheet records into collections to create, checking every row
+/// before any request is made.
+///
+/// Each record's fields become the row's metadata, with the `image` column
+/// taken out as the row's cover image (a path relative to the current
+/// directory). Indexed columns (`subject[0]`, `subject[1]`, ...) give
+/// several values for one field, as in `ia upload --spreadsheet`.
+///
+/// `defaults` and `default_image` are the values given once for every row
+/// (on the command line): a field a row fills in replaces every default
+/// value for that field, for that row only; fields the row does not fill in
+/// keep the defaults. This is the rule a batch upload applies between `-m`
+/// and a row. Rows keep their order.
+///
+/// # Errors
+///
+/// Returns `IaError::Config` when `records` is empty, and
+/// `IaError::Config` listing every problem when any row has an invalid
+/// identifier, an identifier already used on another row, no parent
+/// `collection`, an image that does not exist or has no extension, or a
+/// metadata field that cannot be sent as an S3 header.
+pub fn collection_rows(
+    records: Vec<SpreadsheetRecord>,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    if records.is_empty() {
+        return Err(IaError::Config("spreadsheet contains no records".into()));
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows = Vec::with_capacity(records.len());
+
+    for (identifier, mut fields) in records {
+        let image = fields
+            .remove(IMAGE_COLUMN)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| default_image.map(Path::to_path_buf));
+
+        let own = row_metadata(fields);
+        let named: HashSet<&str> = own.iter().map(|(k, _)| k.as_str()).collect();
+        let mut metadata: Vec<(String, String)> = defaults
+            .iter()
+            .filter(|(k, _)| !named.contains(k.as_str()))
+            .cloned()
+            .collect();
+        metadata.extend(own);
+
+        if let Err(e) = validate_identifier(&identifier) {
+            errors.push(e.to_string());
+        }
+        if !seen.insert(identifier.clone()) {
+            errors.push(format!("{identifier}: on more than one row"));
+        }
+        if !metadata
+            .iter()
+            .any(|(k, v)| k == "collection" && !v.is_empty())
+        {
+            errors.push(format!(
+                "{identifier}: no parent collection (give a collection column or --collection)"
+            ));
+        }
+        if let Some(img) = &image {
+            if let Err(message) = check_image(img) {
+                errors.push(format!("{identifier}: {message}"));
+            }
+        }
+        if let Err(e) = encode_metadata_headers(&build_collection_metadata(&metadata)) {
+            errors.push(format!("{identifier}: {e}"));
+        }
+
+        rows.push(CollectionRow {
+            identifier,
+            metadata,
+            image,
+        });
+    }
+
+    if errors.is_empty() {
+        Ok(rows)
+    } else {
+        Err(IaError::Config(format!(
+            "batch validation failed:\n  {}",
+            errors.join("\n  ")
+        )))
+    }
+}
+
+/// Check that a cover image exists and has an extension, from which its
+/// content type is inferred. Returns the problem as text.
+fn check_image(img: &Path) -> std::result::Result<(), String> {
+    if !img.exists() {
+        return Err(format!("image file not found: {}", img.display()));
+    }
+    if img.extension().is_none() {
+        return Err(format!(
+            "image file has no extension, cannot infer content type: {}",
+            img.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Build the full metadata list for a collection item.
@@ -548,5 +664,177 @@ mod tests {
             err.to_string().to_lowercase().contains("credentials")
                 || err.to_string().to_lowercase().contains("s3")
         );
+    }
+
+    // -- collection_rows --
+
+    fn rec(id: &str, fields: &[(&str, &str)]) -> SpreadsheetRecord {
+        (
+            id.to_string(),
+            fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn rows_keep_file_order_and_take_identifier_and_image_out_of_metadata() {
+        let img = temp_image_with_content("png", b"x");
+        let img_path = img.path().display().to_string();
+        let records = vec![
+            rec(
+                "coll-b",
+                &[
+                    ("collection", "parent"),
+                    ("title", "B"),
+                    ("image", &img_path),
+                ],
+            ),
+            rec("coll-a", &[("collection", "parent"), ("description", "A")]),
+        ];
+        let rows = collection_rows(records, &[], None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].identifier, "coll-b");
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[("collection", "parent"), ("title", "B")])
+        );
+        assert_eq!(rows[0].image.as_deref(), Some(img.path()));
+        assert_eq!(rows[1].identifier, "coll-a");
+        assert_eq!(
+            sorted(rows[1].metadata.clone()),
+            kv(&[("collection", "parent"), ("description", "A")])
+        );
+        assert_eq!(rows[1].image, None);
+    }
+
+    #[test]
+    fn defaults_apply_unless_the_row_names_the_field() {
+        let defaults = kv(&[
+            ("collection", "shared-parent"),
+            ("subject", "default-a"),
+            ("subject", "default-b"),
+            ("hidden", "true"),
+        ]);
+        let records = vec![
+            rec("coll-one", &[("title", "One")]),
+            rec(
+                "coll-two",
+                &[("collection", "other-parent"), ("subject", "own")],
+            ),
+        ];
+        let rows = collection_rows(records, &defaults, None).unwrap();
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[
+                ("collection", "shared-parent"),
+                ("hidden", "true"),
+                ("subject", "default-a"),
+                ("subject", "default-b"),
+                ("title", "One"),
+            ])
+        );
+        assert_eq!(
+            sorted(rows[1].metadata.clone()),
+            kv(&[
+                ("collection", "other-parent"),
+                ("hidden", "true"),
+                ("subject", "own"),
+            ])
+        );
+    }
+
+    #[test]
+    fn image_cell_replaces_the_default_image() {
+        let own = temp_image_with_content("jpg", b"x");
+        let shared = temp_image_with_content("png", b"y");
+        let own_path = own.path().display().to_string();
+        let records = vec![
+            rec("coll-own", &[("collection", "p"), ("image", &own_path)]),
+            rec("coll-shared", &[("collection", "p")]),
+        ];
+        let rows = collection_rows(records, &[], Some(shared.path())).unwrap();
+        assert_eq!(rows[0].image.as_deref(), Some(own.path()));
+        assert_eq!(rows[1].image.as_deref(), Some(shared.path()));
+    }
+
+    #[test]
+    fn indexed_columns_give_several_values() {
+        let records = vec![rec(
+            "coll-idx",
+            &[
+                ("collection", "p"),
+                ("subject[0]", "first"),
+                ("subject[1]", "second"),
+            ],
+        )];
+        let rows = collection_rows(records, &[], None).unwrap();
+        assert_eq!(
+            rows[0].metadata,
+            kv(&[
+                ("collection", "p"),
+                ("subject", "first"),
+                ("subject", "second")
+            ])
+        );
+    }
+
+    #[test]
+    fn every_bad_row_is_reported_together() {
+        let no_ext = tempfile::Builder::new()
+            .prefix("ia-test-no-ext-")
+            .tempfile()
+            .unwrap();
+        let no_ext_path = no_ext.path().display().to_string();
+        let records = vec![
+            rec("ok-row", &[("collection", "p")]),
+            rec("ab", &[("collection", "p")]),
+            rec("dup-row", &[("collection", "p")]),
+            rec("dup-row", &[("collection", "p")]),
+            rec("no-parent", &[("title", "T")]),
+            rec(
+                "missing-image",
+                &[("collection", "p"), ("image", "/nonexistent/ia-test.png")],
+            ),
+            rec(
+                "no-extension",
+                &[("collection", "p"), ("image", &no_ext_path)],
+            ),
+            rec("bad-key", &[("collection", "p"), ("bad key", "v")]),
+        ];
+        let err = collection_rows(records, &[], None).unwrap_err();
+        assert!(matches!(err, IaError::Config(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("batch validation failed"), "{msg}");
+        for needle in [
+            "ab",
+            "dup-row: on more than one row",
+            "no-parent: no parent collection",
+            "missing-image: image file not found",
+            "no-extension: image file has no extension",
+            "bad-key:",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+        assert!(!msg.contains("ok-row"), "{msg}");
+    }
+
+    #[test]
+    fn empty_records_are_an_error() {
+        let err = collection_rows(Vec::new(), &[], None).unwrap_err();
+        assert!(err.to_string().contains("no records"), "{err}");
     }
 }

@@ -80,7 +80,7 @@ Validates everything as above, sends nothing, needs no keys. Prints each row as 
 
 `--joblog <PATH>` records one entry per row: op `collection-create`, item the identifier, file empty, `ok` with the elapsed time or `error` with the message, written before the row's result is printed. A rerun with the same job log and file skips identifiers whose latest `collection-create` entry is `ok`, and prints `resuming: skipping <n> collection(s) already created in joblog` unless `-q`; failed rows run again. Validation still covers every row, so a rerun of a corrected file is checked the same way. `--no-resume` runs every row. `ia status --joblog <PATH> --failed-items` lists the identifiers that failed. The job log applies to `--spreadsheet` only; the single form ignores it, as today.
 
-A zero-byte create PUT (no image) is sent once; a throttled or failed row is retried by rerunning with the job log. Retrying that PUT within the run, as image uploads already are, is a separate change (filed as its own issue).
+A zero-byte create PUT (no image) is sent once; a throttled or failed row is retried by rerunning with the job log. Retrying that PUT within the run, as image uploads already are, is a separate change, #152.
 
 ## Tests
 
@@ -107,9 +107,9 @@ CLI tests (`ia-cli/tests/collection_bulk.rs`), each with a config whose host is 
 `long_about` and `after_long_help` of `ia collection create`, the `--spreadsheet` flag's help; docs/usage.md `ia collection` section (columns, defaults rule, validation, output, job log); README.md command list.
 
 ## Tasks
-- [ ] Plan committed first.
-- [ ] Red: tests above.
-- [ ] Green: `collection_rows`, `--spreadsheet`.
-- [ ] Help, docs/usage.md, README.md.
-- [ ] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
+- [x] Plan committed first.
+- [x] Red: tests above.
+- [x] Green: `collection_rows`, `--spreadsheet`.
+- [x] Help, docs/usage.md, README.md.
+- [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
 - [ ] Code review; PR.
