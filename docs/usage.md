@@ -182,7 +182,7 @@ Every backend handles throttling the same way: a `429` on any request is retried
 | `--itemlist` | Output identifiers only (one per line) |
 | `-n, --num-found` | Print result count only |
 | `-p, --parameters <K=V>` | Extra query parameters (`key:value` or `key=value`, repeatable) |
-| `--timeout <SECS>` | Request timeout in seconds |
+| `--timeout <SECS>` | Give up on a request after this many seconds (at least 1), counted from connect to the end of the response body. It can only shorten the client's own limits (30 s to connect, 60 s without response data); each retry of a request gets the same limit |
 | `--json` | Output results as JSONL (one object per line) |
 
 #### `scrape` and `advanced` flags
