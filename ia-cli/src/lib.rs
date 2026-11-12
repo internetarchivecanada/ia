@@ -323,7 +323,10 @@ pub async fn run() -> Result<()> {
         Commands::Ai(args) => {
             commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
         }
-        Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
+        Commands::Collection(args) => {
+            commands::collection::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume)
+                .await?
+        }
         Commands::Download(args) => {
             commands::download::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume)
                 .await?
