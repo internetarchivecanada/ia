@@ -1211,7 +1211,7 @@ ia collection create my-collection \
 
 ##### Many collections from one file
 
-`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive, a blank cell is no value, and a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands. Standard input is not read.
+`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive (in JSONL, except `identifier`, which must be lower case), a blank cell is no value, and a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands. Standard input is not read.
 
 | Column | Meaning |
 |--------|---------|

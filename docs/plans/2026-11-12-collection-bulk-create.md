@@ -106,10 +106,16 @@ CLI tests (`ia-cli/tests/collection_bulk.rs`), each with a config whose host is 
 
 `long_about` and `after_long_help` of `ia collection create`, the `--spreadsheet` flag's help; docs/usage.md `ia collection` section (columns, defaults rule, validation, output, job log); README.md command list.
 
+## Code review (2026-11-12), closed before the PR
+
+Taken: tests that a missing identifier or a missing `--collection` without `--spreadsheet` is a usage error; resume uses `joblog::successful_items` instead of a copy of it; a malformed `-m` with `--spreadsheet --json` is `{"error": {…}}` on stderr like the other command-level errors; the `--collection` help says "rows without a collection value", since a blank cell counts as none; docs/usage.md notes that the JSONL `identifier` key must be lower case; a missing `--image` is reported once rather than once per row; `IMAGE_COLUMN` is crate-private.
+
+Not changed: the duplicate-identifier check compares identifiers exactly. Whether archive.org treats two identifiers that differ only in case as one item was not checked against the live service, so validation does not assume it; such a row fails at request time and is reported like any other failed row.
+
 ## Tasks
 - [x] Plan committed first.
 - [x] Red: tests above.
 - [x] Green: `collection_rows`, `--spreadsheet`.
 - [x] Help, docs/usage.md, README.md.
 - [x] `cargo test -p ia-core -p ia-cli`, `cargo clippy -p ia-core -p ia-cli -- -D warnings`.
-- [ ] Code review; PR.
+- [x] Code review; PR.

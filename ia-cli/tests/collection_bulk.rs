@@ -382,6 +382,41 @@ fn identifier_and_spreadsheet_conflict() {
 }
 
 #[test]
+fn neither_identifier_nor_spreadsheet_is_a_usage_error() {
+    let cfg = config_without_keys();
+    let dir = TempDir::new().unwrap();
+    let out = run_create(cfg.path(), dir.path(), &["--collection", "p"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run_create(cfg.path(), dir.path(), &["one-coll"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(stderr_of(&out).contains("--collection"));
+}
+
+#[test]
+fn malformed_metadata_flag_is_a_json_error_with_json() {
+    let cfg = config_without_keys();
+    let dir = TempDir::new().unwrap();
+    write_file(
+        &dir,
+        "cols.csv",
+        "identifier,collection
+c-one,p
+",
+    );
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &["--spreadsheet", "cols.csv", "-m", "no-colon", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err: Value = serde_json::from_str(stderr_of(&out).trim()).unwrap();
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid KEY:VALUE format"));
+}
+
+#[test]
 fn spreadsheet_does_not_need_collection_flag() {
     let cfg = config_without_keys();
     let dir = TempDir::new().unwrap();

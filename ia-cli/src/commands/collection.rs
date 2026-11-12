@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -84,7 +83,7 @@ pub struct CreateArgs {
     )]
     pub identifier: Option<String>,
 
-    /// Parent collection identifier (with --spreadsheet: for rows without a collection column)
+    /// Parent collection identifier (with --spreadsheet: for rows without a collection value)
     #[arg(short = 'C', long, required_unless_present = "spreadsheet")]
     pub collection: Option<String>,
 
@@ -207,21 +206,6 @@ fn command_error(err: IaError, json: bool) -> Result<()> {
     Err(err.into())
 }
 
-/// Identifiers whose latest `collection-create` entry in the job log is
-/// `ok`.
-fn created_in_joblog(path: &Path) -> std::result::Result<HashSet<String>, IaError> {
-    let mut latest: HashMap<String, bool> = HashMap::new();
-    for entry in joblog::read(path)? {
-        if entry.op == JOBLOG_OP {
-            latest.insert(entry.item, entry.status == "ok");
-        }
-    }
-    Ok(latest
-        .into_iter()
-        .filter_map(|(item, ok)| ok.then_some(item))
-        .collect())
-}
-
 /// One row's outcome.
 struct RowResult {
     row: CollectionRow,
@@ -241,7 +225,12 @@ async fn run_spreadsheet(
     joblog: Option<PathBuf>,
     no_resume: bool,
 ) -> Result<()> {
-    let defaults = flag_metadata(args)?;
+    let defaults = match flag_metadata(args) {
+        Ok(defaults) => defaults,
+        Err(e) => {
+            return command_error(IaError::InvalidArgument(format!("{e:#}")), args.json);
+        }
+    };
     let records = match read_spreadsheet(path) {
         Ok(records) => records,
         Err(e) if args.json => return command_error(e, true),
@@ -257,8 +246,8 @@ async fn run_spreadsheet(
 
     if let (Some(log), false) = (&joblog, no_resume) {
         if log.exists() {
-            let done = match created_in_joblog(log) {
-                Ok(done) => done,
+            let done = match joblog::read(log) {
+                Ok(entries) => joblog::successful_items(&entries, JOBLOG_OP),
                 Err(e) => return command_error(e, args.json),
             };
             let before = rows.len();

@@ -87,7 +87,7 @@ pub struct CollectionRow {
 
 /// The spreadsheet column that names a row's cover image. It is never sent
 /// as metadata.
-pub const IMAGE_COLUMN: &str = "image";
+pub(crate) const IMAGE_COLUMN: &str = "image";
 
 /// Turn spreadsheet records into collections to create, checking every row
 /// before any request is made.
@@ -120,15 +120,24 @@ pub fn collection_rows(
     }
 
     let mut errors: Vec<String> = Vec::new();
+    // A bad default image is one problem, reported once, not once per row.
+    let default_ok = match default_image.map(check_image) {
+        Some(Err(message)) => {
+            errors.push(format!("--image: {message}"));
+            false
+        }
+        _ => true,
+    };
     let mut seen: HashSet<String> = HashSet::new();
     let mut rows = Vec::with_capacity(records.len());
 
     for (identifier, mut fields) in records {
-        let image = fields
+        let own_image = fields
             .remove(IMAGE_COLUMN)
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| default_image.map(Path::to_path_buf));
+            .map(PathBuf::from);
+        let checked = own_image.is_some() || default_ok;
+        let image = own_image.or_else(|| default_image.map(Path::to_path_buf));
 
         let own = row_metadata(fields);
         let named: HashSet<&str> = own.iter().map(|(k, _)| k.as_str()).collect();
@@ -153,7 +162,7 @@ pub fn collection_rows(
                 "{identifier}: no parent collection (give a collection column or --collection)"
             ));
         }
-        if let Some(img) = &image {
+        if let (Some(img), true) = (&image, checked) {
             if let Err(message) = check_image(img) {
                 errors.push(format!("{identifier}: {message}"));
             }
@@ -836,5 +845,19 @@ mod tests {
     fn empty_records_are_an_error() {
         let err = collection_rows(Vec::new(), &[], None).unwrap_err();
         assert!(err.to_string().contains("no records"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_default_image_is_reported_once() {
+        let records = vec![
+            rec("coll-one", &[("collection", "p")]),
+            rec("coll-two", &[("collection", "p")]),
+        ];
+        let missing = Path::new("/nonexistent/ia-test-default.png");
+        let msg = collection_rows(records, &[], Some(missing))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(msg.matches("image file not found").count(), 1, "{msg}");
+        assert!(msg.contains("--image: image file not found"), "{msg}");
     }
 }
