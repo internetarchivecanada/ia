@@ -22,12 +22,20 @@ async fn handle_num_found(
     query: &str,
     backend: NumFoundBackend,
     params: &[(String, String)],
+    timeout: Option<u64>,
     json: bool,
 ) -> Result<()> {
+    let timeout = timeout.map(std::time::Duration::from_secs);
     let count = match backend {
-        NumFoundBackend::Scrape => search::num_found(client, query, params).await?,
-        NumFoundBackend::Advanced => search::advanced_num_found(client, query, params).await?,
-        NumFoundBackend::Fts { dsl } => search::fts_num_found(client, query, dsl, params).await?,
+        NumFoundBackend::Scrape => {
+            search::num_found_with_timeout(client, query, params, timeout).await?
+        }
+        NumFoundBackend::Advanced => {
+            search::advanced_num_found_with_timeout(client, query, params, timeout).await?
+        }
+        NumFoundBackend::Fts { dsl } => {
+            search::fts_num_found_with_timeout(client, query, dsl, params, timeout).await?
+        }
     };
     if json {
         println!("{}", serde_json::json!({"num_found": count}));
@@ -56,8 +64,9 @@ pub struct SharedSearchArgs {
     #[arg(short = 'p', long)]
     pub parameters: Vec<String>,
 
-    /// Request timeout in seconds
-    #[arg(long)]
+    /// Give up on a request after this many seconds, if that is sooner than the
+    /// client's own limits (30 s to connect, 60 s without response data)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: Option<u64>,
 }
 
@@ -220,8 +229,9 @@ pub struct SearchArgs {
     #[arg(short = 'p', long)]
     pub parameters: Vec<String>,
 
-    /// Request timeout in seconds
-    #[arg(long)]
+    /// Give up on a request after this many seconds, if that is sooner than the
+    /// client's own limits (30 s to connect, 60 s without response data)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout: Option<u64>,
 
     #[command(subcommand)]
@@ -273,6 +283,7 @@ async fn run_scrape(
             &query,
             NumFoundBackend::Scrape,
             &extra_params,
+            shared.timeout,
             shared.json,
         )
         .await;
@@ -300,6 +311,7 @@ async fn run_advanced(
             &query,
             NumFoundBackend::Advanced,
             &extra_params,
+            shared.timeout,
             shared.json,
         )
         .await;
@@ -336,6 +348,7 @@ async fn run_fts(client: &IaClient, args: FtsArgs, quiet: u8) -> Result<()> {
             &args.query,
             NumFoundBackend::Fts { dsl: args.dsl },
             &params,
+            args.shared.timeout,
             args.shared.json,
         )
         .await;
