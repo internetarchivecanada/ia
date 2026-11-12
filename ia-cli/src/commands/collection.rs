@@ -232,11 +232,9 @@ async fn run_spreadsheet(
     };
     let mut rows = match read_collection_spreadsheet(path, &defaults, args.image.as_deref()) {
         Ok(rows) => rows,
-        // A validation problem (`Config`) names the rows; a read error
-        // (missing file, malformed CSV) is given the file's name.
-        Err(e) if args.json || matches!(e, IaError::Config(_)) => {
-            return command_error(e, args.json)
-        }
+        // A validation problem names the rows; a read error (missing file,
+        // unsupported extension, malformed CSV) is given the file's name.
+        Err(e) if args.json || is_validation_error(&e) => return command_error(e, args.json),
         Err(e) => {
             return Err(anyhow::Error::new(e)
                 .context(format!("failed to read spreadsheet: {}", path.display())))
@@ -446,4 +444,11 @@ fn metadata_json(metadata: &[(String, String)]) -> serde_json::Map<String, serde
         }
     }
     map
+}
+
+/// Whether `err` is the row check of `read_collection_spreadsheet`
+/// (every problem, or no records) rather than a failure to read the file.
+fn is_validation_error(err: &IaError) -> bool {
+    matches!(err, IaError::Config(m)
+        if m.starts_with("batch validation failed") || m == "spreadsheet contains no records")
 }

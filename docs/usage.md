@@ -1224,13 +1224,13 @@ JSON lines are read by value type. JSON keys are case-insensitive, `identifier` 
 | an array of strings | one value per element, as `subject[0]`, `subject[1]`, ... columns give; `[]` is no value |
 | a number, a boolean, an object, or an array holding anything but strings | refused |
 
-`image` and indexed keys (`subject[0]`) take a string or `null` only. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused. Refused lines and values are reported with the other problems below, before any request; write numbers and booleans as strings (`"1942"`, `"true"`).
+`image` and indexed keys (`subject[0]`) take a string or `null` only. String values are trimmed, so a value of only spaces is no value. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused; a key repeated in the same letter case keeps its last value, as JSON parsers do. Refused lines and values are reported with the other problems below, before any request; write numbers and booleans as strings (`"1942"`, `"true"`).
 
 | Column | Meaning |
 |--------|---------|
 | `identifier` | The new collection's identifier (required) |
 | `collection` | The parent collection; required on every row unless `--collection` is given |
-| `image` | Path to a cover image, relative to the current directory |
+| `image` | Path to a cover image, relative to the current directory; one path per row (`image[0]` is refused) |
 | any other column | Metadata, as `-m KEY:VALUE` gives it (`title`, `description`, `subject`, ...); `subject[0]`, `subject[1]`, ... give several values, as in `ia upload --spreadsheet` |
 
 Each row gets what a single `ia collection create` applies: `mediatype=collection` (a `mediatype` column is dropped), derive disabled, and the image stored as `<identifier>_itemimage.<ext>`.

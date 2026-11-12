@@ -777,3 +777,17 @@ async fn jsonl_null_uses_the_default_parent_and_arrays_repeat() {
     assert_eq!(h("x-archive-meta00-subject").await.as_deref(), Some("a"));
     assert_eq!(h("x-archive-meta01-subject").await.as_deref(), Some("b"));
 }
+
+#[test]
+fn an_unsupported_extension_names_the_file() {
+    let cfg = config_without_keys();
+    let dir = TempDir::new().unwrap();
+    write_file(&dir, "cols.txt", "identifier,collection\nc-one,p\n");
+    let out = run_create(cfg.path(), dir.path(), &["--spreadsheet", "cols.txt"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("failed to read spreadsheet") && stderr.contains("cols.txt"),
+        "{stderr}"
+    );
+}

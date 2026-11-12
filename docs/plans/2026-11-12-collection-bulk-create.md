@@ -112,6 +112,22 @@ Taken: tests that a missing identifier or a missing `--collection` without `--sp
 
 Not changed: the duplicate-identifier check compares identifiers exactly. Whether archive.org treats two identifiers that differ only in case as one item was not checked against the live service, so validation does not assume it; such a row fails at request time and is reported like any other failed row.
 
+## Second review (2026-11-12), closed before merge
+
+- **Dry run with an image sent requests.** The image path called `upload_file` with the default `checksum: true`. Its skip check sends `GET /metadata/<id>` before the upload's own dry-run return. On a real run, an item that already held an identical image was reported as created although no PUT was sent and no metadata applied. Now `create_with_image` returns before the upload on a dry run and sets `checksum: false`, and a `Skipped` or `DryRun` upload status is an error, never "created". The single form is fixed with it. A create does not check whether the identifier exists: it sends its PUT and reports the server's answer.
+- **JSONL values were stored as their JSON text.** `read_collection_spreadsheet` reads JSONL by value type for this command only:
+  - `null` is no value, and an array of strings gives repeated values (as `key[i]`).
+  - A string is trimmed.
+  - Numbers, booleans, objects and mixed arrays are refused with the other problems before any request.
+  - Keys are case-insensitive, `identifier` included, and a line without a string identifier is reported.
+  - The shared reader is unchanged; the same behavior in the other commands is #154.
+- **`--dry-run --json` showed one value of a repeated field.** It now shows an array, in the single and the bulk form, and leaves out a user `mediatype`, which is dropped before sending.
+- **Smaller fixes.** An image path that is a directory is refused. An indexed `image[N]` column is refused. Read errors of the shared reader keep the `failed to read spreadsheet: <path>` context.
+- **Not changed:**
+  - A repeated CSV header keeps the last non-empty cell, and a blank-identifier CSV row is skipped (shared reader, #154).
+  - A repeated JSON key in the same letter case keeps its last value (JSON parser behavior, documented).
+  - A bare field plus its indexed column (`subject` with `subject[0]`) follows the upload rule for indexed columns.
+
 ## Tasks
 - [x] Plan committed first.
 - [x] Red: tests above.

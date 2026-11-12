@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
+use crate::metadata::write::parse_indexed_key;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::batch::row_metadata;
 use crate::upload::headers::encode_metadata_headers;
@@ -150,6 +151,18 @@ fn rows_with_problems(
         let checked = own_image.is_some() || default_ok;
         let image = own_image.or_else(|| default_image.map(Path::to_path_buf));
 
+        // `image` names one file; an indexed `image[N]` would otherwise
+        // become a metadata field called `image`.
+        let mut indexed_image: Vec<&String> = fields
+            .keys()
+            .filter(|k| parse_indexed_key(k).is_some_and(|(f, _)| f == IMAGE_COLUMN))
+            .collect();
+        indexed_image.sort();
+        for key in indexed_image {
+            errors.push(format!(
+                "{identifier}: {key}: the image column takes one path, not indexed values"
+            ));
+        }
         let own = row_metadata(fields);
         let named: HashSet<&str> = own.iter().map(|(k, _)| k.as_str()).collect();
         let mut metadata: Vec<(String, String)> = defaults
@@ -313,7 +326,9 @@ fn read_jsonl_rows(path: &Path) -> Result<(Vec<SpreadsheetRecord>, Vec<String>)>
             };
             match value {
                 serde_json::Value::Null => {}
-                serde_json::Value::String(v) => put(key, v.clone(), &mut problems),
+                // Trimmed, as the CSV reader trims every cell, so a value
+                // of only spaces is no value.
+                serde_json::Value::String(v) => put(key, v.trim().to_string(), &mut problems),
                 serde_json::Value::Array(items)
                     if key != IMAGE_COLUMN
                         && !key.contains('[')
@@ -321,7 +336,7 @@ fn read_jsonl_rows(path: &Path) -> Result<(Vec<SpreadsheetRecord>, Vec<String>)>
                 {
                     for (i, item) in items.iter().enumerate() {
                         if let Some(v) = item.as_str() {
-                            put(format!("{key}[{i}]"), v.to_string(), &mut problems);
+                            put(format!("{key}[{i}]"), v.trim().to_string(), &mut problems);
                         }
                     }
                 }
@@ -332,7 +347,10 @@ fn read_jsonl_rows(path: &Path) -> Result<(Vec<SpreadsheetRecord>, Vec<String>)>
                     } else {
                         "a string, an array of strings, or null"
                     },
-                    json_kind(other)
+                    match other {
+                        serde_json::Value::Array(_) => "an array",
+                        other => json_kind(other),
+                    }
                 )),
             }
         }
@@ -1185,5 +1203,38 @@ mod tests {
             !msg.contains("line 2") && !msg.contains("upper-key"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn jsonl_strings_are_trimmed_so_blank_is_no_value() {
+        let f = jsonl_file(r#"{"identifier":"ws-row","collection":"  ","title":" T "}"#);
+        let defaults = kv(&[("collection", "parent")]);
+        let rows = read_collection_spreadsheet(f.path(), &defaults, None).unwrap();
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[("collection", "parent"), ("title", "T")])
+        );
+    }
+
+    #[test]
+    fn jsonl_array_under_image_is_named_an_array() {
+        let f = jsonl_file(r#"{"identifier":"arr-img","collection":"p","image":["x.png"]}"#);
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("arr-img: image must be a string or null (got an array)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_indexed_image_column_is_refused() {
+        let records = vec![rec(
+            "idx-img",
+            &[("collection", "p"), ("image[0]", "x.png")],
+        )];
+        let msg = collection_rows(records, &[], None).unwrap_err().to_string();
+        assert!(msg.contains("idx-img: image[0]:"), "{msg}");
     }
 }
