@@ -15,25 +15,9 @@ Outside tests: never send write requests (POST/PUT/DELETE/PATCH) to live archive
 - `IaClient` wraps `reqwest::Client` with middleware retry stack
 - `ia-core` is a standalone library with external consumers. Public API changes must consider them.
 
-## Crate Stack
+## Dependencies
 
-- CLI: `clap` (derive)
-- Async: `tokio` + `futures`
-- HTTP: `reqwest` (rustls-tls) + `reqwest-middleware` + `reqwest-retry`
-- Serialization: `serde` + `serde_json`
-- Config: `configparser` — INI format for backwards compat with Python `ia.ini`
-- Errors: `thiserror` (library) + `anyhow` (CLI)
-- Logging: `tracing` + `tracing-subscriber`
-- Console: `indicatif` + `console` + `comfy-table`
-- TUI: `ratatui` (default feature, `--dashboard` flag)
-- Metadata write: `json-patch` (RFC 6902); `urlencoding`
-- Spreadsheet: `calamine`; `rust_xlsxwriter`; `csv`
-- Upload: `md-5`; `quick-xml` (decoding XML character references in IA-S3 answers)
-- Update checksum: `aws-lc-rs` (SHA-256; already in the binary as rustls's crypto provider)
-- Auth: `rpassword`
-- Testing: `wiremock` + `assert_cmd` + `tempfile`
-
-Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't add crates without asking. Prefer `std`, existing deps, or small focused code. When a new crate is approved, update this list.
+Don't add crates without asking. Prefer `std`, existing deps, or small focused code. `Cargo.toml` lists the crates; load-bearing pins are explained in Build. Errors: `thiserror` in `ia-core`, `anyhow` in `ia-cli`. Tests: `wiremock`, `assert_cmd`, `tempfile`.
 
 ## Build
 
@@ -44,13 +28,20 @@ Versions live in `Cargo.toml` (load-bearing pins are explained in Build). Don't 
 
 ## Workflow
 
+This repo is built and maintained by agents. Inside the files your task covers, fix what you find (duplicated code, adjacent bugs), with tests. Outside them, file an issue instead.
+
 Work happens on feature branches. main accepts only pull requests, enforced by GitHub branch protection since the repository became public.
 
 - For non-trivial work, write a design doc or implementation plan in `docs/plans/` and commit it before implementation code.
-- Create worktrees with `scripts/ia-worktree <type> <slug>` (types: `fix`, `feat`, `refactor`, `docs`, `chore`) — it names the branch `<type>/<slug>`, checks for branch collisions, and symlinks untracked `.claude` settings. Clean up after merge with `scripts/ia-cleanup <slug>`.
+- Work in the worktree and branch your session was started in. If you have none, make one: `git worktree add -b <type>/<slug> ../worktrees/<slug> origin/main`. Never commit on main.
 - Run `cargo test -p ia-core -p ia-cli` and `cargo clippy -p ia-core -p ia-cli -- -D warnings` before committing.
 - Update CLI help text (`about`, `long_about`, `after_long_help`) when modifying flags or subcommands.
 - When changing user-visible behavior (new flags, commands, or defaults), update: docs/usage.md and README.md.
+
+## Design rules
+
+- Every retry site honours `Retry-After`.
+- No flag without a reason a user would set it; otherwise make it a fixed rule.
 
 ## `--json` Output
 

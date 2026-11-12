@@ -6,23 +6,13 @@
 - [GitHub CLI](https://cli.github.com/) (`gh`) — authenticated
 - Git 2.20+
 
-## Setup
-
-Optionally, enable the local pre-commit hook to prevent accidental commits to main:
-
-```sh
-git config core.hooksPath scripts/hooks
-```
-
-This is a convenience; GitHub branch protection on main is the real guard.
-
 ## Project Structure
 
 ```
 ia/
   ia-core/         Library — client, API types, download/upload engines, search
   ia-cli/          Binary — CLI interface, progress display, TUI dashboards
-  scripts/         Workflow helpers and git hooks
+  scripts/         Audit and test helper scripts
   docs/plans/      Design docs and implementation plans
 ```
 
@@ -43,18 +33,13 @@ Small bug fixes and trivial changes don't need docs — use judgment.
 
 ### Branch
 
-Create a feature branch however you like. There are helper scripts for git worktrees if you
-prefer that workflow:
+Create a feature branch however you like, for example in a git worktree:
 
 ```sh
-scripts/ia-worktree feat my-feature     # creates feat/my-feature branch in a worktree
-scripts/ia-worktree fix search-count    # creates fix/search-count branch in a worktree
+git worktree add -b <type>/<slug> ../worktrees/<slug> origin/main
 ```
 
 Types: `fix`, `feat`, `refactor`, `docs`, `chore`
-
-After merge, `scripts/ia-cleanup <slug>` removes the worktree and local branch.
-`scripts/ia-status` shows active worktrees.
 
 ### Implement
 
@@ -85,8 +70,8 @@ Link any related issues with `Closes #N` in the PR body.
 - **Errors**: `thiserror` in `ia-core`, `anyhow` in `ia-cli`. No `unwrap()`/`expect()` outside tests.
 - **Tests**: hermetic — zero outbound network requests. Every HTTP call (read or write) must
   go through a `wiremock` mock.
-- **Dependencies**: Don't add crates without discussing first. See the crate stack in
-  [`AGENTS.md`](./AGENTS.md).
+- **Dependencies**: Don't add crates without discussing first. See the Dependencies
+  section of [`AGENTS.md`](./AGENTS.md).
 - **CLI help**: Every flag and subcommand needs accurate help text.
 - **JSON output**: Every command supports `--json` for structured output.
 
