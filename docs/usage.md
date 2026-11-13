@@ -172,7 +172,7 @@ ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
-With a subcommand, the query and options go after the subcommand name. A query or option given before it (`ia search --timeout 5 scrape <QUERY>`) is refused with an error naming it, before any request is sent.
+An option given before a subcommand name is used as if given after it (`ia search --timeout 5 scrape <QUERY>`), as `ia update --json list` is. A flag given on both sides counts once, and repeatable options add up in command-line order. Refused before any request, with an error naming each one: a query given before the subcommand name, `-s`/`-f` before `fts` (which takes neither), and `--timeout` on both sides. To search for a word that is a subcommand name, put `--` before it: `ia search -- scrape`.
 
 Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting as the standard schedule or the server's `Retry-After` header says (see "Retry waits"); past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
 
