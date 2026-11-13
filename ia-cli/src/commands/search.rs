@@ -189,7 +189,8 @@ pub struct FtsArgs {
 #[command(
     about = "Search the Internet Archive",
     long_about = "Search the Internet Archive. Uses the scrape API by default. \
-        Choose a subcommand for a different backend.",
+        Choose a subcommand for a different backend; the query and options then go \
+        after the subcommand name (ia search scrape QUERY --json).",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Search (uses scrape by default)</dim>\n  <bold>$ ia search \"collection:nasa\"</bold>\
@@ -238,7 +239,62 @@ pub struct SearchArgs {
     pub command: Option<SearchCommand>,
 }
 
+/// Refuse bare-form options and a query given before a subcommand name
+/// (`ia search --timeout 5 scrape QUERY`): they belong to the bare form, and
+/// the subcommand reads only its own, so they would otherwise be dropped.
+///
+/// clap's `args_conflicts_with_subcommands` cannot do this here: with it, the
+/// optional bare-form query takes the subcommand name as its value.
+fn refuse_options_before_subcommand(args: &SearchArgs) -> Result<()> {
+    let Some(command) = &args.command else {
+        return Ok(());
+    };
+    // Destructured in full so that a new bare-form field must be listed here.
+    let SearchArgs {
+        query,
+        sort,
+        field,
+        itemlist,
+        num_found,
+        json,
+        parameters,
+        timeout,
+        command: _,
+    } = args;
+    let mut given: Vec<String> = Vec::new();
+    if let Some(q) = query {
+        given.push(format!("'{q}'"));
+    }
+    for (name, present) in [
+        ("--sort", !sort.is_empty()),
+        ("--field", !field.is_empty()),
+        ("--itemlist", *itemlist),
+        ("--num-found", *num_found),
+        ("--json", *json),
+        ("--parameters", !parameters.is_empty()),
+        ("--timeout", timeout.is_some()),
+    ] {
+        if present {
+            given.push(name.to_string());
+        }
+    }
+    if given.is_empty() {
+        return Ok(());
+    }
+    let sub = match command {
+        SearchCommand::Scrape(_) => "scrape",
+        SearchCommand::Advanced(_) => "advanced",
+        SearchCommand::Fts(_) => "fts",
+    };
+    bail!(
+        "{} given before the subcommand '{sub}'; the query and options go after it: \
+         ia search {sub} <QUERY> [OPTIONS]",
+        given.join(", ")
+    );
+}
+
 pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
+    refuse_options_before_subcommand(&args)?;
     match args.command {
         Some(SearchCommand::Scrape(sub)) => {
             run_scrape(client, sub.query, sub.sort, sub.field, sub.shared, quiet).await
