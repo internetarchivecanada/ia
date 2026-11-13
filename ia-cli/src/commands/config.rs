@@ -72,6 +72,8 @@ pub enum ConfigCommand {
     /// Validate stored S3 credentials
     #[command(
         long_about = "Check if the stored S3 credentials are valid by contacting archive.org.\n\n\
+            Sends GET /services/user.php?op=whoami with the S3 keys only (no cookies). \
+            Any valid key pair is accepted; no account privileges are needed. \
             Exits with code 0 if valid, 1 if invalid.",
         after_long_help = cstr!(
             "<bold><green>Examples:</green></bold>\n  \
@@ -85,8 +87,10 @@ pub enum ConfigCommand {
 
     /// Show account information
     #[command(
-        long_about = "Retrieve and display account information from archive.org.\n\n\
-            Shows your screenname, email, and itemname.",
+        long_about = "Retrieve and display the account the stored S3 keys belong to.\n\n\
+            Shows the screenname, email, and itemname archive.org reports for the keys \
+            (GET /services/user.php?op=whoami). The email is the account's username \
+            on archive.org, not the logged-in-user cookie.",
         after_long_help = cstr!(
             "<bold><green>Examples:</green></bold>\n  \
              <dim># Show account info</dim>\n  \

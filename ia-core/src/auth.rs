@@ -1,6 +1,7 @@
 //! Authentication with the Internet Archive.
 //!
-//! Handles login via the xauthn API, credential validation, and account info retrieval.
+//! Handles login via the xauthn API, and S3 key validation and account info
+//! retrieval via `/services/user.php?op=whoami`.
 
 use std::path::Path;
 
@@ -59,76 +60,91 @@ struct XauthnCookies {
     logged_in_sig: String,
 }
 
-/// Response from the xauthn info endpoint.
+/// Response from `GET /services/user.php?op=whoami`.
 #[derive(Debug, Deserialize)]
-struct XauthnInfoResponse {
+struct WhoamiResponse {
+    #[serde(default)]
     success: bool,
-    values: Option<XauthnInfoValues>,
-    error: Option<String>,
+    value: Option<WhoamiValue>,
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct XauthnInfoValues {
+struct WhoamiValue {
+    username: Option<String>,
     screenname: Option<String>,
     itemname: Option<String>,
 }
 
-/// Validate S3 keys by calling the IA API.
+/// Validate the configured S3 keys and return the account they belong to.
 ///
-/// Uses the xauthn info endpoint to verify credentials are valid.
-/// Returns an [`AccountInfo`] on success.
+/// Sends `GET /services/user.php?op=whoami` authenticated with the S3 keys
+/// only (no cookies), as the Python library's `ArchiveSession.whoami()`
+/// does. The endpoint answers for any valid key pair, with or without
+/// account privileges. [`AccountInfo::email`] is the server's `username`.
+///
+/// Returns [`IaError::Auth`] when no keys are configured, when archive.org
+/// rejects the keys, or when the answer cannot be read.
 pub async fn check_keys(client: &IaClient) -> Result<AccountInfo> {
     let (access, secret) = client.require_auth()?;
-    let url = format!(
-        "{}://{}/services/xauthn/?op=info",
-        client.protocol(),
-        client.host()
-    );
+    let url = client.url("/services/user.php?op=whoami");
     let resp = client
         .http()
-        .post(&url)
+        .get(&url)
         .header("user-agent", client.user_agent())
         .header("authorization", format!("LOW {access}:{secret}"))
         .send()
         .await
         .map_err(|e| IaError::Auth(format!("key check request failed: {e}")))?;
 
+    let status = resp.status();
     let body = resp
         .text()
         .await
-        .map_err(|e| IaError::Auth(format!("failed to read response: {e}")))?;
+        .map_err(|e| IaError::Auth(format!("failed to read key check response: {e}")))?;
 
-    let parsed: XauthnInfoResponse = serde_json::from_str(&body)
-        .map_err(|e| IaError::Auth(format!("failed to parse response: {e}")))?;
+    let parsed: WhoamiResponse = match serde_json::from_str(&body) {
+        Ok(parsed) => parsed,
+        Err(_)
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN =>
+        {
+            return Err(IaError::Auth(format!(
+                "archive.org rejected the S3 keys (HTTP {status}); check your configuration"
+            )));
+        }
+        Err(e) => {
+            return Err(IaError::Auth(format!(
+                "unexpected key check answer from {url} (HTTP {status}): {e}"
+            )));
+        }
+    };
 
     if !parsed.success {
-        let msg = parsed.error.unwrap_or_else(|| "invalid credentials".into());
-        return Err(IaError::Auth(msg));
+        let reason = match parsed.error {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => s,
+            Some(serde_json::Value::Null) | None => format!("HTTP {status}"),
+            Some(other) => other.to_string(),
+        };
+        return Err(IaError::Auth(format!(
+            "archive.org rejected the S3 keys ({reason}); check your configuration"
+        )));
     }
 
-    let values = parsed.values.unwrap_or(XauthnInfoValues {
-        screenname: None,
-        itemname: None,
-    });
-
-    // Extract email from cookies in client config
-    let email = client
-        .config()
-        .cookies
-        .get("logged-in-user")
-        .cloned()
-        .unwrap_or_default();
+    let value = parsed.value.ok_or_else(|| {
+        IaError::Auth("key check answer reported success but had no account details".into())
+    })?;
 
     Ok(AccountInfo {
-        screenname: values.screenname.unwrap_or_default(),
-        email,
-        itemname: values.itemname,
+        screenname: value.screenname.unwrap_or_default(),
+        email: value.username.unwrap_or_default(),
+        itemname: value.itemname,
     })
 }
 
-/// Retrieve account info from archive.org (alias for `check_keys`).
+/// Retrieve the account the configured S3 keys belong to.
 ///
-/// Uses the same endpoint as [`check_keys`] but is semantically "who am I?"
+/// Same request as [`check_keys`].
 pub async fn whoami(client: &IaClient) -> Result<AccountInfo> {
     check_keys(client).await
 }
@@ -526,59 +542,188 @@ mod tests {
         assert!(msg.contains("Incorrect password"), "got: {msg}");
     }
 
-    #[tokio::test]
-    async fn check_keys_valid() {
-        let server = MockServer::start().await;
-        let body = serde_json::json!({
-            "success": true,
-            "values": {
-                "screenname": "testuser",
-                "itemname": "@testuser"
-            }
-        });
-        Mock::given(method("POST"))
-            .and(path("/services/xauthn/"))
-            .and(query_param("op", "info"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&server)
-            .await;
-
-        let host = server.uri().replace("http://", "");
+    /// Helper: a client with S3 keys and a `logged-in-user` cookie, pointing
+    /// at a mock server.
+    fn keyed_client(server: &MockServer, access: &str, secret: &str) -> IaClient {
         let mut config = crate::config::IaConfig::default();
-        config.general.host = host;
+        config.general.host = server.uri().replace("http://", "");
         config.general.secure = false;
-        config.s3_access = Some("test-access".into());
-        config.s3_secret = Some("test-secret".into());
-        let client = IaClient::from_config(config).unwrap();
+        config.s3_access = Some(access.into());
+        config.s3_secret = Some(secret.into());
+        config
+            .cookies
+            .insert("logged-in-user".into(), "cookie%40example.com".into());
+        config.cookies.insert("logged-in-sig".into(), "sig".into());
+        IaClient::from_config(config).unwrap()
+    }
 
-        let info = check_keys(&client).await.unwrap();
-        assert_eq!(info.screenname, "testuser");
+    async fn mount_whoami(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/services/user.php"))
+            .and(query_param("op", "whoami"))
+            .respond_with(response)
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
-    async fn check_keys_invalid() {
+    async fn check_keys_valid_key_without_privileges() {
         let server = MockServer::start().await;
         let body = serde_json::json!({
-            "success": false,
-            "error": "invalid credentials"
+            "success": true,
+            "value": {
+                "username": "user@example.com",
+                "itemname": "@testuser",
+                "screenname": "testuser",
+                "privs": []
+            }
         });
-        Mock::given(method("POST"))
-            .and(path("/services/xauthn/"))
-            .and(query_param("op", "info"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&server)
-            .await;
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
 
-        let host = server.uri().replace("http://", "");
+        let client = keyed_client(&server, "test-access", "test-secret");
+        let info = check_keys(&client).await.unwrap();
+        assert_eq!(info.screenname, "testuser");
+        assert_eq!(info.itemname.as_deref(), Some("@testuser"));
+        // The email comes from the server's `username`, not the cookie.
+        assert_eq!(info.email, "user@example.com");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(
+            req.headers.get("authorization").unwrap(),
+            "LOW test-access:test-secret"
+        );
+        // S3 keys only: the check must not be answered from cookies.
+        assert!(req.headers.get("cookie").is_none());
+        let ua = req.headers.get("user-agent").unwrap().to_str().unwrap();
+        assert!(ua.contains("; test-access) Rust/"), "User-Agent: {ua}");
+    }
+
+    #[tokio::test]
+    async fn whoami_uses_same_request_as_check_keys() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "success": true,
+            "value": {"username": "user@example.com", "screenname": "testuser"}
+        });
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "a", "s");
+        let info = whoami(&client).await.unwrap();
+        assert_eq!(info.email, "user@example.com");
+        assert_eq!(info.screenname, "testuser");
+        assert_eq!(info.itemname, None);
+    }
+
+    #[tokio::test]
+    async fn check_keys_rejected_key_is_auth_error() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"success": false, "error": "Invalid S3 key"});
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "bad-access", "bad-secret");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("rejected"), "{msg}");
+        assert!(msg.contains("Invalid S3 key"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_rejected_with_http_error_status() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"success": false, "error": "Unauthorized"});
+        mount_whoami(&server, ResponseTemplate::new(401).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "bad-access", "bad-secret");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        assert!(err.to_string().contains("Unauthorized"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_success_false_without_message() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"success": false});
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "a", "s");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        assert!(err.to_string().contains("rejected"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_non_json_answer_is_error() {
+        let server = MockServer::start().await;
+        mount_whoami(
+            &server,
+            ResponseTemplate::new(200).set_body_string("<html>Service unavailable</html>"),
+        )
+        .await;
+
+        let client = keyed_client(&server, "a", "s");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("unexpected key check answer"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_keys_forbidden_html_answer_is_rejection() {
+        let server = MockServer::start().await;
+        mount_whoami(
+            &server,
+            ResponseTemplate::new(403).set_body_string("<html>Forbidden</html>"),
+        )
+        .await;
+
+        let client = keyed_client(&server, "bad-access", "bad-secret");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("rejected") && msg.contains("403"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_error_without_success_field_is_rejection() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"error": "Invalid S3 key"});
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "a", "s");
+        let err = check_keys(&client).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rejected") && msg.contains("Invalid S3 key"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_keys_success_without_value_is_error() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({"success": true});
+        mount_whoami(&server, ResponseTemplate::new(200).set_body_json(&body)).await;
+
+        let client = keyed_client(&server, "a", "s");
+        let err = check_keys(&client).await.unwrap_err();
+        assert!(matches!(err, IaError::Auth(_)), "{err:?}");
+        assert!(err.to_string().contains("no account"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn check_keys_without_keys_sends_nothing() {
+        let server = MockServer::start().await;
         let mut config = crate::config::IaConfig::default();
-        config.general.host = host;
+        config.general.host = server.uri().replace("http://", "");
         config.general.secure = false;
-        config.s3_access = Some("bad-access".into());
-        config.s3_secret = Some("bad-secret".into());
         let client = IaClient::from_config(config).unwrap();
-
-        let result = check_keys(&client).await;
-        assert!(result.is_err());
+        assert!(check_keys(&client).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
