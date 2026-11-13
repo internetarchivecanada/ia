@@ -189,19 +189,24 @@ pub struct FtsArgs {
 #[command(
     about = "Search the Internet Archive",
     long_about = "Search the Internet Archive. Uses the scrape API by default. \
-        Choose a subcommand for a different backend. Options given before the \
-        subcommand name are used as if given after it, when the subcommand takes them.",
+        Choose a subcommand for a different backend.\n\n\
+        The options listed here (the bare form's) may also go before a subcommand \
+        name, and are used as if given after it; -s and -f only before scrape or \
+        advanced. A flag given on both sides counts once and repeatable options add \
+        up; --timeout, which takes a value, may be given on one side only. A \
+        subcommand's own options (--rows, --dsl, --scope, --size, --from) go after \
+        its name.",
     override_usage = "ia-cli search [OPTIONS] <QUERY>\n       \
         ia-cli search [OPTIONS] <COMMAND> <QUERY> [OPTIONS]",
-    after_help = "To search for a word that is a subcommand name, put -- before it: \
-        ia search -- scrape",
+    after_help = "To search for a word that is a subcommand name, put -- before it, \
+        after any options: ia search --itemlist -- scrape",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Search (uses scrape by default)</dim>\n  <bold>$ ia search \"collection:nasa\"</bold>\
          \n\n  <dim># Explicit backend</dim>\n  <bold>$ ia search scrape \"collection:nasa\"</bold>\
          \n\n  <dim># Advanced search (single page)</dim>\n  <bold>$ ia search advanced \"mediatype:texts\"</bold>\
          \n\n  <dim># Full-text search</dim>\n  <bold>$ ia search fts \"apollo 11\"</bold>\
-         \n\n  <dim># Search for a word that is a subcommand name</dim>\n  <bold>$ ia search -- scrape</bold>\n"
+         \n\n  <dim># Search for a word that is a subcommand name (options go before --)</dim>\n  <bold>$ ia search --itemlist -- scrape</bold>\n"
     ),
     subcommand_required = false,
 )]

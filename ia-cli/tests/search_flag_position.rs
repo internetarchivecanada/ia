@@ -23,7 +23,8 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 const SUBCOMMANDS: [&str; 3] = ["scrape", "advanced", "fts"];
 
 /// A server that answers every backend with one result and a total of 7,
-/// after `delay`.
+/// after `delay`. Each result has a field besides the identifier, so output
+/// without `--itemlist` differs from output with it.
 fn search_server_with_delay(rt: &tokio::runtime::Runtime, delay: Duration) -> MockServer {
     let server = rt.block_on(MockServer::start());
     rt.block_on(async {
@@ -31,7 +32,7 @@ fn search_server_with_delay(rt: &tokio::runtime::Runtime, delay: Duration) -> Mo
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({
-                        "items": [{"identifier": "item-1"}],
+                        "items": [{"identifier": "item-1", "title": "Item One"}],
                         "count": 1,
                         "total": 7
                     }))
@@ -43,7 +44,7 @@ fn search_server_with_delay(rt: &tokio::runtime::Runtime, delay: Duration) -> Mo
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({
-                        "response": {"numFound": 7, "start": 0, "docs": [{"identifier": "item-1"}]}
+                        "response": {"numFound": 7, "start": 0, "docs": [{"identifier": "item-1", "title": "Item One"}]}
                     }))
                     .set_delay(delay),
             )
@@ -162,16 +163,35 @@ fn json_before_subcommand_is_used() {
     }
 }
 
+/// `ia search --itemlist <sub> QUERY` prints identifiers only. Control:
+/// without `--itemlist`, every backend prints more than the identifier
+/// (the mock results carry a title), so the assertion observes the flag.
+fn itemlist_before_subcommand_is_used(sub: &str) {
+    let without = stdout_of(&[sub, "collection:test", "-p", "rows=1"]);
+    assert!(
+        without.starts_with("item-1") && without != "item-1\n",
+        "{sub}: {without:?}"
+    );
+    assert_eq!(
+        stdout_of(&["--itemlist", sub, "collection:test", "-p", "rows=1"]),
+        "item-1\n",
+        "{sub}"
+    );
+}
+
 #[test]
-fn itemlist_before_subcommand_is_used() {
-    for sub in SUBCOMMANDS {
-        // Without --itemlist, fts prints more than the identifier.
-        assert_eq!(
-            stdout_of(&["--itemlist", sub, "collection:test", "-p", "rows=1"]),
-            "item-1\n",
-            "{sub}"
-        );
-    }
+fn itemlist_before_scrape_is_used() {
+    itemlist_before_subcommand_is_used("scrape");
+}
+
+#[test]
+fn itemlist_before_advanced_is_used() {
+    itemlist_before_subcommand_is_used("advanced");
+}
+
+#[test]
+fn itemlist_before_fts_is_used() {
+    itemlist_before_subcommand_is_used("fts");
 }
 
 #[test]
@@ -295,6 +315,46 @@ fn sort_and_field_before_fts_are_refused() {
     assert!(stderr.contains("-f/--field"), "{stderr}");
 }
 
+/// A subcommand's own options (not the bare form's) go after its name;
+/// before it, clap refuses them as unexpected arguments, so nothing is
+/// dropped.
+#[test]
+fn subcommand_own_options_before_its_name_are_refused() {
+    for (option, sub) in [
+        (["--rows", "5"], "advanced"),
+        (["-r", "5"], "advanced"),
+        (["--size", "5"], "fts"),
+        (["--scope", "all"], "fts"),
+        (["--from", "5"], "fts"),
+    ] {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server = search_server(&rt);
+        let cfg = config_for(&server);
+        let out = ia_with_config(&cfg)
+            .args(["search", option[0], option[1], sub, "q"])
+            .assert()
+            .failure()
+            .stdout("");
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+        assert!(
+            stderr.contains(&format!("unexpected argument '{}'", option[0])),
+            "{option:?} {sub}: {stderr}"
+        );
+        assert!(rt.block_on(server.received_requests()).unwrap().is_empty());
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = search_server(&rt);
+    let cfg = config_for(&server);
+    let out = ia_with_config(&cfg)
+        .args(["search", "--dsl", "fts", "q"])
+        .assert()
+        .failure()
+        .stdout("");
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("unexpected argument '--dsl'"), "{stderr}");
+    assert!(rt.block_on(server.received_requests()).unwrap().is_empty());
+}
+
 /// A single-value option given on both sides is refused, as clap refuses
 /// `--timeout` given twice after the subcommand name.
 #[test]
@@ -339,6 +399,8 @@ fn bare_form_takes_its_options() {
         stdout_of(&["collection:test", "--json", "-n", "--timeout", "5"]),
         "{\"num_found\":7}\n"
     );
+    // Without --itemlist the title is printed too, so this observes the flag.
+    assert_ne!(stdout_of(&["collection:test", "-p", "rows=1"]), "item-1\n");
     assert_eq!(
         stdout_of(&["--itemlist", "collection:test", "-p", "rows=1"]),
         "item-1\n"
@@ -423,6 +485,9 @@ fn help_usage_shows_the_accepted_forms() {
             stdout.contains("search [OPTIONS] <COMMAND> <QUERY> [OPTIONS]"),
             "{flag}: {stdout}"
         );
-        assert!(stdout.contains("ia search -- scrape"), "{flag}: {stdout}");
+        assert!(
+            stdout.contains("ia search --itemlist -- scrape"),
+            "{flag}: {stdout}"
+        );
     }
 }
