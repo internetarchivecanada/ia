@@ -189,13 +189,24 @@ pub struct FtsArgs {
 #[command(
     about = "Search the Internet Archive",
     long_about = "Search the Internet Archive. Uses the scrape API by default. \
-        Choose a subcommand for a different backend.",
+        Choose a subcommand for a different backend.\n\n\
+        The options listed here (the bare form's) may also go before a subcommand \
+        name, and are used as if given after it; -s and -f only before scrape or \
+        advanced. A flag given on both sides counts once and repeatable options add \
+        up; --timeout, which takes a value, may be given on one side only. A \
+        subcommand's own options (--rows, --dsl, --scope, --size, --from) go after \
+        its name.",
+    override_usage = "ia-cli search [OPTIONS] <QUERY>\n       \
+        ia-cli search [OPTIONS] <COMMAND> <QUERY> [OPTIONS]",
+    after_help = "To search for a word that is a subcommand name, put -- before it, \
+        after any options: ia search --itemlist -- scrape",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Search (uses scrape by default)</dim>\n  <bold>$ ia search \"collection:nasa\"</bold>\
          \n\n  <dim># Explicit backend</dim>\n  <bold>$ ia search scrape \"collection:nasa\"</bold>\
          \n\n  <dim># Advanced search (single page)</dim>\n  <bold>$ ia search advanced \"mediatype:texts\"</bold>\
-         \n\n  <dim># Full-text search</dim>\n  <bold>$ ia search fts \"apollo 11\"</bold>\n"
+         \n\n  <dim># Full-text search</dim>\n  <bold>$ ia search fts \"apollo 11\"</bold>\
+         \n\n  <dim># Search for a word that is a subcommand name (options go before --)</dim>\n  <bold>$ ia search --itemlist -- scrape</bold>\n"
     ),
     subcommand_required = false,
 )]
@@ -204,7 +215,9 @@ pub struct SearchArgs {
     #[arg()]
     pub query: Option<String>,
 
-    // Bare-mode options (when no subcommand specified, defaults to scrape)
+    // Bare-mode options (when no subcommand specified, defaults to scrape).
+    // Before a subcommand name, they are folded into the subcommand's own;
+    // see `fold_parent_options`.
     /// Sort fields (repeatable, e.g., "downloads desc")
     #[arg(short = 's', long)]
     pub sort: Vec<String>,
@@ -238,32 +251,155 @@ pub struct SearchArgs {
     pub command: Option<SearchCommand>,
 }
 
-pub async fn run(client: &IaClient, args: SearchArgs, quiet: u8) -> Result<()> {
-    match args.command {
-        Some(SearchCommand::Scrape(sub)) => {
+/// Prepend `before` (given before the subcommand name) to `after`, keeping
+/// command-line order.
+fn prepend(before: Vec<String>, after: &mut Vec<String>) {
+    let mut all = before;
+    all.append(after);
+    *after = all;
+}
+
+/// Fold the options given before a subcommand name into the subcommand's
+/// own, as `ia update --json list` does: a flag on either side counts, list
+/// options add up in command-line order, and `--timeout` may be given on one
+/// side only (clap refuses it twice on one side).
+///
+/// A query before the name, or an option the subcommand does not take
+/// (`-s`/`-f` before `fts`), cannot be used there and is refused rather than
+/// dropped. Returns the message naming each one.
+fn fold_parent_options(
+    parent: SearchArgs,
+    command: &mut SearchCommand,
+) -> std::result::Result<(), String> {
+    // Destructured in full so that a new bare-form field must be handled here.
+    let SearchArgs {
+        query,
+        sort,
+        field,
+        itemlist,
+        num_found,
+        json,
+        parameters,
+        timeout,
+        command: _,
+    } = parent;
+    let name = command.name();
+
+    let mut problems = Vec::new();
+    if let Some(q) = &query {
+        problems.push(format!(
+            "the query '{q}' was given before the subcommand '{name}'; \
+             it goes after it: ia search {name} <QUERY> [OPTIONS]"
+        ));
+    }
+    let shared = command.shared();
+    if timeout.is_some() && shared.timeout.is_some() {
+        problems.push(format!(
+            "--timeout was given more than once (before and after the subcommand '{name}')"
+        ));
+    }
+    let sort_field = command.sort_field_mut();
+    if sort_field.is_none() {
+        for (spelling, given) in [
+            ("-s/--sort", !sort.is_empty()),
+            ("-f/--field", !field.is_empty()),
+        ] {
+            if given {
+                problems.push(format!(
+                    "{spelling} was given before the subcommand '{name}', which does not take it"
+                ));
+            }
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+
+    if let Some((sub_sort, sub_field)) = sort_field {
+        prepend(sort, sub_sort);
+        prepend(field, sub_field);
+    }
+    let shared = command.shared_mut();
+    shared.itemlist |= itemlist;
+    shared.num_found |= num_found;
+    shared.json |= json;
+    prepend(parameters, &mut shared.parameters);
+    if timeout.is_some() {
+        shared.timeout = timeout;
+    }
+    Ok(())
+}
+
+impl SearchCommand {
+    fn name(&self) -> &'static str {
+        match self {
+            SearchCommand::Scrape(_) => "scrape",
+            SearchCommand::Advanced(_) => "advanced",
+            SearchCommand::Fts(_) => "fts",
+        }
+    }
+
+    fn shared(&self) -> &SharedSearchArgs {
+        match self {
+            SearchCommand::Scrape(a) => &a.shared,
+            SearchCommand::Advanced(a) => &a.shared,
+            SearchCommand::Fts(a) => &a.shared,
+        }
+    }
+
+    fn shared_mut(&mut self) -> &mut SharedSearchArgs {
+        match self {
+            SearchCommand::Scrape(a) => &mut a.shared,
+            SearchCommand::Advanced(a) => &mut a.shared,
+            SearchCommand::Fts(a) => &mut a.shared,
+        }
+    }
+
+    /// The subcommand's `--sort` and `--field`, if it has them.
+    fn sort_field_mut(&mut self) -> Option<(&mut Vec<String>, &mut Vec<String>)> {
+        match self {
+            SearchCommand::Scrape(a) => Some((&mut a.sort, &mut a.field)),
+            SearchCommand::Advanced(a) => Some((&mut a.sort, &mut a.field)),
+            SearchCommand::Fts(_) => None,
+        }
+    }
+}
+
+pub async fn run(client: &IaClient, mut args: SearchArgs, quiet: u8) -> Result<()> {
+    let Some(mut command) = args.command.take() else {
+        // Bare mode: default to scrape
+        let query = args.query.ok_or_else(|| {
+            anyhow::anyhow!("search query required. Run 'ia search --help' for usage.")
+        })?;
+        let shared = SharedSearchArgs {
+            itemlist: args.itemlist,
+            num_found: args.num_found,
+            json: args.json,
+            parameters: args.parameters,
+            timeout: args.timeout,
+        };
+        return run_scrape(client, query, args.sort, args.field, shared, quiet).await;
+    };
+
+    let json = args.json || command.shared().json;
+    if let Err(message) = fold_parent_options(args, &mut command) {
+        if json {
+            ia_core::write_json_error(&ia_core::error::IaError::InvalidArgument(message));
+            std::process::exit(1);
+        }
+        bail!(message);
+    }
+    match command {
+        SearchCommand::Scrape(sub) => {
             run_scrape(client, sub.query, sub.sort, sub.field, sub.shared, quiet).await
         }
-        Some(SearchCommand::Advanced(sub)) => {
+        SearchCommand::Advanced(sub) => {
             run_advanced(
                 client, sub.query, sub.sort, sub.field, sub.rows, sub.shared, quiet,
             )
             .await
         }
-        Some(SearchCommand::Fts(sub)) => run_fts(client, sub, quiet).await,
-        None => {
-            // Bare mode: default to scrape
-            let query = args.query.ok_or_else(|| {
-                anyhow::anyhow!("search query required. Run 'ia search --help' for usage.")
-            })?;
-            let shared = SharedSearchArgs {
-                itemlist: args.itemlist,
-                num_found: args.num_found,
-                json: args.json,
-                parameters: args.parameters,
-                timeout: args.timeout,
-            };
-            run_scrape(client, query, args.sort, args.field, shared, quiet).await
-        }
+        SearchCommand::Fts(sub) => run_fts(client, sub, quiet).await,
     }
 }
 
