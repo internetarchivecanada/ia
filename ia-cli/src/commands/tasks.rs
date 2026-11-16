@@ -192,7 +192,7 @@ pub struct SubmitArgs {
     #[arg(long)]
     pub reduced_priority: bool,
 
-    /// Poll until task completes
+    /// Poll until the task completes; exit non-zero if it fails
     #[arg(long)]
     pub wait: bool,
 
@@ -729,10 +729,7 @@ async fn run_submit(
         }
 
         if args.wait {
-            let interval_secs = args.wait_interval;
-            let max_interval = Duration::from_secs(60);
-            let mut interval = Duration::from_secs(interval_secs);
-
+            let task_id = result.task_id;
             let spinner = if quiet == 0 && !args.json {
                 let sp = ProgressBar::new_spinner();
                 sp.set_style(
@@ -741,103 +738,66 @@ async fn run_submit(
                         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
                 );
                 sp.enable_steady_tick(Duration::from_millis(120));
-                sp.set_message(format!("Task {} — waiting", result.task_id));
+                sp.set_message(format!("Task {task_id} — waiting"));
                 Some(sp)
             } else {
                 None
             };
 
-            loop {
-                let query = tasks::TasksQuery {
-                    task_id: Some(result.task_id),
-                    catalog: Some(true),
-                    ..Default::default()
-                };
-
-                let value = match tasks::get_tasks(client, &query).await {
-                    Ok(value) => value,
-                    Err(ia_core::error::IaError::RateLimited { retry_after }) => {
-                        // Throttled poll: wait what the server asks, or the
-                        // poll interval when it does not say, and poll again.
-                        let wait = if retry_after > 0 {
-                            Duration::from_secs(retry_after)
-                        } else {
-                            interval
-                        };
-                        if let Some(ref sp) = spinner {
-                            sp.set_message(format!(
-                                "Task {} — rate limited, polling again in {}s",
-                                result.task_id,
-                                wait.as_secs()
-                            ));
-                        }
-                        tokio::time::sleep(wait).await;
-                        if retry_after == 0 {
-                            interval = (interval * 2).min(max_interval);
-                        }
-                        continue;
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let still_active = value.catalog.iter().any(|e| e.task_id == result.task_id);
-
-                if !still_active {
+            let failed = tasks::wait_for_task_with_progress(
+                client,
+                task_id,
+                Duration::from_secs(args.wait_interval),
+                None,
+                |entry| {
                     if let Some(ref sp) = spinner {
-                        sp.finish_with_message(format!("Task {} — completed", result.task_id));
+                        let state = match entry.color.as_str() {
+                            "green" => "queued",
+                            "blue" => "running",
+                            "brown" => "paused",
+                            other => other,
+                        };
+                        sp.set_message(format!("Task {task_id} — {state}"));
+                    }
+                },
+            )
+            .await;
+            let failed = match failed {
+                Ok(failed) => failed,
+                Err(e) => {
+                    if let Some(ref sp) = spinner {
+                        sp.abandon();
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            match failed {
+                None => {
+                    if let Some(ref sp) = spinner {
+                        sp.finish_with_message(format!("Task {task_id} — completed"));
                     }
                     if args.json {
                         println!(
                             "{}",
                             serde_json::to_string(&serde_json::json!({
-                                "task_id": result.task_id,
+                                "task_id": task_id,
                                 "status": "completed",
                             }))?
                         );
                     } else if quiet == 0 {
-                        eprintln!("Task {} completed", result.task_id);
+                        eprintln!("Task {task_id} completed");
                     }
-                    break;
                 }
-
-                // Update spinner with current state
-                if let Some(ref sp) = spinner {
-                    let state = value
-                        .catalog
-                        .iter()
-                        .find(|e| e.task_id == result.task_id)
-                        .map(|e| match e.color.as_str() {
-                            "green" => "queued",
-                            "blue" => "running",
-                            "red" => "error",
-                            "brown" => "paused",
-                            other => other,
-                        })
-                        .unwrap_or("unknown");
-                    sp.set_message(format!("Task {} — {}", result.task_id, state));
-                }
-
-                // Check if errored — stop waiting
-                let is_error = value
-                    .catalog
-                    .iter()
-                    .any(|e| e.task_id == result.task_id && e.color == "red");
-                if is_error {
+                Some(entry) => {
                     if let Some(ref sp) = spinner {
-                        sp.finish_with_message(format!("Task {} — error", result.task_id));
+                        sp.finish_with_message(format!("Task {task_id} — error"));
                     }
                     if args.json {
-                        let entry = value.catalog.iter().find(|e| e.task_id == result.task_id);
-                        if let Some(entry) = entry {
-                            println!("{}", serde_json::to_string(entry)?);
-                        }
-                    } else if quiet == 0 {
-                        eprintln!("Task {} error", result.task_id);
+                        println!("{}", serde_json::to_string(&entry)?);
                     }
-                    std::process::exit(1);
+                    bail!("task {task_id} failed (error state); see ia tasks log {task_id}");
                 }
-
-                tokio::time::sleep(interval).await;
-                interval = (interval * 2).min(max_interval);
             }
         }
 

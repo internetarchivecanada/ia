@@ -574,11 +574,15 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
     })
 }
 
-/// Poll a task until it completes (leaves the catalog).
+/// Poll a task until it finishes or fails.
 ///
 /// Uses exponential backoff from `initial_interval`, capped at 60s.
-/// Returns when the task is no longer in the active catalog (completed
-/// or errored).
+///
+/// Returns `Ok(None)` when the task is no longer in the active catalog
+/// (it finished). Returns `Ok(Some(entry))` when the task is in the error
+/// state (color `red`): a failed task stays in the catalog until it is rerun
+/// or cleared, so waiting for it to leave would never end. The entry lets the
+/// caller report the failure.
 ///
 /// A poll answered with `429` is not an error: the wait sleeps the
 /// response's `Retry-After` (or the current poll interval when it has none)
@@ -593,6 +597,20 @@ pub async fn wait_for_task(
     task_id: u64,
     initial_interval: Duration,
     timeout: Option<Duration>,
+) -> Result<Option<TaskEntry>> {
+    wait_for_task_with_progress(client, task_id, initial_interval, timeout, |_| {}).await
+}
+
+/// [`wait_for_task`], calling `on_poll` with the task's catalog entry after
+/// each poll that finds it still active (queued, running or paused).
+///
+/// Lets a caller show the task's current state while it waits.
+pub async fn wait_for_task_with_progress(
+    client: &IaClient,
+    task_id: u64,
+    initial_interval: Duration,
+    timeout: Option<Duration>,
+    mut on_poll: impl FnMut(&TaskEntry),
 ) -> Result<Option<TaskEntry>> {
     let max_interval = Duration::from_secs(60);
     let mut interval = initial_interval;
@@ -638,11 +656,13 @@ pub async fn wait_for_task(
             }
             Err(e) => return Err(e),
         };
-        let still_active = value.catalog.iter().any(|e| e.task_id == task_id);
-
-        if !still_active {
+        let Some(entry) = value.catalog.into_iter().find(|e| e.task_id == task_id) else {
             return Ok(None);
+        };
+        if entry.color == "red" {
+            return Ok(Some(entry));
         }
+        on_poll(&entry);
 
         // Check timeout before sleeping
         if let Some(limit) = timeout {
@@ -655,15 +675,12 @@ pub async fn wait_for_task(
             }
         }
 
-        // Log current state for debugging
-        if let Some(entry) = value.catalog.iter().find(|e| e.task_id == task_id) {
-            tracing::debug!(
-                "task {} still active (color={}), polling in {}s",
-                task_id,
-                entry.color,
-                interval.as_secs()
-            );
-        }
+        tracing::debug!(
+            "task {} still active (color={}), polling in {}s",
+            task_id,
+            entry.color,
+            interval.as_secs()
+        );
 
         tokio::time::sleep(interval).await;
         interval = (interval * 2).min(max_interval);
@@ -1714,6 +1731,47 @@ mod tests {
         match result.unwrap_err() {
             IaError::TaskTimeout { task_id: 777, .. } => {}
             other => panic!("expected TaskTimeout, got: {other}"),
+        }
+    }
+
+    /// A failed task stays in the catalog with color `red`. The wait ends on
+    /// it and hands back the entry, so the caller can tell failure from a task
+    /// that finished and left the catalog (issue #159).
+    #[tokio::test]
+    async fn wait_for_task_returns_for_red_task() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "value": {
+                    "summary": {"queued": 0, "running": 0, "error": 1, "paused": 0},
+                    "catalog": [{"task_id": 42, "identifier": "my-item", "cmd": "derive.php", "color": "red"}]
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = wait_for_task(
+            &client,
+            42,
+            Duration::from_millis(100),
+            Some(Duration::from_secs(2)),
+        )
+        .await;
+        let polls = mock_server.received_requests().await.unwrap().len();
+        match result {
+            Ok(Some(entry)) => {
+                assert_eq!(entry.task_id, 42);
+                assert_eq!(entry.color, "red");
+                assert_eq!(polls, 1, "one poll should see the error state");
+            }
+            other => panic!(
+                "wait_for_task kept polling an errored task until the timeout ({polls} polls): {other:?}"
+            ),
         }
     }
 

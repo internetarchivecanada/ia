@@ -883,7 +883,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--comment <TEXT>` | Explanation for why the task is being submitted |
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
 | `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
-| `--wait` | Poll until task completes |
+| `--wait` | Poll until the task completes. A task that fails (error state) ends the wait with `task <id> failed (error state); see ia tasks log <id>` and exit code 1; with `--json`, its catalog entry is printed first |
 | `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff). A poll answered with `429` waits the response's `Retry-After` (or the poll interval when it has none) and polls again; it does not end the wait |
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |

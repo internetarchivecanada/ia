@@ -23,10 +23,9 @@ never honoured.
    `Retry-After` reaches past it, the wait ends with `TaskTimeout` at once,
    since no poll is allowed before then. There is no separate attempt budget:
    the wait is a poll with its own timeout, not a retry of a failed request.
-3. `ia tasks submit --wait` does the same in its poll loop and shows
-   `rate limited, polling again in Ns` on the spinner. (Issue #159's pull
-   request replaces that loop with the library function; whichever lands
-   second drops the loop's copy.)
+3. `ia tasks submit --wait` polls through `wait_for_task_with_progress`
+   (since issue #159's change), so it gets the same handling; the wait is
+   logged as a warning, `task <id> poll rate limited, polling again in Ns`.
 
 ## Tests
 
