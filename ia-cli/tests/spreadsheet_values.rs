@@ -143,10 +143,9 @@ fn upload_dry_run_lists_each_value_of_a_jsonl_array() {
 }
 
 /// A resumed CSV export reads its own file back to merge the earlier rows.
-/// An export can write `Title` and `title` as two columns (IA keys are
-/// case-sensitive), which the reader refuses as a repeated header. The
-/// export must then stop and leave the file as it was, not start fresh and
-/// overwrite the earlier rows.
+/// When that file cannot be read (here, a header given twice in the same
+/// case, as a hand edit can leave it), the export must stop and leave the
+/// file as it was, not start fresh and overwrite the earlier rows.
 #[tokio::test]
 async fn resumed_export_stops_when_its_file_cannot_be_read() {
     use wiremock::matchers::{method, path};
@@ -167,7 +166,7 @@ async fn resumed_export_stops_when_its_file_cannot_be_read() {
 
     let dir = TempDir::new().unwrap();
     let out = dir.path().join("out.csv");
-    let earlier = "identifier,Title,title\nitem-a,Upper,lower\n";
+    let earlier = "identifier,title,title\nitem-a,one,two\n";
     fs::write(&out, earlier).unwrap();
     let joblog = dir.path().join("export.jsonl");
     fs::write(
@@ -206,5 +205,83 @@ async fn resumed_export_stops_when_its_file_cannot_be_read() {
         fs::read_to_string(&out).unwrap(),
         earlier,
         "file was changed"
+    );
+}
+
+/// Two resumes in a row keep every row and every key in the case IA
+/// returned: the export reads its own file back without lowercasing the
+/// headers, so `Title` stays `Title` and `Title` with `title` stays two
+/// columns.
+#[tokio::test]
+async fn export_resumed_twice_keeps_rows_and_key_case() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for (id, metadata) in [
+        (
+            "item-a",
+            serde_json::json!({"identifier": "item-a", "Title": "A"}),
+        ),
+        (
+            "item-b",
+            serde_json::json!({"identifier": "item-b", "Title": "B upper", "title": "b lower"}),
+        ),
+        (
+            "item-c",
+            serde_json::json!({"identifier": "item-c", "Title": "C"}),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/metadata/{id}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"metadata": metadata, "files": []})),
+            )
+            .mount(&server)
+            .await;
+    }
+    let host = server.uri().replace("http://", "");
+
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.csv");
+    let joblog = dir.path().join("export.jsonl");
+    // Each run adds one item; the joblog skips the earlier ones, so runs 2
+    // and 3 are resumes that read the file back.
+    for ids in ["item-a\n", "item-a\nitem-b\n", "item-a\nitem-b\nitem-c\n"] {
+        let list = dir.path().join("ids.txt");
+        fs::write(&list, ids).unwrap();
+        let (ok, stderr) = run(&[
+            "--insecure",
+            "-H",
+            &host,
+            "--joblog",
+            joblog.to_str().unwrap(),
+            "metadata",
+            "export",
+            list.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert!(ok, "export of {ids:?} failed: {stderr}");
+    }
+
+    // The values hold no delimiter or quote, so each line splits plainly.
+    let content = fs::read_to_string(&out).unwrap();
+    let mut lines = content.lines().map(|l| l.split(',').collect::<Vec<_>>());
+    assert_eq!(
+        lines.next().unwrap(),
+        vec!["identifier", "Title", "title"],
+        "headers"
+    );
+    let rows: Vec<Vec<&str>> = lines.collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["item-a", "A", ""],
+            vec!["item-b", "B upper", "b lower"],
+            vec!["item-c", "C", ""],
+        ],
+        "rows"
     );
 }

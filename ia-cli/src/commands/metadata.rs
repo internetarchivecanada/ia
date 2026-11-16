@@ -1651,12 +1651,13 @@ async fn run_export(
     }
 
     // CSV/TSV/XLSX on resume: read the rows already in the output file, to
-    // merge with the new ones. The file is rewritten at the end, so a file
-    // that cannot be read stops the export before any request: starting
-    // fresh would drop the rows of the items the joblog skips.
+    // merge with the new ones, keeping the case of each key as written. The
+    // file is rewritten at the end, so a file that cannot be read stops the
+    // export before any request: starting fresh would drop the rows of the
+    // items the joblog skips.
     let resumed_records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = match &args.output {
         Some(path) if skipped > 0 && !is_jsonl_path(path) && path.exists() => {
-            ia_core::spreadsheet::read_spreadsheet(path).with_context(|| {
+            ia_core::spreadsheet::read_exported_spreadsheet(path).with_context(|| {
                 format!(
                     "cannot resume the export into {}: its existing rows cannot be read, \
                      so the file was left as it is (move it aside, or rerun with \

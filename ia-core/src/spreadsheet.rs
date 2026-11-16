@@ -10,8 +10,9 @@ pub type SpreadsheetRecord = (String, HashMap<String, String>);
 /// Format auto-detected by file extension: .csv, .tsv, .xlsx, .ods, .jsonl
 ///
 /// Header names are trimmed and compared lowercased, JSONL keys are
-/// compared lowercased, `identifier` included. Values are trimmed, and a blank value is no value. A CSV, TSV,
-/// XLSX or ODS row with a blank identifier is skipped.
+/// compared lowercased, `identifier` included. Values are trimmed, and a
+/// blank value is no value. A CSV, TSV, XLSX or ODS row with a blank
+/// identifier is skipped.
 ///
 /// JSONL values are read by type: a string is the value; `null` is no
 /// value; an array of strings gives one value per element, under the keys
@@ -29,14 +30,51 @@ pub fn read_spreadsheet(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
     read_records(path, Scope::AllFields)
 }
 
+/// Read back a spreadsheet this tool wrote with [`write_spreadsheet`], such
+/// as an `ia metadata export` file being resumed, keeping the case of
+/// header names and JSONL keys.
+///
+/// Item metadata keys are case-sensitive on IA, and an export writes each
+/// key in the case IA returned, so `Title` and `title` are two columns. The
+/// file is rewritten from what is read here, so lowercasing would rename
+/// `Title` to `title` and then refuse the file as soon as a new row brings
+/// `Title` back. Every other rule of [`read_spreadsheet`] applies; the
+/// `identifier` header is still matched in any case. Do not use this for
+/// input a person wrote: there, `Title` and `title` are the same field.
+///
+/// # Errors
+///
+/// As [`read_spreadsheet`], with a header refused only when it is given
+/// twice in the same case.
+pub fn read_exported_spreadsheet(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
+    read_records(path, Scope::AllFieldsKeepCase)
+}
+
 /// What a read checks and returns.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     /// Every field, with every rule of [`read_spreadsheet`].
     AllFields,
+    /// Every field, keeping the case of names, for
+    /// [`read_exported_spreadsheet`].
+    AllFieldsKeepCase,
     /// The identifier only: other fields are neither checked nor returned,
     /// for [`read_identifiers_from_file`].
     IdentifierOnly,
+}
+
+impl Scope {
+    /// The name a header or JSONL key is compared and stored under: trimmed
+    /// headers lowercased, or kept as written for
+    /// [`Scope::AllFieldsKeepCase`]. `identifier` in any case is always
+    /// `identifier`.
+    fn name(self, raw: &str) -> String {
+        if self == Scope::AllFieldsKeepCase && !raw.eq_ignore_ascii_case("identifier") {
+            raw.to_string()
+        } else {
+            raw.to_lowercase()
+        }
+    }
 }
 
 fn read_records(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
@@ -85,7 +123,7 @@ fn check_headers(headers: &[String], scope: Scope) -> Result<()> {
     let problems: Vec<String> = repeated
         .into_iter()
         .map(|h| {
-            if h == "identifier" {
+            if h == "identifier" || scope == Scope::AllFieldsKeepCase {
                 format!("header '{h}' is given more than once")
             } else {
                 format!(
@@ -115,7 +153,7 @@ fn read_csv(path: &Path, delimiter: u8, scope: Scope) -> Result<Vec<SpreadsheetR
     let headers: Vec<String> = reader
         .headers()?
         .iter()
-        .map(|h| h.trim().to_lowercase())
+        .map(|h| scope.name(h.trim()))
         .collect();
     check_headers(&headers, scope)?;
 
@@ -175,7 +213,7 @@ fn read_calamine(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
         .ok_or_else(|| IaError::Config("spreadsheet is empty".into()))?;
     let headers: Vec<String> = header_row
         .iter()
-        .map(|cell| cell.to_string().trim().to_lowercase())
+        .map(|cell| scope.name(cell.to_string().trim()))
         .collect();
     check_headers(&headers, scope)?;
 
@@ -246,7 +284,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
 
         let id_values: Vec<&Value> = object
             .iter()
-            .filter(|(k, _)| k.to_lowercase() == "identifier")
+            .filter(|(k, _)| k.eq_ignore_ascii_case("identifier"))
             .map(|(_, v)| v)
             .collect();
         let identifier = match id_values.as_slice() {
@@ -289,7 +327,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
             }
         };
         for (key, value) in &object {
-            let key = key.to_lowercase();
+            let key = scope.name(key);
             if key == "identifier" {
                 continue;
             }
@@ -1219,6 +1257,51 @@ mod tests {
         let path = file(&dir, "ids.csv", "identifier,Identifier\na,b\n");
         let err = read_identifiers_from_file(&path).expect_err("must be refused");
         assert!(err.to_string().contains("'identifier'"), "{err}");
+    }
+
+    #[test]
+    fn exported_read_keeps_the_case_of_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(
+            &dir,
+            "out.csv",
+            "Identifier,Title,title\na,Upper,lower\nb,B,\n",
+        );
+        let records = read_exported_spreadsheet(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, "a");
+        assert_eq!(records[0].1.get("Title").unwrap(), "Upper");
+        assert_eq!(records[0].1.get("title").unwrap(), "lower");
+        assert_eq!(records[1].1.get("Title").unwrap(), "B");
+        assert!(!records[1].1.contains_key("title"));
+    }
+
+    #[test]
+    fn exported_read_refuses_a_header_repeated_in_the_same_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir, "out.csv", "identifier,Title,Title\na,x,y\n");
+        let err = read_exported_spreadsheet(&path).expect_err("must be refused");
+        assert!(matches!(err, IaError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("header 'Title' is given more than once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn exported_read_keeps_the_case_of_jsonl_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(
+            &dir,
+            "out.jsonl",
+            r#"{"IDENTIFIER":"a","Title":"Upper","title":"lower"}"#,
+        );
+        let records = read_exported_spreadsheet(&path).unwrap();
+        assert_eq!(records[0].0, "a");
+        assert_eq!(records[0].1.get("Title").unwrap(), "Upper");
+        assert_eq!(records[0].1.get("title").unwrap(), "lower");
+        assert_eq!(records[0].1.len(), 2);
     }
 
     #[test]

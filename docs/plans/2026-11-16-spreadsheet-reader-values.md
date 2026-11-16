@@ -71,6 +71,27 @@ or header, before any command makes a request. This is how
 `identifier` header) and ignores the other values, so a JSONL file whose other fields hold numbers
 (a download count, for example) still works as an item list.
 
+## Export read-back
+
+`ia metadata export -o FILE.csv` (or `.tsv`, `.xlsx`) with `--joblog`, when
+resumed, reads the rows already in its file and rewrites the file with them
+and the new items. Two changes follow from the header rule:
+
+- A read error used to print a warning and start fresh, so the rewrite
+  dropped the rows of every item the joblog skipped. The export now reads
+  the file before any request and stops with an error naming the file and
+  the reason, leaving the file as it is.
+- The export writes keys in the case IA returns (`Title` and `title` are
+  separate keys on IA). Read back through the normalising reader, `Title`
+  became `title`, so a later resume met both and was refused. The read-back
+  uses `read_exported_spreadsheet`, the same reader with header case kept;
+  `identifier` is still matched in any case. Every user-input path keeps
+  the normalising reader, where `Title` and `title` are one field.
+
+A file that an earlier version resumed may hold both `title` and `Title`
+columns. It reads, and is rewritten as it is; `--no-resume` exports every
+item again in the case IA returns.
+
 ## Out of scope
 
 - A CSV row whose `identifier` cell is blank is still skipped. The Python
@@ -79,6 +100,16 @@ or header, before any command makes a request. This is how
 - `ia_core::collection::read_jsonl_rows` keeps its own reader; moving it onto
   the shared reader is a follow-up once both are merged.
 - A cell under a blank header is still kept under the empty key.
+
+## Review findings
+
+- The export read-back was the main finding; resolved as above.
+- An identifier given as an array is reported as "an array"; JSONL keys
+  are not trimmed, as in `ia collection create`.
+- An item whose metadata holds an `Identifier` key (other than the
+  `identifier` one) is written as its own column, which the read-back
+  matches as a second `identifier`; the resume then stops with an error.
+  Not handled; no such item is known.
 
 ## Tests
 
