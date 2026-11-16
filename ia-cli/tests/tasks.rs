@@ -811,7 +811,7 @@ async fn test_tasks_submit_wait_survives_429_on_poll() {
     Mock::given(method("GET"))
         .and(path("/services/tasks.php"))
         .and(query_param("task_id", "4343"))
-        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -857,10 +857,10 @@ async fn test_tasks_submit_wait_survives_429_on_poll() {
         "a 429 on the poll ended the wait, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Retry-After: 1 against a 1 s poll interval: the second poll comes
-    // no sooner than 1 s after the first.
+    // Retry-After: 2 against a 1 s poll interval: the second poll comes
+    // no sooner than 2 s after the first, so the wait was the header's.
     assert!(
-        start.elapsed() >= std::time::Duration::from_secs(1),
+        start.elapsed() >= std::time::Duration::from_secs(2),
         "the poll after the 429 came before its Retry-After: {:?}",
         start.elapsed()
     );

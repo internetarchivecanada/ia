@@ -591,7 +591,8 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
 /// If `timeout` is `Some`, returns [`IaError::TaskTimeout`] when the
 /// duration elapses before the task finishes, or at once when a `429`'s
 /// `Retry-After` reaches past it. Pass `None` to poll indefinitely (caller
-/// can still cancel via Ctrl+C).
+/// can still cancel via Ctrl+C); without a timeout, a server that keeps
+/// answering `429` keeps the wait going.
 pub async fn wait_for_task(
     client: &IaClient,
     task_id: u64,
@@ -601,8 +602,22 @@ pub async fn wait_for_task(
     wait_for_task_with_progress(client, task_id, initial_interval, timeout, |_| {}).await
 }
 
-/// [`wait_for_task`], calling `on_poll` with the task's catalog entry after
-/// each poll that finds it still active (queued, running or paused).
+/// What [`wait_for_task_with_progress`] reports after each poll that does
+/// not end the wait.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum TaskWaitProgress<'a> {
+    /// The task is still active (queued, running or paused); its catalog
+    /// entry.
+    Active(&'a TaskEntry),
+    /// The poll was answered with `429`; the wait sleeps `wait` before the
+    /// next poll.
+    RateLimited { wait: Duration },
+}
+
+/// [`wait_for_task`], calling `on_poll` after each poll that does not end
+/// the wait: with the task's catalog entry while it is still active, or with
+/// the time it will sleep after a `429`.
 ///
 /// Lets a caller show the task's current state while it waits.
 pub async fn wait_for_task_with_progress(
@@ -610,7 +625,7 @@ pub async fn wait_for_task_with_progress(
     task_id: u64,
     initial_interval: Duration,
     timeout: Option<Duration>,
-    mut on_poll: impl FnMut(&TaskEntry),
+    mut on_poll: impl FnMut(TaskWaitProgress<'_>),
 ) -> Result<Option<TaskEntry>> {
     let max_interval = Duration::from_secs(60);
     let mut interval = initial_interval;
@@ -636,18 +651,19 @@ pub async fn wait_for_task_with_progress(
                 };
                 if let Some(limit) = timeout {
                     let elapsed = start.elapsed();
-                    if elapsed + wait > limit {
+                    if wait > limit.saturating_sub(elapsed) {
                         return Err(IaError::TaskTimeout {
                             task_id,
                             elapsed: elapsed.as_secs(),
                         });
                     }
                 }
-                tracing::warn!(
+                tracing::debug!(
                     "task {} poll rate limited, polling again in {}s",
                     task_id,
                     wait.as_secs()
                 );
+                on_poll(TaskWaitProgress::RateLimited { wait });
                 tokio::time::sleep(wait).await;
                 if retry_after == 0 {
                     interval = (interval * 2).min(max_interval);
@@ -662,7 +678,7 @@ pub async fn wait_for_task_with_progress(
         if entry.color == "red" {
             return Ok(Some(entry));
         }
-        on_poll(&entry);
+        on_poll(TaskWaitProgress::Active(&entry));
 
         // Check timeout before sleeping
         if let Some(limit) = timeout {
@@ -1898,6 +1914,84 @@ mod tests {
             "the wait slept out a Retry-After past its timeout: {:?}",
             start.elapsed()
         );
+    }
+
+    /// A `Retry-After` too large to add to the elapsed time must not panic
+    /// the timeout check; it reaches past any timeout. The first poll finds
+    /// the task running, so the `429` comes over a second in, when adding the
+    /// header's seconds to the elapsed time overflows.
+    #[tokio::test]
+    async fn wait_for_task_429_huge_retry_after_times_out() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "value": {
+                    "summary": {"queued": 0, "running": 1, "error": 0, "paused": 0},
+                    "catalog": [{"task_id": 42, "identifier": "my-item", "cmd": "derive.php", "color": "blue"}]
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(throttled(&u64::MAX.to_string()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = wait_for_task(
+            &client,
+            42,
+            Duration::from_millis(1100),
+            Some(Duration::from_secs(10)),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IaError::TaskTimeout { task_id: 42, .. })),
+            "expected TaskTimeout, got: {result:?}"
+        );
+    }
+
+    /// A `429` without `Retry-After` waits the poll interval, reports the
+    /// wait to the progress callback, and polls again.
+    #[tokio::test]
+    async fn wait_for_task_429_without_retry_after_waits_interval() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(empty_catalog())
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let mut waits = Vec::new();
+        let result = wait_for_task_with_progress(
+            &client,
+            42,
+            Duration::from_millis(200),
+            None,
+            |progress| {
+                if let TaskWaitProgress::RateLimited { wait } = progress {
+                    waits.push(wait);
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Ok(None)), "got: {result:?}");
+        assert_eq!(waits, vec![Duration::from_millis(200)]);
     }
 
     #[tokio::test]

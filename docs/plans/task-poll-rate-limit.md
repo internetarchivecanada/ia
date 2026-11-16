@@ -24,8 +24,13 @@ never honoured.
    since no poll is allowed before then. There is no separate attempt budget:
    the wait is a poll with its own timeout, not a retry of a failed request.
 3. `ia tasks submit --wait` polls through `wait_for_task_with_progress`
-   (since issue #159's change), so it gets the same handling; the wait is
-   logged as a warning, `task <id> poll rate limited, polling again in Ns`.
+   (since issue #159's change), so it gets the same handling. The progress
+   callback takes a `TaskWaitProgress` event, `Active(entry)` or
+   `RateLimited { wait }`, and the spinner shows
+   `rate limited, polling again in Ns`. The function is not in a release yet,
+   so its signature can still change.
+4. Without a timeout, a server that keeps answering `429` keeps the wait
+   going, as a task that stays queued does.
 
 ## Tests
 
