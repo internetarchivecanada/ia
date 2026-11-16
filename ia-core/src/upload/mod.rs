@@ -5,7 +5,7 @@ pub mod headers;
 mod item;
 pub mod multipart;
 pub(crate) mod progress_body;
-mod retry;
+pub(crate) mod retry;
 pub mod s3_error;
 mod single;
 pub(crate) mod stall_watch;
