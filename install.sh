@@ -13,19 +13,18 @@
 #      replaces any existing ia-cli there.
 #   4. If that folder is not on PATH, adds one line, ending in
 #      "# added by the ia-cli installer", to each startup file a new shell
-#      of the user's login shell ($SHELL) reads:
-#        zsh   ~/.zprofile and ~/.zshrc
+#      may read, for zsh, bash and fish alike, as `pipx ensurepath` does:
+#        zsh   ~/.zprofile and ~/.zshrc               (if zsh is installed)
 #        bash  ~/.bashrc, and ~/.bash_profile, ~/.bash_login or ~/.profile
 #              (the first that exists; ~/.profile if none does)
-#        sh    ~/.profile
-#        fish  ~/.config/fish/conf.d/ia-cli.fish
-#      For other shells (tcsh, csh, ksh, nu) it prints the line to add, in
-#      that shell's syntax, and the file to add it to.
+#        fish  ~/.config/fish/conf.d/ia-cli.fish      (if fish is installed)
+#      Each line is added once and guarded, so a file read twice does not
+#      put the folder on PATH twice.
 # It never uses sudo and writes nothing outside $HOME unless IA_INSTALL_DIR
 # says so. Running it again updates to the latest release.
 #
-# Uninstall: delete the binary and the lines ending in
-# "# added by the ia-cli installer" (for fish, the file ia-cli.fish).
+# Uninstall: delete the binary, the lines ending in
+# "# added by the ia-cli installer", and the file ia-cli.fish if there is one.
 #
 # Settings (environment variables):
 #   IA_VERSION       release to install, for example v0.27.0 (default: latest)
@@ -352,9 +351,9 @@ on_path() {
     return "$found"
 }
 
-# Sets the quoted forms of install_dir for each shell's syntax, and the
-# lines that put it on PATH. $HOME stays unexpanded for the default folder,
-# so the lines keep working if the home folder moves.
+# Sets sh_line and fish_line, the guarded lines that put install_dir on
+# PATH, and the tokens has_path_line looks for. $HOME stays unexpanded for
+# the default folder, so the lines keep working if the home folder moves.
 make_path_lines() {
     if [ "$install_dir" = "$home/bin" ]; then
         # shellcheck disable=SC2016 # expands when the shell reads the line
@@ -362,40 +361,22 @@ make_path_lines() {
         # shellcheck disable=SC2016
         sh_token='$HOME/bin'
         # shellcheck disable=SC2016
-        fish_dir='"$HOME/bin"'
+        sh_export='export PATH="$HOME/bin:$PATH"'
         # shellcheck disable=SC2016
-        csh_dir='"$HOME/bin"'
+        fish_dir='"$HOME/bin"'
     else
         sh_dir="'$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")'"
         sh_token=$sh_dir
+        # shellcheck disable=SC2016
+        sh_export='export PATH='"$sh_dir"':"$PATH"'
         fish_dir="'$(printf '%s' "$install_dir" | sed "s/[\\\\']/\\\\&/g")'"
-        csh_dir=$sh_dir
     fi
-    nu_dir="\"$(printf '%s' "$install_dir" | sed 's/[\\"]/\\&/g')\""
-
-    if [ "$install_dir" = "$home/bin" ]; then
-        # shellcheck disable=SC2016 # $PATH expands when the shell reads the line
-        sh_now='export PATH="$HOME/bin:$PATH"'
-        # shellcheck disable=SC2016
-        csh_now='setenv PATH "$HOME/bin:$PATH"'
-    else
-        # shellcheck disable=SC2016
-        sh_now='export PATH='"$sh_dir"':"$PATH"'
-        # shellcheck disable=SC2016
-        csh_now='setenv PATH '"$csh_dir"':"$PATH"'
-    fi
-    # One line each; the case/contains guard keeps PATH from growing when
-    # more than one of the files is read.
+    # The guards keep PATH from growing when more than one file is read.
     # shellcheck disable=SC2016
-    sh_line='case ":$PATH:" in *:'"$sh_dir"':*) ;; *) '"$sh_now"' ;; esac '"$PROFILE_MARK"
+    sh_line='case ":$PATH:" in *:'"$sh_dir"':*) ;; *) '"$sh_export"' ;; esac '"$PROFILE_MARK"
+    # `contains` and `set -gx` work on old fish as well as new.
     # shellcheck disable=SC2016
     fish_line='if not contains -- '"$fish_dir"' $PATH; set -gx PATH '"$fish_dir"' $PATH; end '"$PROFILE_MARK"
-    # shellcheck disable=SC2016
-    fish_now='set -gx PATH '"$fish_dir"' $PATH'
-    csh_line="$csh_now $PROFILE_MARK"
-    # shellcheck disable=SC2016
-    nu_line='$env.PATH = ($env.PATH | prepend '"$nu_dir"') '"$PROFILE_MARK"
-    nu_now=${nu_line% "$PROFILE_MARK"}
 }
 
 # has_path_line FILE TOKEN: FILE has a line this installer added for this
@@ -404,8 +385,8 @@ has_path_line() {
     [ -f "$1" ] && grep -F "$PROFILE_MARK" "$1" 2>/dev/null | grep -qF "$2"
 }
 
-# append_line FILE LINE: add LINE to FILE on a line of its own, creating the
-# file (and, for fish, its folder) if needed.
+# append_line FILE LINE: add LINE at the end of FILE on a line of its own,
+# creating the file (and its folder) if needed.
 append_line() {
     if [ -e "$1" ] && { [ ! -r "$1" ] || [ ! -w "$1" ]; }; then
         return 1
@@ -419,136 +400,78 @@ append_line() {
     printf '%s%s\n' "$separator" "$2" 2>/dev/null >>"$1"
 }
 
-# set_path_in FILE LINE TOKEN KIND: make sure FILE has the line, and record what
-# happened for the report.
+# short_path FILE: FILE with the home folder shown as ~.
+short_path() {
+    # shellcheck disable=SC2088 # a ~ for display, not for expansion
+    case $1 in
+        "$home"/*) printf '~/%s' "${1#"$home"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# set_path_in FILE LINE TOKEN: make sure FILE has the line; record the
+# result for the report.
 set_path_in() {
     if has_path_line "$1" "$3"; then
-        unchanged_files="$unchanged_files$1
-"
+        unchanged_files="$unchanged_files${unchanged_files:+, }$(short_path "$1")"
+        path_set=1
     elif append_line "$1" "$2"; then
-        changed_files="$changed_files$1
-"
+        changed_files="$changed_files${changed_files:+, }$(short_path "$1")"
+        path_set=1
     else
-        failed_files="$failed_files$1
-"
-        return 0
-    fi
-    path_set=1
-    if [ "$4" = interactive ]; then
-        new_terminal_enough=1
+        failed_files="$failed_files${failed_files:+, }$(short_path "$1")"
     fi
 }
 
-# The first of these that exists is the one a bash login shell reads.
-bash_login_file() {
-    for f in .bash_profile .bash_login; do
-        if [ -f "$home/$f" ]; then
-            printf '%s\n' "$home/$f"
-            return 0
-        fi
-    done
-    printf '%s\n' "$home/.profile"
-}
-
-# Puts install_dir on PATH for the login shell named by $SHELL, the shell
-# new terminal windows start. Follows rustup and uv: every file a new
-# shell of that kind may read gets one marked line. Sets path_status:
-# ready (already on PATH), changed (a file has the line) or manual.
+# Puts install_dir on PATH for zsh, bash and fish, whichever the user runs,
+# as `pipx ensurepath` (userpath) does: every file a new shell of each kind
+# may read gets one marked line. zsh and bash files are written when that
+# shell is installed or already has a startup file; fish only when fish is
+# installed or has a config folder. Sets path_status: ready (already on
+# PATH), changed (at least one file has the line) or manual.
 update_path() {
-    shell_name=${SHELL:-}
-    shell_name=${shell_name##*/}
     changed_files=""
     unchanged_files=""
     failed_files=""
     path_set=""
-    new_terminal_enough=""
     make_path_lines
     if on_path; then
         path_status=ready
         return 0
     fi
+
+    # zsh: .zprofile for login shells (macOS Terminal), .zshrc for the
+    # others (most Linux terminals). ZDOTDIR counts only when exported.
     zdot=${ZDOTDIR:-$home}
-    case $shell_name in
-        zsh)
-            # .zprofile: login shells (macOS Terminal). .zshrc: interactive
-            # shells (most Linux terminals). ZDOTDIR counts only when
-            # exported; one set inside ~/.zshenv without export is not seen.
-            set_path_in "$zdot/.zprofile" "$sh_line" "$sh_token" login
-            set_path_in "$zdot/.zshrc" "$sh_line" "$sh_token" interactive
-            ;;
-        bash)
-            # The login file: macOS Terminal and ssh. .bashrc: interactive
-            # non-login shells (most Linux terminals).
-            set_path_in "$(bash_login_file)" "$sh_line" "$sh_token" login
-            set_path_in "$home/.bashrc" "$sh_line" "$sh_token" interactive
-            ;;
-        sh | dash)
-            set_path_in "$home/.profile" "$sh_line" "$sh_token" login
-            ;;
-        fish)
-            # conf.d is read by every fish shell, login or not.
-            set_path_in "${XDG_CONFIG_HOME:-$home/.config}/fish/conf.d/ia-cli.fish" \
-                "$fish_line" "$fish_dir" interactive
-            ;;
-    esac
+    if has zsh || [ -e "$zdot/.zprofile" ] || [ -e "$zdot/.zshrc" ]; then
+        set_path_in "$zdot/.zprofile" "$sh_line" "$sh_token"
+        set_path_in "$zdot/.zshrc" "$sh_line" "$sh_token"
+    fi
+
+    # bash: the login file bash reads (macOS Terminal, ssh), which is the
+    # first of these that exists, and .bashrc (most Linux terminals).
+    if has bash || [ -e "$home/.bashrc" ] || [ -e "$home/.bash_profile" ]; then
+        login_file="$home/.profile"
+        for f in .bash_login .bash_profile; do
+            if [ -f "$home/$f" ]; then
+                login_file="$home/$f"
+            fi
+        done
+        set_path_in "$login_file" "$sh_line" "$sh_token"
+        set_path_in "$home/.bashrc" "$sh_line" "$sh_token"
+    fi
+
+    # fish: conf.d is read by every fish shell.
+    fish_config="${XDG_CONFIG_HOME:-$home/.config}/fish"
+    if has fish || [ -d "$fish_config" ]; then
+        set_path_in "$fish_config/conf.d/ia-cli.fish" "$fish_line" "$fish_dir"
+    fi
+
     if [ "$path_set" = 1 ]; then
         path_status=changed
     else
         path_status=manual
     fi
-}
-
-# Print each line of a newline-separated list, indented.
-print_files() {
-    printf '%s' "$1" | while IFS= read -r f; do
-        say "    $f"
-    done
-}
-
-# Sets manual_line and manual_file: what to add, and where, for a shell this
-# script does not change files for.
-manual_instructions() {
-    case $shell_name in
-        fish)
-            manual_line=$fish_line
-            manual_file="${XDG_CONFIG_HOME:-$home/.config}/fish/conf.d/ia-cli.fish"
-            ;;
-        tcsh)
-            manual_line=$csh_line
-            manual_file="$home/.tcshrc (or $home/.cshrc if you use that)"
-            ;;
-        csh)
-            manual_line=$csh_line
-            manual_file="$home/.cshrc"
-            ;;
-        nu)
-            manual_line=$nu_line
-            manual_file="Nushell's config.nu (type \$nu.config-path in Nushell to see where it is)"
-            ;;
-        ksh)
-            manual_line=$sh_line
-            manual_file="$home/.profile, and $home/.kshrc if you use one"
-            ;;
-        zsh | bash | sh | dash)
-            manual_line=$sh_line
-            manual_file=$(printf '%s' "$failed_files" | head -n 1)
-            ;;
-        *)
-            manual_line=$sh_line
-            manual_file="your shell's startup file (this line is for sh, bash, zsh and ksh; other shells need their own syntax)"
-            ;;
-    esac
-}
-
-# The line that puts install_dir on PATH in the current window, in the
-# syntax of the user's shell.
-now_line() {
-    case $shell_name in
-        fish) say "    $fish_now" ;;
-        tcsh | csh) say "    $csh_now" ;;
-        nu) say "    $nu_now" ;;
-        *) say "    $sh_now" ;;
-    esac
 }
 
 report() {
@@ -560,59 +483,44 @@ report() {
     else
         say "${bold}Updated $old_version to $new_version${reset} at $dest"
     fi
+    say ""
 
-    if [ "$os" = Darwin ]; then
-        new_window="open a new Terminal window"
-    elif [ "$path_status" = manual ] || [ "$new_terminal_enough" = 1 ]; then
-        new_window="open a new terminal window"
-    else
-        new_window="log out and log back in"
-    fi
-
-    if [ "$path_status" = ready ]; then
-        say ""
-        say "ia-cli is ready. Type: ia-cli --version"
-        # Only here: when a line was just added it puts the install folder
-        # first, so an older copy elsewhere does not matter.
-        other=$(command -v ia-cli 2>/dev/null || true)
-        if [ -n "$other" ] && [ "$(real_dir "${other%/*}")" != "$(real_dir "$install_dir")" ]; then
+    case $path_status in
+        ready)
+            say "ia-cli is ready. Type: ia-cli --version"
+            # Only here: when a line was just added it puts the install
+            # folder first, so an older copy elsewhere does not matter.
+            other=$(command -v ia-cli 2>/dev/null || true)
+            if [ -n "$other" ] && [ "$(real_dir "${other%/*}")" != "$(real_dir "$install_dir")" ]; then
+                say ""
+                say "Note: another ia-cli is at $other and comes first on PATH,"
+                say "so typing ia-cli runs that one. Delete it to use this one."
+            fi
+            ;;
+        changed)
+            say "${bold}Next:${reset} Open a new terminal window, then type: ia-cli --version"
             say ""
-            say "Note: another ia-cli is at $other and comes first on PATH,"
-            say "so typing ia-cli runs that one. Delete it to use this one."
-        fi
-        return 0
-    fi
-
-    if [ -n "$changed_files" ]; then
-        say "So that the shell can find ia-cli, added one line ending in \"$PROFILE_MARK\" to:"
-        print_files "$changed_files"
-    fi
-    if [ -n "$unchanged_files" ]; then
-        say "Already set up, not changed:"
-        print_files "$unchanged_files"
-    fi
-    if [ -n "$failed_files" ] && [ "$path_status" = changed ]; then
-        say "Could not change (no permission), left as they were:"
-        print_files "$failed_files"
-    fi
-
-    if [ "$path_status" = manual ]; then
-        manual_instructions
-        if [ -n "$failed_files" ]; then
-            say "Could not change $manual_file (no permission), so the shell cannot find ia-cli yet."
-        else
-            say "The shell cannot find ia-cli yet, because $install_dir is not on PATH."
-        fi
-        say "Add this line to $manual_file:"
-        say "    $manual_line"
-        say ""
-        say "${bold}Next:${reset} add that line, $new_window, then type: ia-cli --version"
-    else
-        say ""
-        say "${bold}Next:${reset} $new_window, then type: ia-cli --version"
-    fi
-    say "Or, to use ia-cli in this window right away, paste this line first:"
-    now_line
+            if [ -n "$changed_files" ]; then
+                say "(So new terminal windows find ia-cli, one line was added to: $changed_files)"
+            fi
+            if [ -n "$unchanged_files" ]; then
+                say "(Already set up: $unchanged_files)"
+            fi
+            if [ -n "$failed_files" ]; then
+                say "(Could not change, no permission: $failed_files)"
+            fi
+            ;;
+        manual)
+            say "ia-cli is installed, but new terminal windows will not find it yet,"
+            if [ -n "$failed_files" ]; then
+                say "because these files could not be changed: $failed_files"
+            else
+                say "because no zsh, bash or fish setup was found."
+            fi
+            say "Add this line to your shell's startup file, then open a new terminal window:"
+            say "    $sh_export"
+            ;;
+    esac
 }
 
 main() {

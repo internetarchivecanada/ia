@@ -45,10 +45,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # fish, tcsh and zsh let the tests start real shells and check they
-      # find ia-cli. macOS has tcsh and zsh; fish is installed on Ubuntu only.
+      # fish and zsh let the tests start real shells and check they find
+      # ia-cli. macOS has zsh; fish is installed on Ubuntu only.
       - if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish tcsh zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
       # sh is dash on Ubuntu and bash 3.2 in POSIX mode on macOS.
       - run: scripts/test-install.sh
 
@@ -63,5 +63,5 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
       - run: scripts/test-install-live.sh

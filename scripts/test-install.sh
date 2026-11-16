@@ -21,6 +21,17 @@ trap 'exit 1' HUP INT TERM
 failures=0
 checks=0
 
+# The installer sets PATH for zsh, bash and fish when it can find them, so
+# its runs get a PATH that includes wherever they are installed here.
+base_path=/usr/bin:/bin:/usr/sbin:/sbin
+for s in zsh bash fish; do
+    p=$(command -v "$s" 2>/dev/null || true)
+    case ":$base_path:" in
+        *":${p%/*}:"*) ;;
+        *) if [ -n "$p" ]; then base_path="$base_path:${p%/*}"; fi ;;
+    esac
+done
+
 pass() {
     checks=$((checks + 1))
     printf 'ok   %s\n' "$1"
@@ -77,7 +88,7 @@ run_installer() {
     release=$3
     shift 3
     status=0
-    env -i HOME="$home" SHELL="$login_shell" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    env -i HOME="$home" SHELL="$login_shell" PATH="$base_path" \
         TMPDIR="$work" IA_INSTALL_BASE_URL="file://$release" \
         IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 "$@" \
         "$sh" "$installer" >"$work/out" 2>&1 || status=$?
@@ -114,151 +125,123 @@ run_suite() {
     make_release "$rel1" 1.0.0
     make_release "$rel2" 2.0.0
 
-    # zsh: fresh install, then rerun, in a home folder with a space in it.
-    h="$work/home $sh zsh"
-    mkdir -p "$h"
-    run_installer "$h" /bin/zsh "$rel1"
-    check "zsh fresh: exits 0" [ "$status" -eq 0 ]
-    check "zsh fresh: binary runs" sh -c '[ "$("$1" --version)" = "ia-cli 1.0.0" ]' _ "$h/bin/ia-cli"
-    check "zsh fresh: mode 755" sh -c 'ls -l "$1" | grep -q "^-rwxr-xr-x"' _ "$h/bin/ia-cli"
-    check "zsh fresh: one line in .zprofile" [ "$(count_lines "$h/.zprofile")" = 1 ]
-    check "zsh fresh: one line in .zshrc" [ "$(count_lines "$h/.zshrc")" = 1 ]
-    check "zsh fresh (Linux): says a new terminal is enough" out_has "Next: open a new terminal window, then type: ia-cli --version"
-    check "zsh fresh: prints a line for this window" out_has '    export PATH="$HOME/bin:$PATH"'
-    if command -v zsh >/dev/null 2>&1; then
-        check "zsh fresh: a new interactive zsh finds ia-cli" finds_ia_cli "$h" zsh -i -c
-        check "zsh fresh: a new login zsh finds ia-cli" finds_ia_cli "$h" zsh -l -c
+    # Whatever SHELL says (or if it is unset), one run sets PATH for zsh,
+    # bash and fish; a new shell of each kind finds ia-cli; a rerun adds
+    # nothing. The home folder has a space in its name.
+    for login in /bin/zsh /bin/bash /usr/bin/fish unset; do
+        name=${login##*/}
+        h="$work/home $sh $name"
+        mkdir -p "$h"
+        if [ "$login" = unset ]; then
+            status=0
+            env -i HOME="$h" PATH="$base_path" TMPDIR="$work" IA_INSTALL_BASE_URL="file://$rel1" \
+                IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+                "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+        else
+            run_installer "$h" "$login" "$rel1"
+        fi
+        check "SHELL=$name: exits 0" [ "$status" -eq 0 ]
+        check "SHELL=$name: one instruction" out_has "Next: Open a new terminal window, then type: ia-cli --version"
+        check "SHELL=$name: no line to copy" sh -c '! grep -q "export PATH\|set -gx" "$1"' _ "$work/out"
+        check "SHELL=$name: mode 755" sh -c 'ls -l "$1" | grep -q "^-rwxr-xr-x"' _ "$h/bin/ia-cli"
+        check "SHELL=$name: no temporary files left" no_leftovers "$h/bin"
+        if command -v zsh >/dev/null 2>&1; then
+            check "SHELL=$name: a new login zsh finds ia-cli" finds_ia_cli "$h" zsh -l -c
+            check "SHELL=$name: a new interactive zsh finds ia-cli" finds_ia_cli "$h" zsh -i -c
+        fi
+        check "SHELL=$name: a new login bash finds ia-cli" finds_ia_cli "$h" bash -l -c
+        check "SHELL=$name: a new interactive non-login bash finds ia-cli" finds_ia_cli "$h" bash -i -c
+        check "SHELL=$name: a new sh reading ~/.profile finds ia-cli" \
+            sh -c 'HOME="$1"; PATH=/usr/bin:/bin; . "$1/.profile"; [ "$(command -v ia-cli)" = "$1/bin/ia-cli" ]' _ "$h"
+        if command -v fish >/dev/null 2>&1; then
+            check "SHELL=$name: a new login fish finds ia-cli" finds_ia_cli "$h" fish -l -c
+            check "SHELL=$name: a new non-login fish finds ia-cli" finds_ia_cli "$h" fish -c
+        fi
+        run_installer "$h" "$login" "$rel2"
+        check "SHELL=$name rerun: updated" sh -c '[ "$("$1" --version)" = "ia-cli 2.0.0" ]' _ "$h/bin/ia-cli"
+        check "SHELL=$name rerun: reports the update" out_has "Updated ia-cli 1.0.0 to ia-cli 2.0.0"
+        check "SHELL=$name rerun: says already set up" out_has "(Already set up:"
+        for f in .zprofile .zshrc .profile .bashrc .config/fish/conf.d/ia-cli.fish; do
+            if [ -e "$h/$f" ]; then
+                check "SHELL=$name rerun: one line in $f" [ "$(count_lines "$h/$f")" = 1 ]
+            fi
+        done
+    done
+    check "files: zsh, bash and sh files written" \
+        sh -c 'for f in .zprofile .zshrc .profile .bashrc; do [ -f "$1/$f" ] || exit 1; done' _ "$work/home $sh zsh"
+    if command -v fish >/dev/null 2>&1; then
+        check "files: fish file written" [ -f "$work/home $sh zsh/.config/fish/conf.d/ia-cli.fish" ]
     fi
-    check "zsh fresh: no temporary files left" no_leftovers "$h/bin"
-    check "zsh fresh: profile line works with a space in HOME" \
-        sh -c 'HOME="$1"; PATH=/usr/bin:/bin; . "$1/.zprofile"; [ "$(command -v ia-cli)" = "$1/bin/ia-cli" ]' _ "$h"
+    check "files: no .bash_profile created" [ ! -e "$work/home $sh zsh/.bash_profile" ]
+    if command -v bash >/dev/null 2>&1; then
+        check "bash: PATH has the folder once when .profile and .bashrc are both read" \
+            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c ". \"\$HOME/.profile\"; . \"\$HOME/.bashrc\"; echo \$PATH")" = "$1/bin:/usr/bin:/bin" ]' _ "$work/home $sh bash" "$(command -v bash)"
+    fi
+    if command -v fish >/dev/null 2>&1; then
+        check "fish: PATH has the folder once when the file is read twice" \
+            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$3" -c "source \"$2\"; string join \\n \$PATH" | grep -cx "$1/bin")" = 1 ]' _ "$work/home $sh fish" "$work/home $sh fish/.config/fish/conf.d/ia-cli.fish" "$(command -v fish)"
+    fi
 
-    run_installer "$h" /bin/zsh "$rel2"
-    check "zsh rerun: exits 0" [ "$status" -eq 0 ]
-    check "zsh rerun: updated" sh -c '[ "$("$1" --version)" = "ia-cli 2.0.0" ]' _ "$h/bin/ia-cli"
-    check "zsh rerun: reports the update" out_has "Updated ia-cli 1.0.0 to ia-cli 2.0.0"
-    check "zsh rerun: still one line in .zprofile" [ "$(count_lines "$h/.zprofile")" = 1 ]
-    check "zsh rerun: still one line in .zshrc" [ "$(count_lines "$h/.zshrc")" = 1 ]
-    check "zsh rerun: says the files were not changed" out_has "Already set up, not changed:"
+    # fish is neither installed nor configured: nothing written for it.
+    h="$work/home $sh nofish"
+    mkdir -p "$h"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$work" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    if ! [ -x /usr/bin/fish ] && ! [ -x /bin/fish ]; then
+        check "no fish: no ~/.config created" [ ! -e "$h/.config" ]
+    fi
 
-    # zsh with ZDOTDIR.
+    # fish config folder exists (fish not on PATH), with XDG_CONFIG_HOME and
+    # another conf.d file: ia-cli.fish added beside it, the other untouched.
+    h="$work/home $sh fish-xdg"
+    mkdir -p "$h/xdg/fish/conf.d"
+    printf 'set -g other 1\n' >"$h/xdg/fish/conf.d/other.fish"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$work" XDG_CONFIG_HOME="$h/xdg" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "fish config folder: line in XDG conf.d" [ "$(count_lines "$h/xdg/fish/conf.d/ia-cli.fish")" = 1 ]
+    check "fish config folder: other file untouched" [ "$(cat "$h/xdg/fish/conf.d/other.fish")" = "set -g other 1" ]
+    check "fish config folder: no ~/.config" [ ! -e "$h/.config" ]
+
+    # zsh with an exported ZDOTDIR.
     h="$work/home $sh zdotdir"
     mkdir -p "$h/zdot"
     run_installer "$h" /bin/zsh "$rel1" ZDOTDIR="$h/zdot"
-    check "zsh ZDOTDIR: line in ZDOTDIR/.zprofile" [ "$(count_lines "$h/zdot/.zprofile")" = 1 ]
-    check "zsh ZDOTDIR: no ~/.zprofile" [ ! -e "$h/.zprofile" ]
+    check "ZDOTDIR: line in ZDOTDIR/.zprofile" [ "$(count_lines "$h/zdot/.zprofile")" = 1 ]
+    check "ZDOTDIR: line in ZDOTDIR/.zshrc" [ "$(count_lines "$h/zdot/.zshrc")" = 1 ]
+    check "ZDOTDIR: no ~/.zprofile" [ ! -e "$h/.zprofile" ]
 
-    # bash without .bash_profile: ~/.profile, appended on a line of its own.
-    h="$work/home $sh bash-profile"
+    # Existing ~/.profile without a final newline: appended on a line of its own.
+    h="$work/home $sh profile-nonl"
     mkdir -p "$h"
     printf 'existing line without newline' >"$h/.profile"
     run_installer "$h" /bin/bash "$rel1"
-    run_installer "$h" /bin/bash "$rel1"
-    check "bash, no .bash_profile: one line in .profile" [ "$(count_lines "$h/.profile")" = 1 ]
-    check "bash, no .bash_profile: existing line kept" grep -qx 'existing line without newline' "$h/.profile"
-    check "bash, no .bash_profile: no .bash_profile created" [ ! -e "$h/.bash_profile" ]
-    check "bash, no .bash_profile: rerun says reinstalled" out_has "was already installed"
-    check "bash, no .bash_profile: one line in .bashrc" [ "$(count_lines "$h/.bashrc")" = 1 ]
-    check "bash (Linux): says a new terminal is enough" out_has "Next: open a new terminal window"
-    if command -v bash >/dev/null 2>&1; then
-        check "bash: a new interactive non-login bash finds ia-cli" finds_ia_cli "$h" bash -i -c
-        check "bash: a new login bash finds ia-cli" finds_ia_cli "$h" bash -l -c
-        check "bash: PATH has the folder once with both files read" \
-            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c ". \"\$HOME/.profile\"; . \"\$HOME/.bashrc\"; echo \$PATH")" = "$1/bin:/usr/bin:/bin" ]' _ "$h" "$(command -v bash)"
-    fi
+    check "existing .profile: first line kept" sh -c '[ "$(head -n 1 "$1")" = "existing line without newline" ]' _ "$h/.profile"
+    check "existing .profile: one line added" [ "$(count_lines "$h/.profile")" = 1 ]
 
-    # bash with .bash_profile.
+    # bash with .bash_profile: the line goes there, not in ~/.profile.
     h="$work/home $sh bash-bash_profile"
     mkdir -p "$h"
     : >"$h/.bash_profile"
     run_installer "$h" /bin/bash "$rel1"
-    run_installer "$h" /bin/bash "$rel1"
-    check "bash with .bash_profile: one line there" [ "$(count_lines "$h/.bash_profile")" = 1 ]
-    check "bash with .bash_profile: .profile untouched" [ ! -e "$h/.profile" ]
-    check "bash with .bash_profile: one line in .bashrc" [ "$(count_lines "$h/.bashrc")" = 1 ]
+    check "with .bash_profile: one line there" [ "$(count_lines "$h/.bash_profile")" = 1 ]
+    check "with .bash_profile: no .profile" [ ! -e "$h/.profile" ]
 
-    # Folder already on PATH: no profile change.
+    # Folder already on PATH: no file changed.
     h="$work/home $sh onpath"
     mkdir -p "$h/bin"
     status=0
-    env -i HOME="$h" SHELL=/bin/zsh PATH="$h/bin:/usr/bin:/bin" TMPDIR="$work" \
+    env -i HOME="$h" SHELL=/bin/zsh PATH="$h/bin:$base_path" TMPDIR="$work" \
         IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
         "$sh" "$installer" >"$work/out" 2>&1 || status=$?
     check "on PATH: exits 0" [ "$status" -eq 0 ]
-    check "on PATH: no profile written" [ ! -e "$h/.zprofile" ]
-    check "on PATH: says ready" out_has "ia-cli is ready"
+    check "on PATH: says ready" out_has "ia-cli is ready. Type: ia-cli --version"
+    check "on PATH: nothing but bin in HOME" sh -c '[ -z "$(ls -A "$1" | grep -v "^bin$")" ]' _ "$h"
 
-    # fish: conf.d file, created with its folder; rerun keeps one line.
-    h="$work/home $sh fish"
-    mkdir -p "$h"
-    run_installer "$h" /usr/local/bin/fish "$rel1"
-    run_installer "$h" /usr/local/bin/fish "$rel1"
-    fishconf="$h/.config/fish/conf.d/ia-cli.fish"
-    check "fish: exits 0" [ "$status" -eq 0 ]
-    check "fish: one line in conf.d/ia-cli.fish" [ "$(count_lines "$fishconf")" = 1 ]
-    check "fish: only that file written" sh -c '[ "$(cd "$1" && find . -type f ! -path "./bin/*")" = "./.config/fish/conf.d/ia-cli.fish" ]' _ "$h"
-    check "fish: prints a fish line for this window" out_has '    set -gx PATH "$HOME/bin" $PATH'
-    check "fish: prints no sh syntax" sh -c '! grep -q "export PATH" "$1"' _ "$work/out"
-    if command -v fish >/dev/null 2>&1; then
-        check "fish: a new login fish finds ia-cli" finds_ia_cli "$h" fish -l -c
-        check "fish: a new non-login fish finds ia-cli" finds_ia_cli "$h" fish -c
-        check "fish: PATH has the folder once when the file is read twice" \
-            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$3" -c "source \"$2\"; string join \n \$PATH" | grep -cx "$1/bin")" = 1 ]' _ "$h" "$fishconf" "$(command -v fish)"
-    fi
-
-    # fish with an install folder whose name has a quote and a space.
-    if command -v fish >/dev/null 2>&1; then
-        h="$work/home $sh fish-custom"
-        mkdir -p "$h"
-        run_installer "$h" /usr/bin/fish "$rel1" IA_INSTALL_DIR="$h/it's here"
-        check "fish custom folder: a new fish finds ia-cli" \
-            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c "command -v ia-cli")" = "$1/it'"'"'s here/ia-cli" ]' _ "$h" "$(command -v fish)"
-    fi
-
-    # fish with XDG_CONFIG_HOME and another conf.d file already there.
-    h="$work/home $sh fish-xdg"
-    mkdir -p "$h/xdg/fish/conf.d"
-    printf 'set -g other 1\n' >"$h/xdg/fish/conf.d/other.fish"
-    run_installer "$h" /usr/bin/fish "$rel1" XDG_CONFIG_HOME="$h/xdg"
-    check "fish XDG_CONFIG_HOME: line in XDG conf.d" [ "$(count_lines "$h/xdg/fish/conf.d/ia-cli.fish")" = 1 ]
-    check "fish XDG_CONFIG_HOME: other file untouched" [ "$(cat "$h/xdg/fish/conf.d/other.fish")" = "set -g other 1" ]
-    check "fish XDG_CONFIG_HOME: no ~/.config" [ ! -e "$h/.config" ]
-
-    # tcsh: nothing written; the tcsh line and its file are printed.
-    h="$work/home $sh tcsh"
-    mkdir -p "$h"
-    run_installer "$h" /bin/tcsh "$rel1"
-    check "tcsh: exits 0" [ "$status" -eq 0 ]
-    check "tcsh: prints the setenv line" out_has 'setenv PATH "$HOME/bin:$PATH" # added by the ia-cli installer'
-    check "tcsh: names .tcshrc" out_has "Add this line to $h/.tcshrc"
-    check "tcsh: prints no sh syntax" sh -c '! grep -q "export PATH" "$1"' _ "$work/out"
-    check "tcsh: no file written" sh -c '[ -z "$(ls -A "$1" | grep -v "^bin$")" ]' _ "$h"
-    if command -v tcsh >/dev/null 2>&1; then
-        grep 'setenv PATH' "$work/out" | head -n 1 | sed 's/^ *//' >"$h/.tcshrc"
-        check "tcsh: the printed line works in tcsh" \
-            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c "which ia-cli")" = "$1/bin/ia-cli" ]' _ "$h" "$(command -v tcsh)"
-    fi
-
-    # Nushell and an unknown shell: printed, in the right syntax.
-    h="$work/home $sh nu"
-    mkdir -p "$h"
-    run_installer "$h" /usr/bin/nu "$rel1"
-    check "nu: prints the Nushell line" out_has "\$env.PATH = (\$env.PATH | prepend \"$h/bin\")"
-    check "nu: names config.nu" out_has "config.nu"
-    h="$work/home $sh unknown"
-    mkdir -p "$h"
-    run_installer "$h" "" "$rel1"
-    check "no SHELL: says which shells the line is for" out_has "this line is for sh, bash, zsh and ksh"
-    check "no SHELL: no file written" sh -c '[ -z "$(ls -A "$1" | grep -v "^bin$")" ]' _ "$h"
-
-    # sh as the login shell: ~/.profile, read only at login.
-    h="$work/home $sh sh"
-    mkdir -p "$h"
-    run_installer "$h" /bin/sh "$rel1"
-    check "sh: one line in .profile" [ "$(count_lines "$h/.profile")" = 1 ]
-    check "sh (Linux): says to log out and back in" out_has "Next: log out and log back in"
-
-    # Upgrade from the line earlier versions wrote to .zprofile.
+    # Upgrade from the line the first version wrote to .zprofile.
     h="$work/home $sh oldline"
     mkdir -p "$h"
     printf '%s\n' 'export PATH="$HOME/bin:$PATH" # added by the ia-cli installer' >"$h/.zprofile"
@@ -266,11 +249,29 @@ run_suite() {
     check "earlier line: .zprofile not changed" [ "$(count_lines "$h/.zprofile")" = 1 ]
     check "earlier line: .zshrc gets one line" [ "$(count_lines "$h/.zshrc")" = 1 ]
 
+    # No file can be written: the last-resort message with the line to add.
+    h="$work/home $sh readonly-home"
+    mkdir -p "$h" "$work/bin-$sh-ro"
+    chmod 555 "$h"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$work" \
+        IA_INSTALL_DIR="$work/bin-$sh-ro" IA_INSTALL_BASE_URL="file://$rel1" \
+        IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    chmod 755 "$h"
+    check "nothing writable: exits 0" [ "$status" -eq 0 ]
+    check "nothing writable: says so" out_has "new terminal windows will not find it yet"
+    check "nothing writable: gives the line" out_has "    export PATH='$work/bin-$sh-ro':\"\$PATH\""
+
     # IA_INSTALL_DIR with a quote and a space.
     h="$work/home $sh custom"
     mkdir -p "$h"
     run_installer "$h" /bin/zsh "$rel1" IA_INSTALL_DIR="$h/it's here"
     check "IA_INSTALL_DIR: installed there" [ -x "$h/it's here/ia-cli" ]
+    if command -v fish >/dev/null 2>&1; then
+        check "IA_INSTALL_DIR: fish finds it" \
+            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c "command -v ia-cli")" = "$1/it'"'"'s here/ia-cli" ]' _ "$h" "$(command -v fish)"
+    fi
     check "IA_INSTALL_DIR: profile line works" \
         sh -c 'PATH=/usr/bin:/bin; . "$1/.zprofile"; [ "$(command -v ia-cli)" = "$1/it'"'"'s here/ia-cli" ]' _ "$h"
     run_installer "$h" /bin/zsh "$rel1" IA_INSTALL_DIR="relative/dir"
@@ -340,7 +341,7 @@ run_suite() {
     mkdir -p "$h"
     run_installer "$h" /bin/zsh "$mac" IA_INSTALL_UNAME_S=Darwin IA_INSTALL_UNAME_M=arm64
     check "Mac: exits 0" [ "$status" -eq 0 ]
-    check "Mac: says to open a new Terminal window" out_has "Next: open a new Terminal window, then type: ia-cli --version"
+    check "Mac: same instruction" out_has "Next: Open a new terminal window, then type: ia-cli --version"
 
     # SHA256SUMS line in "*name" (binary mode) form.
     star="$work/release-star"
@@ -366,7 +367,8 @@ run_suite() {
     run_installer "$h" /bin/zsh "$rel1"
     chmod 644 "$h/.zprofile"
     check "profile not writable: exits 0" [ "$status" -eq 0 ]
-    check "profile not writable: says so" out_has "Could not change (no permission), left as they were:"
+    check "profile not writable: listed quietly" out_has "(Could not change, no permission: ~/.zprofile)"
+    check "profile not writable: still one instruction" out_has "Next: Open a new terminal window"
     check "profile not writable: other file still set" [ "$(count_lines "$h/.zshrc")" = 1 ]
     check "profile not writable: no raw errors" sh -c '! grep -q "Permission denied" "$1"' _ "$work/out"
     check "profile not writable: profile unchanged" [ ! -s "$h/.zprofile" ]
@@ -430,18 +432,6 @@ run_suite() {
     check "install folder not writable: exits non-zero" [ "$status" -ne 0 ]
     check "install folder not writable: says so" out_has "Cannot write to the folder $h/bin"
     check "install folder not writable: no profile written" [ ! -e "$h/.zprofile" ]
-
-    # Neither zsh file writable: the line is printed.
-    h="$work/home $sh readonly-both"
-    mkdir -p "$h"
-    : >"$h/.zprofile"
-    : >"$h/.zshrc"
-    chmod 000 "$h/.zprofile" "$h/.zshrc"
-    run_installer "$h" /bin/zsh "$rel1"
-    chmod 644 "$h/.zprofile" "$h/.zshrc"
-    check "no profile writable: exits 0" [ "$status" -eq 0 ]
-    check "no profile writable: says so" out_has "Could not change $h/.zprofile (no permission)"
-    check "no profile writable: prints the line" out_has '*) export PATH="$HOME/bin:$PATH" ;; esac # added by the ia-cli installer'
 
     # ~/bin is a file.
     h="$work/home $sh bin-file"
