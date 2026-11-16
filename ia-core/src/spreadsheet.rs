@@ -1,5 +1,5 @@
 use crate::error::{IaError, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -8,7 +8,38 @@ pub type SpreadsheetRecord = (String, HashMap<String, String>);
 
 /// Read a spreadsheet file and return records.
 /// Format auto-detected by file extension: .csv, .tsv, .xlsx, .ods, .jsonl
+///
+/// Header names are trimmed and compared lowercased, JSONL keys are
+/// compared lowercased, `identifier` included. Values are trimmed, and a blank value is no value. A CSV, TSV,
+/// XLSX or ODS row with a blank identifier is skipped.
+///
+/// JSONL values are read by type: a string is the value; `null` is no
+/// value; an array of strings gives one value per element, under the keys
+/// `key[0]`, `key[1]`, … that indexed columns use.
+///
+/// # Errors
+///
+/// [`IaError::InvalidArgument`] listing every problem in the file: a header
+/// given twice (blank headers aside), a missing `identifier` column, and in
+/// JSONL a line that is not a JSON object, has no string identifier, gives
+/// a key twice, or holds a value of another type (a number, a boolean, an
+/// object, an array holding anything but strings, or an array under an
+/// indexed key). Plus the read and parse errors of the file.
 pub fn read_spreadsheet(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
+    read_records(path, Scope::AllFields)
+}
+
+/// What a read checks and returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// Every field, with every rule of [`read_spreadsheet`].
+    AllFields,
+    /// The identifier only: other fields are neither checked nor returned,
+    /// for [`read_identifiers_from_file`].
+    IdentifierOnly,
+}
+
+fn read_records(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -16,17 +47,58 @@ pub fn read_spreadsheet(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
         .to_lowercase();
 
     match ext.as_str() {
-        "csv" => read_csv(path, b','),
-        "tsv" => read_csv(path, b'\t'),
-        "xlsx" | "ods" | "xls" => read_calamine(path),
-        "jsonl" | "ndjson" => read_jsonl(path),
+        "csv" => read_csv(path, b',', scope),
+        "tsv" => read_csv(path, b'\t', scope),
+        "xlsx" | "ods" | "xls" => read_calamine(path, scope),
+        "jsonl" | "ndjson" => read_jsonl(path, scope),
         other => Err(IaError::Config(format!(
             "unsupported spreadsheet format: .{other} (supported: .csv, .tsv, .xlsx, .ods, .jsonl)"
         ))),
     }
 }
 
-fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
+/// The error for the problems found in a file, one per line.
+fn problems_error(problems: &[String]) -> IaError {
+    IaError::InvalidArgument(format!(
+        "spreadsheet has problems:\n  {}",
+        problems.join("\n  ")
+    ))
+}
+
+/// Refuse a header given twice. Rows are keyed by header, so one of the two
+/// cells would be lost. Blank headers are not compared: a trailing
+/// delimiter in the header row gives them.
+fn check_headers(headers: &[String], scope: Scope) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut repeated = BTreeSet::new();
+    for header in headers {
+        if header.is_empty() || (scope == Scope::IdentifierOnly && header != "identifier") {
+            continue;
+        }
+        if !seen.insert(header.as_str()) {
+            repeated.insert(header.as_str());
+        }
+    }
+    if repeated.is_empty() {
+        return Ok(());
+    }
+    let problems: Vec<String> = repeated
+        .into_iter()
+        .map(|h| {
+            if h == "identifier" {
+                format!("header '{h}' is given more than once")
+            } else {
+                format!(
+                    "header '{h}' is given more than once \
+                     (headers are case-insensitive; write several values as '{h}[0]', '{h}[1]')"
+                )
+            }
+        })
+        .collect();
+    Err(problems_error(&problems))
+}
+
+fn read_csv(path: &Path, delimiter: u8, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
     let data = std::fs::read(path)?;
     // Strip BOM if present
     let data = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -45,6 +117,7 @@ fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
         .iter()
         .map(|h| h.trim().to_lowercase())
         .collect();
+    check_headers(&headers, scope)?;
 
     let id_col = headers
         .iter()
@@ -63,7 +136,7 @@ fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
 
         let mut fields = HashMap::new();
         for (i, value) in row.iter().enumerate() {
-            if i == id_col || i >= headers.len() {
+            if scope == Scope::IdentifierOnly || i == id_col || i >= headers.len() {
                 continue;
             }
             let value = value.trim();
@@ -78,7 +151,7 @@ fn read_csv(path: &Path, delimiter: u8) -> Result<Vec<SpreadsheetRecord>> {
     Ok(records)
 }
 
-fn read_calamine(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
+fn read_calamine(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
     use calamine::{open_workbook_auto, DataType, Reader};
 
     let mut workbook = open_workbook_auto(path)
@@ -104,11 +177,14 @@ fn read_calamine(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
         .iter()
         .map(|cell| cell.to_string().trim().to_lowercase())
         .collect();
+    check_headers(&headers, scope)?;
 
     let id_col = headers
         .iter()
         .position(|h| h == "identifier")
-        .ok_or_else(|| IaError::Config("spreadsheet must have an 'identifier' column".into()))?;
+        .ok_or_else(|| {
+            IaError::InvalidArgument("spreadsheet must have an 'identifier' column".into())
+        })?;
 
     let mut records = Vec::new();
     for row in rows {
@@ -122,7 +198,7 @@ fn read_calamine(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
 
         let mut fields = HashMap::new();
         for (i, cell) in row.iter().enumerate() {
-            if i == id_col || i >= headers.len() {
+            if scope == Scope::IdentifierOnly || i == id_col || i >= headers.len() {
                 continue;
             }
             if cell.is_empty() {
@@ -140,46 +216,134 @@ fn read_calamine(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
     Ok(records)
 }
 
-fn read_jsonl(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
-    let content = std::fs::read_to_string(path)?;
-    let mut records = Vec::new();
+/// Read JSONL by value type; see [`read_spreadsheet`]. Every problem in the
+/// file is collected and reported together.
+fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
+    use serde_json::Value;
 
-    for line in content.lines() {
+    let content = std::fs::read_to_string(path)?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let mut records = Vec::new();
+    let mut problems = Vec::new();
+
+    for (n, line) in content.lines().enumerate() {
+        let line_no = n + 1;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let object = match serde_json::from_str::<Value>(line) {
+            Ok(Value::Object(object)) => object,
+            Ok(_) => {
+                problems.push(format!("line {line_no}: not a JSON object"));
+                continue;
+            }
+            Err(e) => {
+                problems.push(format!("line {line_no}: not valid JSON: {e}"));
+                continue;
+            }
+        };
 
-        let obj: HashMap<String, serde_json::Value> = serde_json::from_str(line)
-            .map_err(|e| IaError::Config(format!("JSONL parse error: {e}")))?;
-
-        let identifier = obj
-            .get("identifier")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if identifier.is_empty() {
+        let id_values: Vec<&Value> = object
+            .iter()
+            .filter(|(k, _)| k.to_lowercase() == "identifier")
+            .map(|(_, v)| v)
+            .collect();
+        let identifier = match id_values.as_slice() {
+            [Value::String(id)] if !id.trim().is_empty() => id.trim().to_string(),
+            [] | [Value::Null] | [Value::String(_)] => {
+                problems.push(format!("line {line_no}: no identifier"));
+                continue;
+            }
+            [other] => {
+                problems.push(format!(
+                    "line {line_no}: identifier must be a string (got {})",
+                    match other {
+                        Value::Array(_) => "an array",
+                        other => json_kind(other),
+                    }
+                ));
+                continue;
+            }
+            _ => {
+                problems.push(format!(
+                    "line {line_no}: identifier is given more than once (keys are case-insensitive)"
+                ));
+                continue;
+            }
+        };
+        if scope == Scope::IdentifierOnly {
+            records.push((identifier, HashMap::new()));
             continue;
         }
 
         let mut fields = HashMap::new();
-        for (key, value) in &obj {
+        let mut keys_seen = HashSet::new();
+        let mut put = |key: String, value: &str, problems: &mut Vec<String>| {
+            let value = value.trim();
+            if value.is_empty() {
+                return;
+            }
+            if fields.insert(key.clone(), value.to_string()).is_some() {
+                problems.push(format!("line {line_no}: {key} is given more than once"));
+            }
+        };
+        for (key, value) in &object {
+            let key = key.to_lowercase();
             if key == "identifier" {
                 continue;
             }
-            let s = match value {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if !s.is_empty() {
-                fields.insert(key.to_lowercase(), s);
+            if !keys_seen.insert(key.clone()) {
+                problems.push(format!(
+                    "line {line_no}: {key} is given more than once (keys are case-insensitive)"
+                ));
+                continue;
+            }
+            let indexed = key.contains('[');
+            match value {
+                Value::Null => {}
+                Value::String(v) => put(key, v, &mut problems),
+                Value::Array(items) if !indexed && items.iter().all(Value::is_string) => {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Value::String(v) = item {
+                            put(format!("{key}[{i}]"), v, &mut problems);
+                        }
+                    }
+                }
+                other => problems.push(format!(
+                    "line {line_no}: {key} must be {} (got {})",
+                    if indexed {
+                        "a string or null"
+                    } else {
+                        "a string, an array of strings, or null"
+                    },
+                    match other {
+                        Value::Array(_) if indexed => "an array",
+                        other => json_kind(other),
+                    }
+                )),
             }
         }
-
         records.push((identifier, fields));
     }
 
-    Ok(records)
+    if problems.is_empty() {
+        Ok(records)
+    } else {
+        Err(problems_error(&problems))
+    }
+}
+
+/// A JSON value's kind, for an error message.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array that holds more than strings",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Merge bracket-indexed columns into JSON arrays.
@@ -247,7 +411,9 @@ pub fn merge_indexed_columns(fields: &HashMap<String, String>) -> Vec<(String, s
 const SPREADSHEET_EXTENSIONS: &[&str] = &["csv", "tsv", "xlsx", "ods", "xls", "jsonl", "ndjson"];
 
 /// Read identifiers from a file. Spreadsheet formats (.csv, .tsv, .xlsx, .ods,
-/// .jsonl) are parsed and the `identifier` column is extracted. Unrecognized
+/// .jsonl) are parsed and the `identifier` column is extracted, with the
+/// identifier rules of [`read_spreadsheet`]; other columns are not read, so
+/// their values may be of any type. Unrecognized
 /// extensions (including no extension) are read as plain text — one identifier
 /// per line, skipping blanks and `#` comments. Duplicate identifiers are removed
 /// (preserving first occurrence order).
@@ -259,7 +425,7 @@ pub fn read_identifiers_from_file(path: &Path) -> Result<Vec<String>> {
         .to_lowercase();
 
     let ids: Vec<String> = if SPREADSHEET_EXTENSIONS.contains(&ext.as_str()) {
-        let records = read_spreadsheet(path)?;
+        let records = read_records(path, Scope::IdentifierOnly)?;
         records.into_iter().map(|(id, _)| id).collect()
     } else {
         // Plain text: one identifier per line
@@ -845,5 +1011,220 @@ mod tests {
 
         let ids = read_identifiers_from_file(&path).unwrap();
         assert_eq!(ids, vec!["nasa", "mars"]);
+    }
+
+    // -- value types, identifier key and repeated headers (#154) --
+
+    fn file(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The reader's error for `content`, which must be InvalidArgument.
+    fn refusal(name: &str, content: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_spreadsheet(&file(&dir, name, content)).expect_err("must be refused");
+        assert!(
+            matches!(err, IaError::InvalidArgument(_)),
+            "expected InvalidArgument, got: {err:?}"
+        );
+        err.to_string()
+    }
+
+    fn read(name: &str, content: &str) -> Vec<SpreadsheetRecord> {
+        let dir = tempfile::tempdir().unwrap();
+        read_spreadsheet(&file(&dir, name, content)).unwrap()
+    }
+
+    #[test]
+    fn jsonl_null_is_no_value() {
+        let records = read(
+            "a.jsonl",
+            r#"{"identifier":"a","collection":null,"title":"T"}"#,
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].1.contains_key("collection"), "{records:?}");
+        assert_eq!(records[0].1.get("title").unwrap(), "T");
+    }
+
+    #[test]
+    fn jsonl_string_array_gives_indexed_values() {
+        let records = read("a.jsonl", r#"{"identifier":"a","Subject":["x"," y "]}"#);
+        let fields = &records[0].1;
+        assert_eq!(fields.get("subject[0]").unwrap(), "x");
+        assert_eq!(fields.get("subject[1]").unwrap(), "y");
+        assert!(!fields.contains_key("subject"), "{fields:?}");
+    }
+
+    #[test]
+    fn jsonl_strings_are_trimmed_and_blank_is_no_value() {
+        let records = read(
+            "a.jsonl",
+            r#"{"identifier":" a ","title":" T ","date":"  "}"#,
+        );
+        assert_eq!(records[0].0, "a");
+        assert_eq!(records[0].1.get("title").unwrap(), "T");
+        assert!(!records[0].1.contains_key("date"));
+    }
+
+    #[test]
+    fn jsonl_values_that_are_not_strings_are_refused_together() {
+        let msg = refusal(
+            "a.jsonl",
+            "{\"identifier\":\"a\",\"year\":1999}\n\
+             {\"identifier\":\"b\",\"public\":true}\n\
+             {\"identifier\":\"c\",\"extra\":{\"k\":\"v\"}}\n\
+             {\"identifier\":\"d\",\"subject\":[\"x\",1]}\n",
+        );
+        for want in [
+            "line 1: year must be a string, an array of strings, or null (got a number)",
+            "line 2: public must be",
+            "(got a boolean)",
+            "line 3: extra must be",
+            "(got an object)",
+            "line 4: subject must be",
+            "(got an array that holds more than strings)",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn jsonl_array_under_an_indexed_key_is_refused() {
+        let msg = refusal("a.jsonl", r#"{"identifier":"a","subject[0]":["x"]}"#);
+        assert!(
+            msg.contains("line 1: subject[0] must be a string or null (got an array)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn jsonl_identifier_key_is_case_insensitive() {
+        let records = read("a.jsonl", r#"{"Identifier":"a","title":"T"}"#);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "a");
+        assert!(!records[0].1.contains_key("identifier"));
+    }
+
+    #[test]
+    fn jsonl_line_without_a_string_identifier_is_refused() {
+        let msg = refusal(
+            "a.jsonl",
+            "{\"identifier\":7,\"title\":\"T\"}\n\
+             {\"title\":\"no id\"}\n\
+             {\"identifier\":\"  \"}\n\
+             {\"identifier\":\"a\",\"IDENTIFIER\":\"b\"}\n\
+             \n\
+             [1,2]\n\
+             {not json\n",
+        );
+        for want in [
+            "line 1: identifier must be a string (got a number)",
+            "line 2: no identifier",
+            "line 3: no identifier",
+            "line 4: identifier is given more than once",
+            "line 6: not a JSON object",
+            "line 7: not valid JSON",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn jsonl_key_given_twice_in_different_case_is_refused() {
+        let msg = refusal("a.jsonl", r#"{"identifier":"a","title":"x","Title":"y"}"#);
+        assert!(
+            msg.contains("line 1: title is given more than once"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn csv_repeated_header_is_refused() {
+        let msg = refusal("a.csv", "identifier,title,Title \na,x,y\n");
+        assert!(msg.contains("'title'"), "{msg}");
+        assert!(msg.contains("more than once"), "{msg}");
+        assert!(
+            msg.contains("title[0]"),
+            "should name the indexed form: {msg}"
+        );
+    }
+
+    #[test]
+    fn tsv_repeated_identifier_header_is_refused() {
+        let msg = refusal("a.tsv", "identifier\tIdentifier\na\tb\n");
+        assert!(msg.contains("'identifier'"), "{msg}");
+    }
+
+    #[test]
+    fn csv_blank_headers_are_not_compared() {
+        let records = read("a.csv", "identifier,title,,\na,T,,\n");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.get("title").unwrap(), "T");
+    }
+
+    #[test]
+    fn xlsx_repeated_header_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        for (col, text) in ["identifier", "subject", "SUBJECT"].iter().enumerate() {
+            sheet.write_string(0, col as u16, *text).unwrap();
+            sheet.write_string(1, col as u16, "v").unwrap();
+        }
+        workbook.save(&path).unwrap();
+
+        let err = read_spreadsheet(&path).expect_err("must be refused");
+        assert!(matches!(err, IaError::InvalidArgument(_)), "{err:?}");
+        assert!(err.to_string().contains("'subject'"), "{err}");
+    }
+
+    #[test]
+    fn identifiers_from_jsonl_ignore_other_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(
+            &dir,
+            "ids.jsonl",
+            "{\"Identifier\":\"a\",\"downloads\":12}\n{\"identifier\":\"b\",\"x\":true}\n",
+        );
+        assert_eq!(read_identifiers_from_file(&path).unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn identifiers_from_jsonl_still_need_an_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir, "ids.jsonl", "{\"identifier\":3}\n");
+        let err = read_identifiers_from_file(&path).expect_err("must be refused");
+        assert!(
+            err.to_string()
+                .contains("line 1: identifier must be a string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn jsonl_identifier_array_is_called_an_array() {
+        let msg = refusal("a.jsonl", r#"{"identifier":["a"]}"#);
+        assert!(
+            msg.contains("line 1: identifier must be a string (got an array)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn identifiers_from_csv_refuse_a_repeated_identifier_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir, "ids.csv", "identifier,Identifier\na,b\n");
+        let err = read_identifiers_from_file(&path).expect_err("must be refused");
+        assert!(err.to_string().contains("'identifier'"), "{err}");
+    }
+
+    #[test]
+    fn identifiers_from_csv_ignore_repeated_other_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file(&dir, "ids.csv", "identifier,title,title\na,x,y\n");
+        assert_eq!(read_identifiers_from_file(&path).unwrap(), vec!["a"]);
     }
 }
