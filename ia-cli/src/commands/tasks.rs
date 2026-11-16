@@ -772,7 +772,9 @@ async fn run_submit(
                             ));
                         }
                         tokio::time::sleep(wait).await;
-                        interval = (interval * 2).min(max_interval);
+                        if retry_after == 0 {
+                            interval = (interval * 2).min(max_interval);
+                        }
                         continue;
                     }
                     Err(e) => return Err(e.into()),

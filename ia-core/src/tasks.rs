@@ -631,7 +631,9 @@ pub async fn wait_for_task(
                     wait.as_secs()
                 );
                 tokio::time::sleep(wait).await;
-                interval = (interval * 2).min(max_interval);
+                if retry_after == 0 {
+                    interval = (interval * 2).min(max_interval);
+                }
                 continue;
             }
             Err(e) => return Err(e),

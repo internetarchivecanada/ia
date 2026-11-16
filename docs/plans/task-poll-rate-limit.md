@@ -18,10 +18,11 @@ never honoured.
    absent, as elsewhere), anything else `Http`. All six Tasks API calls use it.
 2. `wait_for_task`: a `RateLimited` poll is not an error. It sleeps the
    `Retry-After` when the server gave one, otherwise the current poll interval
-   (which then doubles, as after any poll), and polls again. The timeout
-   still bounds the wait: when the `Retry-After` reaches past it, the wait
-   ends with `TaskTimeout` at once, since no poll is allowed before then. There is no separate attempt budget: the wait is a
-   poll with its own timeout, not a retry of a failed request.
+   (which then doubles; a wait the server set leaves the interval as it
+   was), and polls again. The timeout still bounds the wait: when the
+   `Retry-After` reaches past it, the wait ends with `TaskTimeout` at once,
+   since no poll is allowed before then. There is no separate attempt budget:
+   the wait is a poll with its own timeout, not a retry of a failed request.
 3. `ia tasks submit --wait` does the same in its poll loop and shows
    `rate limited, polling again in Ns` on the spinner. (Issue #159's pull
    request replaces that loop with the library function; whichever lands

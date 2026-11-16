@@ -737,6 +737,7 @@ async fn test_tasks_submit_wait_survives_429_on_poll() {
         .await;
 
     let host = mock_server.uri().replace("http://", "");
+    let start = std::time::Instant::now();
     let output = ia_cmd()
         .args([
             "--insecure",
@@ -762,6 +763,13 @@ async fn test_tasks_submit_wait_survives_429_on_poll() {
         output.status.success(),
         "a 429 on the poll ended the wait, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    // Retry-After: 1 against a 1 s poll interval: the second poll comes
+    // no sooner than 1 s after the first.
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(1),
+        "the poll after the 429 came before its Retry-After: {:?}",
+        start.elapsed()
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
