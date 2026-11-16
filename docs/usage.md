@@ -884,7 +884,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
 | `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
 | `--wait` | Poll until task completes |
-| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff) |
+| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff). A poll answered with `429` waits the response's `Retry-After` (or the poll interval when it has none) and polls again; it does not end the wait |
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |

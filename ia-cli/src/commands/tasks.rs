@@ -754,7 +754,29 @@ async fn run_submit(
                     ..Default::default()
                 };
 
-                let value = tasks::get_tasks(client, &query).await?;
+                let value = match tasks::get_tasks(client, &query).await {
+                    Ok(value) => value,
+                    Err(ia_core::error::IaError::RateLimited { retry_after }) => {
+                        // Throttled poll: wait what the server asks, or the
+                        // poll interval when it does not say, and poll again.
+                        let wait = if retry_after > 0 {
+                            Duration::from_secs(retry_after)
+                        } else {
+                            interval
+                        };
+                        if let Some(ref sp) = spinner {
+                            sp.set_message(format!(
+                                "Task {} — rate limited, polling again in {}s",
+                                result.task_id,
+                                wait.as_secs()
+                            ));
+                        }
+                        tokio::time::sleep(wait).await;
+                        interval = (interval * 2).min(max_interval);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 let still_active = value.catalog.iter().any(|e| e.task_id == result.task_id);
 
                 if !still_active {
