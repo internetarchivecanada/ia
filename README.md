@@ -70,7 +70,26 @@ Flags and their behavior are documented in `--help` at every level, so there is 
 
 ## Install
 
-Download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
+On macOS or Linux, paste this into Terminal and press Return:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | sh
+```
+
+Run the same command again to update to the latest release.
+
+What [`install.sh`](install.sh) does:
+
+- Downloads the release binary for this computer (Apple Silicon Mac, Intel Mac, or Linux x86_64) and the release's `SHA256SUMS` from GitHub, and stops without installing anything if the checksum does not match.
+- Installs it as `~/bin/ia-cli`, replacing any earlier copy only after the new one has run.
+- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to `~/.zprofile` (zsh, the macOS default) or to `~/.bash_profile`, `~/.bash_login` or `~/.profile` (bash, whichever it reads). For other shells it prints the line to add instead. Running it again does not add the line twice.
+- Prints what it installed and changed.
+
+It does not use `sudo` and writes nothing outside your home folder. `IA_INSTALL_DIR=/some/folder` installs elsewhere and `IA_VERSION=v0.27.0` installs a specific release, for example `curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | IA_VERSION=v0.27.0 sh`.
+
+To uninstall, delete `~/bin/ia-cli` and the line ending in `# added by the ia-cli installer` from the profile file the installer named.
+
+On Windows, or to install by hand, download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 
 | Platform | Asset |
 |----------|-------|
@@ -78,6 +97,9 @@ Download a prebuilt binary from [Releases](https://github.com/internetarchivecan
 | macOS (Apple Silicon), macOS 11 or later | `ia-aarch64-apple-darwin` |
 | macOS (Intel), macOS 10.14 or later | `ia-x86_64-apple-darwin` |
 | Windows (x86_64) | `ia-x86_64-pc-windows-msvc.exe` |
+
+<details>
+<summary>Install by hand on macOS or Linux</summary>
 
 ```sh
 # Example: Linux
@@ -104,6 +126,8 @@ chmod +x "$asset" &&
 sudo mkdir -p /usr/local/bin &&
 sudo mv "$asset" /usr/local/bin/ia-cli
 ```
+
+</details>
 
 Every release ships `SHA256SUMS` and a build provenance attestation. `gh attestation verify ia-x86_64-unknown-linux-musl --repo internetarchivecanada/ia` confirms the asset was built by this repository's release workflow.
 
