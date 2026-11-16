@@ -29,9 +29,20 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary: ia-cli
+          # Runs on macOS 11.0 and later: Rust's default and the first
+          # macOS for Apple Silicon.
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: ia-cli
+          # Cross-compiled on the Apple Silicon runner, so the build does not
+          # depend on an Intel runner image. 10.14 is the oldest macOS the
+          # binary can work on: certificate checks call
+          # SecTrustEvaluateWithError (rustls-platform-verifier, through
+          # security-framework), which macOS 10.14 introduced.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: ia-cli
+            macos-deployment-target: "10.14"
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: ia-cli.exe
@@ -54,6 +65,13 @@ jobs:
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Read by rustc and by the C compiler that builds aws-lc-sys. Set only
+      # where the matrix names a version, so the other builds keep the
+      # environment their caches were saved with.
+      - name: Set minimum macOS version
+        if: matrix.macos-deployment-target
+        run: echo "MACOSX_DEPLOYMENT_TARGET=${{ matrix.macos-deployment-target }}" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --locked -p ia-cli --release --target ${{ matrix.target }}

@@ -65,7 +65,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  # Warm the release build cache: the same three builds release.yml runs,
+  # Warm the release build cache: the same four builds release.yml runs,
   # saved under the key a tag's run restores. A tag's run can read caches
   # saved on main but never another tag's, so without this every release
   # build is cold. Pushes to main only; artifacts are not kept.

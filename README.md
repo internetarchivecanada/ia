@@ -75,16 +75,34 @@ Download a prebuilt binary from [Releases](https://github.com/internetarchivecan
 | Platform | Asset |
 |----------|-------|
 | Linux (x86_64) | `ia-x86_64-unknown-linux-musl` |
-| macOS (Apple Silicon) | `ia-aarch64-apple-darwin` |
+| macOS (Apple Silicon), macOS 11 or later | `ia-aarch64-apple-darwin` |
+| macOS (Intel), macOS 10.14 or later | `ia-x86_64-apple-darwin` |
 | Windows (x86_64) | `ia-x86_64-pc-windows-msvc.exe` |
 
 ```sh
 # Example: Linux
 curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
 curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS
-chmod +x ia-x86_64-unknown-linux-musl
+sha256sum --ignore-missing -c SHA256SUMS &&
+chmod +x ia-x86_64-unknown-linux-musl &&
 sudo mv ia-x86_64-unknown-linux-musl /usr/local/bin/ia-cli
+```
+
+On macOS, `uname -m` prints `arm64` on Apple Silicon and `x86_64` on Intel, which picks the asset. The install runs only if the checksum matches:
+
+```sh
+case "$(uname -m)" in
+  arm64)  asset=ia-aarch64-apple-darwin ;;
+  x86_64) asset=ia-x86_64-apple-darwin ;;
+  *)      echo "no macOS binary for $(uname -m)"; asset= ;;
+esac
+[ -n "$asset" ] &&
+curl -L -o "$asset" "https://github.com/internetarchivecanada/ia/releases/latest/download/$asset" &&
+curl -L -o SHA256SUMS https://github.com/internetarchivecanada/ia/releases/latest/download/SHA256SUMS &&
+grep " $asset\$" SHA256SUMS | shasum -a 256 -c &&
+chmod +x "$asset" &&
+sudo mkdir -p /usr/local/bin &&
+sudo mv "$asset" /usr/local/bin/ia-cli
 ```
 
 Every release ships `SHA256SUMS` and a build provenance attestation. `gh attestation verify ia-x86_64-unknown-linux-musl --repo internetarchivecanada/ia` confirms the asset was built by this repository's release workflow.
