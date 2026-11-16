@@ -141,3 +141,70 @@ fn upload_dry_run_lists_each_value_of_a_jsonl_array() {
     );
     assert!(!stderr.contains("null"), "{stderr}");
 }
+
+/// A resumed CSV export reads its own file back to merge the earlier rows.
+/// An export can write `Title` and `title` as two columns (IA keys are
+/// case-sensitive), which the reader refuses as a repeated header. The
+/// export must then stop and leave the file as it was, not start fresh and
+/// overwrite the earlier rows.
+#[tokio::test]
+async fn resumed_export_stops_when_its_file_cannot_be_read() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/item-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata": {"identifier": "item-b", "title": "B"},
+            "files": []
+        })))
+        // The file is read before any request, so none is made.
+        .expect(0)
+        .mount(&server)
+        .await;
+    let host = server.uri().replace("http://", "");
+
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.csv");
+    let earlier = "identifier,Title,title\nitem-a,Upper,lower\n";
+    fs::write(&out, earlier).unwrap();
+    let joblog = dir.path().join("export.jsonl");
+    fs::write(
+        &joblog,
+        "{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"item-a\",\"file\":\"\",\"status\":\"ok\"}\n",
+    )
+    .unwrap();
+    let ids = dir.path().join("ids.txt");
+    fs::write(&ids, "item-a\nitem-b\n").unwrap();
+
+    let (ok, stderr) = run(&[
+        "--insecure",
+        "-H",
+        &host,
+        "--joblog",
+        joblog.to_str().unwrap(),
+        "metadata",
+        "export",
+        ids.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        !ok,
+        "a resumed export with an unreadable file must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("out.csv"),
+        "error should name the file: {stderr}"
+    );
+    assert!(
+        stderr.contains("header 'title' is given more than once"),
+        "error should give the reason: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        earlier,
+        "file was changed"
+    );
+}

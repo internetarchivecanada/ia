@@ -1414,6 +1414,17 @@ fn write_audit_file(
 
 // ─── Export ──────────────────────────────────────────────────────────────────
 
+/// Whether an export path is JSONL, which is appended to rather than
+/// rewritten.
+fn is_jsonl_path(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    ext == "jsonl" || ext == "ndjson"
+}
+
 /// Collect identifiers from export sources (files, --search, stdin).
 /// Positional args are always files. stdin is line-per-ID.
 async fn collect_identifiers_from_export(
@@ -1639,6 +1650,24 @@ async fn run_export(
         return Ok(());
     }
 
+    // CSV/TSV/XLSX on resume: read the rows already in the output file, to
+    // merge with the new ones. The file is rewritten at the end, so a file
+    // that cannot be read stops the export before any request: starting
+    // fresh would drop the rows of the items the joblog skips.
+    let resumed_records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = match &args.output {
+        Some(path) if skipped > 0 && !is_jsonl_path(path) && path.exists() => {
+            ia_core::spreadsheet::read_spreadsheet(path).with_context(|| {
+                format!(
+                    "cannot resume the export into {}: its existing rows cannot be read, \
+                     so the file was left as it is (move it aside, or rerun with \
+                     --no-resume to export every item again)",
+                    path.display()
+                )
+            })?
+        }
+        _ => Vec::new(),
+    };
+
     // Open joblog writer
     let joblog = joblog_path
         .as_ref()
@@ -1779,12 +1808,7 @@ async fn run_export(
 
     if let Some(ref path) = args.output {
         // Detect JSONL output for streaming writes
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let is_jsonl = ext == "jsonl" || ext == "ndjson";
+        let is_jsonl = is_jsonl_path(path);
 
         // JSONL: open in append mode for streaming writes (resilient to Ctrl+C).
         // CSV/XLSX: collect records in memory for unified column computation.
@@ -1800,19 +1824,8 @@ async fn run_export(
             None
         };
 
-        // CSV/TSV/XLSX on resume: read existing records so we can merge with new ones.
-        let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> =
-            if !is_jsonl && skipped > 0 && path.exists() {
-                ia_core::spreadsheet::read_spreadsheet(path).unwrap_or_else(|e| {
-                    eprintln!(
-                        "{} could not read existing export file, starting fresh: {e}",
-                        style("warning:").yellow().bold(),
-                    );
-                    Vec::new()
-                })
-            } else {
-                Vec::new()
-            };
+        // CSV/TSV/XLSX: the rows read back on resume, then the new ones.
+        let mut records = resumed_records;
 
         while let Some((identifier, result, elapsed_ms)) = rx.recv().await {
             match result {
