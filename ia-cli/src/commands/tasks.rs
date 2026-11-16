@@ -763,7 +763,7 @@ async fn run_submit(
                             };
                             sp.set_message(format!("Task {task_id} — {state}"));
                         }
-                        tasks::TaskWaitProgress::RateLimited { wait } => {
+                        tasks::TaskWaitProgress::RateLimited { wait, .. } => {
                             sp.set_message(format!(
                                 "Task {task_id} — rate limited, polling again in {}s",
                                 wait.as_secs()
