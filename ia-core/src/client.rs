@@ -165,7 +165,17 @@ impl IaClient {
         let user_agent = build_user_agent(config);
 
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+        let user_agent_value = HeaderValue::from_str(&user_agent).map_err(|_| {
+            crate::error::IaError::Config(format!(
+                "invalid user_agent_suffix {:?}: it contains a control character",
+                config
+                    .general
+                    .user_agent_suffix
+                    .as_deref()
+                    .unwrap_or_default()
+            ))
+        })?;
+        headers.insert(USER_AGENT, user_agent_value);
 
         let api = configure_transport(
             Self::base_builder(headers.clone()),
@@ -480,6 +490,41 @@ impl IaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_suffix(suffix: &str) -> IaConfig {
+        let mut config = IaConfig::default();
+        config.general.user_agent_suffix = Some(suffix.to_string());
+        config
+    }
+
+    #[test]
+    fn control_character_in_user_agent_suffix_is_a_config_error() {
+        for bad in ["app\n1.0", "app\r1.0", "app\x001.0", "app\x7f1.0"] {
+            for result in [
+                IaClient::from_config(config_with_suffix(bad)),
+                IaClient::from_config_no_retry(config_with_suffix(bad)),
+            ] {
+                match result {
+                    Err(crate::error::IaError::Config(msg)) => {
+                        assert!(msg.contains("user_agent_suffix"), "got: {msg}");
+                        assert!(msg.contains(&format!("{bad:?}")), "got: {msg}");
+                    }
+                    Err(other) => panic!("expected Config error, got {other:?}"),
+                    Ok(_) => panic!("suffix {bad:?} must be rejected"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_and_tab_user_agent_suffix_is_accepted() {
+        for ok in ["caf\u{e9}/1.0", "app\t1.0"] {
+            assert!(
+                IaClient::from_config(config_with_suffix(ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn read_timeout_aborts_stalled_response() {
