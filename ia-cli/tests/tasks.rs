@@ -700,6 +700,68 @@ async fn test_tasks_submit_wait() {
     );
 }
 
+/// A task that fails stays in the catalog with color `red`. `--wait` stops on
+/// it, exits non-zero, and names the task in the error, under `-q` too
+/// (issue #159).
+#[tokio::test]
+async fn test_tasks_submit_wait_errored_task_fails() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "task_id": 4242, "log": "https://catalogd.archive.org/log/4242" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4242"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": {
+                "summary": {"queued": 0, "running": 0, "error": 1, "paused": 0},
+                "catalog": [{"task_id": 4242, "identifier": "my-item", "cmd": "derive.php", "color": "red"}]
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-q",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an errored task must exit non-zero"
+    );
+    assert!(
+        stderr.contains("task 4242 failed"),
+        "stderr should name the failed task, got: {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn test_tasks_rerun_stdin_raw_ids() {
     let mock_server = MockServer::start().await;
