@@ -59,6 +59,14 @@ make_release() {
         ia-aarch64-apple-darwin >>"$1/SHA256SUMS"
 }
 
+# make_named_release DIR ASSET VERSION [sums-prefix]: a release holding one
+# fake asset; sums-prefix "*" writes the SHA256SUMS line in "*name" form.
+make_named_release() {
+    mkdir -p "$1"
+    printf '#!/bin/sh\necho "ia-cli %s"\n' "$3" >"$1/$2"
+    printf '%s  %s%s\n' "$(sha256_of "$1/$2")" "${4:-}" "$2" >"$1/SHA256SUMS"
+}
+
 # run_installer HOME LOGIN-SHELL RELEASE-DIR [extra VAR=value...]
 # Runs the installer with a clean environment; output goes to $work/out and
 # the exit status to $status.
@@ -226,6 +234,121 @@ run_suite() {
     run_installer "$h" /bin/zsh "$broken"
     check "binary cannot run, fresh: exits non-zero" [ "$status" -ne 0 ]
     check "binary cannot run, fresh: nothing in HOME" [ -z "$(ls -A "$h")" ]
+
+    # Mac success messages.
+    mac="$work/release-mac"
+    make_named_release "$mac" ia-aarch64-apple-darwin 1.0.0
+    h="$work/home $sh mac"
+    mkdir -p "$h"
+    run_installer "$h" /bin/zsh "$mac" IA_INSTALL_UNAME_S=Darwin IA_INSTALL_UNAME_M=arm64
+    check "Mac: exits 0" [ "$status" -eq 0 ]
+    check "Mac: says to open a new Terminal window" out_has "Next: open a new Terminal window, then type: ia-cli --version"
+
+    # SHA256SUMS line in "*name" (binary mode) form.
+    star="$work/release-star"
+    make_named_release "$star" ia-x86_64-unknown-linux-musl 1.0.0 "*"
+    h="$work/home $sh star"
+    mkdir -p "$h"
+    run_installer "$h" /bin/zsh "$star"
+    check "*name checksum line: installs" [ -x "$h/bin/ia-cli" ]
+
+    # bash with only .bash_login.
+    h="$work/home $sh bash_login"
+    mkdir -p "$h"
+    : >"$h/.bash_login"
+    run_installer "$h" /bin/bash "$rel1"
+    check "bash with .bash_login: one line there" [ "$(count_lines "$h/.bash_login")" = 1 ]
+    check "bash with .bash_login: no .profile" [ ! -e "$h/.profile" ]
+
+    # Profile that cannot be written: binary installed, line printed.
+    h="$work/home $sh readonly-profile"
+    mkdir -p "$h"
+    : >"$h/.zprofile"
+    chmod 000 "$h/.zprofile"
+    run_installer "$h" /bin/zsh "$rel1"
+    chmod 644 "$h/.zprofile"
+    check "profile not writable: exits 0" [ "$status" -eq 0 ]
+    check "profile not writable: says so" out_has "Could not change $h/.zprofile"
+    check "profile not writable: prints the line" out_has 'export PATH="$HOME/bin:$PATH"'
+    check "profile not writable: no raw errors" sh -c '! grep -q "Permission denied" "$1"' _ "$work/out"
+    check "profile not writable: profile unchanged" [ ! -s "$h/.zprofile" ]
+
+    # HOME with a trailing slash: same line, written once.
+    h="$work/home $sh slash"
+    mkdir -p "$h"
+    run_installer "$h/" /bin/zsh "$rel1"
+    run_installer "$h/" /bin/zsh "$rel1"
+    check "HOME with trailing slash: installed" [ -x "$h/bin/ia-cli" ]
+    check "HOME with trailing slash: one \$HOME line" grep -qxF 'export PATH="$HOME/bin:$PATH" # added by the ia-cli installer' "$h/.zprofile"
+    check "HOME with trailing slash: still one line" [ "$(count_lines "$h/.zprofile")" = 1 ]
+
+    # Install folder already on PATH, spelled with a trailing slash: ready,
+    # and no note about "another" ia-cli.
+    h="$work/home $sh path-slash"
+    mkdir -p "$h/bin"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="$h/bin/:/usr/bin:/bin" TMPDIR="$work" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "PATH with trailing slash: says ready" out_has "ia-cli is ready"
+    check "PATH with trailing slash: no note about another copy" sh -c '! grep -q "another ia-cli" "$1"' _ "$work/out"
+
+    # Another ia-cli earlier on PATH than the install folder: noted.
+    other="$work/other-$sh"
+    mkdir -p "$other"
+    printf '#!/bin/sh\necho "ia-cli 0.1.0"\n' >"$other/ia-cli"
+    chmod 755 "$other/ia-cli"
+    h="$work/home $sh other-first"
+    mkdir -p "$h/bin"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="$other:$h/bin:/usr/bin:/bin" TMPDIR="$work" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "other copy first on PATH: noted" out_has "another ia-cli is at $other/ia-cli"
+
+    # Another ia-cli on PATH, install folder not on PATH: the new profile
+    # line puts the install folder first, so no note.
+    h="$work/home $sh other-added"
+    mkdir -p "$h"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="$other:/usr/bin:/bin" TMPDIR="$work" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "other copy, line added: no note" sh -c '! grep -q "another ia-cli" "$1"' _ "$work/out"
+
+    # The destination is a folder.
+    h="$work/home $sh dest-dir"
+    mkdir -p "$h/bin/ia-cli"
+    run_installer "$h" /bin/zsh "$rel1"
+    check "destination is a folder: exits non-zero" [ "$status" -ne 0 ]
+    check "destination is a folder: says so" out_has "is a folder"
+
+    # Install folder that cannot be written to.
+    h="$work/home $sh ro-dir"
+    mkdir -p "$h/bin"
+    chmod 555 "$h/bin"
+    run_installer "$h" /bin/zsh "$rel1"
+    chmod 755 "$h/bin"
+    check "install folder not writable: exits non-zero" [ "$status" -ne 0 ]
+    check "install folder not writable: says so" out_has "Cannot write to the folder $h/bin"
+    check "install folder not writable: no profile written" [ ! -e "$h/.zprofile" ]
+
+    # HOME not set.
+    status=0
+    env -i SHELL=/bin/zsh PATH="/usr/bin:/bin" "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "HOME unset: exits non-zero" [ "$status" -ne 0 ]
+    check "HOME unset: says so" out_has "The HOME variable is not set"
+
+    # IA_VERSION that is not a release name (checked before any download).
+    h="$work/home $sh badversion"
+    mkdir -p "$h"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="/usr/bin:/bin" TMPDIR="$work" \
+        IA_VERSION='v1;touch x' IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer" >"$work/out" 2>&1 || status=$?
+    check "bad IA_VERSION: exits non-zero" [ "$status" -ne 0 ]
+    check "bad IA_VERSION: says so" out_has "IA_VERSION is not a release name"
+    check "bad IA_VERSION: nothing in HOME" [ -z "$(ls -A "$h")" ]
 
     # Unsupported platforms.
     for platform in "FreeBSD amd64" "Linux aarch64" "Darwin i386"; do

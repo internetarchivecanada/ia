@@ -129,6 +129,7 @@ detect_asset() {
 choose_base_url() {
     if [ -n "${IA_INSTALL_BASE_URL:-}" ]; then
         base_url=${IA_INSTALL_BASE_URL%/}
+        say "Test setting IA_INSTALL_BASE_URL is set: downloading from $base_url"
     elif [ -n "${IA_VERSION:-}" ]; then
         case $IA_VERSION in
             v*) tag=$IA_VERSION ;;
@@ -152,7 +153,7 @@ download() {
         if [ -n "${IA_INSTALL_BASE_URL:-}" ]; then
             curl -fsSL --retry 3 -o "$2" "$1"
         else
-            curl --proto '=https' -fsSL --retry 3 -o "$2" "$1"
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1"
         fi
     else
         wget -q -O "$2" "$1"
@@ -162,10 +163,10 @@ download() {
 # sha256 FILE: print the file's SHA-256 in hex. need_tools checked that one
 # of the two programs exists.
 sha256() {
-    if has shasum; then
-        shasum -a 256 "$1" | awk '{ print $1 }'
-    else
+    if has sha256sum; then
         sha256sum "$1" | awk '{ print $1 }'
+    else
+        shasum -a 256 "$1" | awk '{ print $1 }'
     fi
 }
 
@@ -199,7 +200,11 @@ download_and_verify() {
         die "The release has no valid checksum for $asset, so the download cannot be checked." \
             "Report this at https://github.com/internetarchivecanada/ia/issues"
     fi
-    actual=$(sha256 "$tmp_dir/$asset")
+    actual=$(sha256 "$tmp_dir/$asset" 2>/dev/null)
+    if [ -z "$actual" ]; then
+        die "This computer could not compute the download's checksum, so it cannot be checked." \
+            "Report this at https://github.com/internetarchivecanada/ia/issues"
+    fi
     if [ "$actual" != "$expected" ]; then
         die "The downloaded file is not the file the release lists (checksum mismatch)." \
             "Nothing was changed. Run the same command again; if this happens again, report it at" \
@@ -209,7 +214,7 @@ download_and_verify() {
 
 # Sets install_dir and dest.
 choose_install_dir() {
-    install_dir=${IA_INSTALL_DIR:-$HOME/bin}
+    install_dir=${IA_INSTALL_DIR:-$home/bin}
     case $install_dir in
         /*) ;;
         *) die "IA_INSTALL_DIR must be a full path starting with /, not: $install_dir" ;;
@@ -244,8 +249,10 @@ install_binary() {
 
     new_bin=$(mktemp "$install_dir/.ia-cli.new.XXXXXX") ||
         die "Cannot write to the folder $install_dir"
-    cp "$tmp_dir/$asset" "$new_bin"
-    chmod 755 "$new_bin"
+    if ! cp "$tmp_dir/$asset" "$new_bin" || ! chmod 755 "$new_bin"; then
+        die "Cannot write ia-cli to the folder $install_dir" \
+            "Check that the disk is not full, then run the same command again."
+    fi
 
     if ! new_version=$("$new_bin" --version </dev/null 2>"$tmp_dir/run-error") ||
         [ -z "$new_version" ]; then
@@ -270,7 +277,9 @@ install_binary() {
     fi
 
     new_version=$(printf '%s\n' "$new_version" | head -n 1)
-    mv -f "$new_bin" "$dest"
+    mv -f "$new_bin" "$dest" ||
+        die "Cannot replace $dest" \
+            "Check that the disk is not full, then run the same command again."
     new_bin=""
     installed=1
 }
@@ -288,16 +297,36 @@ version_older() {
     }'
 }
 
+# real_dir DIR: the folder's path with symlinks and repeated slashes resolved.
+real_dir() {
+    (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
 on_path() {
     case ":${PATH:-}:" in
         *":$install_dir:"* | *":$install_dir/:"*) return 0 ;;
     esac
-    return 1
+    # A PATH entry spelled differently (repeated slashes, a symlink) that is
+    # the same folder.
+    want=$(real_dir "$install_dir")
+    found=1
+    old_ifs=$IFS
+    IFS=:
+    set -f # split PATH on ":" without expanding * or ? in it
+    for entry in ${PATH:-}; do
+        if [ -n "$entry" ] && [ -d "$entry" ] && [ "$(real_dir "$entry")" = "$want" ]; then
+            found=0
+            break
+        fi
+    done
+    set +f
+    IFS=$old_ifs
+    return "$found"
 }
 
 # Sets path_line, the line that puts install_dir on PATH.
 make_path_line() {
-    if [ "$install_dir" = "$HOME/bin" ]; then
+    if [ "$install_dir" = "$home/bin" ]; then
         # shellcheck disable=SC2016 # $HOME and $PATH expand when the profile runs
         path_line='export PATH="$HOME/bin:$PATH" '"$PROFILE_MARK"
     else
@@ -313,16 +342,18 @@ choose_profile() {
     shell_name=${shell_name##*/}
     case $shell_name in
         zsh)
-            profile="${ZDOTDIR:-$HOME}/.zprofile"
+            # ZDOTDIR counts only when exported; one set inside ~/.zshenv
+            # without export is not seen here, and ~/.zprofile is used.
+            profile="${ZDOTDIR:-$home}/.zprofile"
             ;;
         bash)
             # bash reads only the first of these that exists.
-            if [ -f "$HOME/.bash_profile" ]; then
-                profile="$HOME/.bash_profile"
-            elif [ -f "$HOME/.bash_login" ]; then
-                profile="$HOME/.bash_login"
+            if [ -f "$home/.bash_profile" ]; then
+                profile="$home/.bash_profile"
+            elif [ -f "$home/.bash_login" ]; then
+                profile="$home/.bash_login"
             else
-                profile="$HOME/.profile"
+                profile="$home/.profile"
             fi
             ;;
         *)
@@ -333,8 +364,11 @@ choose_profile() {
 
 # Append path_line to profile, on a line of its own.
 append_path_line() {
+    if [ -e "$profile" ] && { [ ! -r "$profile" ] || [ ! -w "$profile" ]; }; then
+        return 1
+    fi
     separator=""
-    if [ -s "$profile" ] && [ -n "$(tail -c 1 "$profile")" ]; then
+    if [ -s "$profile" ] && [ -n "$(tail -c 1 "$profile" 2>/dev/null)" ]; then
         separator="
 "
     fi
@@ -351,7 +385,7 @@ update_path() {
     choose_profile
     if [ -z "$profile" ]; then
         path_status=manual
-    elif [ -f "$profile" ] && grep -qxF "$path_line" "$profile"; then
+    elif [ -f "$profile" ] && grep -qxF "$path_line" "$profile" 2>/dev/null; then
         path_status=present
     elif append_path_line; then
         path_status=added
@@ -405,11 +439,15 @@ report() {
             ;;
     esac
 
-    other=$(command -v ia-cli 2>/dev/null || true)
-    if [ -n "$other" ] && [ "$other" != "$dest" ]; then
-        say ""
-        say "Note: another ia-cli is at $other and comes first on PATH,"
-        say "so typing ia-cli runs that one. Delete it to use this one."
+    # Only when the install folder was already on PATH: otherwise the line
+    # just added puts it first, and an older copy elsewhere does not matter.
+    if [ "$path_status" = ready ]; then
+        other=$(command -v ia-cli 2>/dev/null || true)
+        if [ -n "$other" ] && [ "$(real_dir "${other%/*}")" != "$(real_dir "$install_dir")" ]; then
+            say ""
+            say "Note: another ia-cli is at $other and comes first on PATH,"
+            say "so typing ia-cli runs that one. Delete it to use this one."
+        fi
     fi
 }
 
@@ -417,6 +455,10 @@ main() {
     setup_colours
     if [ -z "${HOME:-}" ]; then
         die "The HOME variable is not set, so there is no home folder to install into."
+    fi
+    home=$HOME
+    if [ "$home" != / ]; then
+        home=${home%/}
     fi
     trap cleanup EXIT
     trap 'exit 1' HUP INT TERM
