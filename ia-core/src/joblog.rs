@@ -39,6 +39,14 @@ pub struct JoblogEntry {
     /// Token usage (for AI operations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<JoblogTokens>,
+    /// The account item name a lock or unlock was sent with (for
+    /// `account-lock` and `account-unlock`, when the lookup returned one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub itemname: Option<String>,
+    /// The comment a lock or unlock was sent with (for `account-lock` and
+    /// `account-unlock`, when one was sent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// Thread-safe append-only JSONL writer.
@@ -97,6 +105,8 @@ impl JoblogEntry {
             retries: None,
             changes: None,
             tokens: None,
+            itemname: None,
+            comment: None,
         }
     }
 
@@ -981,6 +991,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             JoblogEntry {
                 ts: "2026-01-01T00:00:01Z".into(),
@@ -994,6 +1006,8 @@ mod tests {
                 retries: Some(3),
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             JoblogEntry {
                 ts: "2026-01-01T00:00:02Z".into(),
@@ -1007,6 +1021,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
         ];
         let set = successful_files(&entries, "upload");
@@ -1032,6 +1048,8 @@ mod tests {
                 retries: Some(1),
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             JoblogEntry {
                 ts: "2026-01-01T00:00:01Z".into(),
@@ -1045,6 +1063,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             // file-b: succeeded first, then failed → should NOT be in set
             JoblogEntry {
@@ -1059,6 +1079,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             JoblogEntry {
                 ts: "2026-01-01T00:00:03Z".into(),
@@ -1072,6 +1094,8 @@ mod tests {
                 retries: Some(2),
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
         ];
         let set = successful_files(&entries, "upload");
@@ -1093,6 +1117,8 @@ mod tests {
             retries: None,
             changes: None,
             tokens: None,
+            itemname: None,
+            comment: None,
         }];
         let set = successful_files(&entries, "upload");
         assert!(set.is_empty());
@@ -1113,6 +1139,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
             JoblogEntry {
                 ts: "2026-01-01T00:00:01Z".into(),
@@ -1126,6 +1154,8 @@ mod tests {
                 retries: None,
                 changes: None,
                 tokens: None,
+                itemname: None,
+                comment: None,
             },
         ];
         let set = successful_files(&entries, "upload");
