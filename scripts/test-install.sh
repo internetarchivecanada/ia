@@ -217,9 +217,9 @@ run_suite() {
     # Existing ~/.profile without a final newline: appended on a line of its own.
     h="$work/home $sh profile-nonl"
     mkdir -p "$h"
-    printf 'existing line without newline' >"$h/.profile"
+    printf '# existing line without newline' >"$h/.profile"
     run_installer "$h" /bin/bash "$rel1"
-    check "existing .profile: first line kept" sh -c '[ "$(head -n 1 "$1")" = "existing line without newline" ]' _ "$h/.profile"
+    check "existing .profile: first line kept" sh -c '[ "$(head -n 1 "$1")" = "# existing line without newline" ]' _ "$h/.profile"
     check "existing .profile: one line added" [ "$(count_lines "$h/.profile")" = 1 ]
 
     # bash with .bash_profile: the line goes there, not in ~/.profile.
@@ -229,6 +229,19 @@ run_suite() {
     run_installer "$h" /bin/bash "$rel1"
     check "with .bash_profile: one line there" [ "$(count_lines "$h/.bash_profile")" = 1 ]
     check "with .bash_profile: no .profile" [ ! -e "$h/.profile" ]
+    check "with .bash_profile: a new login bash finds ia-cli" finds_ia_cli "$h" bash -l -c
+
+    # A commented-out marked line does not count; a relative PATH entry that
+    # happens to be the install folder does not count either.
+    h="$work/home $sh commented"
+    mkdir -p "$h/bin"
+    printf '%s\n' '#export PATH="$HOME/bin:$PATH" # added by the ia-cli installer' >"$h/.zprofile"
+    status=0
+    (cd "$h/bin" && env -i HOME="$h" SHELL=/bin/zsh PATH=".:$base_path" TMPDIR="$work" \
+        IA_INSTALL_BASE_URL="file://$rel1" IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$sh" "$installer") >"$work/out" 2>&1 || status=$?
+    check "relative PATH entry: not taken as on PATH" out_has "Next: Open a new terminal window"
+    check "commented-out line: a real line added" [ "$(count_lines "$h/.zprofile")" = 2 ]
 
     # Folder already on PATH: no file changed.
     h="$work/home $sh onpath"
@@ -263,17 +276,20 @@ run_suite() {
     check "nothing writable: says so" out_has "new terminal windows will not find it yet"
     check "nothing writable: gives the line" out_has "    export PATH='$work/bin-$sh-ro':\"\$PATH\""
 
-    # IA_INSTALL_DIR with a quote and a space.
+    # IA_INSTALL_DIR with a space, quotes, a $ and a backslash.
     h="$work/home $sh custom"
     mkdir -p "$h"
-    run_installer "$h" /bin/zsh "$rel1" IA_INSTALL_DIR="$h/it's here"
-    check "IA_INSTALL_DIR: installed there" [ -x "$h/it's here/ia-cli" ]
-    if command -v fish >/dev/null 2>&1; then
-        check "IA_INSTALL_DIR: fish finds it" \
-            sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c "command -v ia-cli")" = "$1/it'"'"'s here/ia-cli" ]' _ "$h" "$(command -v fish)"
-    fi
-    check "IA_INSTALL_DIR: profile line works" \
-        sh -c 'PATH=/usr/bin:/bin; . "$1/.zprofile"; [ "$(command -v ia-cli)" = "$1/it'"'"'s here/ia-cli" ]' _ "$h"
+    cdir="$h/it's \"a\" \$b\\c"
+    run_installer "$h" /bin/zsh "$rel1" IA_INSTALL_DIR="$cdir"
+    check "IA_INSTALL_DIR: installed there" [ -x "$cdir/ia-cli" ]
+    check "IA_INSTALL_DIR: sh line works" \
+        sh -c 'PATH=/usr/bin:/bin; . "$1/.zprofile"; [ "$(command -v ia-cli)" = "$2/ia-cli" ]' _ "$h" "$cdir"
+    for shell in bash zsh fish; do
+        if command -v "$shell" >/dev/null 2>&1; then
+            check "IA_INSTALL_DIR: a new $shell finds it" \
+                sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin TERM=dumb "$3" -i -c "command -v ia-cli" 2>/dev/null </dev/null | tail -n 1)" = "$2/ia-cli" ]' _ "$h" "$cdir" "$(command -v "$shell")"
+        fi
+    done
     run_installer "$h" /bin/zsh "$rel1" IA_INSTALL_DIR="relative/dir"
     check "IA_INSTALL_DIR relative: refused" [ "$status" -ne 0 ]
 

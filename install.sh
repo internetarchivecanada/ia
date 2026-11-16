@@ -192,7 +192,11 @@ download_and_verify() {
     say "Downloading ia-cli for $label..."
     if ! download "$base_url/SHA256SUMS" "$tmp_dir/SHA256SUMS" ||
         ! download "$base_url/$asset" "$tmp_dir/$asset"; then
-        case ${http_code:-000} in
+        case $http_code in
+            "")
+                die "The download failed." \
+                    "Check the internet connection, then run the same command again."
+                ;;
             000)
                 die "The download failed: could not reach GitHub." \
                     "Check the internet connection, then run the same command again."
@@ -341,7 +345,9 @@ on_path() {
     IFS=:
     set -f # split PATH on ":" without expanding * or ? in it
     for entry in ${PATH:-}; do
-        if [ -n "$entry" ] && [ -d "$entry" ] && [ "$(real_dir "$entry")" = "$want" ]; then
+        # Relative entries (such as .) depend on the current folder; skip them.
+        case $entry in /*) ;; *) continue ;; esac
+        if [ -d "$entry" ] && [ "$(real_dir "$entry")" = "$want" ]; then
             found=0
             break
         fi
@@ -380,9 +386,10 @@ make_path_lines() {
 }
 
 # has_path_line FILE TOKEN: FILE has a line this installer added for this
-# folder (including the shorter line earlier versions wrote).
+# folder (including the shorter line earlier versions wrote), not commented out.
 has_path_line() {
-    [ -f "$1" ] && grep -F "$PROFILE_MARK" "$1" 2>/dev/null | grep -qF "$2"
+    [ -f "$1" ] && grep -F "$PROFILE_MARK" "$1" 2>/dev/null |
+        grep -v '^[[:space:]]*#' | grep -qF "$2"
 }
 
 # append_line FILE LINE: add LINE at the end of FILE on a line of its own,
@@ -442,7 +449,9 @@ update_path() {
 
     # zsh: .zprofile for login shells (macOS Terminal), .zshrc for the
     # others (most Linux terminals). ZDOTDIR counts only when exported.
+    # A relative ZDOTDIR or XDG_CONFIG_HOME is ignored, as the shells do.
     zdot=${ZDOTDIR:-$home}
+    case $zdot in /*) ;; *) zdot=$home ;; esac
     if has zsh || [ -e "$zdot/.zprofile" ] || [ -e "$zdot/.zshrc" ]; then
         set_path_in "$zdot/.zprofile" "$sh_line" "$sh_token"
         set_path_in "$zdot/.zshrc" "$sh_line" "$sh_token"
@@ -462,7 +471,9 @@ update_path() {
     fi
 
     # fish: conf.d is read by every fish shell.
-    fish_config="${XDG_CONFIG_HOME:-$home/.config}/fish"
+    config_home=${XDG_CONFIG_HOME:-$home/.config}
+    case $config_home in /*) ;; *) config_home=$home/.config ;; esac
+    fish_config="$config_home/fish"
     if has fish || [ -d "$fish_config" ]; then
         set_path_in "$fish_config/conf.d/ia-cli.fish" "$fish_line" "$fish_dir"
     fi
