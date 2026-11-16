@@ -261,8 +261,9 @@ pub struct AccountResult {
     pub action: Action,
     /// Time from the first request to the result.
     pub elapsed_ms: u64,
-    /// The item name the lookup returned, if it succeeded and returned one;
-    /// set whether or not the action that followed succeeded.
+    /// The item name the lookup returned, if it succeeded and returned one
+    /// that a lock or unlock can be sent with; set whether or not the
+    /// action that followed succeeded.
     pub itemname: Option<String>,
     /// What the action produced, or why it failed. The error is shared
     /// when several lines name one account whose lock or unlock failed.
@@ -320,12 +321,13 @@ pub async fn run_one(batch: &Batch<'_>, input: &str) -> AccountResult {
     .await
     .map_err(|e| Arc::new(name_input(e, input)));
     // Taken before the action, so a failed lock or unlock still names the
-    // account it was sent for.
+    // account it was sent for. An item name `set_locked` refuses before
+    // sending is not kept: no request carried it.
     let itemname = found
         .as_ref()
         .ok()
         .and_then(|found| found.itemname())
-        .filter(|name| !name.is_empty())
+        .filter(|name| account::is_usable_itemname(name))
         .map(str::to_string);
     let result = match found {
         Ok(found) => act(batch, input, found).await,
@@ -597,8 +599,8 @@ fn done_in_joblog(path: &Path, op: &str) -> std::result::Result<HashSet<String>,
 }
 
 /// The job log entry for one finished line: `ok` with bytes 0 and the
-/// elapsed time, or `error` with the message. When the lookup returned an
-/// item name, the lock or unlock for this line was sent with it, by this
+/// elapsed time, or `error` with the message. When the lookup returned a
+/// usable item name, the lock or unlock for this line was sent with it, by this
 /// line or by an earlier line whose lookup returned the same string (the
 /// key `lock_once` shares requests by): the entry records that item name,
 /// and `comment` when it is not empty, since an empty comment is not sent.

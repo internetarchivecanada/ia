@@ -18,12 +18,12 @@ Two optional fields on `ia_core::joblog::JoblogEntry`:
 
 | Field | Type | Written when |
 |---|---|---|
-| `itemname` | `Option<String>` | an `account-lock` or `account-unlock` line whose lookup returned an item name: the item name the lock or unlock request was sent with |
+| `itemname` | `Option<String>` | an `account-lock` or `account-unlock` line whose lookup returned an item name a request can be sent with (`account::is_usable_itemname`: starts with `@`, at least two characters): the item name the lock or unlock request was sent with |
 | `comment` | `Option<String>` | the same lines, when `--comment` is not empty: the comment that request carried |
 
 Both are written on `ok` and `error` lines alike. A line whose lookup failed,
-or returned no item name, sends no lock or unlock request and gets neither
-field. A line that shared its request with an earlier line naming the same
+or returned no usable item name, sends no lock or unlock request and gets
+neither field. A line that shared its request with an earlier line naming the same
 account gets the item name and comment of that shared request, so two lines
 for one account show the same `itemname`.
 
