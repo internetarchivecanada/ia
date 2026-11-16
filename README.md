@@ -88,11 +88,13 @@ What [`install.sh`](install.sh) does:
   - fish, when installed: `~/.config/fish/conf.d/ia-cli.fish`
 
   Each line is added once and checks `PATH` first, so a file read twice does not add `~/bin` twice. Existing lines are not changed or reordered.
+
+  An exported `ZDOTDIR` puts the zsh files there instead, and `XDG_CONFIG_HOME` moves the fish folder. A `ZDOTDIR` set in `~/.zshenv` without `export` is not seen by the installer, which then uses `~/.zprofile` and `~/.zshrc`.
 - Prints what it installed and which files it changed. Open a new terminal window afterwards.
 
 It does not use `sudo` and writes nothing outside your home folder. `IA_INSTALL_DIR=/some/folder` installs elsewhere and `IA_VERSION=v0.27.0` installs a specific release, for example `curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | IA_VERSION=v0.27.0 sh`.
 
-To uninstall, delete `~/bin/ia-cli`, each line ending in `# added by the ia-cli installer` from the files listed above, and `~/.config/fish/conf.d/ia-cli.fish` if it exists.
+To uninstall, delete `~/bin/ia-cli`, each line ending in `# added by the ia-cli installer` from the files listed above (the zsh files are in `$ZDOTDIR` if you set it), and `~/.config/fish/conf.d/ia-cli.fish` (`$XDG_CONFIG_HOME/fish/conf.d/ia-cli.fish` if you set it) if it exists.
 
 On Windows, or to install by hand, download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 

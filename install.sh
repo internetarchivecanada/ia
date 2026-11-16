@@ -194,6 +194,10 @@ download_and_verify() {
         ! download "$base_url/$asset" "$tmp_dir/$asset"; then
         case $http_code in
             "")
+                if [ -n "${IA_VERSION:-}" ]; then
+                    die "The download failed. Check the internet connection, and check that" \
+                        "$IA_VERSION is a release listed at $RELEASES_URL"
+                fi
                 die "The download failed." \
                     "Check the internet connection, then run the same command again."
                 ;;
@@ -417,30 +421,39 @@ short_path() {
 }
 
 # set_path_in FILE LINE TOKEN: make sure FILE has the line; record the
-# result for the report.
+# result for the report. Returns 1, and adds FILE to shell_failed, if the
+# file could not be changed (no permission, or a folder by that name).
 set_path_in() {
     if has_path_line "$1" "$3"; then
         unchanged_files="$unchanged_files${unchanged_files:+, }$(short_path "$1")"
         path_set=1
-    elif append_line "$1" "$2"; then
+    elif [ ! -d "$1" ] && append_line "$1" "$2"; then
         changed_files="$changed_files${changed_files:+, }$(short_path "$1")"
         path_set=1
     else
         failed_files="$failed_files${failed_files:+, }$(short_path "$1")"
+        shell_failed="$shell_failed${shell_failed:+ and }$(short_path "$1")"
+        return 1
     fi
 }
 
 # Puts install_dir on PATH for zsh, bash and fish, whichever the user runs,
 # as `pipx ensurepath` (userpath) does: every file a new shell of each kind
-# may read gets one marked line. zsh and bash files are written when that
-# shell is installed or already has a startup file; fish only when fish is
-# installed or has a config folder. Sets path_status: ready (already on
-# PATH), changed (at least one file has the line) or manual.
+# may read gets one marked line. Each shell's files are written when that
+# shell is installed, already has a startup file, or is the login shell.
+# Sets zsh_failed, bash_failed and fish_failed (files that could not be
+# changed; "-" when that shell was skipped), and path_status: ready (already
+# on PATH), changed, or manual (see choose_path_status).
 update_path() {
     changed_files=""
     unchanged_files=""
     failed_files=""
     path_set=""
+    zsh_failed=-
+    bash_failed=-
+    fish_failed=-
+    login_shell=${SHELL:-}
+    login_shell=${login_shell##*/}
     make_path_lines
     if on_path; then
         path_status=ready
@@ -448,39 +461,77 @@ update_path() {
     fi
 
     # zsh: .zprofile for login shells (macOS Terminal), .zshrc for the
-    # others (most Linux terminals). ZDOTDIR counts only when exported.
-    # A relative ZDOTDIR or XDG_CONFIG_HOME is ignored, as the shells do.
+    # others (most Linux terminals). ZDOTDIR counts only when exported: one
+    # set in ~/.zshenv without export is not seen here, and the home folder
+    # is used. A relative ZDOTDIR or XDG_CONFIG_HOME is ignored, as the
+    # shells do.
     zdot=${ZDOTDIR:-$home}
     case $zdot in /*) ;; *) zdot=$home ;; esac
-    if has zsh || [ -e "$zdot/.zprofile" ] || [ -e "$zdot/.zshrc" ]; then
-        set_path_in "$zdot/.zprofile" "$sh_line" "$sh_token"
-        set_path_in "$zdot/.zshrc" "$sh_line" "$sh_token"
+    if has zsh || [ "$login_shell" = zsh ] || [ -e "$zdot/.zprofile" ] || [ -e "$zdot/.zshrc" ]; then
+        shell_failed=""
+        set_path_in "$zdot/.zprofile" "$sh_line" "$sh_token" || true
+        set_path_in "$zdot/.zshrc" "$sh_line" "$sh_token" || true
+        zsh_failed=$shell_failed
     fi
 
     # bash: the login file bash reads (macOS Terminal, ssh), which is the
     # first of these that exists, and .bashrc (most Linux terminals).
-    if has bash || [ -e "$home/.bashrc" ] || [ -e "$home/.bash_profile" ]; then
+    if has bash || [ "$login_shell" = bash ] || [ -e "$home/.bashrc" ] || [ -e "$home/.bash_profile" ]; then
         login_file="$home/.profile"
         for f in .bash_login .bash_profile; do
             if [ -f "$home/$f" ]; then
                 login_file="$home/$f"
             fi
         done
-        set_path_in "$login_file" "$sh_line" "$sh_token"
-        set_path_in "$home/.bashrc" "$sh_line" "$sh_token"
+        shell_failed=""
+        set_path_in "$login_file" "$sh_line" "$sh_token" || true
+        set_path_in "$home/.bashrc" "$sh_line" "$sh_token" || true
+        bash_failed=$shell_failed
     fi
 
     # fish: conf.d is read by every fish shell.
     config_home=${XDG_CONFIG_HOME:-$home/.config}
     case $config_home in /*) ;; *) config_home=$home/.config ;; esac
     fish_config="$config_home/fish"
-    if has fish || [ -d "$fish_config" ]; then
-        set_path_in "$fish_config/conf.d/ia-cli.fish" "$fish_line" "$fish_dir"
+    if has fish || [ "$login_shell" = fish ] || [ -d "$fish_config" ]; then
+        shell_failed=""
+        set_path_in "$fish_config/conf.d/ia-cli.fish" "$fish_line" "$fish_dir" || true
+        fish_failed=$shell_failed
     fi
 
-    if [ "$path_set" = 1 ]; then
-        path_status=changed
-    else
+    choose_path_status
+}
+
+# The "open a new terminal window" message is right only if the files of
+# the user's login shell ($SHELL; zsh and bash when it is unset or another
+# shell) have the line. Otherwise path_status is manual, and manual_files
+# and manual_line say what to add where, in that shell's syntax.
+choose_path_status() {
+    path_status=changed
+    manual_files=""
+    manual_line=$sh_export
+    case $login_shell in
+        zsh) check_shells=zsh ;;
+        bash) check_shells=bash ;;
+        fish) check_shells=fish ;;
+        *) check_shells="zsh bash" ;;
+    esac
+    for sh_name in $check_shells; do
+        case $sh_name in
+            zsh) failed=$zsh_failed ;;
+            bash) failed=$bash_failed ;;
+            *) failed=$fish_failed ;;
+        esac
+        if [ "$failed" != - ] && [ -n "$failed" ]; then
+            path_status=manual
+            manual_files="$manual_files${manual_files:+ and }$failed"
+            if [ "$sh_name" = fish ]; then
+                # shellcheck disable=SC2016 # $PATH expands in fish
+                manual_line='set -gx PATH '"$fish_dir"' $PATH'
+            fi
+        fi
+    done
+    if [ "$path_set" != 1 ]; then
         path_status=manual
     fi
 }
@@ -518,18 +569,21 @@ report() {
                 say "(Already set up: $unchanged_files)"
             fi
             if [ -n "$failed_files" ]; then
-                say "(Could not change, no permission: $failed_files)"
+                say "(Could not change: $failed_files)"
             fi
             ;;
         manual)
-            say "ia-cli is installed, but new terminal windows will not find it yet,"
-            if [ -n "$failed_files" ]; then
-                say "because these files could not be changed: $failed_files"
+            say "ia-cli is installed, but new terminal windows will not find it yet."
+            if [ -n "$manual_files" ]; then
+                say "$manual_files could not be changed."
+                say "${bold}Next:${reset} add this line to $manual_files, then open a new terminal window:"
             else
-                say "because no zsh, bash or fish setup was found."
+                if [ -n "$failed_files" ]; then
+                    say "These files could not be changed: $failed_files"
+                fi
+                say "${bold}Next:${reset} add this line to your shell's startup file, then open a new terminal window:"
             fi
-            say "Add this line to your shell's startup file, then open a new terminal window:"
-            say "    $sh_export"
+            say "    $manual_line"
             ;;
     esac
 }

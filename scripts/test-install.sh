@@ -52,6 +52,19 @@ check() { # description, command...
     if "$@"; then pass "$desc"; else fail "$desc"; fi
 }
 
+# have SHELL: true if SHELL is installed. If it is not, and it is named in
+# IA_TEST_REQUIRE_SHELLS (set by CI where it installs them), that is a
+# failure, not a silent skip.
+have() {
+    if command -v "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    case " ${IA_TEST_REQUIRE_SHELLS:-} " in
+        *" $1 "*) fail "$1 is required by IA_TEST_REQUIRE_SHELLS but is not installed" ;;
+    esac
+    return 1
+}
+
 sha256_of() {
     if command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | awk '{ print $1 }'
@@ -145,7 +158,7 @@ run_suite() {
         check "SHELL=$name: no line to copy" sh -c '! grep -q "export PATH\|set -gx" "$1"' _ "$work/out"
         check "SHELL=$name: mode 755" sh -c 'ls -l "$1" | grep -q "^-rwxr-xr-x"' _ "$h/bin/ia-cli"
         check "SHELL=$name: no temporary files left" no_leftovers "$h/bin"
-        if command -v zsh >/dev/null 2>&1; then
+        if have zsh; then
             check "SHELL=$name: a new login zsh finds ia-cli" finds_ia_cli "$h" zsh -l -c
             check "SHELL=$name: a new interactive zsh finds ia-cli" finds_ia_cli "$h" zsh -i -c
         fi
@@ -153,7 +166,7 @@ run_suite() {
         check "SHELL=$name: a new interactive non-login bash finds ia-cli" finds_ia_cli "$h" bash -i -c
         check "SHELL=$name: a new sh reading ~/.profile finds ia-cli" \
             sh -c 'HOME="$1"; PATH=/usr/bin:/bin; . "$1/.profile"; [ "$(command -v ia-cli)" = "$1/bin/ia-cli" ]' _ "$h"
-        if command -v fish >/dev/null 2>&1; then
+        if have fish; then
             check "SHELL=$name: a new login fish finds ia-cli" finds_ia_cli "$h" fish -l -c
             check "SHELL=$name: a new non-login fish finds ia-cli" finds_ia_cli "$h" fish -c
         fi
@@ -169,15 +182,15 @@ run_suite() {
     done
     check "files: zsh, bash and sh files written" \
         sh -c 'for f in .zprofile .zshrc .profile .bashrc; do [ -f "$1/$f" ] || exit 1; done' _ "$work/home $sh zsh"
-    if command -v fish >/dev/null 2>&1; then
+    if have fish; then
         check "files: fish file written" [ -f "$work/home $sh zsh/.config/fish/conf.d/ia-cli.fish" ]
     fi
     check "files: no .bash_profile created" [ ! -e "$work/home $sh zsh/.bash_profile" ]
-    if command -v bash >/dev/null 2>&1; then
+    if have bash; then
         check "bash: PATH has the folder once when .profile and .bashrc are both read" \
             sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$2" -c ". \"\$HOME/.profile\"; . \"\$HOME/.bashrc\"; echo \$PATH")" = "$1/bin:/usr/bin:/bin" ]' _ "$work/home $sh bash" "$(command -v bash)"
     fi
-    if command -v fish >/dev/null 2>&1; then
+    if have fish; then
         check "fish: PATH has the folder once when the file is read twice" \
             sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin "$3" -c "source \"$2\"; string join \\n \$PATH" | grep -cx "$1/bin")" = 1 ]' _ "$work/home $sh fish" "$work/home $sh fish/.config/fish/conf.d/ia-cli.fish" "$(command -v fish)"
     fi
@@ -285,7 +298,7 @@ run_suite() {
     check "IA_INSTALL_DIR: sh line works" \
         sh -c 'PATH=/usr/bin:/bin; . "$1/.zprofile"; [ "$(command -v ia-cli)" = "$2/ia-cli" ]' _ "$h" "$cdir"
     for shell in bash zsh fish; do
-        if command -v "$shell" >/dev/null 2>&1; then
+        if have "$shell"; then
             check "IA_INSTALL_DIR: a new $shell finds it" \
                 sh -c '[ "$(env -i HOME="$1" PATH=/usr/bin:/bin TERM=dumb "$3" -i -c "command -v ia-cli" 2>/dev/null </dev/null | tail -n 1)" = "$2/ia-cli" ]' _ "$h" "$cdir" "$(command -v "$shell")"
         fi
@@ -380,10 +393,10 @@ run_suite() {
     mkdir -p "$h"
     : >"$h/.zprofile"
     chmod 000 "$h/.zprofile"
-    run_installer "$h" /bin/zsh "$rel1"
+    run_installer "$h" /bin/bash "$rel1"
     chmod 644 "$h/.zprofile"
     check "profile not writable: exits 0" [ "$status" -eq 0 ]
-    check "profile not writable: listed quietly" out_has "(Could not change, no permission: ~/.zprofile)"
+    check "profile not writable: listed quietly" out_has "(Could not change: ~/.zprofile)"
     check "profile not writable: still one instruction" out_has "Next: Open a new terminal window"
     check "profile not writable: other file still set" [ "$(count_lines "$h/.zshrc")" = 1 ]
     check "profile not writable: no raw errors" sh -c '! grep -q "Permission denied" "$1"' _ "$work/out"
@@ -448,6 +461,69 @@ run_suite() {
     check "install folder not writable: exits non-zero" [ "$status" -ne 0 ]
     check "install folder not writable: says so" out_has "Cannot write to the folder $h/bin"
     check "install folder not writable: no profile written" [ ! -e "$h/.zprofile" ]
+
+    # The login shell's own files cannot be changed: the bash and fish files
+    # are written, but a new zsh would not find ia-cli, so the message is the
+    # line to add, naming the zsh files.
+    h="$work/home $sh zsh-readonly"
+    mkdir -p "$h"
+    : >"$h/.zprofile"
+    : >"$h/.zshrc"
+    chmod 444 "$h/.zprofile" "$h/.zshrc"
+    run_installer "$h" /bin/zsh "$rel1"
+    chmod 644 "$h/.zprofile" "$h/.zshrc"
+    check "login shell not set up: exits 0" [ "$status" -eq 0 ]
+    check "login shell not set up: no 'open a new terminal' promise" \
+        sh -c '! grep -q "Next: Open a new terminal window" "$1"' _ "$work/out"
+    check "login shell not set up: names its files" \
+        out_has "Next: add this line to ~/.zprofile and ~/.zshrc, then open a new terminal window:"
+    check "login shell not set up: gives the line" out_has '    export PATH="$HOME/bin:$PATH"'
+    check "login shell not set up: bash file still written" [ "$(count_lines "$h/.bashrc")" = 1 ]
+
+    # Same with bash as the login shell: zsh's files do not matter.
+    h="$work/home $sh zsh-readonly-bash"
+    mkdir -p "$h"
+    : >"$h/.zprofile"
+    : >"$h/.zshrc"
+    chmod 444 "$h/.zprofile" "$h/.zshrc"
+    run_installer "$h" /bin/bash "$rel1"
+    chmod 644 "$h/.zprofile" "$h/.zshrc"
+    check "other shell not set up: still one instruction" out_has "Next: Open a new terminal window"
+
+    # A folder where a startup file should be: "could not change", with no
+    # wrong reason; with fish as the login shell, the fish line is given.
+    h="$work/home $sh dir-profile"
+    mkdir -p "$h/.zshrc" "$h/.config/fish/conf.d/ia-cli.fish"
+    run_installer "$h" /bin/bash "$rel1"
+    check "folder as .zshrc: listed quietly" out_has "(Could not change: ~/.zshrc, ~/.config/fish/conf.d/ia-cli.fish)"
+    check "folder as .zshrc: no permission claim" sh -c '! grep -qi "permission" "$1"' _ "$work/out"
+    run_installer "$h" /usr/bin/fish "$rel1"
+    check "fish file is a folder, fish login: gives the fish line" out_has '    set -gx PATH "$HOME/bin" $PATH'
+    check "fish file is a folder, fish login: names the file" \
+        out_has "Next: add this line to ~/.config/fish/conf.d/ia-cli.fish, then open a new terminal window:"
+
+    # wget only (no curl), IA_VERSION set, download fails with no HTTP
+    # status: the message names both possible causes.
+    nocurl="$work/nocurl-$sh"
+    mkdir -p "$nocurl"
+    for tool in mktemp rm rmdir mkdir sha256sum shasum perl; do
+        p=$(command -v "$tool" 2>/dev/null || true)
+        if [ -n "$p" ]; then
+            ln -sf "$p" "$nocurl/$tool"
+        fi
+    done
+    printf '#!/bin/sh\nexit 8\n' >"$nocurl/wget"
+    chmod 755 "$nocurl/wget"
+    h="$work/home $sh wget"
+    mkdir -p "$h"
+    status=0
+    env -i HOME="$h" SHELL=/bin/zsh PATH="$nocurl" TMPDIR="$work" IA_VERSION=v9.9.9 \
+        IA_INSTALL_UNAME_S=Linux IA_INSTALL_UNAME_M=x86_64 \
+        "$(command -v "$sh")" "$installer" >"$work/out" 2>&1 || status=$?
+    check "wget, IA_VERSION: exits non-zero" [ "$status" -ne 0 ]
+    check "wget, IA_VERSION: names the internet connection" out_has "Check the internet connection"
+    check "wget, IA_VERSION: names the release" \
+        out_has "v9.9.9 is a release listed at https://github.com/internetarchivecanada/ia/releases"
 
     # ~/bin is a file.
     h="$work/home $sh bin-file"

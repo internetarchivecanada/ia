@@ -49,8 +49,11 @@ jobs:
       # ia-cli. macOS has zsh; fish is installed on Ubuntu only.
       - if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
-      # sh is dash on Ubuntu and bash 3.2 in POSIX mode on macOS.
+      # sh is dash on Ubuntu and bash 3.2 in POSIX mode on macOS. A shell
+      # named in IA_TEST_REQUIRE_SHELLS that is missing fails the tests.
       - run: scripts/test-install.sh
+        env:
+          IA_TEST_REQUIRE_SHELLS: ${{ runner.os == 'Linux' && 'bash zsh fish' || 'bash zsh' }}
 
   live:
     name: Installer smoke test, live release (${{ matrix.os }})
@@ -65,3 +68,5 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
       - run: scripts/test-install-live.sh
+        env:
+          IA_TEST_REQUIRE_SHELLS: ${{ runner.os == 'Linux' && 'bash zsh fish' || 'bash zsh' }}

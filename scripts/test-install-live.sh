@@ -34,6 +34,19 @@ check() { # description, command...
     fi
 }
 
+# have SHELL: true if SHELL is installed. If it is not, and it is named in
+# IA_TEST_REQUIRE_SHELLS (set by CI where it installs them), that is a
+# failure, not a silent skip.
+have() {
+    if command -v "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    case " ${IA_TEST_REQUIRE_SHELLS:-} " in
+        *" $1 "*) check "$1 is required by IA_TEST_REQUIRE_SHELLS but is not installed" false ;;
+    esac
+    return 1
+}
+
 runs() { # binary: --version prints "ia-cli X.Y.Z"
     "$1" --version | grep -q '^ia-cli [0-9]'
 }
@@ -73,13 +86,13 @@ run_case() { # SHELL value, or "unset"
     printf '\n== SHELL=%s: fresh install ==\n' "$name"
     "$@" sh "$installer"
     check "$name fresh: binary runs" runs "$h/bin/ia-cli"
-    if command -v zsh >/dev/null 2>&1; then
+    if have zsh; then
         check "$name fresh: a new login zsh finds ia-cli" finds_ia_cli "$h" zsh -l -c
         check "$name fresh: a new interactive zsh finds ia-cli" finds_ia_cli "$h" zsh -i -c
     fi
     check "$name fresh: a new login bash finds ia-cli" finds_ia_cli "$h" bash -l -c
     check "$name fresh: a new interactive non-login bash finds ia-cli" finds_ia_cli "$h" bash -i -c
-    if command -v fish >/dev/null 2>&1; then
+    if have fish; then
         check "$name fresh: a new login fish finds ia-cli" finds_ia_cli "$h" fish -l -c
     fi
 
