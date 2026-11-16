@@ -391,14 +391,22 @@ fn apply_remove(
         Some(serde_json::Value::String(s)) => {
             let value_str = value.as_str().unwrap_or("");
             // Handle semicolon-delimited subjects
-            if key == "subject" && s.contains(';') {
+            if key == "subject" && s.contains(';') && s.trim() != value_str.trim() {
+                let before = s.split(';').count();
                 let parts: Vec<&str> = s.split(';').filter(|p| p.trim() != value_str).collect();
                 if parts.is_empty() {
                     obj.remove(key);
-                } else {
-                    obj.insert(key.to_string(), serde_json::Value::String(parts.join(";")));
+                } else if parts.len() < before {
+                    // Keep each part's own spacing, but drop the whitespace
+                    // that followed a removed leading separator or preceded
+                    // a removed trailing one.
+                    let joined = parts.join(";");
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::String(joined.trim().to_string()),
+                    );
                 }
-            } else if s == value_str {
+            } else if s == value_str || (key == "subject" && s.trim() == value_str.trim()) {
                 if key == "collection" {
                     return Err(last_collection_error(identifier));
                 }

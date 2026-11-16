@@ -2151,3 +2151,46 @@ fn compound_patch_json_output_shape_for_dry_run() {
     );
     assert!(patch.len() >= 3, "expected 3+ ops, got {}", patch.len());
 }
+
+#[test]
+fn remove_whole_semicolon_subject() {
+    let source = json!({"identifier": "test", "subject": "history; art"});
+    let changes = vec![("subject".to_string(), json!("history; art"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert!(dest.get("subject").is_none());
+}
+
+#[test]
+fn remove_one_semicolon_subject_part() {
+    let source = json!({"identifier": "test", "subject": "history; art"});
+    let changes = vec![("subject".to_string(), json!("history"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert_eq!(dest["subject"], json!("art"));
+}
+
+#[test]
+fn remove_middle_and_last_semicolon_subject_parts_keep_spacing() {
+    let source = json!({"identifier": "test", "subject": "a; b; c"});
+    let changes = vec![("subject".to_string(), json!("b"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert_eq!(dest["subject"], json!("a; c"));
+    let changes = vec![("subject".to_string(), json!("c"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert_eq!(dest["subject"], json!("a; b"));
+}
+
+#[test]
+fn remove_only_semicolon_subject_part_deletes_field() {
+    let source = json!({"identifier": "test", "subject": "a; a"});
+    let changes = vec![("subject".to_string(), json!("a"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert!(dest.get("subject").is_none());
+}
+
+#[test]
+fn remove_semicolon_subject_no_match_is_noop() {
+    let source = json!({"identifier": "test", "subject": "a; b"});
+    let changes = vec![("subject".to_string(), json!("z"))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert_eq!(dest["subject"], json!("a; b"));
+}
