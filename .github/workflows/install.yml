@@ -1,0 +1,61 @@
+name: Install script
+
+# Checks install.sh, the one-line installer for macOS and Linux. Runs when
+# the installer or its tests change, and by hand. The live job downloads
+# the latest release from GitHub; it is an installer smoke test, separate
+# from the hermetic cargo tests in ci.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/test-install.sh
+      - scripts/test-install-live.sh
+      - .github/workflows/install.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/test-install.sh
+      - scripts/test-install-live.sh
+      - .github/workflows/install.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # shellcheck is preinstalled on the Ubuntu runner image.
+      - run: shellcheck --version
+      - run: shellcheck -s sh install.sh scripts/test-install.sh scripts/test-install-live.sh
+
+  offline:
+    name: Installer tests, offline (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # sh is dash on Ubuntu and bash 3.2 in POSIX mode on macOS.
+      - run: scripts/test-install.sh
+
+  live:
+    name: Installer smoke test, live release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: scripts/test-install-live.sh
