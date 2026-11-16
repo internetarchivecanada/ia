@@ -18,9 +18,9 @@ never honoured.
    absent, as elsewhere), anything else `Http`. All six Tasks API calls use it.
 2. `wait_for_task`: a `RateLimited` poll is not an error. It sleeps the
    `Retry-After` when the server gave one, otherwise the current poll interval
-   (which then doubles, as after any poll), and polls again. The timeout check
-   applies to it as to any other poll, so a timeout still bounds a wait that
-   is throttled throughout. There is no separate attempt budget: the wait is a
+   (which then doubles, as after any poll), and polls again. The timeout
+   still bounds the wait: when the `Retry-After` reaches past it, the wait
+   ends with `TaskTimeout` at once, since no poll is allowed before then. There is no separate attempt budget: the wait is a
    poll with its own timeout, not a retry of a failed request.
 3. `ia tasks submit --wait` does the same in its poll loop and shows
    `rate limited, polling again in Ns` on the spinner. (Issue #159's pull
@@ -33,6 +33,6 @@ never honoured.
   the issue, and the same `429` check for `list_tasks`, `get_task_log` and
   `get_rate_limit`.
 - A `wait_for_task` test with a timeout shorter than the `Retry-After`, ending
-  in `TaskTimeout`.
+  in `TaskTimeout` without sleeping out the `Retry-After`.
 - ia-cli: `ia tasks submit --wait` whose first poll gets `429` with
   `Retry-After: 1` completes and exits 0.
