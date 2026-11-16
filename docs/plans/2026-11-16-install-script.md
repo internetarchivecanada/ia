@@ -75,3 +75,31 @@ Environment variables for tests only: `IA_INSTALL_BASE_URL` (download base,
 ## Out of scope
 
 Windows, Homebrew, signing and notarization, Rust changes.
+
+## Follow-up: PATH for every shell, without asking
+
+The first version wrote one profile chosen from `$SHELL` and printed an `sh`
+line for anything else. On Linux that misses most new terminals (desktop
+terminals start non-login shells, which read `~/.bashrc` or `~/.zshrc`), and
+the printed line is wrong for fish. The readers must never be asked about
+their shell or told to edit a file, so the installer now does what
+`pipx ensurepath` (the `userpath` library) does: it ignores `$SHELL` and sets
+PATH for zsh, bash and fish together.
+
+- zsh (when installed or already configured): `~/.zprofile` and `~/.zshrc`,
+  as `userpath` does (`rustup` uses `~/.zshenv`); an exported `ZDOTDIR` is
+  honoured.
+- bash: `~/.bashrc`, and the login file bash reads (`~/.bash_profile`, else
+  `~/.bash_login`, else `~/.profile`).
+- fish (when installed or its config folder exists):
+  `$XDG_CONFIG_HOME/fish/conf.d/ia-cli.fish`, one `if not contains ...; set -gx
+  PATH ...; end` line, which works on old and new fish.
+- Each line is guarded so a file read twice does not add the folder twice, is
+  appended once, and a file that already has a marked line for the folder,
+  including the line the first version wrote, is left alone.
+- The message is the same everywhere: what was installed, then "Open a new
+  terminal window, then type: ia-cli --version", then one quiet line listing
+  the files changed. Only if no file could be written does it give a line to
+  add by hand.
+- Failed downloads report the HTTP status instead of raw `curl` output; an
+  unusable `TMPDIR` falls back to `/tmp`; `~/bin` as a file has its own message.

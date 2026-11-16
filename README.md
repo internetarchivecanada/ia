@@ -82,12 +82,19 @@ What [`install.sh`](install.sh) does:
 
 - Downloads the release binary for this computer (Apple Silicon Mac, Intel Mac, or Linux x86_64) and the release's `SHA256SUMS` from GitHub, and stops without installing anything if the checksum does not match.
 - Installs it as `~/bin/ia-cli`, replacing any earlier copy only after the new one has run.
-- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to `~/.zprofile` (zsh, the macOS default) or to `~/.bash_profile`, `~/.bash_login` or `~/.profile` (bash, whichever it reads). For other shells it prints the line to add instead. Running it again does not add the line twice.
-- Prints what it installed and changed.
+- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to each file a new terminal reads, for zsh, bash and fish alike, whichever you use (as `pipx ensurepath` does):
+  - zsh, when installed: `~/.zprofile` and `~/.zshrc`
+  - bash: `~/.bashrc`, and `~/.bash_profile` if it exists, else `~/.bash_login` if it exists, else `~/.profile`
+  - fish, when installed: `~/.config/fish/conf.d/ia-cli.fish`
+
+  Each line is added once and checks `PATH` first, so a file read twice does not add `~/bin` twice. Existing lines are not changed or reordered.
+
+  An exported `ZDOTDIR` puts the zsh files there instead, and `XDG_CONFIG_HOME` moves the fish folder. A `ZDOTDIR` set in `~/.zshenv` without `export` is not seen by the installer, which then uses `~/.zprofile` and `~/.zshrc`.
+- Prints what it installed and which files it changed. Open a new terminal window afterwards.
 
 It does not use `sudo` and writes nothing outside your home folder. `IA_INSTALL_DIR=/some/folder` installs elsewhere and `IA_VERSION=v0.27.0` installs a specific release, for example `curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | IA_VERSION=v0.27.0 sh`.
 
-To uninstall, delete `~/bin/ia-cli` and the line ending in `# added by the ia-cli installer` from the profile file the installer named.
+To uninstall, delete `~/bin/ia-cli`, each line ending in `# added by the ia-cli installer` from the files listed above (the zsh files are in `$ZDOTDIR` if you set it), and `~/.config/fish/conf.d/ia-cli.fish` (`$XDG_CONFIG_HOME/fish/conf.d/ia-cli.fish` if you set it) if it exists.
 
 On Windows, or to install by hand, download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 
