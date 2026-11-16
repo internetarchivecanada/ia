@@ -1924,8 +1924,7 @@ async fn joblog_records_the_item_name_and_the_comment() {
                 assert_eq!(e["status"], "error", "{e}");
                 assert_eq!(
                     keys_of(e),
-                    ["elapsed_ms", "error", "file", "item", "op", "retries", "status", "ts"]
-                        .map(String::from),
+                    ["error", "file", "item", "op", "retries", "status", "ts"].map(String::from),
                     "no itemname or comment without a lookup: {e}"
                 );
             }
@@ -2014,8 +2013,17 @@ async fn joblog_without_a_comment_records_no_comment_key() {
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(
             keys_of(&entries[0]),
-            ["bytes", "elapsed_ms", "file", "item", "itemname", "op", "status", "ts"]
-                .map(String::from),
+            [
+                "bytes",
+                "elapsed_ms",
+                "file",
+                "item",
+                "itemname",
+                "op",
+                "status",
+                "ts"
+            ]
+            .map(String::from),
             "{extra:?}: {}",
             entries[0]
         );

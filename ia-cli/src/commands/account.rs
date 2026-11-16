@@ -58,9 +58,9 @@ const UNLOCK_OP: &str = "account-unlock";
         same item name) get one lock or unlock request between them. A 429 pauses every \
         worker for the server's Retry-After (at least 1 s; 30 s when absent).\n\n\
         --dry-run prints how each line would be looked up and sends nothing. With --lock or \
-        --unlock, --joblog records each line, and a rerun with the same job log skips the lines \
-        it records as done with the same action (--no-resume runs them all). Read actions \
-        ignore --joblog.",
+        --unlock, --joblog records each line with its status, the item name the lookup found \
+        and the comment sent; a rerun with the same job log skips the lines it records as \
+        done with the same action (--no-resume runs them all). Read actions ignore --joblog.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Print an account as JSON</dim>\
@@ -261,6 +261,9 @@ pub struct AccountResult {
     pub action: Action,
     /// Time from the first request to the result.
     pub elapsed_ms: u64,
+    /// The item name the lookup returned, if it succeeded and returned one;
+    /// set whether or not the action that followed succeeded.
+    pub itemname: Option<String>,
     /// What the action produced, or why it failed. The error is shared
     /// when several lines name one account whose lock or unlock failed.
     pub result: std::result::Result<Done, Arc<IaError>>,
@@ -311,26 +314,36 @@ impl<'a> Batch<'a> {
 pub async fn run_one(batch: &Batch<'_>, input: &str) -> AccountResult {
     let start = Instant::now();
     let lookup = LookupType::detect(input);
-    let result = perform(batch, input, lookup).await;
+    let mut itemname = None;
+    let result = perform(batch, input, lookup, &mut itemname).await;
     AccountResult {
         input: input.to_string(),
         lookup,
         action: batch.action,
         elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        itemname,
         result,
     }
 }
 
+/// Look `input` up and run the batch's action. `itemname` is set to the
+/// item name the lookup returned, before the action, so a failed lock or
+/// unlock still names the account it was sent for.
 async fn perform(
     batch: &Batch<'_>,
     input: &str,
     lookup: LookupType,
+    itemname: &mut Option<String>,
 ) -> std::result::Result<Done, Arc<IaError>> {
     let found = with_rate_limit(&batch.limiter, || {
         account::lookup_by(batch.client, lookup, input)
     })
     .await
     .map_err(|e| Arc::new(name_input(e, input)))?;
+    *itemname = found
+        .itemname()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
     let missing = |field: &str| {
         Arc::new(IaError::AccountApi {
             account: input.to_string(),
@@ -581,9 +594,16 @@ fn done_in_joblog(path: &Path, op: &str) -> std::result::Result<HashSet<String>,
 }
 
 /// The job log entry for one finished line: `ok` with bytes 0 and the
-/// elapsed time, or `error` with the message.
-fn joblog_entry(op: &str, result: &AccountResult) -> JoblogEntry {
-    let entry = JoblogEntry::new(op, &result.input, "");
+/// elapsed time, or `error` with the message. When the lookup returned an
+/// item name, a lock or unlock was sent (or shared) for it: the entry
+/// records that item name, and `comment` when it is not empty, since an
+/// empty comment is not sent.
+fn joblog_entry(op: &str, result: &AccountResult, comment: Option<&str>) -> JoblogEntry {
+    let mut entry = JoblogEntry::new(op, &result.input, "");
+    if let Some(itemname) = &result.itemname {
+        entry.itemname = Some(itemname.clone());
+        entry.comment = comment.filter(|c| !c.is_empty()).map(str::to_string);
+    }
     match &result.result {
         Ok(_) => entry.ok(0, result.elapsed_ms),
         Err(e) => entry.error(&format_error_chain(e.as_ref()), 0),
@@ -826,7 +846,7 @@ pub async fn run(
         // stdout ends the process (SIGPIPE has its default action; see
         // `reset_sigpipe` in lib.rs).
         if let Some((op, writer)) = &writer {
-            writer.write(&joblog_entry(op, &result));
+            writer.write(&joblog_entry(op, &result, comment));
         }
         if result.result.is_ok() {
             succeeded += 1;
