@@ -2031,6 +2031,49 @@ async fn joblog_without_a_comment_records_no_comment_key() {
     }
 }
 
+/// A lookup that returns no item name sends no lock; the error line records
+/// neither `itemname` nor `comment`.
+#[tokio::test]
+async fn joblog_lookup_without_an_item_name_records_neither() {
+    let server = MockServer::start().await;
+    let mut values = account(1);
+    values
+        .as_object_mut()
+        .map(|o| o.remove("itemname"))
+        .unwrap_or_default();
+    mount_found(&server, "example-user-1", values).await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("account.jsonl");
+
+    let output = run_account(
+        cfg.path(),
+        &host,
+        &[
+            "example-user-1",
+            "--lock",
+            "--comment",
+            "example note",
+            "--joblog",
+            path_str(&log),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(requests_with_op(&server, "lock_unlock").await.is_empty());
+    let entries = joblog_entries(&log);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["status"], "error", "{}", entries[0]);
+    assert!(entries[0].get("itemname").is_none(), "{}", entries[0]);
+    assert!(entries[0].get("comment").is_none(), "{}", entries[0]);
+}
+
 /// A job log whose entries carry `itemname` and `comment` resumes like one
 /// without them: the `ok` lines are skipped, the failed one runs again.
 #[tokio::test]

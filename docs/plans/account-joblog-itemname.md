@@ -45,9 +45,10 @@ there; `joblog_entry` copies it, and the batch's comment, onto the entry.
   read the same way. The other readers (`ia status`, the dashboard's log tab
   and job log view) deserialize `JoblogEntry` and ignore fields they do not
   show.
-- `JoblogEntry` is public in `ia-core`, and adding public fields breaks code
-  that builds it with a struct literal. `JoblogEntry::new` is the constructor,
-  and `changes` and `tokens` were added the same way; the release note says so.
+- `JoblogEntry` is public in `ia-core`, so new public fields break code that
+  builds it with a struct literal. `ia-core` is not published
+  (`publish = false`), `JoblogEntry::new` is the constructor, and `changes`
+  and `tokens` were added the same way.
 
 ## Tests
 
