@@ -2194,3 +2194,32 @@ fn remove_semicolon_subject_no_match_is_noop() {
     let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
     assert_eq!(dest["subject"], json!("a; b"));
 }
+
+#[test]
+fn remove_semicolon_subject_with_empty_parts_leaves_no_stray_separator() {
+    for (src, rm, want) in [
+        ("a;", "a", None),
+        (";a", "a", None),
+        ("a;;b", "a", Some("b")),
+        ("a;;b", "b", Some("a")),
+        ("a;b;", "b", Some("a")),
+        ("a;b;", "a", Some("b")),
+        ("a;b", " b ", Some("a")),
+    ] {
+        let source = json!({"identifier": "test", "subject": src});
+        let changes = vec![("subject".to_string(), json!(rm))];
+        let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+        match want {
+            None => assert!(dest.get("subject").is_none(), "{src} minus {rm}"),
+            Some(w) => assert_eq!(dest["subject"], json!(w), "{src} minus {rm}"),
+        }
+    }
+}
+
+#[test]
+fn remove_empty_value_from_semicolon_subject_is_noop() {
+    let source = json!({"identifier": "test", "subject": "a;;b"});
+    let changes = vec![("subject".to_string(), json!(""))];
+    let dest = prepare_metadata(&source, &changes, &MetadataOp::Remove, "test").unwrap();
+    assert_eq!(dest["subject"], json!("a;;b"));
+}
