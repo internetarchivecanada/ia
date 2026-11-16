@@ -760,6 +760,37 @@ async fn test_tasks_submit_wait_errored_task_fails() {
         stderr.contains("task 4242 failed"),
         "stderr should name the failed task, got: {stderr}"
     );
+
+    // With --json the failed entry goes to stdout, and the exit is still 1.
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "an errored task must exit non-zero"
+    );
+    assert!(
+        stdout.contains("\"color\":\"red\""),
+        "stdout should carry the failed catalog entry, got: {stdout}"
+    );
 }
 
 #[tokio::test]
