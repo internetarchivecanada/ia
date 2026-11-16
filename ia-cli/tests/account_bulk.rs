@@ -1841,6 +1841,246 @@ async fn joblog_records_a_positional_lock() {
     assert_eq!(entries[0]["status"], "ok");
 }
 
+/// The keys of a job log entry, sorted.
+fn keys_of(entry: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = entry
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// Each looked-up line records the item name its lock was sent with and the
+/// comment; two lines for one account show the same item name; a line whose
+/// lookup failed records neither.
+#[tokio::test]
+async fn joblog_records_the_item_name_and_the_comment() {
+    let server = MockServer::start().await;
+    mount_found(&server, "example-user-1", account(1)).await;
+    mount_found(&server, "user-1@example.com", account(1)).await;
+    mount_not_found(&server, "nobody@example.org").await;
+    mount_found(&server, "@example-user-3", account(3)).await;
+    mount_lock_for(
+        &server,
+        "@example-user-1",
+        true,
+        Some("example note"),
+        lock_ok(),
+        1,
+    )
+    .await;
+    mount_lock_for(
+        &server,
+        "@example-user-3",
+        true,
+        Some("example note"),
+        lock_ok(),
+        1,
+    )
+    .await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("account.jsonl");
+
+    let output = run_account_stdin(
+        cfg.path(),
+        &host,
+        &[
+            "-j",
+            "1",
+            "--lock",
+            "--comment",
+            "example note",
+            "--joblog",
+            path_str(&log),
+        ],
+        "example-user-1\nuser-1@example.com\nnobody@example.org\n@example-user-3\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let entries = joblog_entries(&log);
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    for e in &entries {
+        assert_eq!(e["op"], "account-lock", "{e}");
+        match e["item"].as_str().unwrap_or_default() {
+            "example-user-1" | "user-1@example.com" => {
+                assert_eq!(e["status"], "ok", "{e}");
+                assert_eq!(e["itemname"], "@example-user-1", "{e}");
+                assert_eq!(e["comment"], "example note", "{e}");
+            }
+            "@example-user-3" => {
+                assert_eq!(e["status"], "ok", "{e}");
+                assert_eq!(e["itemname"], "@example-user-3", "{e}");
+                assert_eq!(e["comment"], "example note", "{e}");
+            }
+            "nobody@example.org" => {
+                assert_eq!(e["status"], "error", "{e}");
+                assert_eq!(
+                    keys_of(e),
+                    ["elapsed_ms", "error", "file", "item", "op", "retries", "status", "ts"]
+                        .map(String::from),
+                    "no itemname or comment without a lookup: {e}"
+                );
+            }
+            other => panic!("unexpected item {other}: {e}"),
+        }
+    }
+}
+
+/// A lock that the server refuses after a successful lookup records the
+/// item name and the comment on each error line, including the line that
+/// shared the request.
+#[tokio::test]
+async fn joblog_records_the_item_name_and_the_comment_of_a_failed_lock() {
+    let server = MockServer::start().await;
+    mount_found(&server, "example-user-1", account(1)).await;
+    mount_found(&server, "@example-user-1", account(1)).await;
+    mount_lock_for(
+        &server,
+        "@example-user-1",
+        false,
+        Some("example note"),
+        ResponseTemplate::new(500).set_body_string("server error"),
+        1,
+    )
+    .await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("account.jsonl");
+
+    let output = run_account_stdin(
+        cfg.path(),
+        &host,
+        &[
+            "-j",
+            "1",
+            "--unlock",
+            "--comment",
+            "example note",
+            "--joblog",
+            path_str(&log),
+        ],
+        "example-user-1\n@example-user-1\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let entries = joblog_entries(&log);
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    for e in &entries {
+        assert_eq!(e["op"], "account-unlock", "{e}");
+        assert_eq!(e["status"], "error", "{e}");
+        assert_eq!(e["itemname"], "@example-user-1", "{e}");
+        assert_eq!(e["comment"], "example note", "{e}");
+    }
+}
+
+/// Without `--comment`, or with an empty one, which is not sent, the entry
+/// has the item name and no `comment` key.
+#[tokio::test]
+async fn joblog_without_a_comment_records_no_comment_key() {
+    for extra in [&[][..], &["--comment", ""][..]] {
+        let server = MockServer::start().await;
+        mount_found(&server, "example-user-1", account(1)).await;
+        mount_lock_for(&server, "@example-user-1", true, None, lock_ok(), 1).await;
+        mount_unexpected(&server).await;
+        let host = host_of(&server);
+        let cfg = config_with_cookies(&host);
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("account.jsonl");
+
+        let mut args = vec!["example-user-1", "--lock", "--joblog", path_str(&log)];
+        args.extend(extra);
+        let output = run_account(cfg.path(), &host, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            stderr_of(&output)
+        );
+        let entries = joblog_entries(&log);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            keys_of(&entries[0]),
+            ["bytes", "elapsed_ms", "file", "item", "itemname", "op", "status", "ts"]
+                .map(String::from),
+            "{extra:?}: {}",
+            entries[0]
+        );
+        assert_eq!(entries[0]["itemname"], "@example-user-1");
+    }
+}
+
+/// A job log whose entries carry `itemname` and `comment` resumes like one
+/// without them: the `ok` lines are skipped, the failed one runs again.
+#[tokio::test]
+async fn joblog_with_item_names_resumes() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("account.jsonl");
+    let seeded = [
+        json!({"ts": "2026-01-01T00:00:00Z", "op": "account-lock", "item": "example-user-1",
+               "file": "", "status": "ok", "bytes": 0, "elapsed_ms": 5,
+               "itemname": "@example-user-1", "comment": "example note"}),
+        json!({"ts": "2026-01-01T00:00:01Z", "op": "account-lock", "item": "user-1@example.com",
+               "file": "", "status": "ok", "bytes": 0, "elapsed_ms": 5,
+               "itemname": "@example-user-1", "comment": "example note"}),
+        json!({"ts": "2026-01-01T00:00:02Z", "op": "account-lock", "item": "@example-user-3",
+               "file": "", "status": "error", "error": "example failure", "retries": 0,
+               "itemname": "@example-user-3", "comment": "example note"}),
+    ]
+    .map(|e| format!("{e}\n"))
+    .concat();
+    fs::write(&log, seeded).unwrap();
+
+    let server = MockServer::start().await;
+    mount_found(&server, "@example-user-3", account(3)).await;
+    mount_lock_for(
+        &server,
+        "@example-user-3",
+        true,
+        Some("example note"),
+        lock_ok(),
+        1,
+    )
+    .await;
+    mount_unexpected(&server).await;
+    let host = host_of(&server);
+    let cfg = config_with_cookies(&host);
+    let output = run_account_stdin(
+        cfg.path(),
+        &host,
+        &[
+            "--lock",
+            "--comment",
+            "example note",
+            "--joblog",
+            path_str(&log),
+        ],
+        "example-user-1\nuser-1@example.com\n@example-user-3\n",
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(has_line(&stderr, &resuming_line(2)), "stderr: {stderr}");
+    assert_eq!(stdout_of(&output), "@example-user-3: locked\n");
+    let entries = joblog_entries(&log);
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert_eq!(entries[3]["item"], "@example-user-3");
+    assert_eq!(entries[3]["status"], "ok");
+    assert_eq!(entries[3]["itemname"], "@example-user-3");
+}
+
 /// An earlier lock entry does not make an unlock run skip the line.
 #[tokio::test]
 async fn joblog_unlock_run_is_not_skipped_by_a_lock_entry() {
