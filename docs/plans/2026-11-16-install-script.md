@@ -75,3 +75,25 @@ Environment variables for tests only: `IA_INSTALL_BASE_URL` (download base,
 ## Out of scope
 
 Windows, Homebrew, signing and notarization, Rust changes.
+
+## Follow-up: PATH for every login shell
+
+The first version wrote one profile per shell and printed `sh` syntax for
+anything else. On Linux that misses most new terminals (desktop terminals
+start non-login shells, which read `~/.bashrc` or `~/.zshrc`), and the printed
+line is wrong for fish, tcsh and Nushell. Following `rustup` and `uv`:
+
+- zsh: `~/.zprofile` and `~/.zshrc`; bash: `~/.bashrc` and the login file bash
+  reads; sh/dash: `~/.profile`; fish: `$XDG_CONFIG_HOME/fish/conf.d/ia-cli.fish`
+  (the folder is created; no other file is touched).
+- Each line is guarded (`case ":$PATH:"` / `contains`) so PATH does not grow
+  when several files are read, and stays one marked line per file. A file that
+  already has a marked line for the folder, including the shorter line the
+  first version wrote, is left alone.
+- tcsh, csh, ksh, Nushell and an unset `SHELL` get the line in their own syntax
+  with the file to put it in; the `sh` line is labelled as such.
+- The closing message says "open a new terminal window" when a file a new
+  terminal reads was set, "log out and log back in" only for `~/.profile`
+  alone, and prints a line for the current window in the shell's syntax.
+- Failed downloads report the HTTP status instead of raw `curl` output; an
+  unusable `TMPDIR` falls back to `/tmp`; `~/bin` as a file has its own message.

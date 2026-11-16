@@ -82,12 +82,18 @@ What [`install.sh`](install.sh) does:
 
 - Downloads the release binary for this computer (Apple Silicon Mac, Intel Mac, or Linux x86_64) and the release's `SHA256SUMS` from GitHub, and stops without installing anything if the checksum does not match.
 - Installs it as `~/bin/ia-cli`, replacing any earlier copy only after the new one has run.
-- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to `~/.zprofile` (zsh, the macOS default) or to `~/.bash_profile`, `~/.bash_login` or `~/.profile` (bash, whichever it reads). For other shells it prints the line to add instead. Running it again does not add the line twice.
-- Prints what it installed and changed.
+- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to each startup file a new terminal may read for your login shell, as the `rustup` and `uv` installers do:
+  - zsh (the macOS default): `~/.zprofile` and `~/.zshrc`
+  - bash: `~/.bashrc` (most Linux terminals), and the first of `~/.bash_profile`, `~/.bash_login` or `~/.profile` (macOS Terminal and ssh logins)
+  - sh: `~/.profile`
+  - fish: `~/.config/fish/conf.d/ia-cli.fish`
+
+  For other shells (tcsh, csh, ksh, Nushell) it prints the line to add, in that shell's syntax, and names the file. Running it again does not add a line twice.
+- Prints what it installed and changed, and a line to paste to use `ia-cli` in the current window.
 
 It does not use `sudo` and writes nothing outside your home folder. `IA_INSTALL_DIR=/some/folder` installs elsewhere and `IA_VERSION=v0.27.0` installs a specific release, for example `curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | IA_VERSION=v0.27.0 sh`.
 
-To uninstall, delete `~/bin/ia-cli` and the line ending in `# added by the ia-cli installer` from the profile file the installer named.
+To uninstall, delete `~/bin/ia-cli` and each line ending in `# added by the ia-cli installer` from the files the installer named (for fish, delete `ia-cli.fish`).
 
 On Windows, or to install by hand, download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 

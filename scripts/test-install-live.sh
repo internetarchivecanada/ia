@@ -17,6 +17,7 @@ set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
 installer="$repo/install.sh"
 work=$(mktemp -d "${TMPDIR:-/tmp}/ia-install-live.XXXXXX")
+work=$(cd "$work" && pwd -P) # no // or symlinks, so shells print the same path
 trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 
@@ -44,7 +45,7 @@ runs() { # binary: --version prints "ia-cli X.Y.Z"
     "$1" --version | grep -q '^ia-cli [0-9]'
 }
 
-one_line() { # profile
+one_line() { # file
     [ "$(grep -c 'added by the ia-cli installer' "$1")" = 1 ]
 }
 
@@ -67,7 +68,9 @@ run_case() { # name SHELL profile-to-create profile-expected
     clean_env "$h" "$shell" sh "$installer"
     check "$name fresh: binary runs" runs "$h/bin/ia-cli"
     check "$name fresh: one line in $4" one_line "$profile"
-    check "$name fresh: the line puts ia-cli on PATH" on_path_after_login "$h" "$profile"
+    if [ "$name" != fish ]; then
+        check "$name fresh: the line puts ia-cli on PATH" on_path_after_login "$h" "$profile"
+    fi
 
     printf '\n== %s: second run, piped to sh ==\n' "$name"
     clean_env "$h" "$shell" sh <"$installer"
@@ -75,9 +78,31 @@ run_case() { # name SHELL profile-to-create profile-expected
     check "$name rerun: still one line in $4" one_line "$profile"
 }
 
+# finds_ia_cli HOME SHELL ARGS...: a new shell started that way, with only
+# HOME and a minimal PATH, finds HOME/bin/ia-cli.
+finds_ia_cli() {
+    fh=$1
+    shell_path=$(command -v "$2")
+    shift 2
+    [ "$(env -i HOME="$fh" PATH=/usr/bin:/bin TERM=dumb "$shell_path" "$@" 'command -v ia-cli' 2>/dev/null </dev/null | tail -n 1)" = "$fh/bin/ia-cli" ]
+}
+
 run_case zsh /bin/zsh "" .zprofile
+check "zsh: one line in .zshrc" one_line "$h/.zshrc"
 run_case bash-profile /bin/bash "" .profile
+check "bash: one line in .bashrc" one_line "$h/.bashrc"
+if command -v bash >/dev/null 2>&1; then
+    check "bash: a new interactive non-login bash finds ia-cli" finds_ia_cli "$h" bash -i -c
+fi
 run_case bash-bash_profile /bin/bash .bash_profile .bash_profile
+
+if command -v fish >/dev/null 2>&1; then
+    run_case fish /usr/bin/fish "" .config/fish/conf.d/ia-cli.fish
+    check "fish: a new login fish finds ia-cli" finds_ia_cli "$h" fish -l -c
+    check "fish: a new non-login fish finds ia-cli" finds_ia_cli "$h" fish -c
+else
+    printf '\n(fish is not installed; fish case skipped)\n'
+fi
 
 printf '\n== pinned release: IA_VERSION=v0.27.0 ==\n'
 h="$work/home pinned"
