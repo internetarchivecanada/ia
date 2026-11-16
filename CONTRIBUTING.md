@@ -109,7 +109,7 @@ Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
 This bumps the workspace version, commits, tags, and pushes. The GitHub Actions
 release workflow then builds binaries and creates the GitHub Release.
 
-The release workflow builds the three binaries and runs the checks and the
+The release workflow builds the four binaries and runs the checks and the
 tests on ubuntu, macOS and Windows at the same time; the release is published
 only when all of them pass. Builds and tests restore the dependency caches
 that every push to main keeps warm (the `Release build` and `Release platform
