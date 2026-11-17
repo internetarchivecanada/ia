@@ -749,15 +749,27 @@ async fn run_submit(
                 task_id,
                 Duration::from_secs(args.wait_interval),
                 None,
-                |entry| {
-                    if let Some(ref sp) = spinner {
-                        let state = match entry.color.as_str() {
-                            "green" => "queued",
-                            "blue" => "running",
-                            "brown" => "paused",
-                            other => other,
-                        };
-                        sp.set_message(format!("Task {task_id} — {state}"));
+                |progress| {
+                    let Some(ref sp) = spinner else {
+                        return;
+                    };
+                    match progress {
+                        tasks::TaskWaitProgress::Active(entry) => {
+                            let state = match entry.color.as_str() {
+                                "green" => "queued",
+                                "blue" => "running",
+                                "brown" => "paused",
+                                other => other,
+                            };
+                            sp.set_message(format!("Task {task_id} — {state}"));
+                        }
+                        tasks::TaskWaitProgress::RateLimited { wait, .. } => {
+                            sp.set_message(format!(
+                                "Task {task_id} — rate limited, polling again in {}s",
+                                wait.as_secs()
+                            ));
+                        }
+                        _ => {}
                     }
                 },
             )

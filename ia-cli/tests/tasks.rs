@@ -793,6 +793,84 @@ async fn test_tasks_submit_wait_errored_task_fails() {
     );
 }
 
+/// A 429 on a poll after the task was queued is rate limiting, not a
+/// failure: the wait honours Retry-After and goes on (issue #160).
+#[tokio::test]
+async fn test_tasks_submit_wait_survives_429_on_poll() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "task_id": 4343, "log": "https://catalogd.archive.org/log/4343" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4343"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4343"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": {
+                "summary": {"queued": 0, "running": 0, "error": 0, "paused": 0},
+                "catalog": []
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let start = std::time::Instant::now();
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a 429 on the poll ended the wait, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Retry-After: 2 against a 1 s poll interval: the second poll comes
+    // no sooner than 2 s after the first, so the wait was the header's.
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(2),
+        "the poll after the 429 came before its Retry-After: {:?}",
+        start.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"status\":\"completed\""),
+        "should show completed status, got: {stdout}"
+    );
+}
+
 #[tokio::test]
 async fn test_tasks_rerun_stdin_raw_ids() {
     let mock_server = MockServer::start().await;

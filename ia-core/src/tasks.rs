@@ -221,20 +221,35 @@ fn build_tasks_request(
     Ok(req)
 }
 
+/// The error for a Tasks API response that did not succeed.
+///
+/// A `429` is [`IaError::RateLimited`] with the response's `Retry-After`
+/// (0 when it has none): the transport leaves every `429` to the caller, and
+/// a polling caller waits it out. Anything else is [`IaError::Http`].
+async fn response_error(resp: reqwest::Response) -> IaError {
+    let retry_after = crate::retry::extract_retry_after(resp.headers());
+    if resp.status().as_u16() == 429 {
+        return IaError::RateLimited {
+            retry_after: retry_after.unwrap_or(0),
+        };
+    }
+    IaError::Http {
+        status: resp.status().as_u16(),
+        message: resp.text().await.unwrap_or_default(),
+        retry_after,
+    }
+}
+
 /// Fetch tasks from the archive.org Tasks API (read-only).
 pub async fn get_tasks(client: &IaClient, query: &TasksQuery) -> Result<TasksValue> {
     let req = build_tasks_request(client, query)?;
     let resp = req.send().await?;
 
     let status = resp.status();
-    let retry_after = crate::retry::extract_retry_after(resp.headers());
     if !status.is_success() {
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
+    let retry_after = crate::retry::extract_retry_after(resp.headers());
 
     let body = resp.text().await.map_err(reqwest_middleware::Error::from)?;
     let parsed: TasksResponse = serde_json::from_str(&body)?;
@@ -289,12 +304,7 @@ pub async fn list_tasks(
 
     let status = resp.status();
     if !status.is_success() {
-        let retry_after = crate::retry::extract_retry_after(resp.headers());
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
 
     let mut stream = resp.bytes_stream();
@@ -395,17 +405,8 @@ pub async fn submit_task(
 
     let resp = req.send().await?;
     let status = resp.status();
-    if status.as_u16() == 429 {
-        let retry_after = crate::retry::extract_retry_after(resp.headers()).unwrap_or(0);
-        return Err(IaError::RateLimited { retry_after });
-    }
     if !status.is_success() {
-        let retry_after = crate::retry::extract_retry_after(resp.headers());
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
 
     let body_text = resp.text().await.map_err(reqwest_middleware::Error::from)?;
@@ -453,17 +454,8 @@ pub async fn rerun_task(client: &IaClient, task_id: u64) -> Result<String> {
         .await?;
 
     let status = resp.status();
-    if status.as_u16() == 429 {
-        let retry_after = crate::retry::extract_retry_after(resp.headers()).unwrap_or(0);
-        return Err(IaError::RateLimited { retry_after });
-    }
     if !status.is_success() {
-        let retry_after = crate::retry::extract_retry_after(resp.headers());
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
 
     let body_text = resp.text().await.map_err(reqwest_middleware::Error::from)?;
@@ -524,12 +516,7 @@ pub async fn get_task_log(client: &IaClient, task_id: u64) -> Result<String> {
         return Err(IaError::TaskNotFound { task_id });
     }
     if !status.is_success() {
-        let retry_after = crate::retry::extract_retry_after(resp.headers());
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
 
     let text = resp.text().await.map_err(reqwest_middleware::Error::from)?;
@@ -555,12 +542,7 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
 
     let status = resp.status();
     if !status.is_success() {
-        let retry_after = crate::retry::extract_retry_after(resp.headers());
-        return Err(IaError::Http {
-            status: status.as_u16(),
-            message: resp.text().await.unwrap_or_default(),
-            retry_after,
-        });
+        return Err(response_error(resp).await);
     }
 
     let body = resp.text().await.map_err(reqwest_middleware::Error::from)?;
@@ -602,9 +584,16 @@ pub async fn get_rate_limit(client: &IaClient, cmd: &str) -> Result<RateLimitInf
 /// or cleared, so waiting for it to leave would never end. The entry lets the
 /// caller report the failure.
 ///
+/// A poll answered with `429` is not an error: the wait sleeps the
+/// response's `Retry-After` (or the current poll interval when it has none)
+/// and polls again.
+///
 /// If `timeout` is `Some`, returns [`IaError::TaskTimeout`] when the
-/// duration elapses before the task finishes. Pass `None` to poll
-/// indefinitely (caller can still cancel via Ctrl+C).
+/// duration elapses before the task finishes, or at once when a `429`'s
+/// `Retry-After` reaches past it (a `429` without one waits at most the time
+/// left). Pass `None` to poll indefinitely (caller
+/// can still cancel via Ctrl+C); without a timeout, a server that keeps
+/// answering `429` keeps the wait going.
 pub async fn wait_for_task(
     client: &IaClient,
     task_id: u64,
@@ -614,8 +603,23 @@ pub async fn wait_for_task(
     wait_for_task_with_progress(client, task_id, initial_interval, timeout, |_| {}).await
 }
 
-/// [`wait_for_task`], calling `on_poll` with the task's catalog entry after
-/// each poll that finds it still active (queued, running or paused).
+/// What [`wait_for_task_with_progress`] reports after each poll that does
+/// not end the wait.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum TaskWaitProgress<'a> {
+    /// The task is still active (queued, running or paused); its catalog
+    /// entry.
+    Active(&'a TaskEntry),
+    /// The poll was answered with `429`; the wait sleeps `wait` before the
+    /// next poll.
+    #[non_exhaustive]
+    RateLimited { wait: Duration },
+}
+
+/// [`wait_for_task`], calling `on_poll` after each poll that does not end
+/// the wait: with the task's catalog entry while it is still active, or with
+/// the time it will sleep after a `429`.
 ///
 /// Lets a caller show the task's current state while it waits.
 pub async fn wait_for_task_with_progress(
@@ -623,7 +627,7 @@ pub async fn wait_for_task_with_progress(
     task_id: u64,
     initial_interval: Duration,
     timeout: Option<Duration>,
-    mut on_poll: impl FnMut(&TaskEntry),
+    mut on_poll: impl FnMut(TaskWaitProgress<'_>),
 ) -> Result<Option<TaskEntry>> {
     let max_interval = Duration::from_secs(60);
     let mut interval = initial_interval;
@@ -636,14 +640,48 @@ pub async fn wait_for_task_with_progress(
             ..Default::default()
         };
 
-        let value = get_tasks(client, &query).await?;
+        let value = match get_tasks(client, &query).await {
+            Ok(value) => value,
+            Err(IaError::RateLimited { retry_after }) => {
+                // Throttled: no answer about the task. Wait what the server
+                // asks, or the poll interval when it does not say, and poll
+                // again. A Retry-After past the timeout ends the wait now,
+                // since no poll is allowed before the deadline; the interval
+                // is only ours, so it is cut to the time left.
+                let elapsed = start.elapsed();
+                let left = timeout.map(|limit| limit.saturating_sub(elapsed));
+                let wait = if retry_after > 0 {
+                    Duration::from_secs(retry_after)
+                } else {
+                    left.map_or(interval, |left| interval.min(left))
+                };
+                if left.is_some_and(|left| left.is_zero() || wait > left) {
+                    return Err(IaError::TaskTimeout {
+                        task_id,
+                        elapsed: elapsed.as_secs(),
+                    });
+                }
+                tracing::debug!(
+                    "task {} poll rate limited, polling again in {}s",
+                    task_id,
+                    wait.as_secs()
+                );
+                on_poll(TaskWaitProgress::RateLimited { wait });
+                tokio::time::sleep(wait).await;
+                if retry_after == 0 {
+                    interval = interval.saturating_mul(2).min(max_interval);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let Some(entry) = value.catalog.into_iter().find(|e| e.task_id == task_id) else {
             return Ok(None);
         };
         if entry.color == "red" {
             return Ok(Some(entry));
         }
-        on_poll(&entry);
+        on_poll(TaskWaitProgress::Active(&entry));
 
         // Check timeout before sleeping
         if let Some(limit) = timeout {
@@ -664,7 +702,7 @@ pub async fn wait_for_task_with_progress(
         );
 
         tokio::time::sleep(interval).await;
-        interval = (interval * 2).min(max_interval);
+        interval = interval.saturating_mul(2).min(max_interval);
     }
 }
 
@@ -1754,6 +1792,242 @@ mod tests {
                 "wait_for_task kept polling an errored task until the timeout ({polls} polls): {other:?}"
             ),
         }
+    }
+
+    // -- 429 on the Tasks API reads (issue #160) --
+
+    fn empty_catalog() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "value": {
+                "summary": {"queued": 0, "running": 0, "error": 0, "paused": 0},
+                "catalog": []
+            }
+        }))
+    }
+
+    fn throttled(retry_after: &str) -> ResponseTemplate {
+        ResponseTemplate::new(429).insert_header("Retry-After", retry_after)
+    }
+
+    #[tokio::test]
+    async fn get_tasks_429_is_rate_limited() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .respond_with(throttled("7"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = get_tasks(&client, &TasksQuery::default()).await;
+        assert!(
+            matches!(result, Err(IaError::RateLimited { retry_after: 7 })),
+            "get_tasks: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_task_reads_429_is_rate_limited() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .respond_with(throttled("7"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let list = list_tasks(&client, &TasksQuery::default())
+            .await
+            .map(|_| ());
+        let log = get_task_log(&client, 42).await.map(|_| ());
+        let limit = get_rate_limit(&client, "derive.php").await.map(|_| ());
+        for (name, result) in [
+            ("list_tasks", list),
+            ("get_task_log", log),
+            ("get_rate_limit", limit),
+        ] {
+            assert!(
+                matches!(result, Err(IaError::RateLimited { retry_after: 7 })),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
+    /// One throttled poll must not end the wait: it waits out the
+    /// `Retry-After` and polls again.
+    #[tokio::test]
+    async fn wait_for_task_survives_429_on_poll() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(throttled("1"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(empty_catalog())
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let start = Instant::now();
+        let result = wait_for_task(&client, 42, Duration::from_millis(100), None).await;
+        assert!(
+            matches!(result, Ok(None)),
+            "a 429 on the poll ended wait_for_task: {result:?}"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_secs(1),
+            "the poll after the 429 came before its Retry-After: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A `Retry-After` that reaches past the timeout ends the wait at once:
+    /// no poll is allowed before the deadline.
+    #[tokio::test]
+    async fn wait_for_task_429_past_timeout_times_out() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(throttled("30"))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let start = Instant::now();
+        let result = wait_for_task(
+            &client,
+            42,
+            Duration::from_millis(100),
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IaError::TaskTimeout { task_id: 42, .. })),
+            "expected TaskTimeout, got: {result:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the wait slept out a Retry-After past its timeout: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A `Retry-After` of `u64::MAX` seconds reaches past any timeout and
+    /// ends the wait without panicking. The first poll finds the task
+    /// running, so the `429` comes over a second in: a check that added the
+    /// header's seconds to the elapsed time would overflow there.
+    #[tokio::test]
+    async fn wait_for_task_429_huge_retry_after_times_out() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "value": {
+                    "summary": {"queued": 0, "running": 1, "error": 0, "paused": 0},
+                    "catalog": [{"task_id": 42, "identifier": "my-item", "cmd": "derive.php", "color": "blue"}]
+                }
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(throttled(&u64::MAX.to_string()))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let result = wait_for_task(
+            &client,
+            42,
+            Duration::from_millis(1100),
+            Some(Duration::from_secs(10)),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IaError::TaskTimeout { task_id: 42, .. })),
+            "expected TaskTimeout, got: {result:?}"
+        );
+    }
+
+    /// A `429` without `Retry-After` waits the poll interval, reports the
+    /// wait to the progress callback, and polls again.
+    #[tokio::test]
+    async fn wait_for_task_429_without_retry_after_waits_interval() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(empty_catalog())
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let mut waits = Vec::new();
+        let result = wait_for_task_with_progress(
+            &client,
+            42,
+            Duration::from_millis(200),
+            None,
+            |progress| {
+                if let TaskWaitProgress::RateLimited { wait } = progress {
+                    waits.push(wait);
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Ok(None)), "got: {result:?}");
+        assert_eq!(waits, vec![Duration::from_millis(200)]);
+    }
+
+    /// A `429` without `Retry-After` does not end the wait before its
+    /// timeout: the interval sleep is cut to the time left, then the wait
+    /// times out.
+    #[tokio::test]
+    async fn wait_for_task_429_without_retry_after_runs_to_timeout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/services/tasks.php"))
+            .and(query_param("task_id", "42"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&mock_server)
+            .await;
+
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let start = Instant::now();
+        let result = wait_for_task(
+            &client,
+            42,
+            Duration::from_millis(200),
+            Some(Duration::from_millis(300)),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(IaError::TaskTimeout { task_id: 42, .. })),
+            "expected TaskTimeout, got: {result:?}"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "a 429 without Retry-After ended the wait before its timeout: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
