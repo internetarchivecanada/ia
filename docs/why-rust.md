@@ -24,7 +24,7 @@ Beyond connection handling:
 
 The Python CLI requires a working Python environment. Version conflicts, broken pip installs, and virtualenv confusion are real support burdens — especially for non-developer users like archivists and librarians.
 
-The Rust version compiles to a single static binary for Linux (x86_64), macOS (Apple Silicon), and Windows (x86_64). Download, make executable, run. No package manager required.
+The Rust version compiles to a single static binary for Linux (x86_64), macOS (Apple Silicon and Intel), and Windows (x86_64). Download, make executable, run. No package manager required.
 
 ## Agent and machine native
 
