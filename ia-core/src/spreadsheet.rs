@@ -301,6 +301,10 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 problems.push(format!("line {line_no}: no identifier"));
                 continue;
             }
+            [Json::BadString] => {
+                problems.push(format!("line {line_no}: identifier {BAD_STRING}"));
+                continue;
+            }
             [other] => {
                 problems.push(format!(
                     "line {line_no}: identifier must be a string (got {})",
@@ -348,6 +352,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
             let indexed = key.contains('[');
             match value {
                 Json::Null => {}
+                Json::BadString => problems.push(format!("line {line_no}: {key} {BAD_STRING}")),
                 Json::String(v) | Json::Scalar(v) => put(key, v, &mut problems),
                 Json::Strings(items) if !indexed => {
                     for (i, item) in items.iter().enumerate() {
@@ -378,6 +383,9 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
     }
 }
 
+/// The problem text for [`Json::BadString`], after the key.
+const BAD_STRING: &str = "is not a valid string (it holds an unpaired \\u surrogate escape)";
+
 /// A JSONL value, classified from its raw text. The line has already
 /// parsed, so the text is valid JSON and its first character names its
 /// kind. Only strings are parsed again: a number keeps the text it was
@@ -392,6 +400,10 @@ enum Json {
     Strings(Vec<String>),
     /// An array holding anything but strings.
     OtherArray,
+    /// A string, or an array element, that is valid JSON but not valid
+    /// text: an unpaired surrogate escape such as `\ud800`. serde_json
+    /// accepts one when it skips a raw value and refuses it in a `String`.
+    BadString,
     Object,
 }
 
@@ -401,22 +413,22 @@ impl Json {
         let text = raw.get().trim();
         match text.as_bytes().first() {
             Some(b'n') => Json::Null,
-            // A string always parses here; the fallback is never reached.
-            Some(b'"') => serde_json::from_str(text).map_or(Json::Null, Json::String),
+            Some(b'"') => serde_json::from_str(text).map_or(Json::BadString, Json::String),
             Some(b'{') => Json::Object,
             Some(b'[') => match serde_json::from_str::<Vec<&RawValue>>(text) {
-                Ok(items) => items
-                    .iter()
-                    .map(|item| {
-                        let item = item.get().trim();
-                        if item.starts_with('"') {
-                            serde_json::from_str::<String>(item).ok()
-                        } else {
-                            None
+                Ok(items) => {
+                    let mut strings = Vec::with_capacity(items.len());
+                    for item in items {
+                        if !item.get().trim_start().starts_with('"') {
+                            return Json::OtherArray;
                         }
-                    })
-                    .collect::<Option<Vec<String>>>()
-                    .map_or(Json::OtherArray, Json::Strings),
+                        match Json::of(item) {
+                            Json::String(s) => strings.push(s),
+                            _ => return Json::BadString,
+                        }
+                    }
+                    Json::Strings(strings)
+                }
                 Err(_) => Json::OtherArray,
             },
             _ => Json::Scalar(text.to_string()),
@@ -433,6 +445,7 @@ impl Json {
             Json::Strings(_) => "an array of strings",
             Json::OtherArray => "an array that holds more than strings",
             Json::Object => "an object",
+            Json::BadString => "a string that is not valid",
         }
     }
 }
@@ -1221,6 +1234,24 @@ mod tests {
         ] {
             assert!(msg.contains(want), "missing {want:?} in: {msg}");
         }
+    }
+
+    #[test]
+    fn jsonl_unpaired_surrogate_escape_is_refused() {
+        let msg = refusal(
+            "a.jsonl",
+            "{\"identifier\":\"a\",\"title\":\"\\ud800\"}\n\
+             {\"identifier\":\"b\",\"subject\":[\"x\",\"\\ud800\"]}\n\
+             {\"identifier\":\"\\ud800\"}\n",
+        );
+        for want in [
+            "line 1: title is not a valid string",
+            "line 2: subject is not a valid string",
+            "line 3: identifier is not a valid string",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in: {msg}");
+        }
+        assert!(!msg.contains("no identifier"), "{msg}");
     }
 
     #[test]
