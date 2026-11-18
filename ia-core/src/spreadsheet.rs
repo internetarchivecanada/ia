@@ -125,7 +125,7 @@ fn check_headers(headers: &[String], scope: Scope) -> Result<()> {
     let problems: Vec<String> = repeated
         .into_iter()
         .map(|h| {
-            if h == "identifier" || scope == Scope::AllFieldsKeepCase {
+            if h == "identifier" || h.contains('[') || scope == Scope::AllFieldsKeepCase {
                 format!("header '{h}' is given more than once")
             } else {
                 format!(
@@ -285,25 +285,19 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 continue;
             }
         };
-        // The line parsed, so a value that does not parse again is a number
-        // too large for f64 (`1e400`); it is a number, sent as written.
-        let object: Vec<(&String, &str, Value)> = raw
+        let object: Vec<(&String, Json)> = raw
             .iter()
-            .map(|(key, text)| {
-                let value = serde_json::from_str::<Value>(text.get())
-                    .unwrap_or_else(|_| Value::Number(0.into()));
-                (key, text.get().trim(), value)
-            })
+            .map(|(key, text)| (key, Json::of(text)))
             .collect();
 
-        let id_values: Vec<&Value> = object
+        let id_values: Vec<&Json> = object
             .iter()
-            .filter(|(k, _, _)| k.eq_ignore_ascii_case("identifier"))
-            .map(|(_, _, v)| v)
+            .filter(|(k, _)| k.eq_ignore_ascii_case("identifier"))
+            .map(|(_, v)| v)
             .collect();
         let identifier = match id_values.as_slice() {
-            [Value::String(id)] if !id.trim().is_empty() => id.trim().to_string(),
-            [] | [Value::Null] | [Value::String(_)] => {
+            [Json::String(id)] if !id.trim().is_empty() => id.trim().to_string(),
+            [] | [Json::Null] | [Json::String(_)] => {
                 problems.push(format!("line {line_no}: no identifier"));
                 continue;
             }
@@ -311,8 +305,8 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 problems.push(format!(
                     "line {line_no}: identifier must be a string (got {})",
                     match other {
-                        Value::Array(_) => "an array",
-                        other => json_kind(other),
+                        Json::Strings(_) | Json::OtherArray => "an array",
+                        other => other.kind(),
                     }
                 ));
                 continue;
@@ -340,7 +334,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 problems.push(format!("line {line_no}: {key} is given more than once"));
             }
         };
-        for (key, text, value) in &object {
+        for (key, value) in &object {
             let key = scope.name(key);
             if key == "identifier" {
                 continue;
@@ -353,14 +347,11 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
             }
             let indexed = key.contains('[');
             match value {
-                Value::Null => {}
-                Value::String(v) => put(key, v, &mut problems),
-                Value::Number(_) | Value::Bool(_) => put(key, text, &mut problems),
-                Value::Array(items) if !indexed && items.iter().all(Value::is_string) => {
+                Json::Null => {}
+                Json::String(v) | Json::Scalar(v) => put(key, v, &mut problems),
+                Json::Strings(items) if !indexed => {
                     for (i, item) in items.iter().enumerate() {
-                        if let Value::String(v) = item {
-                            put(format!("{key}[{i}]"), v, &mut problems);
-                        }
+                        put(format!("{key}[{i}]"), item, &mut problems);
                     }
                 }
                 other => problems.push(format!(
@@ -371,8 +362,8 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                         "a string, a number, a boolean, an array of strings, or null"
                     },
                     match other {
-                        Value::Array(_) if indexed => "an array",
-                        other => json_kind(other),
+                        Json::Strings(_) | Json::OtherArray if indexed => "an array",
+                        other => other.kind(),
                     }
                 )),
             }
@@ -387,15 +378,62 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
     }
 }
 
-/// A JSON value's kind, for an error message.
-fn json_kind(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array that holds more than strings",
-        serde_json::Value::Object(_) => "an object",
+/// A JSONL value, classified from its raw text. The line has already
+/// parsed, so the text is valid JSON and its first character names its
+/// kind. Only strings are parsed again: a number keeps the text it was
+/// written with (`1.50`, `1e3`, `1e400`), and an object or an array holding
+/// anything but strings is refused without being parsed, however deep.
+enum Json {
+    Null,
+    String(String),
+    /// A number or boolean, as written.
+    Scalar(String),
+    /// An array of strings (an empty array included).
+    Strings(Vec<String>),
+    /// An array holding anything but strings.
+    OtherArray,
+    Object,
+}
+
+impl Json {
+    fn of(raw: &serde_json::value::RawValue) -> Json {
+        use serde_json::value::RawValue;
+        let text = raw.get().trim();
+        match text.as_bytes().first() {
+            Some(b'n') => Json::Null,
+            // A string always parses here; the fallback is never reached.
+            Some(b'"') => serde_json::from_str(text).map_or(Json::Null, Json::String),
+            Some(b'{') => Json::Object,
+            Some(b'[') => match serde_json::from_str::<Vec<&RawValue>>(text) {
+                Ok(items) => items
+                    .iter()
+                    .map(|item| {
+                        let item = item.get().trim();
+                        if item.starts_with('"') {
+                            serde_json::from_str::<String>(item).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Option<Vec<String>>>()
+                    .map_or(Json::OtherArray, Json::Strings),
+                Err(_) => Json::OtherArray,
+            },
+            _ => Json::Scalar(text.to_string()),
+        }
+    }
+
+    /// The value's kind, for an error message.
+    fn kind(&self) -> &'static str {
+        match self {
+            Json::Null => "null",
+            Json::String(_) => "a string",
+            Json::Scalar(t) if t == "true" || t == "false" => "a boolean",
+            Json::Scalar(_) => "a number",
+            Json::Strings(_) => "an array of strings",
+            Json::OtherArray => "an array that holds more than strings",
+            Json::Object => "an object",
+        }
     }
 }
 
@@ -1161,6 +1199,47 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("no identifier"), "{msg}");
+    }
+
+    #[test]
+    fn jsonl_containers_holding_an_out_of_range_number_are_refused() {
+        let deep = format!("{}\"x\"{}", "[".repeat(200), "]".repeat(200));
+        let msg = refusal(
+            "a.jsonl",
+            &format!(
+                "{{\"identifier\":\"a\",\"subject\":[\"x\",1e400]}}\n\
+                 {{\"identifier\":\"b\",\"extra\":{{\"k\":1e400}}}}\n\
+                 {{\"identifier\":\"c\",\"deep\":{deep}}}\n"
+            ),
+        );
+        for want in [
+            "line 1: subject must be",
+            "(got an array that holds more than strings)",
+            "line 2: extra must be",
+            "(got an object)",
+            "line 3: deep must be",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn jsonl_array_of_numbers_is_refused() {
+        let msg = refusal("a.jsonl", r#"{"identifier":"a","subject":[1,2]}"#);
+        assert!(
+            msg.contains("line 1: subject must be a string, a number, a boolean, an array of strings, or null (got an array that holds more than strings)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn csv_repeated_indexed_header_gives_no_index_hint() {
+        let msg = refusal("a.csv", "identifier,subject[0],subject[0]\na,x,y\n");
+        assert!(
+            msg.contains("header 'subject[0]' is given more than once"),
+            "{msg}"
+        );
+        assert!(!msg.contains("subject[0][0]"), "{msg}");
     }
 
     #[test]

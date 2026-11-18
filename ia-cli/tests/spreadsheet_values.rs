@@ -313,3 +313,43 @@ async fn export_resumed_twice_keeps_rows_and_key_case() {
         "rows"
     );
 }
+
+/// A JSONL `"priority": -5` reaches the task submission as -5.
+#[tokio::test]
+async fn tasks_submit_sends_a_jsonl_number_priority() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .and(body_partial_json(
+            serde_json::json!({"identifier": "item-a", "priority": -5}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "value": {"task_id": 1234, "log": "https://catalogd.archive.org/log/1234"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let host = server.uri().replace("http://", "");
+
+    let dir = TempDir::new().unwrap();
+    let sheet = dir.path().join("jobs.jsonl");
+    fs::write(
+        &sheet,
+        "{\"identifier\":\"item-a\",\"cmd\":\"derive.php\",\"priority\":-5}\n",
+    )
+    .unwrap();
+    let (ok, stderr) = run(&[
+        "--insecure",
+        "-H",
+        &host,
+        "tasks",
+        "submit",
+        "--spreadsheet",
+        sheet.to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+}
