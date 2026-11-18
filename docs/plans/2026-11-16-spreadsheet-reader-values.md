@@ -13,14 +13,16 @@ decided behaviour, implemented once in the reader so every command gets it.
 
 The rules of `ia collection create --spreadsheet` (#147,
 `ia_core::collection::read_jsonl_rows`) become the rules of the shared reader,
-so one JSONL file means the same thing to every command:
+except for numbers and booleans, so one JSONL file means the same thing to
+`ia upload`, `ia metadata`, `ia tasks submit` and `ia verify`:
 
 | Value | Result |
 |-------|--------|
 | string | the value, trimmed (as the CSV reader trims every cell); blank is no value |
 | `null` | no value, so a `-m` default for the field still applies |
+| number, boolean | the value as written in the file (`1.50`, `1e3`, `true`) |
 | array of strings | one value per element, as indexed columns `key[0]`, `key[1]`, … |
-| number, boolean, object, array holding anything but strings | refused |
+| object, array holding anything but strings | refused |
 
 An array gives indexed keys because that is how every consumer already
 receives several values for one field from a CSV (`subject[0]`,
@@ -29,11 +31,15 @@ merges them with `merge_indexed_columns`. An array under a key that is
 already indexed (`"subject[0]": ["a"]`) is refused, since it has no position
 to expand into.
 
-Numbers and booleans are refused rather than converted: their JSON text is
-not what the user typed (`1.50` reads as `1.5`, `1e3` as `1000.0`), and the
-fix, quoting the value, is one the error can name. This matches
-`ia collection create`. The Python client has no JSONL spreadsheet input, so
-there is nothing there to match.
+Numbers and booleans are sent as text, since files that use them work
+today and must keep working. Earlier versions sent serde_json's rendering
+(`1.50` as `1.5`); the reader now keeps each value's raw JSON text
+(serde_json's `raw_value` feature), so the value sent is the one written in
+the file. Arrays still take strings only: an array was never split into
+values before this change, so no file relies on numbers inside one. A
+numeric `identifier` was skipped before and is refused now.
+`ia collection create` keeps refusing numbers and booleans. The Python
+client has no JSONL spreadsheet input, so there is nothing there to match.
 
 ### 2. The `identifier` key is case-insensitive
 
@@ -116,8 +122,9 @@ item again in the case IA returns.
 `ia-core/src/spreadsheet.rs` unit tests, written first and failing:
 
 - JSONL: `null` is no value; an array of strings gives `key[0]`, `key[1]`;
-  a number, a boolean, an object and a mixed array are each refused, all in
-  one error with line numbers; an array under an indexed key is refused;
+  numbers and booleans are kept as written (`1.50`, `1e3`, `-5`, a 30-digit
+  number, `true`), indexed keys included; an object and a mixed array are
+  each refused, all in one error with line numbers; an array under an indexed key is refused;
   `Identifier` is read as the identifier; a numeric, blank or missing
   identifier is refused; a key given twice in different case is refused;
   string values are trimmed; a line that is not an object is reported with
@@ -128,7 +135,8 @@ item again in the case IA returns.
   identifiers, and reads `Identifier`.
 
 `ia-cli/tests/spreadsheet_values.rs`: for each of `ia upload`,
-`ia metadata`, `ia tasks submit` and `ia verify`, a JSONL file with a number
-value and a CSV with a repeated header both fail with the reader's message,
+`ia metadata`, `ia tasks submit` and `ia verify`, a JSONL file with number and
+boolean values passes the reader and a CSV with a repeated header fails with
+the reader's message; `ia upload --dry-run` shows `1.50` and `1e3` as written,
 with the host pointed at a closed local port so no request can leave the
 machine.

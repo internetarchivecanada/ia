@@ -667,16 +667,17 @@ Required columns: `identifier`, `file`. Header names in CSV, TSV, XLSX and ODS f
 
 A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each value is sent as its own header, in ascending numeric index (`subject[2]` before `subject[10]`), whatever the column order. A row follows the rule `ia metadata` applies to `-m`: a bare `subject` column is the field's list, and `subject[N]` overwrites position N or, past the end, is appended. So `subject=a` with `subject[1]=b` sends `a` and `b`, and `subject=a` with `subject[0]=x` sends only `x`. Of two columns for one position (`subject[0]` and `subject[00]`), the later in column-name order wins.
 
-A JSONL (`.jsonl`, `.ndjson`) line is one JSON object, and its values are read by type. These rules, and the header rules above, are the same for every `--spreadsheet` command (`ia upload`, `ia metadata`, `ia tasks submit`, `ia verify`, `ia collection create`):
+A JSONL (`.jsonl`, `.ndjson`) line is one JSON object, and its values are read by type. These rules, and the header rules above, are the same for `ia upload`, `ia metadata`, `ia tasks submit` and `ia verify` (`ia collection create` refuses numbers and booleans; see its section):
 
 | JSON value | Meaning |
 |------------|---------|
 | a string | the value, trimmed; a value of only spaces is no value |
 | `null` | no value: a `-m` value for the field, if any, applies |
+| a number or a boolean | the value as written in the file: `1.50` is sent as `1.50`, `1e3` as `1e3`, `true` as `true` |
 | an array of strings | one value per element, as `subject[0]`, `subject[1]`, ... columns give |
-| a number, a boolean, an object, or an array holding anything but strings | refused; write numbers and booleans as strings (`"1942"`, `"true"`) |
+| an object, or an array holding anything but strings | refused |
 
-Indexed keys (`subject[0]`) take a string or `null` only. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused; a key repeated in the same letter case keeps its last value, as JSON parsers do. Every refused line, value and header in the file is reported together before any request. When a file is read only for its identifiers (`ia metadata export`), only the identifier is checked.
+Indexed keys (`subject[0]`) take a string, a number, a boolean or `null`, not an array. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused; a key repeated in the same letter case keeps its last value, as JSON parsers do. Every refused line, value and header in the file is reported together before any request. When a file is read only for its identifiers (`ia metadata export`), only the identifier is checked.
 
 `-m` values apply to every item. A field the row fills in (bare or indexed) replaces every `-m` value for that field, as in the Python client; `-m` fields the row leaves empty are sent as given. With `-m mediatype:texts` and a row whose `mediatype` is `audio`, that item is `audio`. A row that fills in any metadata must itself have `mediatype` and `collection`: the required-field check looks at the row, not at `-m`.
 
@@ -900,7 +901,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
 | `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`). Note: `-p` is a raw *task* parameter, not a search parameter. |
-| `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). In JSONL every value is a string, `priority` included (`"-5"`). |
+| `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). In JSONL, `priority` may be a number (`-5`) or a string (`"-5"`). |
 | `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
 | `--dry-run` | Print what would be submitted without sending |
 | `--json` | Output as JSON |

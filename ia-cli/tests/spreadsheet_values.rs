@@ -1,6 +1,6 @@
-//! Every `--spreadsheet` command refuses what the shared reader refuses
-//! (#154): a JSONL value that is not a string, an array of strings or
-//! `null`, and a repeated header. The host is a closed local port, so no
+//! Every `--spreadsheet` command reads a file the same way (#154): JSONL
+//! numbers and booleans are sent as written, and a repeated header is
+//! refused. The host is a closed local port, so no
 //! request can leave the machine even if a command got past the reader.
 
 use std::fs;
@@ -64,24 +64,52 @@ fn assert_every_command_refuses(sheet: &Path, want: &str) {
     }
 }
 
-#[test]
-fn jsonl_number_value_is_refused_by_every_command() {
-    let dir = TempDir::new().unwrap();
+/// A JSONL file whose values are numbers and booleans.
+fn sheet_with_numbers(dir: &TempDir) -> std::path::PathBuf {
     let data = dir.path().join("a.txt");
     fs::write(&data, "x").unwrap();
     let sheet = dir.path().join("sheet.jsonl");
     fs::write(
         &sheet,
         format!(
-            "{{\"identifier\":\"item-a\",\"file\":{},\"cmd\":\"derive.php\",\"mediatype\":\"texts\",\"collection\":\"test_collection\",\"year\":1999}}\n",
+            "{{\"identifier\":\"item-a\",\"file\":{},\"cmd\":\"derive.php\",\"mediatype\":\"texts\",\"collection\":\"test_collection\",\"year\":1999,\"price\":1.50,\"count\":1e3,\"public\":true}}\n",
             serde_json::to_string(data.to_str().unwrap()).unwrap()
         ),
     )
     .unwrap();
-    assert_every_command_refuses(
-        &sheet,
-        "line 1: year must be a string, an array of strings, or null (got a number)",
-    );
+    sheet
+}
+
+#[test]
+fn jsonl_numbers_and_booleans_pass_the_reader_of_every_command() {
+    let dir = TempDir::new().unwrap();
+    let sheet = sheet_with_numbers(&dir);
+    for args in commands(&sheet) {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_, stderr) = run(&args);
+        assert!(
+            !stderr.contains("spreadsheet has problems"),
+            "ia {args:?} refused the file: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn upload_dry_run_sends_jsonl_numbers_and_booleans_as_written() {
+    let dir = TempDir::new().unwrap();
+    let sheet = sheet_with_numbers(&dir);
+    let (ok, stderr) = run(&[
+        "upload",
+        "--spreadsheet",
+        sheet.to_str().unwrap(),
+        "--dry-run",
+        "--no-collection-check",
+    ]);
+    assert!(ok, "{stderr}");
+    for want in ["1999", "1.50", "1e3", "true"] {
+        assert!(stderr.contains(want), "missing {want:?}: {stderr}");
+    }
+    assert!(!stderr.contains("1000"), "1e3 was re-rendered: {stderr}");
 }
 
 #[test]

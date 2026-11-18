@@ -1,5 +1,5 @@
 use crate::error::{IaError, Result};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -14,18 +14,20 @@ pub type SpreadsheetRecord = (String, HashMap<String, String>);
 /// blank value is no value. A CSV, TSV, XLSX or ODS row with a blank
 /// identifier is skipped.
 ///
-/// JSONL values are read by type: a string is the value; `null` is no
-/// value; an array of strings gives one value per element, under the keys
-/// `key[0]`, `key[1]`, … that indexed columns use.
+/// JSONL values are read by type: a string is the value; a number or a
+/// boolean is the value as written in the file (`1.50` stays `1.50`, `1e3`
+/// stays `1e3`); `null` is no value; an array of strings gives one value
+/// per element, under the keys `key[0]`, `key[1]`, … that indexed columns
+/// use.
 ///
 /// # Errors
 ///
 /// [`IaError::InvalidArgument`] listing every problem in the file: a header
 /// given twice (blank headers aside), a missing `identifier` column, and in
 /// JSONL a line that is not a JSON object, has no string identifier, gives
-/// a key twice, or holds a value of another type (a number, a boolean, an
-/// object, an array holding anything but strings, or an array under an
-/// indexed key). Plus the read and parse errors of the file.
+/// a key twice, or holds a value of another type (an object, an array
+/// holding anything but strings, or an array under an indexed key). Plus
+/// the read and parse errors of the file.
 pub fn read_spreadsheet(path: &Path) -> Result<Vec<SpreadsheetRecord>> {
     read_records(path, Scope::AllFields)
 }
@@ -257,6 +259,7 @@ fn read_calamine(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
 /// Read JSONL by value type; see [`read_spreadsheet`]. Every problem in the
 /// file is collected and reported together.
 fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
+    use serde_json::value::RawValue;
     use serde_json::Value;
 
     let content = std::fs::read_to_string(path)?;
@@ -270,22 +273,30 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
         if line.is_empty() {
             continue;
         }
-        let object = match serde_json::from_str::<Value>(line) {
-            Ok(Value::Object(object)) => object,
-            Ok(_) => {
-                problems.push(format!("line {line_no}: not a JSON object"));
-                continue;
-            }
+        // Each value is kept as its raw JSON text, so a number is sent as
+        // written (`1.50`, `1e3`), not as serde_json would print it.
+        let raw = match serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(line) {
+            Ok(raw) => raw,
             Err(e) => {
-                problems.push(format!("line {line_no}: not valid JSON: {e}"));
+                problems.push(match serde_json::from_str::<Value>(line) {
+                    Ok(_) => format!("line {line_no}: not a JSON object"),
+                    Err(_) => format!("line {line_no}: not valid JSON: {e}"),
+                });
                 continue;
             }
         };
+        let mut object = Vec::with_capacity(raw.len());
+        for (key, text) in &raw {
+            match serde_json::from_str::<Value>(text.get()) {
+                Ok(value) => object.push((key, text.get().trim(), value)),
+                Err(e) => problems.push(format!("line {line_no}: not valid JSON: {e}")),
+            }
+        }
 
         let id_values: Vec<&Value> = object
             .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("identifier"))
-            .map(|(_, v)| v)
+            .filter(|(k, _, _)| k.eq_ignore_ascii_case("identifier"))
+            .map(|(_, _, v)| v)
             .collect();
         let identifier = match id_values.as_slice() {
             [Value::String(id)] if !id.trim().is_empty() => id.trim().to_string(),
@@ -326,7 +337,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 problems.push(format!("line {line_no}: {key} is given more than once"));
             }
         };
-        for (key, value) in &object {
+        for (key, text, value) in &object {
             let key = scope.name(key);
             if key == "identifier" {
                 continue;
@@ -341,6 +352,7 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
             match value {
                 Value::Null => {}
                 Value::String(v) => put(key, v, &mut problems),
+                Value::Number(_) | Value::Bool(_) => put(key, text, &mut problems),
                 Value::Array(items) if !indexed && items.iter().all(Value::is_string) => {
                     for (i, item) in items.iter().enumerate() {
                         if let Value::String(v) = item {
@@ -351,9 +363,9 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 other => problems.push(format!(
                     "line {line_no}: {key} must be {} (got {})",
                     if indexed {
-                        "a string or null"
+                        "a string, a number, a boolean, or null"
                     } else {
-                        "a string, an array of strings, or null"
+                        "a string, a number, a boolean, an array of strings, or null"
                     },
                     match other {
                         Value::Array(_) if indexed => "an array",
@@ -1107,22 +1119,39 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_values_that_are_not_strings_are_refused_together() {
+    fn jsonl_numbers_and_booleans_are_sent_as_written() {
+        let records = read(
+            "a.jsonl",
+            r#"{"identifier":"a","year":1999,"price":1.50,"count":1e3,"priority":-5,"big":123456789012345678901234567890,"public":true,"draft":false,"subject[0]":7}"#,
+        );
+        let fields = &records[0].1;
+        for (key, want) in [
+            ("year", "1999"),
+            ("price", "1.50"),
+            ("count", "1e3"),
+            ("priority", "-5"),
+            ("big", "123456789012345678901234567890"),
+            ("public", "true"),
+            ("draft", "false"),
+            ("subject[0]", "7"),
+        ] {
+            assert_eq!(fields.get(key).map(String::as_str), Some(want), "{key}: {fields:?}");
+        }
+    }
+
+    #[test]
+    fn jsonl_objects_and_mixed_arrays_are_refused_together() {
         let msg = refusal(
             "a.jsonl",
-            "{\"identifier\":\"a\",\"year\":1999}\n\
-             {\"identifier\":\"b\",\"public\":true}\n\
-             {\"identifier\":\"c\",\"extra\":{\"k\":\"v\"}}\n\
-             {\"identifier\":\"d\",\"subject\":[\"x\",1]}\n",
+            "{\"identifier\":\"c\",\"extra\":{\"k\":\"v\"}}\n\
+             {\"identifier\":\"d\",\"subject\":[\"x\",1]}\n\
+             {\"identifier\":\"e\",\"subject[0]\":{}}\n",
         );
         for want in [
-            "line 1: year must be a string, an array of strings, or null (got a number)",
-            "line 2: public must be",
-            "(got a boolean)",
-            "line 3: extra must be",
-            "(got an object)",
-            "line 4: subject must be",
+            "line 1: extra must be a string, a number, a boolean, an array of strings, or null (got an object)",
+            "line 2: subject must be",
             "(got an array that holds more than strings)",
+            "line 3: subject[0] must be a string, a number, a boolean, or null (got an object)",
         ] {
             assert!(msg.contains(want), "missing {want:?} in: {msg}");
         }
@@ -1132,7 +1161,7 @@ mod tests {
     fn jsonl_array_under_an_indexed_key_is_refused() {
         let msg = refusal("a.jsonl", r#"{"identifier":"a","subject[0]":["x"]}"#);
         assert!(
-            msg.contains("line 1: subject[0] must be a string or null (got an array)"),
+            msg.contains("line 1: subject[0] must be a string, a number, a boolean, or null (got an array)"),
             "{msg}"
         );
     }
