@@ -70,22 +70,71 @@ Flags and their behavior are documented in `--help` at every level, so there is 
 
 ## Install
 
-Download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
+On macOS or Linux, paste this into Terminal and press Return:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | sh
+```
+
+Run the same command again to update to the latest release.
+
+What [`install.sh`](install.sh) does:
+
+- Downloads the release binary for this computer (Apple Silicon Mac, Intel Mac, or Linux x86_64) and the release's `SHA256SUMS` from GitHub, and stops without installing anything if the checksum does not match.
+- Installs it as `~/bin/ia-cli`, replacing any earlier copy only after the new one has run.
+- If `~/bin` is not already on `PATH`, adds one line ending in `# added by the ia-cli installer` to each file a new terminal reads, for zsh, bash and fish alike, whichever you use (as `pipx ensurepath` does):
+  - zsh, when installed: `~/.zprofile` and `~/.zshrc`
+  - bash: `~/.bashrc`, and `~/.bash_profile` if it exists, else `~/.bash_login` if it exists, else `~/.profile`
+  - fish, when installed: `~/.config/fish/conf.d/ia-cli.fish`
+
+  Each line is added once and checks `PATH` first, so a file read twice does not add `~/bin` twice. Existing lines are not changed or reordered.
+
+  An exported `ZDOTDIR` puts the zsh files there instead, and `XDG_CONFIG_HOME` moves the fish folder. A `ZDOTDIR` set in `~/.zshenv` without `export` is not seen by the installer, which then uses `~/.zprofile` and `~/.zshrc`.
+- Prints what it installed and which files it changed. Open a new terminal window afterwards.
+
+It does not use `sudo` and writes nothing outside your home folder. `IA_INSTALL_DIR=/some/folder` installs elsewhere and `IA_VERSION=v0.27.0` installs a specific release, for example `curl -fsSL https://raw.githubusercontent.com/internetarchivecanada/ia/main/install.sh | IA_VERSION=v0.27.0 sh`.
+
+To uninstall, delete `~/bin/ia-cli`, each line ending in `# added by the ia-cli installer` from the files listed above (the zsh files are in `$ZDOTDIR` if you set it), and `~/.config/fish/conf.d/ia-cli.fish` (`$XDG_CONFIG_HOME/fish/conf.d/ia-cli.fish` if you set it) if it exists.
+
+On Windows, or to install by hand, download a prebuilt binary from [Releases](https://github.com/internetarchivecanada/ia/releases). What changed in each release, including anything that breaks a script, is in [`docs/releases/`](docs/releases/).
 
 | Platform | Asset |
 |----------|-------|
 | Linux (x86_64) | `ia-x86_64-unknown-linux-musl` |
-| macOS (Apple Silicon) | `ia-aarch64-apple-darwin` |
+| macOS (Apple Silicon), macOS 11 or later | `ia-aarch64-apple-darwin` |
+| macOS (Intel), macOS 10.14 or later | `ia-x86_64-apple-darwin` |
 | Windows (x86_64) | `ia-x86_64-pc-windows-msvc.exe` |
+
+<details>
+<summary>Install by hand on macOS or Linux</summary>
 
 ```sh
 # Example: Linux
 curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/ia-x86_64-unknown-linux-musl
 curl -LO https://github.com/internetarchivecanada/ia/releases/latest/download/SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS
-chmod +x ia-x86_64-unknown-linux-musl
+sha256sum --ignore-missing -c SHA256SUMS &&
+chmod +x ia-x86_64-unknown-linux-musl &&
 sudo mv ia-x86_64-unknown-linux-musl /usr/local/bin/ia-cli
 ```
+
+On macOS, `uname -m` prints `arm64` on Apple Silicon and `x86_64` on Intel, which picks the asset. The install runs only if the checksum matches:
+
+```sh
+case "$(uname -m)" in
+  arm64)  asset=ia-aarch64-apple-darwin ;;
+  x86_64) asset=ia-x86_64-apple-darwin ;;
+  *)      echo "no macOS binary for $(uname -m)"; asset= ;;
+esac
+[ -n "$asset" ] &&
+curl -L -o "$asset" "https://github.com/internetarchivecanada/ia/releases/latest/download/$asset" &&
+curl -L -o SHA256SUMS https://github.com/internetarchivecanada/ia/releases/latest/download/SHA256SUMS &&
+grep " $asset\$" SHA256SUMS | shasum -a 256 -c &&
+chmod +x "$asset" &&
+sudo mkdir -p /usr/local/bin &&
+sudo mv "$asset" /usr/local/bin/ia-cli
+```
+
+</details>
 
 Every release ships `SHA256SUMS` and a build provenance attestation. `gh attestation verify ia-x86_64-unknown-linux-musl --repo internetarchivecanada/ia` confirms the asset was built by this repository's release workflow.
 

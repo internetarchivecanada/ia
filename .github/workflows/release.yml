@@ -40,7 +40,7 @@ jobs:
     name: Test
     uses: ./.github/workflows/test.yml
 
-  # The three release builds, restored from the cache that every push to main
+  # The four release builds, restored from the cache that every push to main
   # saves under the same key (the "Release build" job in ci.yml).
   build:
     name: Build

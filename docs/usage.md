@@ -895,8 +895,8 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--comment <TEXT>` | Explanation for why the task is being submitted |
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
 | `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
-| `--wait` | Poll until task completes |
-| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff) |
+| `--wait` | Poll until the task completes. A task that fails (error state) ends the wait with `task <id> failed (error state); see ia tasks log <id>` and exit code 1; with `--json`, its catalog entry is printed first |
+| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff). A poll answered with `429` waits the response's `Retry-After` (or the poll interval when it has none) and polls again; it does not end the wait, so a server that keeps answering `429` keeps it going |
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
@@ -1129,7 +1129,7 @@ The comment is shown for a lock or unlock when it is not empty, in double quotes
 
 #### Job log
 
-Only `--lock` and `--unlock` use `--joblog`; with a read action it is ignored, neither read nor written. Each account is recorded as it finishes: `op` is `account-lock` or `account-unlock`, `item` the input line, `file` empty, and `status` `ok` (with `bytes` 0 and `elapsed_ms`) or `error` with the message. A line that shared another line's request gets its own entry with that request's status.
+Only `--lock` and `--unlock` use `--joblog`; with a read action it is ignored, neither read nor written. Each account is recorded as it finishes: `op` is `account-lock` or `account-unlock`, `item` the input line, `file` empty, and `status` `ok` (with `bytes` 0 and `elapsed_ms`) or `error` with the message. When a lock or unlock request was sent for the line, the entry also has `itemname`, the item name the request was sent with, and `comment`, the `--comment` it carried (absent when no comment was given; an empty comment is not sent). Both are recorded when the request then failed. A line whose lookup failed, or returned no item name starting with `@`, sends no lock or unlock and has neither. A line that shared another line's request gets its own entry with that request's status, item name and comment, so lines that named the same account show the same `itemname`. Resume reads only `op`, `item` and `status`, so a job log written before `itemname` and `comment` were recorded resumes the same way.
 
 A rerun with the same `--joblog` skips a line when its latest entry among `account-lock` and `account-unlock` is `ok` and has the op of this run, printing `resuming: skipping <n> account(s) already done in joblog` on stderr unless `-q`. Lines that failed run again. So a lock list rerun after the same lines were unlocked through the same job log locks them again, and an unlock run is not skipped because of an earlier lock. When every line is already done, the command prints that line and exits 0. `--no-resume` runs every line.
 
