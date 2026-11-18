@@ -4847,4 +4847,261 @@ mod tests {
             body[1024..1024 + j.done[1] as usize]
         );
     }
+
+    // -- connections reused within the cap (plan of 2026-11-18) --
+
+    /// A keep-alive loopback server reached as `localhost:<port>`, so the
+    /// download transport's resolver gate applies (an IP literal bypasses
+    /// it). It serves any number of requests per connection and counts TCP
+    /// connections in `gauge` from accept to close, idle ones included.
+    /// `/busy` answers 429 with `Retry-After: 0`; a `Range` is answered 206
+    /// from `body`; any other request gets the whole of `body`. Each
+    /// request is held `hold` first.
+    struct ReuseServer {
+        host: String,
+        gauge: Arc<Gauge>,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn reuse_server(body: &[u8], hold: Duration, gauge: Arc<Gauge>) -> ReuseServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = Arc::new(body.to_vec());
+        let (g, acc, req) = (
+            Arc::clone(&gauge),
+            Arc::clone(&accepted),
+            Arc::clone(&requests),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                acc.fetch_add(1, Ordering::SeqCst);
+                let (gauge, requests, body) = (Arc::clone(&g), Arc::clone(&req), Arc::clone(&body));
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    gauge.enter();
+                    loop {
+                        let head = read_head(&mut stream).await;
+                        if head.is_empty() {
+                            break;
+                        }
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(hold).await;
+                        let lower = head.to_ascii_lowercase();
+                        let path = lower.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let range = lower.lines().find_map(|l| {
+                            l.strip_prefix("range: bytes=").and_then(|r| {
+                                let (a, b) = r.trim().split_once('-')?;
+                                let a = a.parse::<usize>().ok()?;
+                                let b = if b.is_empty() {
+                                    body.len() - 1
+                                } else {
+                                    b.parse::<usize>().ok()?
+                                };
+                                Some((a, b))
+                            })
+                        });
+                        let (status, extra, bytes) = if path.contains("/busy") {
+                            (
+                                "429 Too Many Requests",
+                                "retry-after: 0\r\n".to_string(),
+                                Vec::new(),
+                            )
+                        } else {
+                            match range {
+                                Some((a, b)) => (
+                                    "206 Partial Content",
+                                    format!("content-range: bytes {a}-{b}/{}\r\n", body.len()),
+                                    body[a..=b].to_vec(),
+                                ),
+                                None => ("200 OK", String::new(), body.to_vec()),
+                            }
+                        };
+                        let answer = format!(
+                            "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\n\r\n",
+                            bytes.len()
+                        );
+                        if stream.write_all(answer.as_bytes()).await.is_err()
+                            || stream.write_all(&bytes).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    gauge.leave();
+                });
+            }
+        });
+        ReuseServer {
+            host: format!("localhost:{port}"),
+            gauge,
+            accepted,
+            requests,
+        }
+    }
+
+    /// A client whose host is `host`, over plain HTTP.
+    fn client_for(host: &str) -> IaClient {
+        let mut config = crate::config::IaConfig::default();
+        config.general.host = host.to_string();
+        config.general.secure = false;
+        IaClient::from_config(config).unwrap()
+    }
+
+    /// Wait up to `limit` for `gauge` to show at most `n` open.
+    async fn open_at_most(gauge: &Gauge, n: usize, limit: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let open = gauge.open.load(Ordering::SeqCst);
+            if open <= n || tokio::time::Instant::now() >= deadline {
+                return open;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn forty_small_files_reuse_at_most_six_connections() {
+        let body = body_of(2048);
+        let server = reuse_server(&body, Duration::from_millis(20), Arc::default()).await;
+        let client = client_for(&server.host);
+        let dir = tempfile::tempdir().unwrap();
+
+        download_files(&client, 40, &body, 8, &DownloadOpts::default(), dir.path()).await;
+
+        assert_eq!(server.requests.load(Ordering::SeqCst), 40);
+        let accepted = server.accepted.load(Ordering::SeqCst);
+        assert!(accepted <= 6, "{accepted} TCP connections for 40 files");
+        assert!(server.gauge.most() <= 6, "{} open at once", server.gauge.most());
+    }
+
+    #[tokio::test]
+    async fn a_pair_holds_six_sockets_idle_ones_included_and_lets_them_go() {
+        let body = body_of(2048);
+        let both = Arc::new(Gauge::default());
+        let a = reuse_server(&body, Duration::from_millis(20), Arc::clone(&both)).await;
+        let b = reuse_server(&body, Duration::from_millis(20), Arc::clone(&both)).await;
+        let nodes = [a.host.clone(), b.host.clone()];
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let to = nodes.clone();
+        // The front server alternates its redirect between the two nodes.
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let node = to[turn.fetch_add(1, Ordering::SeqCst) % 2].clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://{node}{}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n",
+                            conn.path
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            })
+        });
+        let (front, _) = spawn_raw(&body, handler).await;
+        let files: Vec<serde_json::Value> = (0..30)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("f{i}.bin"),
+                    "source": "original",
+                    "size": body.len().to_string(),
+                    "md5": md5_hex(&body),
+                    "mtime": "1700000000",
+                })
+            })
+            .collect();
+        let item: crate::types::ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "big-item"},
+            "files": files,
+            "d1": nodes[0],
+            "d2": nodes[1],
+        }))
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let o = DownloadOpts {
+            destdir: dir.path().to_path_buf(),
+            no_directories: true,
+            ..Default::default()
+        };
+
+        let done = download_item_with_metadata(
+            &front,
+            "big-item",
+            &item,
+            &o,
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(done.files_downloaded, 30, "{:?}", done.results);
+        // Busy and idle sockets on the two nodes together, at every moment.
+        assert!(both.most() <= 6, "{} open on the pair at once", both.most());
+        // Idle slots let their sockets go once nothing more is queued.
+        let open = open_at_most(&both, 0, Duration::from_secs(5)).await;
+        assert_eq!(open, 0, "idle connections kept open");
+    }
+
+    #[tokio::test]
+    async fn a_budget_drop_closes_idle_connections_at_once() {
+        let body = body_of(2048);
+        let server = reuse_server(&body, Duration::from_millis(100), Arc::default()).await;
+        let client = client_for(&server.host);
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts::default();
+
+        // Six files at once leave six idle connections behind.
+        download_files(&client, 6, &body, 6, &opts, dir.path()).await;
+        assert_eq!(
+            server.gauge.open.load(Ordering::SeqCst),
+            6,
+            "no idle connections kept"
+        );
+
+        // A 429 on one of them halves the budget to 3.
+        let url = format!("http://{}/download/big-item/busy", server.host);
+        let err = super::super::fetch_response_via(
+            client.range_http(),
+            &client,
+            &url,
+            None,
+            false,
+            Some(&opts),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, IaError::Http { status: 429, .. }), "{err:?}");
+
+        // The other five idle connections close at once, not after the
+        // idle time; the one that answered may stay.
+        let open = open_at_most(&server.gauge, 1, Duration::from_millis(500)).await;
+        assert!(open <= 1, "{open} still open after the drop");
+    }
+
+    #[tokio::test]
+    async fn a_split_file_reuses_its_streams_connections() {
+        let _layout = small_layout();
+        let body = body_of(12 * PART as usize);
+        let server = reuse_server(&body, Duration::from_millis(20), Arc::default()).await;
+        let client = client_for(&server.host);
+        let dir = tempfile::tempdir().unwrap();
+
+        download_files(&client, 1, &body, 8, &DownloadOpts::default(), dir.path()).await;
+
+        // Twelve parts over six streams, each stream on one connection.
+        assert_eq!(server.requests.load(Ordering::SeqCst), 12);
+        assert_eq!(server.gauge.most(), 6, "open at once");
+        let accepted = server.accepted.load(Ordering::SeqCst);
+        assert!(accepted <= 6, "{accepted} TCP connections for 12 parts");
+    }
 }
