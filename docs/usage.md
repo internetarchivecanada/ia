@@ -402,7 +402,7 @@ ia metadata --itemlist items.txt -m "subject:archived"
 
 #### `ia metadata export`
 
-Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2), and grows by one after as many consecutive successes as it currently allows, up to 200; `--jobs N` pins it.
+Bulk-export metadata for many items. Reads identifiers from files (CSV, TSV, XLSX, ODS, JSONL, or plain text with one ID per line), `--itemlist`, `--search`, or stdin. Outputs JSONL to stdout by default, or writes to a file with `-o` (format inferred from extension). In file mode, multi-value fields expand into indexed columns: `subject[0]`, `subject[1]`, etc. When an export with `--joblog` resumes into a CSV, TSV or XLSX file, the rows already in the file are read back and the file is rewritten with them and the new items. Header names keep their case in that read-back, since metadata keys are case-sensitive: `Title` and `title` stay two columns. A file resumed by version 0.27.0 or earlier may hold a `Title` value under a lowercased `title` column; it still reads and is kept as it is, and `--no-resume` exports every item again in the case IA returns. If the rows cannot be read (for example, a hand edit left one header twice), the export stops before any request and leaves the file as it is; move the file aside, or rerun with `--no-resume` to export every item again. With `--jobs` omitted the export adapts its concurrency to the server: it starts at 10 requests in flight, halves on a `429` (never below 2), and grows by one after as many consecutive successes as it currently allows, up to 200; `--jobs N` pins it.
 
 | Flag | Description |
 |------|-------------|
@@ -663,9 +663,21 @@ ia upload cleanup my-item big.iso --abort
 
 **`ia upload --spreadsheet <FILE>`** — Batch upload from a spreadsheet file (CSV/TSV/XLSX/ODS/JSONL). Each row specifies an identifier, file path, and optional metadata. Rows sharing the same identifier are grouped into a single item upload.
 
-Required columns: `identifier`, `file`. Header names in CSV, TSV, XLSX and ODS files are case-insensitive, and so are JSONL keys other than `identifier`: `REMOTE_NAME`, `Remote_Name` and `remote_name` are the same column. An optional `REMOTE_NAME` column names the file on IA, row by row: a row with it filled in stores its file under that name, and a row without it keeps the file's name. `--remote-dir` is not applied to a spreadsheet batch. `REMOTE_NAME` is never sent as item metadata. These stop the batch before any upload: a `REMOTE_NAME` on a row whose `file` is a directory, a name that does not stay inside the item (such as `../x`), two files of one item given the same name (two rows with one `REMOTE_NAME`, or a `REMOTE_NAME` equal to another row's file name), and one file on two rows of an item with different `REMOTE_NAME` values. All other columns become metadata. When several rows share an identifier, the metadata of the first of them that has any is used, and a blank cell is no value.
+Required columns: `identifier`, `file`. Header names in CSV, TSV, XLSX and ODS files are case-insensitive, and so are JSONL keys, `identifier` included: `REMOTE_NAME`, `Remote_Name` and `remote_name` are the same column. A header given twice (`title` and `Title`) is refused, naming the header, since one of the two cells would be lost; write several values as `title[0]`, `title[1]`. Blank headers are not compared. An optional `REMOTE_NAME` column names the file on IA, row by row: a row with it filled in stores its file under that name, and a row without it keeps the file's name. `--remote-dir` is not applied to a spreadsheet batch. `REMOTE_NAME` is never sent as item metadata. These stop the batch before any upload: a `REMOTE_NAME` on a row whose `file` is a directory, a name that does not stay inside the item (such as `../x`), two files of one item given the same name (two rows with one `REMOTE_NAME`, or a `REMOTE_NAME` equal to another row's file name), and one file on two rows of an item with different `REMOTE_NAME` values. All other columns become metadata. When several rows share an identifier, the metadata of the first of them that has any is used, and a blank cell is no value.
 
 A multi-value field takes indexed columns: `subject[0]`, `subject[1]`, ... Each value is sent as its own header, in ascending numeric index (`subject[2]` before `subject[10]`), whatever the column order. A row follows the rule `ia metadata` applies to `-m`: a bare `subject` column is the field's list, and `subject[N]` overwrites position N or, past the end, is appended. So `subject=a` with `subject[1]=b` sends `a` and `b`, and `subject=a` with `subject[0]=x` sends only `x`. Of two columns for one position (`subject[0]` and `subject[00]`), the later in column-name order wins.
+
+A JSONL (`.jsonl`, `.ndjson`) line is one JSON object, and its values are read by type. These rules, and the header rules above, are the same for `ia upload`, `ia metadata`, `ia tasks submit` and `ia verify` (`ia collection create` refuses numbers and booleans; see its section):
+
+| JSON value | Meaning |
+|------------|---------|
+| a string | the value, trimmed; a value of only spaces is no value |
+| `null` | no value: a `-m` value for the field, if any, applies |
+| a number or a boolean | the value as written in the file: `1.50` is sent as `1.50`, `1e3` as `1e3`, `true` as `true` |
+| an array of strings | one value per element, as `subject[0]`, `subject[1]`, ... columns give |
+| an object, or an array holding anything but strings | refused |
+
+Indexed keys (`subject[0]`) take a string, a number, a boolean or `null`, not an array. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused; a key repeated in the same letter case keeps its last value, as JSON parsers do. Every refused line, value and header in the file is reported together before any request. When a file is read only for its identifiers (`ia metadata export`), only the identifier is checked.
 
 `-m` values apply to every item. A field the row fills in (bare or indexed) replaces every `-m` value for that field, as in the Python client; `-m` fields the row leaves empty are sent as given. With `-m mediatype:texts` and a row whose `mediatype` is `audio`, that item is `audio`. A row that fills in any metadata must itself have `mediatype` and `collection`: the required-field check looks at the row, not at `-m`.
 
@@ -889,7 +901,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
 | `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`). Note: `-p` is a raw *task* parameter, not a search parameter. |
-| `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). |
+| `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). In JSONL, `priority` may be a number (`-5`) or a string (`"-5"`). |
 | `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
 | `--dry-run` | Print what would be submitted without sending |
 | `--json` | Output as JSON |
@@ -1215,7 +1227,7 @@ A create always sends its request and reports the server's answer; it does not f
 
 ##### Many collections from one file
 
-`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive and a blank cell is no value. In a CSV, TSV, XLSX or ODS file a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands; when a header appears twice, the last non-empty cell of the two is used. Standard input is not read.
+`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive and a blank cell is no value. In a CSV, TSV, XLSX or ODS file a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands, and a header given twice is refused. Standard input is not read.
 
 JSON lines are read by value type. JSON keys are case-insensitive, `identifier` included.
 
