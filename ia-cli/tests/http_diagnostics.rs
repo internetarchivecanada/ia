@@ -73,6 +73,12 @@ fn download(server: &MockServer, dir: &TempDir, extra: &[&str]) -> std::process:
         .env_remove("IA_ACCESS_KEY_ID")
         .env_remove("IA_SECRET_ACCESS_KEY")
         .env("IA_CONFIG_FILE", dir.path().join("no-such-ia.ini"))
+        // The connection slot files go to the test target directory,
+        // never to the user's cache.
+        .env(
+            "IA_CACHE_DIR",
+            concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+        )
         .output()
         .unwrap()
 }

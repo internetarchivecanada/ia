@@ -479,17 +479,17 @@ impl ServerSlots {
             );
         }
         let permit = loop {
-            let next_growth = self.grow(&node);
+            // At the cap no growth is due, but a drop may come while this
+            // request waits; looking again once an interval has passed
+            // finds the growth that drop makes due.
+            let next_look = self
+                .grow(&node)
+                .unwrap_or_else(|| Instant::now() + self.inner.growth_interval);
             let acquire = Arc::clone(&node.semaphore).acquire_owned();
-            match next_growth {
-                Some(at) => {
-                    tokio::select! {
-                        biased;
-                        permit = acquire => break permit.ok()?,
-                        () = tokio::time::sleep_until(at) => {}
-                    }
-                }
-                None => break acquire.await.ok()?,
+            tokio::select! {
+                biased;
+                permit = acquire => break permit.ok()?,
+                () = tokio::time::sleep_until(next_look) => {}
             }
         };
         node.state().in_use += 1;
@@ -1004,6 +1004,28 @@ mod tests {
             let slots = slots.clone();
             tokio::spawn(async move { slots.acquire(S).await.is_some() })
         };
+        tokio::time::advance(GROWTH_INTERVAL + Duration::from_millis(1)).await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("the waiter got no slot when the budget grew")
+            .unwrap());
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_began_waiting_at_full_budget_gets_one_when_it_grows_back() {
+        let slots = ServerSlots::default();
+        let mut held = take(&slots, 6).await;
+        // Waiting while the budget is at the cap: no growth is due yet.
+        let waiter = {
+            let slots = slots.clone();
+            tokio::spawn(async move { slots.acquire(S).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        slots.report(&held[0], S, 429);
+        // Three come back and are forgotten; three long transfers stay.
+        held.truncate(3);
+        assert_eq!(slots.budget(S), 3);
         tokio::time::advance(GROWTH_INTERVAL + Duration::from_millis(1)).await;
         assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
