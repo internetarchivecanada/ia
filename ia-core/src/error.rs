@@ -35,6 +35,7 @@ pub struct JsonErrorBody {
 ///         IaError::NotFound(_) => (),
 ///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
+///         IaError::SearchFailed { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
 ///         IaError::SourceChecksumMismatch { .. } => (),
@@ -79,6 +80,7 @@ pub struct JsonErrorBody {
 ///         IaError::TaskRerunFailed { .. } => (),
 ///         IaError::TaskNotFound { .. } => (),
 ///         IaError::TaskTimeout { .. } => (),
+///         IaError::AccountApi { .. } => (),
 ///         IaError::Network(_) => (),
 ///         IaError::Io(_) => (),
 ///         IaError::Json(_) => (),
@@ -94,6 +96,7 @@ pub struct JsonErrorBody {
 ///         IaError::NotFound(_) => (),
 ///         IaError::ItemUnavailable { .. } => (),
 ///         IaError::Http { .. } => (),
+///         IaError::SearchFailed { .. } => (),
 ///         IaError::RateLimited { .. } => (),
 ///         IaError::ChecksumMismatch { .. } => (),
 ///         IaError::SourceChecksumMismatch { .. } => (),
@@ -138,6 +141,7 @@ pub struct JsonErrorBody {
 ///         IaError::TaskRerunFailed { .. } => (),
 ///         IaError::TaskNotFound { .. } => (),
 ///         IaError::TaskTimeout { .. } => (),
+///         IaError::AccountApi { .. } => (),
 ///         IaError::Network(_) => (),
 ///         IaError::Io(_) => (),
 ///         IaError::Json(_) => (),
@@ -173,6 +177,18 @@ pub enum IaError {
         message: String,
         retry_after: Option<u64>,
     },
+
+    /// A search API answered with a success status but reported an error
+    /// in its body, or sent a body that is not JSON. The full-text search
+    /// API answers a request it rejects (for example one without `q`) with
+    /// HTTP 200 and `{"user_message": {"msg_type": "ERROR", "text": ...}}`;
+    /// `message` is that text. A non-success status is [`IaError::Http`].
+    /// Not retryable: a rejected request fails the same way again. That
+    /// includes a non-JSON 200 such as a proxy's maintenance page, which
+    /// may clear on its own; the caller decides whether to run the search
+    /// again.
+    #[error("search failed: {message}")]
+    SearchFailed { status: u16, message: String },
 
     #[error("rate limited (retry after {retry_after}s)")]
     RateLimited { retry_after: u64 },
@@ -429,6 +445,14 @@ pub enum IaError {
     #[error("timed out waiting for task {task_id} after {elapsed}s")]
     TaskTimeout { task_id: u64, elapsed: u64 },
 
+    /// The account API (`/services/xauthn/`) answered, but not with what was
+    /// asked: an error body, an empty or missing `values` object, a body that
+    /// is not JSON, an account other than the one looked up, a missing field
+    /// the action needs, or a refused lock or unlock. `account` is the value
+    /// the caller passed. See [`crate::account`].
+    #[error("account API error for {account}: {message}")]
+    AccountApi { account: String, message: String },
+
     #[error(transparent)]
     Network(#[from] reqwest_middleware::Error),
 
@@ -540,6 +564,8 @@ impl IaError {
         match self {
             // HTTP 4xx client errors are permanent (except 429 rate-limit)
             IaError::Http { status, .. } => *status == 429 || *status >= 500,
+            // The server rejected the request; the same request fails again.
+            IaError::SearchFailed { .. } => false,
             // Transient — may succeed on retry
             IaError::RateLimited { .. } => true,
             IaError::Network(_) => true,
@@ -609,6 +635,8 @@ impl IaError {
             IaError::TaskRerunFailed { .. } => false,
             IaError::TaskNotFound { .. } => false,
             IaError::TaskTimeout { .. } => false,
+            // The account API answered; the same request gets the same answer.
+            IaError::AccountApi { .. } => false,
             // 102: data node offline or not responding. 101 (creation
             // pending), 104 (deleted) and the rest will not change within a
             // retry budget.
@@ -664,6 +692,10 @@ impl IaError {
                     extra.insert("retry_after".into(), (*secs).into());
                 }
                 "http_error"
+            }
+            IaError::SearchFailed { status, .. } => {
+                extra.insert("status".into(), (*status).into());
+                "search_failed"
             }
             IaError::RateLimited { retry_after } => {
                 extra.insert("retry_after".into(), (*retry_after).into());
@@ -929,6 +961,10 @@ impl IaError {
                 extra.insert("task_id".into(), (*task_id).into());
                 extra.insert("elapsed_secs".into(), (*elapsed).into());
                 "task_timeout"
+            }
+            IaError::AccountApi { account, .. } => {
+                extra.insert("account".into(), account.clone().into());
+                "account_api_error"
             }
             IaError::Network(_) => "network",
             IaError::Io(_) => "io",
@@ -1209,6 +1245,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "item unavailable: some-item: something went wrong"
+        );
+    }
+
+    #[test]
+    fn search_failed_display_json_and_not_retryable() {
+        let err = IaError::SearchFailed {
+            status: 200,
+            message: "the parameter q is required".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "search failed: the parameter q is required"
+        );
+        assert!(!err.is_retryable());
+        let v = parse_json_error(&err);
+        assert_eq!(v["error"]["code"], "search_failed");
+        assert_eq!(v["error"]["status"], 200);
+        assert_eq!(
+            v["error"]["message"],
+            "search failed: the parameter q is required"
         );
     }
 

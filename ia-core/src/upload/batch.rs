@@ -223,7 +223,7 @@ pub fn group_records(records: Vec<SpreadsheetRecord>) -> Result<Vec<ItemGroup>> 
 ///
 /// An empty value is no value, as the readers treat a blank cell: it
 /// neither sends an empty header nor replaces a `-m` value.
-fn row_metadata(fields: HashMap<String, String>) -> Vec<(String, String)> {
+pub(crate) fn row_metadata(fields: HashMap<String, String>) -> Vec<(String, String)> {
     let mut columns: Vec<(String, String)> =
         fields.into_iter().filter(|(_, v)| !v.is_empty()).collect();
     columns.sort();

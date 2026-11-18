@@ -80,6 +80,10 @@ If the server answers a `Range` request with `416 Range Not Satisfiable`, the `.
 
 Files with no `size` in metadata are not checked, nor is `<identifier>_files.xml`, which records its own size before it is final. The one exception is a 416 on a resume: with no metadata size to compare against, the server's length is taken as the file's, so the `.part` file is removed and the download restarts, even when the `.part` file is already that long; the message then says the item metadata has no size that can confirm it.
 
+#### Names that differ only in case
+
+An item can hold files whose names differ only in letter case, such as `Photo.txt` and `photo.txt`. On a case-insensitive filesystem (the default on macOS and Windows) both names are the same file, so downloading both would replace one with the other. Of the files selected for a download, the first in the item's order is downloaded; each later file whose name, including its directories, is the same apart from case is not requested and is reported as failed with `photo.txt not downloaded: its name differs from Photo.txt only in letter case, so both would be written to the same path on a case-insensitive filesystem` (when one item is downloaded with `--json`, that file's line has the error code `download_failed` and this text as the message; when several items are downloaded, the item's line counts it in `files_failed` and the text is in the `--joblog`). It counts as a failure in the summary and the job log, and the command exits with status 1. With `--dry-run` a refused file is likewise reported as failed and the command exits with status 1. The names are compared, not the destination, so the same files are refused on every platform, including on a case-sensitive filesystem where both could be stored. Names that differ only in Unicode normalization (an accented letter written as one code point or as a letter and a combining accent) are not detected. To fetch a refused file, download it by name on its own into a different `--destdir`. Into the same `--destdir` on a case-insensitive filesystem, the check does not apply (only one file is selected): when the two sizes differ, the refused file replaces the file kept; when size and mtime are equal, it is reported as skipped, matched against the kept file's bytes, and nothing is written.
+
 #### Slow and stalled downloads
 
 A connection that keeps sending bytes too slowly is treated like one that dropped (the re-request rule is at the end of this section). Once a stream is 30 s old, `ia` compares its average rate over the last 60 s (or over the stream's whole life while it is younger than that) with the `--min-speed` floor, once a second, whether or not any bytes are arriving. Below the floor, the stream is abandoned, the `.part` file is flushed, and the file is re-requested with `Range` from the bytes on disk. The new stream gets its own 30 s grace; the md5 comparison still covers the whole file.
@@ -197,6 +201,8 @@ ia search advanced <QUERY> [OPTIONS]   # advanced search API (single page)
 ia search fts <QUERY> [OPTIONS]        # full-text search (scroll-based, auto-paginates)
 ```
 
+The bare form's options (`-s`, `-f`, `--itemlist`, `-n`, `--json`, `-p`, `--timeout`) may also go before a subcommand name, and are used as if given after it (`ia search --timeout 5 scrape <QUERY>`), as `ia update --json list` is; `-s` and `-f` only before `scrape` or `advanced`. A flag given on both sides counts once, and repeatable options (`-p`, `-s`, `-f`) add up in command-line order; `--timeout`, which takes a value, may be given on one side only, so two values never compete. A subcommand's own options (`--rows`, `--dsl`, `--scope`, `--size`, `--from`) go after its name; before it they are refused as unexpected arguments. Also refused before any request, with an error naming each one: a query given before the subcommand name, `-s`/`-f` before `fts` (which takes neither), and `--timeout` on both sides. To search for a word that is a subcommand name, put `--` before it, after any options: `ia search --itemlist -- scrape`.
+
 Every backend handles throttling the same way: a `429` on any request is retried up to three times, waiting as the standard schedule or the server's `Retry-After` header says (see "Retry waits"); past that the command fails with `rate limited (retry after Ns)` (`--json` error code `rate_limited`). A `5xx` is retried by the HTTP layer on the same rule.
 
 #### Shared flags (all backends)
@@ -207,7 +213,7 @@ Every backend handles throttling the same way: a `429` on any request is retried
 | `--itemlist` | Output identifiers only (one per line) |
 | `-n, --num-found` | Print result count only |
 | `-p, --parameters <K=V>` | Extra query parameters (`key:value` or `key=value`, repeatable) |
-| `--timeout <SECS>` | Request timeout in seconds |
+| `--timeout <SECS>` | Give up on a request after this many seconds (at least 1), counted from connect to the end of the response body. It can only shorten the client's own limits (30 s to connect, 60 s without response data); each retry of a request gets the same limit |
 | `--json` | Output results as JSONL (one object per line) |
 
 #### `scrape` and `advanced` flags
@@ -222,10 +228,16 @@ Every backend handles throttling the same way: a `429` on any request is retried
 
 | Flag | Description |
 |------|-------------|
-| `--dsl` | Treat the query as raw Elasticsearch DSL |
-| `--scope <SCOPE>` | Index/scope filter |
-| `--size <N>` | Results per scroll batch (default: 1000) |
-| `--from <N>` | Starting offset |
+| `--dsl` | Send the query as is, without the `!L` prefix (for Elasticsearch DSL) |
+| `--scope <SCOPE>` | Value for the API's `scope` parameter; also sent with `--num-found` |
+| `--size <N>` | Results per request (default: 1000) |
+| `--from <N>` | Start at this offset and fetch one page of `--size` results, without scrolling |
+
+`fts` sends a POST to `https://be-api.us.archive.org/ia-pub-fts-api` with the JSON body `{"q": "!L <QUERY>", "size": 1000, "scroll": true}` and follows each `_scroll_id` until a page has no hits. The API rejects `from` together with scroll, so `--from` sends `"scroll": false` and stops after one page. `--num-found` sends a GET with `q` (and `scope`) and prints `hits.total`.
+
+Each result is one matching file or page, so an item can appear more than once. The identifier printed (and the one `--itemlist` prints) is the item's identifier, taken from the hit's `fields.identifier`. `--json` output also carries the hit's `_id` (`identifier|sha1` of the matching file, unique per hit) and `highlight`, the matching text with each match marked `{{{like this}}}`.
+
+The API answers a request it rejects with HTTP 200 and an error message in the body (for example `the parameter q is required`). `fts` prints that message on stderr as `search failed: ...` and exits 1, as it does for a body that is not JSON.
 
 #### Examples
 
@@ -245,8 +257,11 @@ ia search advanced "mediatype:texts" --rows 10
 # Full-text search (searches file contents, not just metadata)
 ia search fts "apollo 11 transcript"
 
-# Full-text search with raw Elasticsearch DSL
-ia search fts --dsl '{"match": {"text": "moon landing"}}'
+# Identifiers of items whose text matches, for ia download
+ia search fts "apollo 11 transcript" --itemlist
+
+# Results 21 to 30 of a full-text search, in one request
+ia search fts "apollo 11 transcript" --from 20 --size 10
 
 # Return specific fields, sorted by downloads
 ia search "mediatype:audio" --field identifier --field title --sort "downloads desc"
@@ -448,7 +463,7 @@ ia search "collection:nasa" -f identifier | ia metadata export
 
 #### `ia metadata audit`
 
-Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations.
+Audit item metadata against the live Internet Archive schema. Reports type mismatches, missing required fields, deprecated fields, and repeatability violations. Every metadata field of the item is checked against its schema entry.
 
 | Flag | Description |
 |------|-------------|
@@ -897,8 +912,8 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--comment <TEXT>` | Explanation for why the task is being submitted |
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
 | `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
-| `--wait` | Poll until task completes |
-| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff) |
+| `--wait` | Poll until the task completes. A task that fails (error state) ends the wait with `task <id> failed (error state); see ia tasks log <id>` and exit code 1; with `--json`, its catalog entry is printed first |
+| `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff). A poll answered with `429` waits the response's `Retry-After` (or the poll interval when it has none) and polls again; it does not end the wait, so a server that keeps answering `429` keeps it going |
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
@@ -1011,6 +1026,170 @@ ia tasks rate-limit make_dark
 ia tasks rate-limit --json
 ```
 
+### `ia account`
+
+Look up, lock or unlock archive.org accounts. The account API is admin-only. Alias: `ia ac`.
+
+```sh
+ia account [OPTIONS] <USER>
+ia account [OPTIONS] --itemlist <FILE>
+... | ia account [OPTIONS]
+```
+
+`USER` is an email address, a screen name, or an item name (which starts with `@`). A list of accounts, one per line, comes from `--itemlist` or standard input (see "Bulk input").
+
+#### Flags
+
+At most one action flag may be given. With none, the command prints the whole account.
+
+| Flag | Description |
+|------|-------------|
+| `<USER>` | Account: an email address, a screen name, or an `@`item name |
+| `-g, --get-email` | Print the account's canonical email address (`canonical_email`) |
+| `-s, --get-screenname` | Print the account's screen name |
+| `--get-itemname` | Print the account's item name |
+| `--is-locked` | Print `true` or `false` |
+| `-L, --lock` | Lock the account |
+| `-u, --unlock` | Unlock the account |
+| `--comment <TEXT>` | Comment recorded with the lock or unlock; requires `--lock` or `--unlock`. An empty comment is not sent |
+| `--itemlist <FILE>` | Read accounts from `FILE`, one per line; `-` reads standard input. Cannot be combined with `USER` |
+| `--dry-run` | Print how each account would be looked up and what would be done; send nothing |
+| `--json` | Output one JSON object per account on stdout |
+
+The global `-j/--jobs` (default 2 for this command), `--joblog` and `--no-resume` apply; see "Bulk input" and "Job log".
+
+`--get-itemname`, `--is-locked` and `--comment` have no short form: `-i`, `-l` and `-c` are the global `--insecure`, `--log` and `--config-file`.
+
+#### Lookup type
+
+The lookup field is chosen from the form of `USER`:
+
+1. A value that starts with `@` is an item name.
+2. Otherwise, a value shaped like an email address is an email address: a local part of letters, digits and `_ . + -`, one `@`, then two or more dot-separated labels of letters, digits and `-` (not starting or ending with `-`), the last two or more letters.
+3. Anything else is a screen name.
+
+There is no flag to force a lookup type. A screen name shaped like an email address is looked up as an email address; its `@`item name reaches the same account.
+
+Every answer is checked to be the account asked for, ignoring letter case: an email lookup must match the account's `email` or `canonical_email`, a screen-name lookup its `screenname`, an item-name lookup its `itemname`. A mismatch fails with `lookup answered with a different account`.
+
+#### Credentials and host
+
+Requests carry the `logged-in-user` and `logged-in-sig` cookies from the `[cookies]` section of the config file, which `ia config login` writes. S3 keys are not sent. Without both cookies the command stops before any request.
+
+The cookies are sent only over https to `archive.org` or a subdomain of it, or to a loopback address (`localhost`, `127.0.0.1`, `[::1]`, any port, http allowed). With any other `-H` host, with `--insecure` on a non-loopback host, or with a user name or password in the host, the command stops before any request. A 429 pauses for its Retry-After, at least 1 second, or 30 seconds when it has none.
+
+#### Requests
+
+- A lookup is one `POST /services/xauthn/?op=info`.
+- `--lock` and `--unlock` look the account up first, then send `POST /services/xauthn/?op=lock_unlock` with the item name the lookup returned: two requests per account. The lock or unlock is sent whatever the account's current state.
+- Redirects are not followed; a 3xx answer is an error.
+- A 429 pauses every worker and sends the same request again (see "Rate limiting").
+- A 5xx is not retried. A lock answered with a 5xx may still have been applied; look the account up with `--is-locked` before sending it again.
+
+#### Output
+
+| Action | Human output (stdout) |
+|--------|-----------------------|
+| none | the account's `values` object as indented JSON |
+| `--get-email`, `--get-screenname`, `--get-itemname` | the value |
+| `--is-locked` | `true` or `false` |
+| `--lock`, `--unlock` | `<USER>: locked` or `<USER>: unlocked` |
+
+With a list, each stdout line starts with its input line, so results match input: `<line>: <value>`, `<line>: true`, `<line>: locked`, `<line>: locked (same account as <other line>)`, and with no action flag `<line>: <values as one line of JSON>`. Results print as each account finishes, not in input order.
+
+Errors print `error: <line>: <message>` on stderr. `-q` drops the lock and unlock lines; `-qq` also drops error lines. Read values print at every quiet level, since they are the output. After a list of more than one account, `<n> succeeded, <m> failed` follows on stderr, except with `--json` or `-qq`. The command exits 1 when any account failed, else 0, at every quiet level.
+
+With `--json`, stdout carries one compact object per account:
+
+```json
+{"account":"person@example.com","lookup":"email","action":"get-email","status":"ok","canonical_email":"person@example.com","elapsed_ms":12}
+{"account":"@example-user","lookup":"itemname","action":"lookup","status":"ok","values":{"…":"…"},"elapsed_ms":9}
+{"account":"example-user-1","lookup":"screenname","action":"is-locked","status":"ok","locked":false,"elapsed_ms":8}
+{"account":"example-user-1","lookup":"screenname","action":"lock","status":"ok","itemname":"@example-user-1","response":{"…":"…"},"elapsed_ms":20}
+{"account":"@example-user-1","lookup":"itemname","action":"lock","status":"ok","itemname":"@example-user-1","same_as":"example-user-1","elapsed_ms":20}
+{"account":"nobody@example.org","lookup":"email","action":"lock","status":"error","error":{"code":"account_api_error","message":"account API error for nobody@example.org: account not found","account":"nobody@example.org"},"elapsed_ms":7}
+```
+
+`action` is one of `lookup`, `get-email`, `get-screenname`, `get-itemname`, `is-locked`, `lock`, `unlock`. `response` is the server's answer to the lock or unlock, as JSON, or as a JSON string when the answer is not JSON. `same_as` marks a line whose account another line already locked or unlocked in this run (see "Several lines for one account"); such a record has no `response`. The command exits 1 after the last object when any account has `"status":"error"`. Errors that stop the command before any account (missing cookies, a host the cookies may not go to, no account given, an empty `USER`, an unreadable or empty list) print `{"error": {"code": "...", "message": "..."}}` on stderr and exit 1.
+
+| Error code | Cause |
+|------------|-------|
+| `auth_error` | cookies missing; host not archive.org or loopback |
+| `http_error` | a redirect, or another non-2xx answer (the message is the response body) |
+| `account_api_error` | account not found, an answer that is not JSON, a different account in the answer, a field the action needs missing, no usable item name, or a refused lock or unlock |
+| `network` | connection failure |
+| `invalid_argument` | no account given, an empty `USER`, `--itemlist -` with a terminal on standard input, or a list with no accounts in it |
+| `io` | the `--itemlist` file, standard input or the job log could not be read |
+
+#### Bulk input
+
+Without `USER`, the accounts come from `--itemlist <FILE>`, or else from standard input when it is not a terminal. `--itemlist -` reads standard input too (as does `--itemlist /dev/stdin`, the form other commands document); with a terminal on standard input it fails with `--itemlist - needs standard input from a pipe or file`. With no source at all the command fails with `no account given: pass USER, --itemlist <FILE>, or pipe accounts on standard input`; an empty or blank `USER` fails with `USER is empty`. As with other commands, a job runner that leaves standard input open as a pipe makes a command with no `USER` wait for it.
+
+A byte-order mark at the start of the list is removed. Each line is trimmed. Blank lines and lines starting with `#` are skipped, and a line repeated exactly is run once. Lines are not checked as item identifiers, so email addresses with `+` and screen names with spaces are kept. A list that names no account fails with `no accounts found in <FILE>` (or `standard input`).
+
+Accounts run concurrently, `--jobs` at a time, default 2. Every form runs the same code for each account: a positional `USER` is a list of one, printed in the single-account form.
+
+#### Several lines for one account
+
+`Person@Example.com`, `person@example.com`, `example-user` and `@example-user` can all name one account. With `--lock` or `--unlock`, requests are shared within a run by the item name each lookup returns, compared exactly as the server returns it (every spelling of one account looks up to the same item name; two item names that differ only in letter case are two accounts): the first line to reach the lock sends it, and later lines for the same item name wait for that result and report it as their own, with `(same account as <first line>)` in human output and `same_as` in JSON. One account gets one lock request and one comment per run. If that request fails, every line for the account fails with its error. Every line is still looked up. Read actions share nothing; each line gets its own lookup.
+
+#### Dry run
+
+`--dry-run` sends nothing, not even the lookup, and does not need the cookies or check the host. It works with every action, so a list can be checked for how each line will be looked up:
+
+```
+dry-run person@example.com: lock (lookup by email), comment "spam"
+dry-run @example-user: lock (lookup by itemname)
+```
+
+The comment is shown for a lock or unlock when it is not empty, in double quotes with quotes, backslashes and control characters escaped (`"say \"hi\"\nnext"`), so it stays on one line. Then, unless `-qq`, `dry-run: would lock 2 account(s), nothing sent` on stderr. With `--json`, each account is `{"account":"…","lookup":"…","action":"…","status":"dry_run","comment":"…","dry_run":true}` (`comment` only when shown) and there is no footer. A dry run writes nothing to the job log, but applies its resume skip first, so it shows what a resumed run would do.
+
+#### Job log
+
+Only `--lock` and `--unlock` use `--joblog`; with a read action it is ignored, neither read nor written. Each account is recorded as it finishes: `op` is `account-lock` or `account-unlock`, `item` the input line, `file` empty, and `status` `ok` (with `bytes` 0 and `elapsed_ms`) or `error` with the message. When a lock or unlock request was sent for the line, the entry also has `itemname`, the item name the request was sent with, and `comment`, the `--comment` it carried (absent when no comment was given; an empty comment is not sent). Both are recorded when the request then failed. A line whose lookup failed, or returned no item name starting with `@`, sends no lock or unlock and has neither. A line that shared another line's request gets its own entry with that request's status, item name and comment, so lines that named the same account show the same `itemname`. Resume reads only `op`, `item` and `status`, so a job log written before `itemname` and `comment` were recorded resumes the same way.
+
+A rerun with the same `--joblog` skips a line when its latest entry among `account-lock` and `account-unlock` is `ok` and has the op of this run, printing `resuming: skipping <n> account(s) already done in joblog` on stderr unless `-q`. Lines that failed run again. So a lock list rerun after the same lines were unlocked through the same job log locks them again, and an unlock run is not skipped because of an earlier lock. When every line is already done, the command prints that line and exits 0. `--no-resume` runs every line.
+
+Resume works per input line; sharing a lock works per account, and only within one run. A rerun with the same job log skips only the lines it records, as written: a different spelling of an account that is already locked (`@example-user` after `person@example.com`) is a new line, so it is looked up and sends another lock, with its comment.
+
+Each entry is written before the account's result is printed, so a lock the server accepted is recorded even when the output pipe closes.
+
+Keep one job log per action. `ia status --joblog <PATH> --failed-items` lists lines that never succeeded without looking at `op`, so a log that mixes locks and unlocks reports them together.
+
+An interruption can send a lock twice. A Ctrl-C while a lock request is in flight, or a failure after the server may already have acted (a `5xx`, a read timeout), leaves no `ok` entry, so a rerun sends that lock again, with its comment.
+
+#### Rate limiting
+
+A `429` on a lookup or a lock pauses every worker for the server's `Retry-After`, at least 1 second (30 seconds when absent), printing `Rate limited. Pausing all workers for <n>s...` on stderr once per pause, then sends the same request again, with no cap. A `429` on the lock repeats only the lock, not the lookup. `ia metadata modify` pauses its workers the same way.
+
+#### Examples
+
+```sh
+# Print an account as JSON
+ia account person@example.com
+
+# Print the item name of a screen name
+ia account example-user --get-itemname
+
+# Check whether an account is locked
+ia account @example-user --is-locked
+
+# Lock an account with a comment
+ia account person@example.com --lock --comment "spam"
+
+# Unlock an account, one JSON object on stdout
+ia account @example-user --unlock --json
+
+# Check how each line of a list would be looked up, sending nothing
+ia account --itemlist accounts.txt --lock --dry-run
+
+# Lock every account in a list, recording each in a job log
+ia account --itemlist accounts.txt --lock --comment "spam" --joblog lock.jsonl
+
+# Print whether each piped account is locked, four at a time
+cat accounts.txt | ia account --is-locked -j 4
+```
+
 ### `ia collection`
 
 Manage Internet Archive collections.
@@ -1021,18 +1200,20 @@ Create a new collection item on Internet Archive via S3. Only the identifier and
 
 ```sh
 ia collection create <IDENTIFIER> --collection <COLL> [OPTIONS]
+ia collection create --spreadsheet <FILE> [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `<IDENTIFIER>` | Collection identifier (3-100 chars, alphanumeric + `._-@`) |
-| `-C, --collection <COLL>` | Parent collection identifier (required) |
+| `-C, --collection <COLL>` | Parent collection identifier (required without `--spreadsheet`; with it, the parent of rows that have no `collection` column) |
 | `-t, --title <TITLE>` | Collection title |
 | `-D, --description <DESC>` | Collection description |
 | `-s, --subject <SUBJ>` | Subject/topic |
 | `-I, --image <PATH>` | Path to collection cover image |
 | `-m, --metadata <K:V>` | Additional metadata (repeatable) |
-| `--dry-run` | Validate and show full details without creating the collection |
+| `--spreadsheet <FILE>` | Create one collection per row of a file (CSV with a header row, TSV, XLSX, ODS, JSONL); conflicts with `<IDENTIFIER>` |
+| `--dry-run` | Validate and show full details without sending any request; with `--json`, `metadata` shows a field given more than once as an array of its values |
 | `--json` | Output as JSON |
 
 ```sh
@@ -1059,6 +1240,58 @@ ia collection create my-collection \
     --collection opensource --dry-run
 ```
 
+A create always sends its request and reports the server's answer; it does not first check whether the identifier exists. With `--image`, the image is sent even when the item already holds an identical one.
+
+##### Many collections from one file
+
+`--spreadsheet <FILE>` creates one collection per row. It reads the files `ia upload --spreadsheet` reads, chosen by extension: `.csv` (with a header row), `.tsv`, `.xlsx`, `.ods`, `.jsonl` or `.ndjson`, one JSON object per line. Header names are case-insensitive and a blank cell is no value. In a CSV, TSV, XLSX or ODS file a row whose `identifier` cell is blank is skipped, as in the other `--spreadsheet` commands; when a header appears twice, the last non-empty cell of the two is used. Standard input is not read.
+
+JSON lines are read by value type. JSON keys are case-insensitive, `identifier` included.
+
+| JSON value | Meaning |
+|------------|---------|
+| a string | the value (an empty string is no value) |
+| `null` | no value: the command-line value, if any, applies |
+| an array of strings | one value per element, as `subject[0]`, `subject[1]`, ... columns give; `[]` is no value |
+| a number, a boolean, an object, or an array holding anything but strings | refused |
+
+`image` and indexed keys (`subject[0]`) take a string or `null` only. String values are trimmed, so a value of only spaces is no value. A line that is not a JSON object, has no string `identifier`, or gives one key twice in different letter case is refused; a key repeated in the same letter case keeps its last value, as JSON parsers do. Refused lines and values are reported with the other problems below, before any request; write numbers and booleans as strings (`"1942"`, `"true"`).
+
+| Column | Meaning |
+|--------|---------|
+| `identifier` | The new collection's identifier (required) |
+| `collection` | The parent collection; required on every row unless `--collection` is given |
+| `image` | Path to a cover image, relative to the current directory; one path per row (`image[0]` is refused) |
+| any other column | Metadata, as `-m KEY:VALUE` gives it (`title`, `description`, `subject`, ...); `subject[0]`, `subject[1]`, ... give several values, as in `ia upload --spreadsheet` |
+
+Each row gets what a single `ia collection create` applies: `mediatype=collection` (a `mediatype` column is dropped), derive disabled, and the image stored as `<identifier>_itemimage.<ext>`.
+
+`--collection`, `--title`, `--description`, `--subject`, `--image` and `-m` apply to every row. A field a row fills in replaces every command-line value for that field, for that row only; a field the row leaves blank or does not have keeps the command-line values. So `--collection opensource` gives every row that parent, and a row with its own `collection` cell uses that one instead. This is the rule `ia upload --spreadsheet` applies between `-m` and a row.
+
+Every row is checked before the first request, and every problem is reported in one error that names the identifiers: an invalid identifier, an identifier on more than one row, a row with no parent collection, an image that does not exist, is not a file, or has no extension, and a column name that cannot be sent as metadata. Nothing is sent if any row fails these checks. S3 keys are checked once, before the first request.
+
+Rows run concurrently up to the global `-j/--jobs` (default 8). A failed row does not stop the others. Each created row prints `created: <url>` on stdout (dropped at `-q`), each failed row `error: <identifier>: <message>` on stderr (dropped at `-qq`), and, for more than one row, `<n> created, <m> failed` on stderr at the end. The exit status is 1 if any row failed.
+
+With `--json`, stdout has one object per row: a created row is the object a single create prints, `{"identifier", "status", "url"}`; a failed row is `{"identifier", "error": {"code", "message", ...}}`. An error that stops the whole command, such as a failed check, is `{"error": {...}}` on stderr.
+
+`--dry-run` checks every row the same way, sends nothing (not even for a row with an image) and needs no keys. It prints each row as a single dry run does, then `dry-run: would create <n> collection(s), nothing sent` on stderr.
+
+`--joblog <PATH>` records each row as it finishes: `op` is `collection-create`, `item` the identifier, `file` empty, and `status` `ok` or `error` with the message. A rerun with the same `--joblog` checks every row again, then skips the identifiers whose latest entry is `ok`, printing `resuming: skipping <n> collection(s) already created in joblog`; failed rows run again. `--no-resume` runs every row. `ia status --joblog <PATH> --failed-items` lists the identifiers that failed. A collection created without an image is one PUT that is not retried within the run; a row refused for load (`SlowDown`) or a dropped connection fails, and the rerun with the job log sends it again. The single form ignores `--joblog`.
+
+```sh
+# collections.csv:
+#   identifier,title,description
+#   example-series-1,Series 1,Photographs from series 1
+#   example-series-2,Series 2,Photographs from series 2
+ia collection create --spreadsheet collections.csv --collection opensource -m hidden:true
+
+# Check every row without sending anything
+ia collection create --spreadsheet collections.jsonl --dry-run
+
+# Record each row; rerun the same command to retry the rows that failed
+ia collection create --spreadsheet collections.csv --joblog create.jsonl
+```
+
 ### `ia config`
 
 Configure Internet Archive credentials and settings.
@@ -1073,10 +1306,12 @@ ia config <SUBCOMMAND>
 |------------|-------------|
 | `login` | Log in to archive.org and save credentials |
 | `show` | Print current configuration as JSON |
-| `check` | Validate stored S3 credentials |
-| `whoami` | Show account information (screenname, email) |
+| `check` | Validate stored S3 credentials; exit 1 if archive.org rejects them or cannot be reached |
+| `whoami` | Show the account the S3 keys belong to (screenname, email, itemname) |
 | `print-cookies` | Print cookies in Netscape format |
 | `print-auth` | Print the Authorization header for S3 API requests |
+
+`check` and `whoami` send one `GET /services/user.php?op=whoami` authenticated with the S3 keys only (no cookies). Any valid key pair is accepted; no account privileges are needed. The email shown is the account's username as archive.org reports it, not the `logged-in-user` cookie. With `--json`, `check` prints `{"valid": true, "screenname", "email", "itemname"}` or `{"valid": false, "error"}`; `valid: false` and exit 1 are also given when archive.org cannot be reached or gives an unexpected answer, and the `error` text says which.
 
 #### Flags
 
@@ -1084,7 +1319,7 @@ ia config <SUBCOMMAND>
 |------|------------|-------------|
 | `-u, --username <EMAIL>` | `login` | Email address (prompts if omitted) |
 | `-p, --password <PASS>` | `login` | Password (prompts if omitted) |
-| `--netrc` | `login` | Read credentials from `~/.netrc` |
+| `--netrc` | `login` | Read credentials from the `machine archive.org` entry in `~/.netrc`. A `default` entry is not used, and a malformed file is an error. |
 | `--show-secrets` | `show` | Show secret values instead of redacting them |
 | `--json` | all | Output as JSON |
 
@@ -1291,8 +1526,8 @@ These options can be used with any subcommand:
 | Flag | Description |
 |------|-------------|
 | `-c, --config-file <PATH>` | Path to configuration file |
-| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` uses 2, `ia metadata audit` 10). For `ia download`: files downloaded at once across all servers; any one server gets at most 6 connections, so files on the same server may wait (see "Connections") |
-| `-i, --insecure` | Allow insecure (HTTP) connections |
+| `-j, --jobs <N>` | Concurrent operations (default 8; `ia metadata export` adapts to the server when it is omitted, `ia metadata modify` and `ia account` use 2, `ia metadata audit` 10). For `ia download`: files downloaded at once across all servers; any one server gets at most 6 connections, so files on the same server may wait (see "Connections") |
+| `-i, --insecure` | Allow insecure (HTTP) connections (`ia account` refuses it for any host but a loopback address, since its login cookies go only over https) |
 | `-H, --host <HOST>` | Override the archive.org host |
 | `--user-agent-suffix <STRING>` | Append to the default User-Agent |
 | `--joblog <PATH>` | Write operation results to a JSONL log file; a rerun with the same `--joblog` skips what it records as done (see "Job logging") |
@@ -1323,11 +1558,11 @@ ia --config-file ~/my-ia.ini download nasa
 
 The retries that answer a failed request wait on one schedule: the per-file download retries, every IA-S3 request in an upload, a search page answered with `429`, the HTTP layer's own retries of a `5xx`, the LLM client, and the self-updater. The wait is random, up to a cap that doubles with each attempt from 1 s to 60 s (full jitter, so many clients retrying at once do not land together). When the failed response carries a `Retry-After` header, that wait is used instead, as given: the seconds form or the HTTP-date form, even above 60 s, and `Retry-After: 0` means try again at once. `ia update` is on the schedule with its cap at 30 s. How many retries each command makes, and what it retries, is in that command's section.
 
-Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit` and `ia metadata` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`).
+Not on it: the in-stream re-request after a dropped download connection (0.5 s, 1.5 s, 4.5 s; see "Slow and stalled downloads"), the re-request after a stall and the re-send of a dead upload (both at once), and the `429` handling of `ia tasks submit`, `ia metadata` and `ia account` (`ia tasks` waits the `Retry-After` or 2 s doubling to 60 s; `ia metadata` pauses every worker for the `Retry-After`; `ia account` pauses every worker for the `Retry-After`, at least 1 s, or 30 s when there is none).
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit` and `ai qa`. `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit`, `collection create --spreadsheet` and `ai qa`; for `account --lock` and `account --unlock`, accounts whose latest lock or unlock entry is `ok` with the same action (read actions of `ia account` ignore `--joblog`). `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and `--multipart` uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging
@@ -1376,7 +1611,12 @@ ia download nasa --json
 
 # Pipe search JSON into download
 ia search "collection:nasa" --json | ia download --itemlist /dev/stdin
+
+# One object per account, each with "status": "ok" or "error"
+ia account --itemlist accounts.txt --is-locked --json
 ```
+
+`ia account --json` prints one object per account with `account`, `lookup`, `action` and `status` (`ok`, `error`, or `dry_run` with `--dry-run`), and its command-level errors as `{"error": {...}}` on stderr (see "Output" under `ia account`).
 
 When `--json` is active:
 

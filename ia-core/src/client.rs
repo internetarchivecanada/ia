@@ -178,7 +178,17 @@ impl IaClient {
         let user_agent = build_user_agent(config);
 
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+        let user_agent_value = HeaderValue::from_str(&user_agent).map_err(|_| {
+            crate::error::IaError::Config(format!(
+                "invalid user_agent_suffix {:?}: it contains a control character",
+                config
+                    .general
+                    .user_agent_suffix
+                    .as_deref()
+                    .unwrap_or_default()
+            ))
+        })?;
+        headers.insert(USER_AGENT, user_agent_value);
 
         let api = configure_transport(
             Self::base_builder(headers.clone()),
@@ -263,12 +273,15 @@ impl IaClient {
         let raw_http = transports.upload.clone();
         let api_for_writes = transports.api.clone();
 
+        // Timing sits inside the retry middleware, so each attempt is one
+        // request with its own latency, as on the download transport
+        // (`retry::send_recorded`).
         let http = ClientBuilder::new(transports.api)
+            .with(
+                RetryMiddleware::new(retry_policy, LoggingRetryStrategy::new(stats.clone()))
+                    .with_stats(stats.clone()),
+            )
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryMiddleware::new(
-                retry_policy,
-                LoggingRetryStrategy::new(stats.clone()),
-            ))
             .build();
 
         // Writes must not be replayed on a 5xx, but a connection that was
@@ -276,11 +289,14 @@ impl IaClient {
         // safe and dropping it would be a regression against the retrying
         // client. Timing is kept so writes still appear in -v diagnostics.
         let api_no_retry = ClientBuilder::new(api_for_writes)
+            .with(
+                RetryMiddleware::new(
+                    retry_policy,
+                    crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
+                )
+                .with_stats(stats.clone()),
+            )
             .with(TimingMiddleware::new(stats.clone()))
-            .with(RetryMiddleware::new(
-                retry_policy,
-                crate::retry::ConnectOnlyRetryStrategy::new(stats.clone()),
-            ))
             .build();
 
         // Upload transport: timing only, no retry layer.
@@ -436,8 +452,9 @@ impl IaClient {
     #[doc(hidden)]
     pub fn from_config_no_retry(config: IaConfig) -> Result<Self> {
         let transports = Self::build_transports(&config, CONNECT_TIMEOUT, READ_TIMEOUT)?;
-        // Stats are required by the struct but will always be zeros — no
-        // TimingMiddleware or LoggingRetryStrategy is wired in this path.
+        // No TimingMiddleware or retry strategy is wired in this path, so
+        // the stats see only the download transport's requests
+        // (`retry::send_recorded`).
         let stats = Arc::new(RetryStats::new(0));
         let raw_http = transports.upload.clone();
         let api_for_writes = transports.api.clone();
@@ -510,6 +527,41 @@ impl IaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_suffix(suffix: &str) -> IaConfig {
+        let mut config = IaConfig::default();
+        config.general.user_agent_suffix = Some(suffix.to_string());
+        config
+    }
+
+    #[test]
+    fn control_character_in_user_agent_suffix_is_a_config_error() {
+        for bad in ["app\n1.0", "app\r1.0", "app\x001.0", "app\x7f1.0"] {
+            for result in [
+                IaClient::from_config(config_with_suffix(bad)),
+                IaClient::from_config_no_retry(config_with_suffix(bad)),
+            ] {
+                match result {
+                    Err(crate::error::IaError::Config(msg)) => {
+                        assert!(msg.contains("user_agent_suffix"), "got: {msg}");
+                        assert!(msg.contains(&format!("{bad:?}")), "got: {msg}");
+                    }
+                    Err(other) => panic!("expected Config error, got {other:?}"),
+                    Ok(_) => panic!("suffix {bad:?} must be rejected"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_and_tab_user_agent_suffix_is_accepted() {
+        for ok in ["caf\u{e9}/1.0", "app\t1.0"] {
+            assert!(
+                IaClient::from_config(config_with_suffix(ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn read_timeout_aborts_stalled_response() {
