@@ -593,6 +593,11 @@ pub(crate) async fn fetch_response_via(
                 send_on_slot(client, guard, &server, &request).await?
             }
             _ => {
+                // A slot taken idle from a named host keeps no socket
+                // beside this request's own.
+                if let Some(guard) = slot.as_mut() {
+                    guard.drop_client().await;
+                }
                 let mut req = request(http);
                 if download.is_some() {
                     // A download's connection lives only as long as its
@@ -1570,7 +1575,13 @@ pub async fn download_file(
         };
         // Close the abandoned connection before opening the next one, and
         // give its slot back now: a body error waits before re-requesting,
-        // and the server's slot must not sit idle through that wait.
+        // and the server's slot must not sit idle through that wait. A
+        // body left before its end takes its connection with it.
+        if !matches!(end, StreamEnd::Done) {
+            if let Some(guard) = slot.as_mut() {
+                guard.spend();
+            }
+        }
         drop(stream);
         drop(slot.take());
 

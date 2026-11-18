@@ -1102,6 +1102,14 @@ impl Budget {
     }
 }
 
+/// The connection of `slot` goes with a response dropped before its body
+/// ends (see `slots::SlotGuard::spend`).
+fn spend(slot: &mut super::Slot) {
+    if let Some(guard) = slot.as_mut() {
+        guard.spend();
+    }
+}
+
 /// Wait until the stream is told to stop (or the download that runs it is
 /// gone). The guard `wait_for` returns is dropped here: it is not `Send`,
 /// and a `select!` that kept it would make the download future `!Send`.
@@ -1258,7 +1266,7 @@ async fn fetch_part(
     let (stall_window, stall_grace) = stall::policy();
     while done < len {
         let span = (start + done, start + len - 1);
-        let (body_response, slot) = match response.take() {
+        let (body_response, mut slot) = match response.take() {
             Some(answer) => answer,
             None => match request_span(shared, k, span, budget, stop).await? {
                 Some(answer) => answer,
@@ -1266,6 +1274,8 @@ async fn fetch_part(
             },
         };
         if shared.sheds(slot.as_ref()) {
+            // Its body unread, the connection cannot be reused.
+            spend(&mut slot);
             drop(body_response);
             drop(slot);
             shared.give_back(k);
@@ -1344,7 +1354,11 @@ async fn fetch_part(
         };
         // Close the connection and give its slot back (before any wait or
         // next request), then put what arrived on record: it is the offset
-        // of the next request, or of a later run.
+        // of the next request, or of a later run. A body left before its
+        // end takes its connection with it.
+        if !matches!(ended, Ended::Done) {
+            spend(&mut slot);
+        }
         drop(body);
         drop(slot);
         shared.record(k, &mut out, done).await?;
