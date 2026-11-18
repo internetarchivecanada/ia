@@ -285,13 +285,16 @@ fn read_jsonl(path: &Path, scope: Scope) -> Result<Vec<SpreadsheetRecord>> {
                 continue;
             }
         };
-        let mut object = Vec::with_capacity(raw.len());
-        for (key, text) in &raw {
-            match serde_json::from_str::<Value>(text.get()) {
-                Ok(value) => object.push((key, text.get().trim(), value)),
-                Err(e) => problems.push(format!("line {line_no}: not valid JSON: {e}")),
-            }
-        }
+        // The line parsed, so a value that does not parse again is a number
+        // too large for f64 (`1e400`); it is a number, sent as written.
+        let object: Vec<(&String, &str, Value)> = raw
+            .iter()
+            .map(|(key, text)| {
+                let value = serde_json::from_str::<Value>(text.get())
+                    .unwrap_or_else(|_| Value::Number(0.into()));
+                (key, text.get().trim(), value)
+            })
+            .collect();
 
         let id_values: Vec<&Value> = object
             .iter()
@@ -1122,7 +1125,7 @@ mod tests {
     fn jsonl_numbers_and_booleans_are_sent_as_written() {
         let records = read(
             "a.jsonl",
-            r#"{"identifier":"a","year":1999,"price":1.50,"count":1e3,"priority":-5,"big":123456789012345678901234567890,"public":true,"draft":false,"subject[0]":7}"#,
+            r#"{"identifier":"a","year":1999,"price":1.50,"count":1e3,"priority":-5,"big":123456789012345678901234567890,"public":true,"draft":false,"subject[0]":7,"huge":1e400}"#,
         );
         let fields = &records[0].1;
         for (key, want) in [
@@ -1134,9 +1137,26 @@ mod tests {
             ("public", "true"),
             ("draft", "false"),
             ("subject[0]", "7"),
+            ("huge", "1e400"),
         ] {
             assert_eq!(fields.get(key).map(String::as_str), Some(want), "{key}: {fields:?}");
         }
+    }
+
+    #[test]
+    fn jsonl_key_repeated_in_the_same_case_keeps_its_last_value() {
+        let records = read("a.jsonl", r#"{"identifier":"a","x":"1","x":2}"#);
+        assert_eq!(records[0].1.get("x").unwrap(), "2");
+    }
+
+    #[test]
+    fn jsonl_out_of_range_number_as_identifier_is_refused() {
+        let msg = refusal("a.jsonl", r#"{"identifier":1e400}"#);
+        assert!(
+            msg.contains("line 1: identifier must be a string (got a number)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("no identifier"), "{msg}");
     }
 
     #[test]
