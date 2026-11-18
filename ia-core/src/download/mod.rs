@@ -1477,6 +1477,7 @@ pub async fn download_file(
         drop(stream);
         drop(slot.take());
 
+        let shed = matches!(end, StreamEnd::Shed);
         match end {
             StreamEnd::Done => break,
             StreamEnd::Shed => {
@@ -1561,8 +1562,10 @@ pub async fn download_file(
         }
 
         // Re-request from the bytes on disk. Shared by the stream-error,
-        // stall and shed paths.
-        client.retry_stats().record_retry();
+        // stall and shed paths; a shed is not a retry, as for range streams.
+        if !shed {
+            client.retry_stats().record_retry();
+        }
         let (new_resp, new_slot) = fetch_response_via(
             client.range_http(),
             client,

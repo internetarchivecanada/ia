@@ -3491,6 +3491,9 @@ mod tests {
             ranges.lock().unwrap().iter().any(Option::is_some),
             "no whole file was resumed with Range"
         );
+        // The 429 was resent once; a connection given back and resumed is
+        // not a retry.
+        assert_eq!(client.retry_stats().summary().retries_total, 1);
     }
 
     #[tokio::test]
