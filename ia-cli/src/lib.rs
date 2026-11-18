@@ -88,7 +88,7 @@ struct Cli {
     #[arg(long, global = true, help_heading = "Global Options")]
     no_resume: bool,
 
-    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify uses 2)
+    /// Concurrent operations (default 8; metadata export adapts to the server when omitted, metadata modify and account use 2)
     #[arg(short = 'j', long, global = true, help_heading = "Global Options", value_parser = parse_jobs)]
     jobs: Option<usize>,
 
@@ -102,6 +102,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // No doc comment here: clap would turn it into `about` and clear the
+    // `long_about` set on AccountArgs. Both live on the struct.
+    #[command(visible_alias = "ac")]
+    Account(commands::account::AccountArgs),
     // No doc comment here: clap would turn it into `about` and clear the
     // `long_about` set on AiArgs. Both live on the struct.
     #[cfg(feature = "alpha")]
@@ -331,11 +335,25 @@ pub async fn run() -> Result<()> {
     let jobs = cli.jobs.unwrap_or(8);
 
     match cli.command {
+        Commands::Account(args) => {
+            commands::account::run(
+                &client,
+                args,
+                cli.quiet,
+                cli.jobs,
+                cli.joblog,
+                cli.no_resume,
+            )
+            .await?
+        }
         #[cfg(feature = "alpha")]
         Commands::Ai(args) => {
             commands::ai::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume).await?
         }
-        Commands::Collection(args) => commands::collection::run(&client, args, cli.quiet).await?,
+        Commands::Collection(args) => {
+            commands::collection::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume)
+                .await?
+        }
         Commands::Download(args) => {
             commands::download::run(&client, args, cli.quiet, jobs, cli.joblog, cli.no_resume)
                 .await?

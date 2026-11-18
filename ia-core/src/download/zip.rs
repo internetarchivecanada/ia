@@ -7,8 +7,47 @@
 
 use tracing::debug;
 
+use super::DownloadOpts;
 use crate::client::IaClient;
 use crate::error::{IaError, Result};
+use crate::upload::s3_error::unescape_xml_text;
+
+/// GET `url` and read its whole body, `what` naming it in an error. With
+/// `opts`, the request goes over the HTTP/1.1 download transport and holds a
+/// connection slot (see [`DownloadOpts::server_slots`]) until the body is
+/// read, like any download; without, it takes no slot.
+async fn fetch_body(
+    client: &IaClient,
+    url: &str,
+    opts: Option<&DownloadOpts>,
+    what: &str,
+) -> Result<Vec<u8>> {
+    // count_views=false → inject cnt=0 so zip listings/members don't
+    // increment the public view counter for the parent item.
+    let (response, slot) = match opts {
+        Some(opts) => {
+            super::fetch_response_via(
+                client.range_http(),
+                client,
+                url,
+                None,
+                false,
+                Some(opts),
+                None,
+            )
+            .await?
+        }
+        None => (super::fetch_response(client, url, None, false).await?, None),
+    };
+    let body = response.bytes().await.map_err(|e| IaError::Http {
+        status: 0,
+        message: format!("failed to read {what}: {e}"),
+        retry_after: None,
+    });
+    // The body is read: the connection is closed and its slot goes back.
+    drop(slot);
+    Ok(body?.to_vec())
+}
 
 /// A single entry within a ZIP file on archive.org.
 #[derive(Debug, Clone)]
@@ -25,10 +64,32 @@ pub struct ZipEntry {
 ///
 /// Fetches the HTML directory listing at `/download/{identifier}/{zip_filename}/`
 /// and parses the table rows to extract file entries.
+///
+/// Takes no connection slot; [`list_zip_contents_with`] does.
 pub async fn list_zip_contents(
     client: &IaClient,
     identifier: &str,
     zip_filename: &str,
+) -> Result<Vec<ZipEntry>> {
+    list_zip(client, identifier, zip_filename, None).await
+}
+
+/// [`list_zip_contents`], holding a connection slot of `opts` on the
+/// datanode that serves the listing, like any download.
+pub async fn list_zip_contents_with(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    opts: &DownloadOpts,
+) -> Result<Vec<ZipEntry>> {
+    list_zip(client, identifier, zip_filename, Some(opts)).await
+}
+
+async fn list_zip(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    opts: Option<&DownloadOpts>,
 ) -> Result<Vec<ZipEntry>> {
     // Trailing `/` is required: without it archive.org redirects to the raw
     // binary zip download; with it, the redirect goes to the HTML directory
@@ -41,17 +102,11 @@ pub async fn list_zip_contents(
 
     debug!(identifier, zip_filename, "listing zip contents");
 
-    // Use fetch_response for auth headers + redirect following with auth
-    // preservation (reqwest strips Authorization on redirect by default).
-    // count_views=false → inject cnt=0 so zip listings/members don't
-    // increment the public view counter for the parent item.
-    let response = super::fetch_response(client, &url, None, false).await?;
-
-    let html = response.text().await.map_err(|e| IaError::Http {
-        status: 0,
-        message: format!("failed to read zip listing body: {e}"),
-        retry_after: None,
-    })?;
+    // fetch_response_via (through fetch_body) sends the auth headers and
+    // follows redirects keeping them (reqwest strips Authorization on
+    // redirect by default).
+    let body = fetch_body(client, &url, opts, "zip listing body").await?;
+    let html = String::from_utf8_lossy(&body);
 
     Ok(parse_zip_listing_html(&html))
 }
@@ -60,11 +115,36 @@ pub async fn list_zip_contents(
 ///
 /// Uses `fetch_response` internally for auth headers, redirect following with
 /// auth preservation, SSRF guard, and HTML error page stripping.
+///
+/// Takes no connection slot; [`download_zip_member_with`] does.
 pub async fn download_zip_member(
     client: &IaClient,
     identifier: &str,
     zip_filename: &str,
     member_path: &str,
+) -> Result<Vec<u8>> {
+    zip_member(client, identifier, zip_filename, member_path, None).await
+}
+
+/// [`download_zip_member`], holding a connection slot of `opts` on the
+/// datanode that serves the member, like any download. With
+/// [`DownloadOpts::for_item`], the slot comes from the item's pair.
+pub async fn download_zip_member_with(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    member_path: &str,
+    opts: &DownloadOpts,
+) -> Result<Vec<u8>> {
+    zip_member(client, identifier, zip_filename, member_path, Some(opts)).await
+}
+
+async fn zip_member(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    member_path: &str,
+    opts: Option<&DownloadOpts>,
 ) -> Result<Vec<u8>> {
     let url = build_zip_member_url(client, identifier, zip_filename, member_path);
 
@@ -73,19 +153,7 @@ pub async fn download_zip_member(
         zip_filename, member_path, "downloading zip member"
     );
 
-    // count_views=false → inject cnt=0 so zip listings/members don't
-    // increment the public view counter for the parent item.
-    let response = super::fetch_response(client, &url, None, false).await?;
-
-    response
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| IaError::Http {
-            status: 0,
-            message: format!("failed to read zip member body: {e}"),
-            retry_after: None,
-        })
+    fetch_body(client, &url, opts, "zip member body").await
 }
 
 /// Download a ZIP member and convert to another format (e.g., JP2 → JPEG).
@@ -95,12 +163,46 @@ pub async fn download_zip_member(
 ///
 /// Uses `fetch_response` internally for auth headers, redirect following with
 /// auth preservation, SSRF guard, and HTML error page stripping.
+///
+/// Takes no connection slot; [`download_zip_member_converted_with`] does.
 pub async fn download_zip_member_converted(
     client: &IaClient,
     identifier: &str,
     zip_filename: &str,
     member_path: &str,
     ext: &str,
+) -> Result<Vec<u8>> {
+    zip_member_converted(client, identifier, zip_filename, member_path, ext, None).await
+}
+
+/// [`download_zip_member_converted`], holding a connection slot of `opts`
+/// on the datanode that serves the member, like any download.
+pub async fn download_zip_member_converted_with(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    member_path: &str,
+    ext: &str,
+    opts: &DownloadOpts,
+) -> Result<Vec<u8>> {
+    zip_member_converted(
+        client,
+        identifier,
+        zip_filename,
+        member_path,
+        ext,
+        Some(opts),
+    )
+    .await
+}
+
+async fn zip_member_converted(
+    client: &IaClient,
+    identifier: &str,
+    zip_filename: &str,
+    member_path: &str,
+    ext: &str,
+    opts: Option<&DownloadOpts>,
 ) -> Result<Vec<u8>> {
     let base_url = build_zip_member_url(client, identifier, zip_filename, member_path);
     let url = format!("{base_url}&ext={ext}");
@@ -110,19 +212,7 @@ pub async fn download_zip_member_converted(
         zip_filename, member_path, ext, "downloading converted zip member"
     );
 
-    // count_views=false → inject cnt=0 so zip listings/members don't
-    // increment the public view counter for the parent item.
-    let response = super::fetch_response(client, &url, None, false).await?;
-
-    response
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| IaError::Http {
-            status: 0,
-            message: format!("failed to read converted zip member body: {e}"),
-            retry_after: None,
-        })
+    fetch_body(client, &url, opts, "converted zip member body").await
 }
 
 /// Find the best JP2 zip file for an item.
@@ -181,6 +271,11 @@ pub(crate) fn build_zip_member_url(
 ///
 /// We only match lines starting with `<tr>` to avoid picking up navigation
 /// links (`#maincontent`, external URLs) that appear elsewhere in the page.
+///
+/// The link text is the member's path with HTML character references
+/// (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#039;`) that are decoded here, so
+/// [`ZipEntry::path`] is the real name and can be passed to
+/// [`download_zip_member`].
 pub(crate) fn parse_zip_listing_html(html: &str) -> Vec<ZipEntry> {
     let mut entries = Vec::new();
 
@@ -211,7 +306,9 @@ pub(crate) fn parse_zip_listing_html(html: &str) -> Vec<ZipEntry> {
                         if !display_name.is_empty() {
                             let (size, modified) = parse_table_cells(after_tag);
                             entries.push(ZipEntry {
-                                path: display_name.to_string(),
+                                // The link text is HTML: `a&b.jp2` is sent
+                                // as `a&amp;b.jp2`.
+                                path: unescape_xml_text(display_name),
                                 size,
                                 modified,
                             });
@@ -363,6 +460,91 @@ mod tests {
         assert_eq!(entries[0].path, "file.jp2");
         assert_eq!(entries[0].size, Some(12345));
         assert_eq!(entries[0].modified, Some("2024-01-01".to_string()));
+    }
+
+    /// One listing row for `name_html` (the link text as the zip view
+    /// sends it), parsed; returns the single entry's path.
+    fn parse_one_name(name_html: &str) -> String {
+        let html = format!(
+            r#"<tr><td><a href="//archive.org/download/item/item.zip/x">{name_html}</a><td>2026-01-01 00:00<td id="size">5</tr>"#
+        );
+        let entries = parse_zip_listing_html(&html);
+        assert_eq!(entries.len(), 1, "{html}");
+        assert_eq!(entries[0].size, Some(5));
+        entries[0].path.clone()
+    }
+
+    /// #117: the link text is HTML; its character references are decoded so
+    /// the path is the member's real name.
+    #[test]
+    fn parse_zip_listing_decodes_ampersand_and_angle_brackets() {
+        assert_eq!(parse_one_name("a&amp;b &lt;c&gt;.jp2"), "a&b <c>.jp2");
+    }
+
+    #[test]
+    fn parse_zip_listing_decodes_quotes() {
+        assert_eq!(
+            parse_one_name("&quot;q&quot; it&#039;s &apos;x&apos; &#39;y&#x27;.jp2"),
+            "\"q\" it's 'x' 'y'.jp2"
+        );
+    }
+
+    #[test]
+    fn parse_zip_listing_decodes_once() {
+        // A member literally named `a&amp;b.jp2` is sent as `a&amp;amp;b.jp2`.
+        assert_eq!(parse_one_name("a&amp;amp;b.jp2"), "a&amp;b.jp2");
+    }
+
+    #[test]
+    fn parse_zip_listing_plain_name_unchanged() {
+        assert_eq!(
+            parse_one_name("dir/plain name_01 (v2).jp2"),
+            "dir/plain name_01 (v2).jp2"
+        );
+    }
+
+    /// #117: a listed name with escaped characters downloads the member it
+    /// names: the request path is the real name, percent-encoded.
+    #[tokio::test]
+    async fn listed_name_with_entities_downloads_that_member() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download/item/item.zip/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<tr><td><a href="//archive.org/download/item/item.zip/a%26b%20%3Cc%3E.jp2">a&amp;b &lt;c&gt;.jp2</a><td>2026-01-01 00:00<td id="size">5</tr>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bytes".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = crate::IaClient::from_config(mock_config(&server.uri())).unwrap();
+        let entries = list_zip_contents(&client, "item", "item.zip")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a&b <c>.jp2");
+
+        let bytes = download_zip_member(&client, "item", "item.zip", &entries[0].path)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"bytes");
+
+        let requests = server.received_requests().await.unwrap();
+        let member_paths: Vec<&str> = requests
+            .iter()
+            .map(|r| r.url.path())
+            .filter(|p| !p.ends_with('/'))
+            .collect();
+        assert_eq!(
+            member_paths,
+            ["/download/item/item.zip/a%26b%20%3Cc%3E.jp2"]
+        );
     }
 
     #[test]

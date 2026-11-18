@@ -1,3 +1,4 @@
+pub mod account;
 #[cfg(feature = "alpha")]
 pub mod ai;
 pub mod collection;

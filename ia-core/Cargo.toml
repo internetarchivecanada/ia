@@ -33,7 +33,7 @@ libc = "0.2"
 # Advisory locks on the per-server slot files that share the cap of 6 connections
 # per datanode between ia processes (flock on Unix, LockFileEx on Windows).
 fs4 = { version = "1", default-features = false, features = ["sync"] }
-json-patch = "4"
+json-patch = "5"
 calamine = "0.38"
 csv = "1"
 rust_xlsxwriter = "0.102"

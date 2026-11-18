@@ -25,15 +25,15 @@ async fn test_tasks_list_json() {
     )
     .unwrap();
 
-    // Mock whoami (POST /services/xauthn/?op=info)
-    Mock::given(method("POST"))
-        .and(path("/services/xauthn/"))
-        .and(query_param("op", "info"))
+    // Mock whoami (GET /services/user.php?op=whoami)
+    Mock::given(method("GET"))
+        .and(path("/services/user.php"))
+        .and(query_param("op", "whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
-            "values": {
+            "value": {
+                "username": "test@example.com",
                 "screenname": "testuser",
-                "email": "test@example.com",
                 "itemname": "@testuser"
             }
         })))
@@ -95,14 +95,14 @@ async fn test_tasks_completed_only_requires_identifier() {
     let mock_server = MockServer::start().await;
 
     // Mock whoami so it doesn't fail before our validation
-    Mock::given(method("POST"))
-        .and(path("/services/xauthn/"))
-        .and(query_param("op", "info"))
+    Mock::given(method("GET"))
+        .and(path("/services/user.php"))
+        .and(query_param("op", "whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
-            "values": {
+            "value": {
+                "username": "test@example.com",
                 "screenname": "testuser",
-                "email": "test@example.com",
                 "itemname": "@testuser"
             }
         })))
@@ -697,6 +697,177 @@ async fn test_tasks_submit_wait() {
     assert!(
         stdout.contains("\"status\":\"completed\""),
         "should show completed status"
+    );
+}
+
+/// A task that fails stays in the catalog with color `red`. `--wait` stops on
+/// it, exits non-zero, and names the task in the error, under `-q` too
+/// (issue #159).
+#[tokio::test]
+async fn test_tasks_submit_wait_errored_task_fails() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "task_id": 4242, "log": "https://catalogd.archive.org/log/4242" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4242"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": {
+                "summary": {"queued": 0, "running": 0, "error": 1, "paused": 0},
+                "catalog": [{"task_id": 4242, "identifier": "my-item", "cmd": "derive.php", "color": "red"}]
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-q",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an errored task must exit non-zero"
+    );
+    assert!(
+        stderr.contains("task 4242 failed"),
+        "stderr should name the failed task, got: {stderr}"
+    );
+
+    // With --json the failed entry goes to stdout, and the exit is still 1.
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "an errored task must exit non-zero"
+    );
+    assert!(
+        stdout.contains("\"color\":\"red\""),
+        "stdout should carry the failed catalog entry, got: {stdout}"
+    );
+}
+
+/// A 429 on a poll after the task was queued is rate limiting, not a
+/// failure: the wait honours Retry-After and goes on (issue #160).
+#[tokio::test]
+async fn test_tasks_submit_wait_survives_429_on_poll() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": { "task_id": 4343, "log": "https://catalogd.archive.org/log/4343" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4343"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "2"))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/services/tasks.php"))
+        .and(query_param("task_id", "4343"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "value": {
+                "summary": {"queued": 0, "running": 0, "error": 0, "paused": 0},
+                "catalog": []
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let host = mock_server.uri().replace("http://", "");
+    let start = std::time::Instant::now();
+    let output = ia_cmd()
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "tasks",
+            "submit",
+            "my-item",
+            "--cmd",
+            "derive",
+            "--wait",
+            "--wait-interval",
+            "1",
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a 429 on the poll ended the wait, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Retry-After: 2 against a 1 s poll interval: the second poll comes
+    // no sooner than 2 s after the first, so the wait was the header's.
+    assert!(
+        start.elapsed() >= std::time::Duration::from_secs(2),
+        "the poll after the 429 came before its Retry-After: {:?}",
+        start.elapsed()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"status\":\"completed\""),
+        "should show completed status, got: {stdout}"
     );
 }
 

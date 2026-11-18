@@ -88,12 +88,12 @@ async fn config_login_user_agent_has_no_access_key_even_if_config_has_one() {
 #[tokio::test]
 async fn config_check_user_agent_carries_configured_access_key() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/services/xauthn/"))
-        .and(query_param("op", "info"))
+    Mock::given(method("GET"))
+        .and(path("/services/user.php"))
+        .and(query_param("op", "whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
-            "values": {"screenname": "tester", "itemname": "@tester"}
+            "value": {"username": "u@example.com", "screenname": "tester", "itemname": "@tester"}
         })))
         .mount(&server)
         .await;

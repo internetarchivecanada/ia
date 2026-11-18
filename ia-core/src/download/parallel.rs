@@ -1086,6 +1086,8 @@ impl Budget {
             self.failed_requests as u32,
         );
         self.failed_requests += 1;
+        // The stream sends the request again (see `RetryStats::record_retry`).
+        shared.client.retry_stats().record_retry();
         warn!(
             file = %shared.file.name,
             start,
@@ -1388,6 +1390,7 @@ async fn fetch_part(
                     });
                 }
                 budget.stalls += 1;
+                shared.client.retry_stats().record_retry();
                 // No backoff, as on one stream: the server is answering,
                 // too slowly.
                 warn!(
@@ -1409,6 +1412,7 @@ async fn fetch_part(
         if budget.stream_errors < super::MAX_STREAM_RETRIES {
             budget.stream_errors += 1;
             let backoff = super::stream_retry_backoff(budget.stream_errors);
+            shared.client.retry_stats().record_retry();
             warn!(
                 file = %shared.file.name,
                 start,
@@ -2689,6 +2693,11 @@ mod tests {
             3,
             "{got:?}"
         );
+        // Each request is in the HTTP line, the two resends as retries.
+        let stats = client.retry_stats().summary();
+        assert_eq!(stats.requests_total, got.len() as u64);
+        assert_eq!(stats.retries_total, 2);
+        assert_eq!(stats.status_5xx_count, 2);
     }
 
     #[tokio::test]
@@ -4132,6 +4141,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn twelve_zip_members_on_one_pair_open_six_connections_and_keep_none() {
+        let body = body_of(2048);
+        let both = Arc::new(Gauge::default());
+        let nodes = [
+            keep_alive_node(&body, Arc::clone(&both)).await,
+            keep_alive_node(&body, Arc::clone(&both)).await,
+        ];
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let to = nodes.clone();
+        let handler: RawHandler = Arc::new(move |mut conn| {
+            let node = to[turn.fetch_add(1, Ordering::SeqCst) % 2].clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = conn
+                    .stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://{node}{}\r\n\
+                             content-length: 0\r\nconnection: close\r\n\r\n",
+                            conn.path
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            })
+        });
+        let (front, _) = spawn_raw(&body, handler).await;
+        let item: crate::types::ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "zip-item"},
+            "files": [],
+            "d1": nodes[0],
+            "d2": nodes[1],
+        }))
+        .unwrap();
+        let o = DownloadOpts::default().for_item(&item);
+
+        let members = (0..12).map(|i| {
+            let (front, o) = (&front, &o);
+            async move {
+                super::super::zip::download_zip_member_with(
+                    front,
+                    "zip-item",
+                    "pages.zip",
+                    &format!("p{i}.jp2"),
+                    o,
+                )
+                .await
+            }
+        });
+        let got = futures::future::try_join_all(members).await.unwrap();
+
+        assert!(got.iter().all(|b| *b == body));
+        // Like any download: six at once on the pair, each on its own TCP
+        // connection, and none kept open afterwards.
+        assert_eq!(both.most(), 6, "TCP connections open on the pair at once");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while both.open.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            both.open.load(Ordering::SeqCst),
+            0,
+            "idle connections kept open"
+        );
+    }
+
+    #[tokio::test]
     async fn every_download_connection_carries_one_request_and_asks_to_close() {
         let _layout = small_layout();
         let big = body_of(12 * PART as usize);
@@ -4387,6 +4463,8 @@ mod tests {
             ],
         );
         assert_eq!(read_journal(dir.path()).done[1], 40);
+        // The three re-requests are retries; the failed fourth is not resent.
+        assert_eq!(client.retry_stats().summary().retries_total, 3);
     }
 
     const DRIP: Duration = Duration::from_millis(250);
@@ -4449,6 +4527,7 @@ mod tests {
             .collect();
         assert_eq!(resumed.len(), 1, "{seen:?}");
         assert!(resumed[0] <= 1024 + 12, "resumed from {}", resumed[0]);
+        assert_eq!(client.retry_stats().summary().retries_total, 1);
     }
 
     #[tokio::test]

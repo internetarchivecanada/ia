@@ -1,7 +1,11 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::error::{IaError, Result};
 use crate::identifier::validate_identifier;
+use crate::metadata::write::parse_indexed_key;
+use crate::spreadsheet::SpreadsheetRecord;
+use crate::upload::batch::row_metadata;
 use crate::upload::headers::encode_metadata_headers;
 use crate::upload::s3_error::describe_s3_failure;
 use crate::upload::{build_s3_item_url, upload_file, UploadOpts, UploadStatus};
@@ -47,25 +51,16 @@ pub async fn create_collection(
 
     // Validate image path eagerly, before any network requests.
     if let Some(img) = image {
-        if !img.exists() {
-            return Err(IaError::UploadFailed {
-                identifier: identifier.to_string(),
-                key: img.display().to_string(),
-                message: format!("image file not found: {}", img.display()),
-                status: None,
-            });
-        }
-        if img.extension().is_none() {
-            return Err(IaError::UploadFailed {
-                identifier: identifier.to_string(),
-                key: "(image)".into(),
-                message: format!(
-                    "image file has no extension, cannot infer content type: {}",
-                    img.display()
-                ),
-                status: None,
-            });
-        }
+        check_image(img).map_err(|message| IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key: if img.exists() {
+                "(image)".into()
+            } else {
+                img.display().to_string()
+            },
+            message,
+            status: None,
+        })?;
     }
 
     let full_metadata = build_collection_metadata(metadata);
@@ -76,6 +71,323 @@ pub async fn create_collection(
     } else {
         create_without_image(client, identifier, &full_metadata, dry_run, url).await
     }
+}
+
+/// One collection to create, from a spreadsheet row merged with the
+/// command-line defaults by [`collection_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CollectionRow {
+    /// The new collection's identifier.
+    pub identifier: String,
+    /// Metadata to send, as `create_collection` takes it.
+    pub metadata: Vec<(String, String)>,
+    /// Cover image, from the row's `image` column or the default image.
+    pub image: Option<PathBuf>,
+}
+
+/// The spreadsheet column that names a row's cover image. It is never sent
+/// as metadata.
+pub(crate) const IMAGE_COLUMN: &str = "image";
+
+/// Turn spreadsheet records into collections to create, checking every row
+/// before any request is made.
+///
+/// Each record's fields become the row's metadata, with the `image` column
+/// taken out as the row's cover image (a path relative to the current
+/// directory). Indexed columns (`subject[0]`, `subject[1]`, ...) give
+/// several values for one field, as in `ia upload --spreadsheet`.
+///
+/// `defaults` and `default_image` are the values given once for every row
+/// (on the command line): a field a row fills in replaces every default
+/// value for that field, for that row only; fields the row does not fill in
+/// keep the defaults. This is the rule a batch upload applies between `-m`
+/// and a row. Rows keep their order.
+///
+/// # Errors
+///
+/// Returns `IaError::Config` when `records` is empty, and
+/// `IaError::Config` listing every problem when any row has an invalid
+/// identifier, an identifier already used on another row, no parent
+/// `collection`, an image that does not exist or has no extension, or a
+/// metadata field that cannot be sent as an S3 header.
+pub fn collection_rows(
+    records: Vec<SpreadsheetRecord>,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    rows_with_problems(records, Vec::new(), defaults, default_image)
+}
+
+/// [`collection_rows`], with `problems` the reader already found reported
+/// first, in the same error.
+fn rows_with_problems(
+    records: Vec<SpreadsheetRecord>,
+    problems: Vec<String>,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    if records.is_empty() && problems.is_empty() {
+        return Err(IaError::Config("spreadsheet contains no records".into()));
+    }
+
+    let mut errors: Vec<String> = problems;
+    // A bad default image is one problem, reported once, not once per row.
+    let default_ok = match default_image.map(check_image) {
+        Some(Err(message)) => {
+            errors.push(format!("--image: {message}"));
+            false
+        }
+        _ => true,
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows = Vec::with_capacity(records.len());
+
+    for (identifier, mut fields) in records {
+        let own_image = fields
+            .remove(IMAGE_COLUMN)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let checked = own_image.is_some() || default_ok;
+        let image = own_image.or_else(|| default_image.map(Path::to_path_buf));
+
+        // `image` names one file; an indexed `image[N]` would otherwise
+        // become a metadata field called `image`.
+        let mut indexed_image: Vec<&String> = fields
+            .keys()
+            .filter(|k| parse_indexed_key(k).is_some_and(|(f, _)| f == IMAGE_COLUMN))
+            .collect();
+        indexed_image.sort();
+        for key in indexed_image {
+            errors.push(format!(
+                "{identifier}: {key}: the image column takes one path, not indexed values"
+            ));
+        }
+        let own = row_metadata(fields);
+        let named: HashSet<&str> = own.iter().map(|(k, _)| k.as_str()).collect();
+        let mut metadata: Vec<(String, String)> = defaults
+            .iter()
+            .filter(|(k, _)| !named.contains(k.as_str()))
+            .cloned()
+            .collect();
+        metadata.extend(own);
+
+        if let Err(e) = validate_identifier(&identifier) {
+            errors.push(e.to_string());
+        }
+        if !seen.insert(identifier.clone()) {
+            errors.push(format!("{identifier}: on more than one row"));
+        }
+        if !metadata
+            .iter()
+            .any(|(k, v)| k == "collection" && !v.is_empty())
+        {
+            errors.push(format!(
+                "{identifier}: no parent collection (give a collection column or --collection)"
+            ));
+        }
+        if let (Some(img), true) = (&image, checked) {
+            if let Err(message) = check_image(img) {
+                errors.push(format!("{identifier}: {message}"));
+            }
+        }
+        if let Err(e) = encode_metadata_headers(&build_collection_metadata(&metadata)) {
+            errors.push(format!("{identifier}: {e}"));
+        }
+
+        rows.push(CollectionRow {
+            identifier,
+            metadata,
+            image,
+        });
+    }
+
+    if errors.is_empty() {
+        Ok(rows)
+    } else {
+        Err(IaError::Config(format!(
+            "batch validation failed:\n  {}",
+            errors.join("\n  ")
+        )))
+    }
+}
+
+/// Read a spreadsheet file and turn it into collections to create with
+/// [`collection_rows`], checking every row before any request is made.
+///
+/// CSV, TSV, XLSX and ODS files are read with
+/// [`crate::spreadsheet::read_spreadsheet`]. JSONL (`.jsonl`, `.ndjson`)
+/// is read here, by value type rather than as text: a `null` is no value,
+/// so a default applies; an array of strings gives one value per element,
+/// as indexed columns do; a string is the value. Any other value (a number,
+/// a boolean, an object, an array holding anything but strings) is refused,
+/// since its text would be sent as metadata. Keys are case-insensitive,
+/// `identifier` included, and a line with no string identifier is refused
+/// rather than skipped. Every such problem is reported with the other
+/// validation problems.
+///
+/// # Errors
+///
+/// As [`collection_rows`], plus the JSONL problems above, and the read
+/// errors of the file.
+pub fn read_collection_spreadsheet(
+    path: &Path,
+    defaults: &[(String, String)],
+    default_image: Option<&Path>,
+) -> Result<Vec<CollectionRow>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "jsonl" || ext == "ndjson" {
+        let (records, problems) = read_jsonl_rows(path)?;
+        rows_with_problems(records, problems, defaults, default_image)
+    } else {
+        collection_rows(
+            crate::spreadsheet::read_spreadsheet(path)?,
+            defaults,
+            default_image,
+        )
+    }
+}
+
+/// Read a JSONL file into records by value type, with the problems found;
+/// see [`read_collection_spreadsheet`].
+fn read_jsonl_rows(path: &Path) -> Result<(Vec<SpreadsheetRecord>, Vec<String>)> {
+    let content = std::fs::read_to_string(path)?;
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let mut records = Vec::new();
+    let mut problems = Vec::new();
+
+    for (n, line) in content.lines().enumerate() {
+        let line_no = n + 1;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let object = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Object(object)) => object,
+            Ok(_) => {
+                problems.push(format!("line {line_no}: not a JSON object"));
+                continue;
+            }
+            Err(e) => {
+                problems.push(format!("line {line_no}: not valid JSON: {e}"));
+                continue;
+            }
+        };
+
+        let id_keys: Vec<&String> = object
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("identifier"))
+            .collect();
+        let identifier = match (id_keys.as_slice(), id_keys.first().map(|k| &object[*k])) {
+            ([_], Some(serde_json::Value::String(id))) if !id.trim().is_empty() => {
+                id.trim().to_string()
+            }
+            ([_], Some(serde_json::Value::String(_) | serde_json::Value::Null)) | ([], _) => {
+                problems.push(format!("line {line_no}: no identifier"));
+                continue;
+            }
+            ([_], Some(other)) => {
+                problems.push(format!(
+                    "line {line_no}: identifier must be a string (got {})",
+                    json_kind(other)
+                ));
+                continue;
+            }
+            _ => {
+                problems.push(format!(
+                    "line {line_no}: identifier is given more than once"
+                ));
+                continue;
+            }
+        };
+
+        let mut fields: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut keys_seen: HashSet<String> = HashSet::new();
+        for (key, value) in &object {
+            let key = key.to_lowercase();
+            if key == "identifier" {
+                continue;
+            }
+            if !keys_seen.insert(key.clone()) {
+                problems.push(format!(
+                    "{identifier}: {key} is given more than once (keys are case-insensitive)"
+                ));
+                continue;
+            }
+            let mut put = |k: String, v: String, problems: &mut Vec<String>| {
+                if fields.insert(k.clone(), v).is_some() {
+                    problems.push(format!("{identifier}: {k} is given more than once"));
+                }
+            };
+            match value {
+                serde_json::Value::Null => {}
+                // Trimmed, as the CSV reader trims every cell, so a value
+                // of only spaces is no value.
+                serde_json::Value::String(v) => put(key, v.trim().to_string(), &mut problems),
+                serde_json::Value::Array(items)
+                    if key != IMAGE_COLUMN
+                        && !key.contains('[')
+                        && items.iter().all(serde_json::Value::is_string) =>
+                {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Some(v) = item.as_str() {
+                            put(format!("{key}[{i}]"), v.trim().to_string(), &mut problems);
+                        }
+                    }
+                }
+                other => problems.push(format!(
+                    "{identifier}: {key} must be {} (got {})",
+                    if key == IMAGE_COLUMN || key.contains('[') {
+                        "a string or null"
+                    } else {
+                        "a string, an array of strings, or null"
+                    },
+                    match other {
+                        serde_json::Value::Array(_) => "an array",
+                        other => json_kind(other),
+                    }
+                )),
+            }
+        }
+        records.push((identifier, fields));
+    }
+
+    Ok((records, problems))
+}
+
+/// A JSON value's kind, for an error message.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array that holds more than strings",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// Check that a cover image exists and has an extension, from which its
+/// content type is inferred. Returns the problem as text.
+fn check_image(img: &Path) -> std::result::Result<(), String> {
+    if !img.exists() {
+        return Err(format!("image file not found: {}", img.display()));
+    }
+    if !img.is_file() {
+        return Err(format!("image is not a file: {}", img.display()));
+    }
+    if img.extension().is_none() {
+        return Err(format!(
+            "image file has no extension, cannot infer content type: {}",
+            img.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Build the full metadata list for a collection item.
@@ -126,11 +438,25 @@ async fn create_with_image(
     let key = format!("{identifier}_itemimage.{ext}");
     let content_type = infer_content_type(ext);
 
+    // A dry run returns before `upload_file`, which can send requests
+    // before its own dry-run check.
+    if dry_run {
+        return Ok(CreateCollectionResult {
+            identifier: identifier.to_string(),
+            status: 0,
+            url,
+        });
+    }
+
+    // `checksum: false`: the upload's skip check would send a metadata GET
+    // and, when the item already holds an identical image, skip the PUT,
+    // so no metadata would be applied while the create reported success.
+    // A create always sends its PUT and reports the server's answer.
     let opts = UploadOpts {
         metadata: metadata.to_vec(),
         no_derive: true,
         verify: false,
-        dry_run,
+        checksum: false,
         headers: vec![("Content-Type".to_string(), content_type.to_string())],
         no_collection_check: true,
         ..UploadOpts::default()
@@ -142,17 +468,18 @@ async fn create_with_image(
     .await?;
 
     match result.status {
-        UploadStatus::Uploaded | UploadStatus::Skipped | UploadStatus::Resumed => {
-            Ok(CreateCollectionResult {
-                identifier: identifier.to_string(),
-                status: 200,
-                url,
-            })
-        }
-        UploadStatus::DryRun => Ok(CreateCollectionResult {
+        UploadStatus::Uploaded | UploadStatus::Resumed => Ok(CreateCollectionResult {
             identifier: identifier.to_string(),
-            status: 0,
+            status: 200,
             url,
+        }),
+        // Neither is produced with `checksum: false` and `dry_run: false`;
+        // reporting either as created would claim a PUT that was not sent.
+        UploadStatus::Skipped | UploadStatus::DryRun => Err(IaError::UploadFailed {
+            identifier: identifier.to_string(),
+            key,
+            message: "the image upload was not sent".into(),
+            status: None,
         }),
         UploadStatus::Failed(msg) => Err(IaError::UploadFailed {
             identifier: identifier.to_string(),
@@ -548,5 +875,366 @@ mod tests {
             err.to_string().to_lowercase().contains("credentials")
                 || err.to_string().to_lowercase().contains("s3")
         );
+    }
+
+    // -- collection_rows --
+
+    fn rec(id: &str, fields: &[(&str, &str)]) -> SpreadsheetRecord {
+        (
+            id.to_string(),
+            fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn rows_keep_file_order_and_take_identifier_and_image_out_of_metadata() {
+        let img = temp_image_with_content("png", b"x");
+        let img_path = img.path().display().to_string();
+        let records = vec![
+            rec(
+                "coll-b",
+                &[
+                    ("collection", "parent"),
+                    ("title", "B"),
+                    ("image", &img_path),
+                ],
+            ),
+            rec("coll-a", &[("collection", "parent"), ("description", "A")]),
+        ];
+        let rows = collection_rows(records, &[], None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].identifier, "coll-b");
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[("collection", "parent"), ("title", "B")])
+        );
+        assert_eq!(rows[0].image.as_deref(), Some(img.path()));
+        assert_eq!(rows[1].identifier, "coll-a");
+        assert_eq!(
+            sorted(rows[1].metadata.clone()),
+            kv(&[("collection", "parent"), ("description", "A")])
+        );
+        assert_eq!(rows[1].image, None);
+    }
+
+    #[test]
+    fn defaults_apply_unless_the_row_names_the_field() {
+        let defaults = kv(&[
+            ("collection", "shared-parent"),
+            ("subject", "default-a"),
+            ("subject", "default-b"),
+            ("hidden", "true"),
+        ]);
+        let records = vec![
+            rec("coll-one", &[("title", "One")]),
+            rec(
+                "coll-two",
+                &[("collection", "other-parent"), ("subject", "own")],
+            ),
+        ];
+        let rows = collection_rows(records, &defaults, None).unwrap();
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[
+                ("collection", "shared-parent"),
+                ("hidden", "true"),
+                ("subject", "default-a"),
+                ("subject", "default-b"),
+                ("title", "One"),
+            ])
+        );
+        assert_eq!(
+            sorted(rows[1].metadata.clone()),
+            kv(&[
+                ("collection", "other-parent"),
+                ("hidden", "true"),
+                ("subject", "own"),
+            ])
+        );
+    }
+
+    #[test]
+    fn image_cell_replaces_the_default_image() {
+        let own = temp_image_with_content("jpg", b"x");
+        let shared = temp_image_with_content("png", b"y");
+        let own_path = own.path().display().to_string();
+        let records = vec![
+            rec("coll-own", &[("collection", "p"), ("image", &own_path)]),
+            rec("coll-shared", &[("collection", "p")]),
+        ];
+        let rows = collection_rows(records, &[], Some(shared.path())).unwrap();
+        assert_eq!(rows[0].image.as_deref(), Some(own.path()));
+        assert_eq!(rows[1].image.as_deref(), Some(shared.path()));
+    }
+
+    #[test]
+    fn indexed_columns_give_several_values() {
+        let records = vec![rec(
+            "coll-idx",
+            &[
+                ("collection", "p"),
+                ("subject[0]", "first"),
+                ("subject[1]", "second"),
+            ],
+        )];
+        let rows = collection_rows(records, &[], None).unwrap();
+        assert_eq!(
+            rows[0].metadata,
+            kv(&[
+                ("collection", "p"),
+                ("subject", "first"),
+                ("subject", "second")
+            ])
+        );
+    }
+
+    #[test]
+    fn every_bad_row_is_reported_together() {
+        let no_ext = tempfile::Builder::new()
+            .prefix("ia-test-no-ext-")
+            .tempfile()
+            .unwrap();
+        let no_ext_path = no_ext.path().display().to_string();
+        let records = vec![
+            rec("ok-row", &[("collection", "p")]),
+            rec("ab", &[("collection", "p")]),
+            rec("dup-row", &[("collection", "p")]),
+            rec("dup-row", &[("collection", "p")]),
+            rec("no-parent", &[("title", "T")]),
+            rec(
+                "missing-image",
+                &[("collection", "p"), ("image", "/nonexistent/ia-test.png")],
+            ),
+            rec(
+                "no-extension",
+                &[("collection", "p"), ("image", &no_ext_path)],
+            ),
+            rec("bad-key", &[("collection", "p"), ("bad key", "v")]),
+        ];
+        let err = collection_rows(records, &[], None).unwrap_err();
+        assert!(matches!(err, IaError::Config(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("batch validation failed"), "{msg}");
+        for needle in [
+            "ab",
+            "dup-row: on more than one row",
+            "no-parent: no parent collection",
+            "missing-image: image file not found",
+            "no-extension: image file has no extension",
+            "bad-key:",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+        assert!(!msg.contains("ok-row"), "{msg}");
+    }
+
+    #[test]
+    fn empty_records_are_an_error() {
+        let err = collection_rows(Vec::new(), &[], None).unwrap_err();
+        assert!(err.to_string().contains("no records"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_default_image_is_reported_once() {
+        let records = vec![
+            rec("coll-one", &[("collection", "p")]),
+            rec("coll-two", &[("collection", "p")]),
+        ];
+        let missing = Path::new("/nonexistent/ia-test-default.png");
+        let msg = collection_rows(records, &[], Some(missing))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(msg.matches("image file not found").count(), 1, "{msg}");
+        assert!(msg.contains("--image: image file not found"), "{msg}");
+    }
+
+    // -- review of PR 153 --
+
+    #[tokio::test]
+    async fn dry_run_with_image_sends_no_request() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(599))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = test_client(&server).await;
+        let img = temp_image_with_content("png", b"\x89PNG fake");
+        let result = create_collection(&client, "dry-img", &[], Some(img.path()), true)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 0);
+    }
+
+    #[tokio::test]
+    async fn existing_item_with_the_same_image_is_still_sent() {
+        let server = MockServer::start().await;
+        let img = temp_image_with_content("png", b"\x89PNG same bytes");
+        let md5 = crate::upload::checksum::compute_file_md5_async(img.path())
+            .await
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/metadata/existing-coll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata": {"identifier": "existing-coll", "mediatype": "collection"},
+                "files": [{"name": "existing-coll_itemimage.png", "md5": md5, "size": "16"}],
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/existing-coll/existing-coll_itemimage.png"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&server).await;
+        let result = create_collection(&client, "existing-coll", &[], Some(img.path()), false)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+    }
+
+    #[test]
+    fn an_image_that_is_a_directory_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let logo_dir = dir.path().join("logo.d");
+        std::fs::create_dir(&logo_dir).unwrap();
+        let logo = logo_dir.display().to_string();
+        let records = vec![rec("dir-image", &[("collection", "p"), ("image", &logo)])];
+        let msg = collection_rows(records, &[], None).unwrap_err().to_string();
+        assert!(msg.contains("dir-image: image is not a file"), "{msg}");
+    }
+
+    fn jsonl_file(contents: &str) -> NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn jsonl_null_is_no_value_and_the_default_applies() {
+        let f = jsonl_file(r#"{"identifier":"series-1","collection":null,"title":null}"#);
+        let defaults = kv(&[("collection", "parent")]);
+        let rows = read_collection_spreadsheet(f.path(), &defaults, None).unwrap();
+        assert_eq!(rows[0].metadata, kv(&[("collection", "parent")]));
+    }
+
+    #[test]
+    fn jsonl_array_of_strings_gives_repeated_values() {
+        let f = jsonl_file(r#"{"identifier":"series-1","collection":"p","subject":["a","b"]}"#);
+        let rows = read_collection_spreadsheet(f.path(), &[], None).unwrap();
+        assert_eq!(
+            rows[0].metadata,
+            kv(&[("collection", "p"), ("subject", "a"), ("subject", "b")])
+        );
+    }
+
+    #[test]
+    fn jsonl_values_that_cannot_be_sent_are_refused_with_every_other_problem() {
+        let f = jsonl_file(concat!(
+            r#"{"identifier":"num-row","collection":"p","year":1942}"#,
+            "\n",
+            r#"{"identifier":"bool-row","collection":"p","hidden":true}"#,
+            "\n",
+            r#"{"identifier":"obj-row","collection":"p","x":{"a":"b"}}"#,
+            "\n",
+            r#"{"identifier":"mixed-row","collection":"p","subject":["a",1]}"#,
+            "\n",
+            r#"{"identifier":"no-parent"}"#,
+            "\n",
+            r#"{"identifier":"good-row","collection":"p"}"#,
+            "\n",
+        ));
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "num-row: year",
+            "bool-row: hidden",
+            "obj-row: x",
+            "mixed-row: subject",
+            "no-parent: no parent collection",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in {msg}");
+        }
+        assert!(!msg.contains("good-row"), "{msg}");
+    }
+
+    #[test]
+    fn jsonl_line_without_a_usable_identifier_is_reported() {
+        let f = jsonl_file(concat!(
+            r#"{"identifier":12345,"collection":"p"}"#,
+            "\n",
+            r#"{"Identifier":"upper-key","collection":"p"}"#,
+            "\n",
+            r#"{"title":"no identifier","collection":"p"}"#,
+            "\n",
+        ));
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("line 1: identifier must be a string (got a number)"),
+            "{msg}"
+        );
+        assert!(msg.contains("line 3: no identifier"), "{msg}");
+        // Keys are case-insensitive, `identifier` included: line 2 is a row.
+        assert!(
+            !msg.contains("line 2") && !msg.contains("upper-key"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn jsonl_strings_are_trimmed_so_blank_is_no_value() {
+        let f = jsonl_file(r#"{"identifier":"ws-row","collection":"  ","title":" T "}"#);
+        let defaults = kv(&[("collection", "parent")]);
+        let rows = read_collection_spreadsheet(f.path(), &defaults, None).unwrap();
+        assert_eq!(
+            sorted(rows[0].metadata.clone()),
+            kv(&[("collection", "parent"), ("title", "T")])
+        );
+    }
+
+    #[test]
+    fn jsonl_array_under_image_is_named_an_array() {
+        let f = jsonl_file(r#"{"identifier":"arr-img","collection":"p","image":["x.png"]}"#);
+        let msg = read_collection_spreadsheet(f.path(), &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("arr-img: image must be a string or null (got an array)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn an_indexed_image_column_is_refused() {
+        let records = vec![rec(
+            "idx-img",
+            &[("collection", "p"), ("image[0]", "x.png")],
+        )];
+        let msg = collection_rows(records, &[], None).unwrap_err().to_string();
+        assert!(msg.contains("idx-img: image[0]:"), "{msg}");
     }
 }

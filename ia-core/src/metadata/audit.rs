@@ -83,10 +83,19 @@ pub fn audit_item(
     let schema_map: HashMap<&str, &SchemaField> =
         schema.iter().map(|f| (f.field.as_str(), f)).collect();
 
-    // Collect all metadata fields (typed + extra) into a unified view.
-    let mut all_fields: HashMap<&str, Option<&MetadataValue>> = HashMap::new();
+    // Extra fields arrive as `serde_json::Value`. Convert each one with the
+    // same deserialization the typed fields use, so every field gets the
+    // same checks. A `null` is left out, as a typed field's `null`
+    // deserializes to `None`.
+    let extra_values: Vec<(&str, MetadataValue)> = metadata
+        .extra
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(key, value)| (key.as_str(), to_metadata_value(value)))
+        .collect();
 
-    // Add typed fields.
+    // Every present field, typed and extra, by name.
+    let mut all_fields: HashMap<&str, &MetadataValue> = HashMap::new();
     add_typed_field(&mut all_fields, "identifier", &metadata.identifier);
     add_typed_field(&mut all_fields, "title", &metadata.title);
     add_typed_field(&mut all_fields, "description", &metadata.description);
@@ -99,57 +108,12 @@ pub fn audit_item(
     add_typed_field(&mut all_fields, "publicdate", &metadata.publicdate);
     add_typed_field(&mut all_fields, "addeddate", &metadata.addeddate);
     add_typed_field(&mut all_fields, "uploader", &metadata.uploader);
-
-    // Add extra fields (these are serde_json::Value, so we can't check
-    // MetadataValue variants — but we can check presence for required/deprecated).
-    for key in metadata.extra.keys() {
-        all_fields.entry(key.as_str()).or_insert(None);
+    for (key, value) in &extra_values {
+        all_fields.insert(key, value);
     }
 
-    // Check each field that has a value.
-    for (&field_name, value_opt) in &all_fields {
-        if let Some(schema_field) = schema_map.get(field_name) {
-            // Field exists in schema.
-            if let Some(value) = value_opt {
-                // Check for unexpected type.
-                if value.is_other() {
-                    findings.push(Finding {
-                        field: field_name.to_string(),
-                        severity: Severity::Warning,
-                        kind: FindingKind::TypeMismatch,
-                        message: format!(
-                            "unexpected type: got {}",
-                            describe_value(&value.as_value())
-                        ),
-                    });
-                }
-
-                // Check repeatability: non-repeatable but has multiple values.
-                if schema_field.repeatable == "No" {
-                    if let MetadataValue::Multiple(v) = value {
-                        if v.len() > 1 {
-                            findings.push(Finding {
-                                field: field_name.to_string(),
-                                severity: Severity::Warning,
-                                kind: FindingKind::Repeatability,
-                                message: format!("not repeatable but has {} values", v.len()),
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Check deprecated.
-            let field_present = value_opt.is_some() || metadata.extra.contains_key(field_name);
-            if schema_field.required == "Deprecated" && field_present {
-                findings.push(Finding {
-                    field: field_name.to_string(),
-                    severity: Severity::Info,
-                    kind: FindingKind::Deprecated,
-                    message: "deprecated field is present".to_string(),
-                });
-            }
-        } else if value_opt.is_some() || metadata.extra.contains_key(field_name) {
+    for (&field_name, &value) in &all_fields {
+        let Some(schema_field) = schema_map.get(field_name) else {
             // Field not in schema — informational.
             findings.push(Finding {
                 field: field_name.to_string(),
@@ -157,29 +121,59 @@ pub fn audit_item(
                 kind: FindingKind::Unknown,
                 message: "field not in schema".to_string(),
             });
+            continue;
+        };
+
+        // Check for unexpected type.
+        if value.is_other() {
+            findings.push(Finding {
+                field: field_name.to_string(),
+                severity: Severity::Warning,
+                kind: FindingKind::TypeMismatch,
+                message: format!("unexpected type: got {}", describe_value(&value.as_value())),
+            });
+        }
+
+        // Check repeatability: non-repeatable but has multiple values.
+        if schema_field.repeatable == "No" {
+            if let MetadataValue::Multiple(v) = value {
+                if v.len() > 1 {
+                    findings.push(Finding {
+                        field: field_name.to_string(),
+                        severity: Severity::Warning,
+                        kind: FindingKind::Repeatability,
+                        message: format!("not repeatable but has {} values", v.len()),
+                    });
+                }
+            }
+        }
+
+        // Check deprecated.
+        if schema_field.required == "Deprecated" {
+            findings.push(Finding {
+                field: field_name.to_string(),
+                severity: Severity::Info,
+                kind: FindingKind::Deprecated,
+                message: "deprecated field is present".to_string(),
+            });
         }
     }
 
     // Check for missing required fields.
     for schema_field in schema {
-        if schema_field.required == "Yes" || schema_field.required == "Recommended" {
-            let present = all_fields
-                .get(schema_field.field.as_str())
-                .is_some_and(|v| v.is_some() || metadata.extra.contains_key(&schema_field.field));
-
-            if !present {
-                let severity = if schema_field.required == "Yes" {
-                    Severity::Error
-                } else {
-                    Severity::Warning
-                };
-                findings.push(Finding {
-                    field: schema_field.field.clone(),
-                    severity,
-                    kind: FindingKind::MissingRequired,
-                    message: format!("missing {} field", schema_field.required.to_lowercase()),
-                });
-            }
+        let required = schema_field.required == "Yes" || schema_field.required == "Recommended";
+        if required && !all_fields.contains_key(schema_field.field.as_str()) {
+            let severity = if schema_field.required == "Yes" {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            findings.push(Finding {
+                field: schema_field.field.clone(),
+                severity,
+                kind: FindingKind::MissingRequired,
+                message: format!("missing {} field", schema_field.required.to_lowercase()),
+            });
         }
     }
 
@@ -203,13 +197,20 @@ pub fn audit_item(
 }
 
 fn add_typed_field<'a>(
-    map: &mut HashMap<&'a str, Option<&'a MetadataValue>>,
+    map: &mut HashMap<&'a str, &'a MetadataValue>,
     name: &'a str,
     value: &'a Option<MetadataValue>,
 ) {
     if let Some(v) = value {
-        map.insert(name, Some(v));
+        map.insert(name, v);
     }
+}
+
+/// Convert an untyped metadata value to a [`MetadataValue`], the way a typed
+/// field is deserialized: a string, an array of strings, or anything else
+/// as `Other`.
+fn to_metadata_value(value: &serde_json::Value) -> MetadataValue {
+    serde_json::from_value(value.clone()).unwrap_or_else(|_| MetadataValue::Other(value.clone()))
 }
 
 /// Describe a JSON value type for human-readable messages.
@@ -507,6 +508,180 @@ mod tests {
             .iter()
             .any(|f| f.field == "collection" && f.message.contains("not repeatable"));
         assert!(!rep, "collection is repeatable — should not flag");
+    }
+
+    /// A schema field with the given name, `required` and `repeatable`
+    /// values.
+    fn field(name: &str, required: &str, repeatable: &str) -> SchemaField {
+        SchemaField {
+            field: name.to_string(),
+            label: name.to_string(),
+            required: required.to_string(),
+            repeatable: repeatable.to_string(),
+            internal_use_only: "No".to_string(),
+            defined_by: "uploader".to_string(),
+            edit_access: "uploader".to_string(),
+            definition: String::new(),
+            accepted_values: String::new(),
+            usage_notes: String::new(),
+            example: vec![],
+        }
+    }
+
+    fn audit_json(metadata: serde_json::Value, schema: &[SchemaField]) -> Vec<Finding> {
+        let metadata: MetadataFields = serde_json::from_value(metadata).unwrap();
+        audit_item("test-item", &metadata, schema).findings
+    }
+
+    /// `(field, kind, message)` of each finding, for comparisons.
+    fn summary(findings: &[Finding]) -> Vec<(String, FindingKind, String)> {
+        findings
+            .iter()
+            .map(|f| (f.field.clone(), f.kind.clone(), f.message.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn untyped_field_repeatability_violation() {
+        let findings = audit_json(
+            serde_json::json!({"volume": ["1", "2"]}),
+            &[field("volume", "No", "No")],
+        );
+        assert_eq!(
+            summary(&findings),
+            vec![(
+                "volume".to_string(),
+                FindingKind::Repeatability,
+                "not repeatable but has 2 values".to_string()
+            )]
+        );
+        assert_eq!(findings[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn untyped_field_checked_like_typed_field() {
+        // The same values under a typed field (`title`) and an untyped one
+        // (`volume`) with the same schema entry give the same findings.
+        for value in [
+            serde_json::json!(["a", "b", "c"]),
+            serde_json::json!(42),
+            serde_json::json!({"k": "v"}),
+            serde_json::json!(["a", 1]),
+            serde_json::json!("a"),
+            serde_json::json!(["a"]),
+        ] {
+            let typed = audit_json(
+                serde_json::json!({"title": value.clone()}),
+                &[field("title", "No", "No")],
+            );
+            let untyped = audit_json(
+                serde_json::json!({"volume": value.clone()}),
+                &[field("volume", "No", "No")],
+            );
+            let rename = |s: Vec<(String, FindingKind, String)>| {
+                s.into_iter()
+                    .map(|(_, kind, message)| (kind, message))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rename(summary(&typed)),
+                rename(summary(&untyped)),
+                "value {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn untyped_field_unexpected_type() {
+        let findings = audit_json(
+            serde_json::json!({"volume": 3}),
+            &[field("volume", "No", "Yes")],
+        );
+        assert_eq!(
+            summary(&findings),
+            vec![(
+                "volume".to_string(),
+                FindingKind::TypeMismatch,
+                "unexpected type: got number (3)".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn untyped_repeatable_field_multiple_values_ok() {
+        let findings = audit_json(
+            serde_json::json!({"contributor": ["a", "b"], "volume": "1"}),
+            &[
+                field("contributor", "No", "Yes"),
+                field("volume", "No", "No"),
+            ],
+        );
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn untyped_field_deprecated_unknown_and_required_still_reported() {
+        let findings = audit_json(
+            serde_json::json!({"old_thing": ["x", "y"], "made_up": ["p", "q"]}),
+            &[
+                field("old_thing", "Deprecated", "No"),
+                field("scanner", "Recommended", "No"),
+            ],
+        );
+        assert_eq!(
+            summary(&findings),
+            vec![
+                (
+                    "old_thing".to_string(),
+                    FindingKind::Repeatability,
+                    "not repeatable but has 2 values".to_string()
+                ),
+                (
+                    "scanner".to_string(),
+                    FindingKind::MissingRequired,
+                    "missing recommended field".to_string()
+                ),
+                (
+                    "made_up".to_string(),
+                    FindingKind::Unknown,
+                    "field not in schema".to_string()
+                ),
+                (
+                    "old_thing".to_string(),
+                    FindingKind::Deprecated,
+                    "deprecated field is present".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn null_field_is_absent_for_typed_and_untyped_fields() {
+        // A typed field deserializes `null` to `None`; an untyped field's
+        // `null` is treated the same way, so neither is a type mismatch and
+        // both count as missing.
+        let findings = audit_json(
+            serde_json::json!({"title": null, "volume": null, "made_up": null}),
+            &[
+                field("title", "Recommended", "No"),
+                field("volume", "Recommended", "No"),
+            ],
+        );
+        assert_eq!(
+            summary(&findings),
+            vec![
+                (
+                    "title".to_string(),
+                    FindingKind::MissingRequired,
+                    "missing recommended field".to_string()
+                ),
+                (
+                    "volume".to_string(),
+                    FindingKind::MissingRequired,
+                    "missing recommended field".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
