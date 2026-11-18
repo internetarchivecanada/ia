@@ -1139,7 +1139,11 @@ mod tests {
             ("subject[0]", "7"),
             ("huge", "1e400"),
         ] {
-            assert_eq!(fields.get(key).map(String::as_str), Some(want), "{key}: {fields:?}");
+            assert_eq!(
+                fields.get(key).map(String::as_str),
+                Some(want),
+                "{key}: {fields:?}"
+            );
         }
     }
 
@@ -1181,7 +1185,9 @@ mod tests {
     fn jsonl_array_under_an_indexed_key_is_refused() {
         let msg = refusal("a.jsonl", r#"{"identifier":"a","subject[0]":["x"]}"#);
         assert!(
-            msg.contains("line 1: subject[0] must be a string, a number, a boolean, or null (got an array)"),
+            msg.contains(
+                "line 1: subject[0] must be a string, a number, a boolean, or null (got an array)"
+            ),
             "{msg}"
         );
     }
