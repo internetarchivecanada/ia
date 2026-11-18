@@ -53,6 +53,9 @@ struct Transports {
     /// The download-auth transport over HTTP/1.1 only, for the parallel
     /// Range requests of one file (#16).
     range: reqwest::Client,
+    /// The default headers of the download transports, for the clients of
+    /// download slots ([`IaClient::slot_http`]).
+    download_headers: HeaderMap,
     user_agent: String,
 }
 
@@ -118,6 +121,8 @@ pub struct IaClient {
     /// ends, so the sockets open to a datanode never outnumber the slots
     /// held there: IA operations count open connections.
     range_http: reqwest::Client,
+    /// See [`Self::slot_http`].
+    download_headers: HeaderMap,
     config: IaConfig,
     user_agent: String,
     retry_stats: Arc<RetryStats>,
@@ -229,7 +234,7 @@ impl IaClient {
         // download transport. Each request has its own connection, closed
         // when its response ends.
         let range = configure_transport(
-            Self::base_builder(headers),
+            Self::base_builder(headers.clone()),
             connect_timeout,
             Some(read_timeout),
         )
@@ -244,6 +249,7 @@ impl IaClient {
             upload,
             no_redirect,
             range,
+            download_headers: headers,
             user_agent,
         })
     }
@@ -321,6 +327,7 @@ impl IaClient {
             api_no_retry,
             no_redirect_http: transports.no_redirect,
             range_http: transports.range,
+            download_headers: transports.download_headers,
             config,
             user_agent: transports.user_agent,
             retry_stats: stats,
@@ -435,6 +442,30 @@ impl IaClient {
         &self.range_http
     }
 
+    /// A client for one download slot (#16): the download transport's
+    /// headers and timeouts, HTTP/1.1, no redirects, keep-alive with at
+    /// most one idle connection, and `resolver` for every new connection.
+    /// The slot's resolver lets the client open one connection in its life
+    /// (see `download::slots`), which the slot's requests then reuse.
+    pub(crate) fn slot_http(
+        &self,
+        resolver: Arc<dyn reqwest::dns::Resolve>,
+    ) -> Result<reqwest::Client> {
+        configure_transport(
+            Self::base_builder(self.download_headers.clone()),
+            CONNECT_TIMEOUT,
+            Some(READ_TIMEOUT),
+        )
+        .http1_only()
+        .pool_max_idle_per_host(1)
+        // The slot closes its idle connection itself (`download::slots`).
+        .pool_idle_timeout(None)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(resolver)
+        .build()
+        .map_err(|e| crate::error::IaError::Config(format!("failed to build slot client: {e}")))
+    }
+
     /// The current configuration.
     pub fn config(&self) -> &IaConfig {
         &self.config
@@ -469,6 +500,7 @@ impl IaClient {
             api_no_retry,
             no_redirect_http: transports.no_redirect,
             range_http: transports.range,
+            download_headers: transports.download_headers,
             config,
             user_agent: transports.user_agent,
             retry_stats: stats,

@@ -561,7 +561,7 @@ pub(crate) async fn fetch_response_via(
                     .as_deref()
                     .and_then(|pair| pair.key_for(&server))
                     .unwrap_or(&server);
-                opts.server_slots.acquire(key).await
+                opts.server_slots.acquire_on(key, &server).await
             }
             None => None,
         };
@@ -571,25 +571,41 @@ pub(crate) async fn fetch_response_via(
         if let (Some(held), Some(s)) = (slot.as_mut(), starting.take()) {
             held.carry(s);
         }
-        let mut req = http.get(&current_url);
-        if download.is_some() {
-            // A download's connection lives only as long as its slot: it is
-            // closed when the response ends, so the sockets open to a server
-            // never outnumber the slots held there (see `IaClient::range_http`).
-            req = req.header("Connection", "close");
-        }
-        if let Some(ref auth) = auth_value {
-            req = req.header("Authorization", auth);
-        }
-        if let Some(range) = range {
-            req = req.header("Range", range.header_value());
-        }
+        let request = |http: &reqwest::Client| {
+            let mut req = http.get(&current_url);
+            if let Some(ref auth) = auth_value {
+                req = req.header("Authorization", auth);
+            }
+            if let Some(range) = range {
+                req = req.header("Range", range.header_value());
+            }
+            req
+        };
 
-        // Recorded here, per hop, because this transport bypasses the
+        // Recorded here, per hop, because these transports bypass the
         // client's middleware (see `retry::send_recorded`).
-        let r = crate::retry::send_recorded(client.retry_stats(), req)
-            .await
-            .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?;
+        let r = match slot.as_mut() {
+            // The slot's own client, which reuses the slot's connection
+            // (see `slots::Seat`). hyper skips the resolver, and so the
+            // slot's one-connection gate, for a host given as an IP
+            // address; those take the path below.
+            Some(guard) if !host_is_address(&current_url) => {
+                send_on_slot(client, guard, &server, &request).await?
+            }
+            _ => {
+                let mut req = request(http);
+                if download.is_some() {
+                    // A download's connection lives only as long as its
+                    // slot: it is closed when the response ends, so the
+                    // sockets open to a server never outnumber the slots
+                    // held there (see `IaClient::range_http`).
+                    req = req.header("Connection", "close");
+                }
+                crate::retry::send_recorded(client.retry_stats(), req)
+                    .await
+                    .map_err(|e| IaError::Network(reqwest_middleware::Error::Reqwest(e)))?
+            }
+        };
 
         if r.status().is_redirection() {
             let location = r
@@ -618,8 +634,9 @@ pub(crate) async fn fetch_response_via(
                         || new_url.authority() == config_host
                         // This crate's own tests redirect between loopback
                         // servers on different ports, standing for an item's
-                        // two datanodes. Never in a build that ships.
-                        || (cfg!(test) && host == "127.0.0.1") =>
+                        // two datanodes, by address or as localhost. Never in
+                        // a build that ships.
+                        || (cfg!(test) && (host == "127.0.0.1" || host == "localhost")) =>
                 {
                     debug!(location = %new_url, "following redirect");
                     current_url = new_url.to_string();
@@ -673,6 +690,86 @@ pub(crate) async fn fetch_response_via(
     }
 
     Ok((response, slot))
+}
+
+/// How many times a request on a slot's client is sent again, 5 ms apart,
+/// when the client asks for a second connection (see
+/// [`slots::SecondConnection`]) before the slot replaces the client: about
+/// the time hyper takes to put the previous response's connection back in
+/// the pool.
+const SECOND_CONNECTION_TRIES: u32 = 10;
+
+/// Send `request` over the slot `guard`'s own client, to `server` (the
+/// URL's authority). A refused second connection means the slot's
+/// connection is not idle in its pool: not back yet (after a few tries it
+/// is), or gone, and then the slot replaces its client. Nothing was sent on
+/// a refusal, so it is not recorded as a request. A failed send, or an
+/// answer with `Connection: close`, spends the slot's connection.
+async fn send_on_slot(
+    client: &IaClient,
+    guard: &mut slots::SlotGuard,
+    server: &str,
+    request: &(dyn Fn(&reqwest::Client) -> reqwest::RequestBuilder + Sync),
+) -> Result<reqwest::Response> {
+    let mut refused = 0;
+    loop {
+        let http = guard.http(client, server).await?;
+        let started = std::time::Instant::now();
+        let sent = request(&http).send().await;
+        drop(http);
+        match sent {
+            Err(e) if slots::is_second_connection(&e) => {
+                refused += 1;
+                if refused >= SECOND_CONNECTION_TRIES {
+                    debug!(
+                        server,
+                        "the slot's connection is gone; replacing its client"
+                    );
+                    guard.spend();
+                    refused = 0;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            Err(e) => {
+                client
+                    .retry_stats()
+                    .record_exchange(started.elapsed(), None);
+                guard.spend();
+                return Err(IaError::Network(reqwest_middleware::Error::Reqwest(e)));
+            }
+            Ok(response) => {
+                client
+                    .retry_stats()
+                    .record_exchange(started.elapsed(), Some(&response));
+                let closes = response
+                    .headers()
+                    .get_all(reqwest::header::CONNECTION)
+                    .iter()
+                    .any(|v| {
+                        v.to_str()
+                            .is_ok_and(|v| v.to_ascii_lowercase().contains("close"))
+                    });
+                if closes {
+                    guard.spend();
+                }
+                return Ok(response);
+            }
+        }
+    }
+}
+
+/// Whether `url`'s host is an IP address (or the URL does not parse).
+fn host_is_address(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_none_or(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok()
+        })
 }
 
 /// The server a download URL goes to, for [`ServerSlots`]: its authority

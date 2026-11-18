@@ -4865,6 +4865,18 @@ mod tests {
     }
 
     async fn reuse_server(body: &[u8], hold: Duration, gauge: Arc<Gauge>) -> ReuseServer {
+        reuse_server_with(body, hold, gauge, false).await
+    }
+
+    /// [`reuse_server`] that, with `close_each`, closes every connection
+    /// after its first answer without saying so (no `Connection: close`),
+    /// as a server that times out an idle connection does.
+    async fn reuse_server_with(
+        body: &[u8],
+        hold: Duration,
+        gauge: Arc<Gauge>,
+        close_each: bool,
+    ) -> ReuseServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4928,6 +4940,7 @@ mod tests {
                         );
                         if stream.write_all(answer.as_bytes()).await.is_err()
                             || stream.write_all(&bytes).await.is_err()
+                            || close_each
                         {
                             break;
                         }
@@ -4976,7 +4989,11 @@ mod tests {
         assert_eq!(server.requests.load(Ordering::SeqCst), 40);
         let accepted = server.accepted.load(Ordering::SeqCst);
         assert!(accepted <= 6, "{accepted} TCP connections for 40 files");
-        assert!(server.gauge.most() <= 6, "{} open at once", server.gauge.most());
+        assert!(
+            server.gauge.most() <= 6,
+            "{} open at once",
+            server.gauge.most()
+        );
     }
 
     #[tokio::test]
@@ -5086,6 +5103,65 @@ mod tests {
         // idle time; the one that answered may stay.
         let open = open_at_most(&server.gauge, 1, Duration::from_millis(500)).await;
         assert!(open <= 1, "{open} still open after the drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_slot_never_opens_a_second_socket_while_its_first_returns() {
+        // Requests back to back on one slot, answered at once: the next is
+        // sent while hyper is still putting the previous connection back in
+        // its pool, which is when hyper starts a second connection.
+        let body = body_of(64);
+        let server = reuse_server(&body, Duration::ZERO, Arc::default()).await;
+        let client = client_for(&server.host);
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            server_slots: ServerSlots::with_cap(1),
+            ..Default::default()
+        };
+
+        download_files(&client, 200, &body, 4, &opts, dir.path()).await;
+
+        assert_eq!(server.requests.load(Ordering::SeqCst), 200);
+        assert_eq!(server.gauge.most(), 1, "sockets open at once on one slot");
+    }
+
+    #[tokio::test]
+    async fn a_slot_client_opens_one_connection_in_its_life() {
+        let body = body_of(64);
+        let server = reuse_server_with(&body, Duration::ZERO, Arc::default(), true).await;
+        let client = client_for(&server.host);
+        let http = client
+            .slot_http(Arc::new(super::super::slots::OneConnection::default()))
+            .unwrap();
+        let url = format!("http://{}/download/big-item/f0.bin", server.host);
+
+        let first = http.get(&url).send().await.unwrap();
+        assert_eq!(first.bytes().await.unwrap(), body);
+        // The server closed that connection; a second is refused before any
+        // socket opens.
+        open_at_most(&server.gauge, 0, Duration::from_secs(2)).await;
+        let err = http.get(&url).send().await.unwrap_err();
+
+        assert!(super::super::slots::is_second_connection(&err), "{err:?}");
+        assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slot_whose_connection_is_gone_replaces_its_client() {
+        let body = body_of(64);
+        let server = reuse_server_with(&body, Duration::ZERO, Arc::default(), true).await;
+        let client = client_for(&server.host);
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DownloadOpts {
+            server_slots: ServerSlots::with_cap(1),
+            ..Default::default()
+        };
+
+        download_files(&client, 5, &body, 2, &opts, dir.path()).await;
+
+        // One connection per file, as the server closes each, one at a time.
+        assert_eq!(server.accepted.load(Ordering::SeqCst), 5);
+        assert_eq!(server.gauge.most(), 1, "sockets open at once on one slot");
     }
 
     #[tokio::test]
