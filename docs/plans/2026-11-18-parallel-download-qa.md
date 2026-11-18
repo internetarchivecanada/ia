@@ -36,6 +36,13 @@ From one client (Apple M1 Pro, Wi-Fi), 2026-11-18 between 17:06 and
   11.1 s (0.49 times), with 2 to 3 times the CPU time. The cause is a new
   TCP and TLS connection for every file, to archive.org and again to the
   datanode, where v0.27.0 reuses a few; see "Many small files" below.
+- **Fixed by reusing connections (build `bb038f0`, 18:51 to 20:02
+  UTC):** each slot now owns one connection that its next requests reuse
+  (`docs/plans/2026-11-18-download-connection-reuse.md`). Measured again
+  on all six cases, no case is slower than v0.27.0 on the median: tiny
+  files 14.1 against 14.8 s, small files 15.3 against 15.8 s, one large
+  file 2.9 times as fast. The tiny-file item opened 13 connections
+  against 17 for v0.27.0. See "Connection reuse" below.
 - **Contract:** no sample of any run of the rebased build saw more than
   6 established connections to a datanode pair. Every finished file
   matched the md5 in the item metadata (198 files per build), every
@@ -191,6 +198,69 @@ One run of each build on the tiny item with
 For files of a few megabytes or more the handshakes are a small part of
 each transfer, which is why the earlier cases did not show this. The
 code was not changed.
+
+## Connection reuse (added 18:51 to 20:02 UTC)
+
+After the small-file runs above, the download transport was changed so
+that each of a server's 6 slots owns one HTTP/1.1 connection, kept for
+2 s after its last request and reused by the slot's next request, with
+the slot file locked for as long as the socket may live
+(`docs/plans/2026-11-18-download-connection-reuse.md`). All six cases
+were measured again, the #121 head at `bb038f0` against v0.27.0, three
+interleaved rounds, default `-j`, 30 s apart, with the sampler counting
+the ia-cli processes only. Records:
+`parallel-download-qa-2026-11-18/results/2026-11-18-reuse.jsonl`. The
+link was slower this evening than in the afternoon (one connection to
+`ia800807` ran at 4.9 to 7.4 MB/s), so compare within this run, not with
+the tables above.
+
+| Case | Build | Median wall s | Min to max wall s | Median MB/s | Median files/s | Median CPU s | Median peak RSS MiB | Peak connections per pair | md5 ok / bad |
+|---|---|---|---|---|---|---|---|---|---|
+| single | new | 113.5 | 100.9 to 155.4 | 19.32 | | 24.41 | 30 | 6 | 3 / 0 |
+| single | v0.27.0 | 332.5 | 298.1 to 447.0 | 6.60 | | 29.15 | 19 | 1 | 3 / 0 |
+| multi | new | 123.5 | 95.8 to 142.3 | 15.13 | | 22.80 | 31 | 6 | 45 / 0 |
+| multi | v0.27.0 | 158.8 | 120.1 to 166.5 | 11.77 | | 23.07 | 25 | 6 | 45 / 0 |
+| many | new | 9.5 | 8.4 to 10.7 | 21.72 | 5.0 | 2.15 | 31 | 6 | 144 / 0 |
+| many | v0.27.0 | 9.5 | 9.5 to 13.6 | 21.72 | 5.0 | 2.21 | 31 | 8 | 144 / 0 |
+| twoproc | new | 63.2 | 53.6 to 141.1 | 21.08 | | 14.84 | 28 | 6 | 6 / 0 |
+| twoproc | v0.27.0 | 116.1 | 103.8 to 151.0 | 11.48 | | 16.03 | 20 | 2 | 6 / 0 |
+| tiny | new | 14.1 | 13.0 to 16.0 | 0.50 | 89.7 | 2.10 | 35 | 6 | 3,798 / 0 |
+| tiny | v0.27.0 | 14.8 | 14.2 to 18.3 | 0.48 | 85.7 | 2.06 | 32 | 8 | 3,798 / 0 |
+| small | new | 15.3 | 15.2 to 23.2 | 17.13 | 32.5 | 3.30 | 34 | archive.org 7 | 1,491 / 0 |
+| small | v0.27.0 | 15.8 | 12.9 to 17.0 | 16.54 | 31.4 | 3.41 | 34 | archive.org 9 | 1,491 / 0 |
+
+Paired ratio of throughput, new over v0.27.0, rounds 0, 1, 2: single
+3.29, 2.62, 2.88; multi 1.12, 1.25, 1.35; many 1.13, 1.00, 1.27;
+twoproc 1.64, 2.16, 1.07; tiny 0.92, 1.00, 1.42; small 0.85, 0.68,
+1.11. Every process exited 0 and no run left a `.part` or `.part.json`.
+
+- **Against the acceptance bar.** No case is slower than v0.27.0 on the
+  median. The two paired ratios below 0.9 are both on the small-file
+  item, whose round-1 run of the new build took 23.2 s against 15.2 and
+  15.3 s in the other two rounds; its median is 15.3 against 15.8 s.
+- **Six connections instead of eight.** On the tiny item, v0.27.0 at
+  `-j 6` took a median of 16.8 s against 14.3 s at `-j 8` (18:22 to
+  18:24 UTC), so six connections could have cost up to 1.17 times there.
+  The new build at six is not slower than v0.27.0 at eight; on this
+  client the per-file round trips, not the connection count, set the
+  pace once connections are reused.
+- **Connections opened.** One run of the new build on the tiny item with
+  `RUST_LOG=hyper_util=debug` (18:49 UTC, 15.6 s): 13 new TCP
+  connections in all, 7 to archive.org and 6 to `ia801906`, against
+  2,541 before the change and 17 for v0.27.0. CPU time per case is now
+  equal to v0.27.0's or lower.
+- **Contract.** The highest number of established connections to a
+  datanode pair in any sample of the new build was 6, idle ones
+  included. In two of the three one-file runs the item's two hosts both
+  served it at different times (`ia600807` and `ia800807`, 6 each, never
+  more than 6 together). archive.org itself saw at most 7 from one
+  process and 8 from two (6 slots plus one metadata connection per
+  process).
+- **Review fixes after the run.** `9924913` changes four edge paths found
+  in review (a request on the pair's other host waiting on another
+  process while its own idle slots could serve it, a connection kept
+  after an abandoned body, the close grace on a cancelled request, and a
+  host given as an IP address). None is on the path these runs took.
 
 ## Not measured
 
