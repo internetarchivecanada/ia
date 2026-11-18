@@ -628,3 +628,80 @@ async fn zip_members_share_the_six_with_whole_files_across_processes() {
     assert!(gauge.most() <= 6, "{} open at once", gauge.most());
     assert_eq!(gauge.seen(), FILES + 4);
 }
+
+// ─── Connections reused within the cap ──────────────────────────────────────
+
+/// A keep-alive loopback server reached as `localhost:<port>` (a host name,
+/// so the download transport reuses connections; an IP literal does not).
+/// It serves any number of requests per connection: metadata at once, a
+/// download after 20 ms. A connection counts in the gauge from its first
+/// download request until it closes, idle time included; `seen` counts
+/// such connections, not requests.
+async fn keep_alive_server() -> (String, Arc<Gauge>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gauge = Arc::new(Gauge::default());
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let (counted, served) = (Arc::clone(&gauge), Arc::clone(&downloads));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (gauge, downloads) = (Arc::clone(&counted), Arc::clone(&served));
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut counted = false;
+                'conn: loop {
+                    let mut head = Vec::new();
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break 'conn,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = if let Some(rest) = path.strip_prefix("/metadata/") {
+                        item_json(rest.split('?').next().unwrap_or("")).into_bytes()
+                    } else {
+                        if !counted {
+                            counted = true;
+                            gauge.enter();
+                        }
+                        downloads.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        FILE_BODY.to_vec()
+                    };
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                    if stream.write_all(head.as_bytes()).await.is_err()
+                        || stream.write_all(&body).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                if counted {
+                    gauge.leave();
+                }
+            });
+        }
+    });
+    (format!("localhost:{port}"), gauge, downloads)
+}
+
+#[tokio::test]
+async fn two_processes_reuse_connections_and_stay_within_six_together() {
+    let (host, gauge, downloads) = keep_alive_server().await;
+    let cache = TempDir::new().unwrap();
+    let (a, dir_a) = spawn_ia(&host, "item-a", cache.path(), &["-j", "8"]);
+    let (b, dir_b) = spawn_ia(&host, "item-b", cache.path(), &["-j", "8"]);
+    tokio::join!(finish(a, LIMIT), finish(b, LIMIT));
+    assert_item(&dir_a, "item-a");
+    assert_item(&dir_b, "item-b");
+    assert_eq!(downloads.load(Ordering::SeqCst), 2 * FILES);
+    // Open download sockets, busy or idle, of both processes together.
+    assert!(gauge.most() <= 6, "{} open at once", gauge.most());
+    // Each process opens at most its six and reuses them; one connection
+    // per file would be 100.
+    assert!(gauge.seen() <= 12, "{} download connections", gauge.seen());
+}

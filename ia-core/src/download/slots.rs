@@ -45,6 +45,16 @@ const FIRST_POLL: Duration = Duration::from_millis(50);
 /// The longest wait between two looks at the slot files.
 const LAST_POLL: Duration = Duration::from_millis(500);
 
+/// How long a slot keeps its idle connection, and its slot file, after its
+/// last request: long enough for the next file of a queue, short enough
+/// that another process waits little for it.
+pub(crate) const IDLE_KEEP: Duration = Duration::from_secs(2);
+
+/// How long after a slot drops its client its next connection may open, or
+/// its slot file is unlocked. hyper closes a dropped client's socket in its
+/// connection task, a task poll later; this covers it.
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_millis(100);
+
 /// How long a request waits on other processes' slot files before one
 /// warning says so, once per server: at the default log level a wait is
 /// otherwise silent, and a suspended `ia` keeps its slots.
@@ -152,6 +162,121 @@ struct NodeState {
     /// request holds a slot here: they are already out of the free
     /// permits, so [`ServerSlots::room`] does not count them again.
     starting_held: usize,
+    /// Slots no request holds that keep their connection and slot file
+    /// for the next request (see [`Seat`]). In use plus idle never exceed
+    /// the budget.
+    idle: Vec<Seat>,
+    /// The id the next idle seat gets.
+    next_seat: u64,
+}
+
+/// What a slot keeps besides its permit, and keeps while idle: its slot
+/// file (across processes) and the connection it owns.
+///
+/// A seat's client may open one connection in its life ([`OneConnection`]),
+/// so a seat has at most one socket open, busy or idle, and holds its slot
+/// file for as long as it may have one: from when it is taken until
+/// [`CLOSE_GRACE`] after its client is dropped.
+#[derive(Debug, Default)]
+struct Seat {
+    file: Option<std::fs::File>,
+    line: Option<Line>,
+    /// When the seat last dropped a client: its next connection waits
+    /// until [`CLOSE_GRACE`] after this.
+    retired_at: Option<Instant>,
+    /// The seat's id while it is idle, for its idle timer.
+    id: u64,
+}
+
+/// A seat's client and the host its one connection goes to.
+#[derive(Debug)]
+struct Line {
+    http: reqwest::Client,
+    host: String,
+    /// The connection is known to be gone (a failed send, an answer with
+    /// `Connection: close`, or connects refused): the next request on the
+    /// seat replaces the client.
+    spent: bool,
+}
+
+/// The resolver of a seat's client: the first resolution goes through, and
+/// every later one is refused before any socket exists. hyper resolves once
+/// for every new connection to a host name, so the client opens one
+/// connection in its life. That keeps hyper's pool from opening a second
+/// one while the first is on its way back to the pool (hyper races a new
+/// connection against the return of an idle one), the extra socket that
+/// would break the cap.
+#[derive(Debug, Default)]
+pub(crate) struct OneConnection {
+    opened: AtomicBool,
+}
+
+impl reqwest::dns::Resolve for OneConnection {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        if self.opened.swap(true, Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(
+                Box::new(SecondConnection) as Box<dyn std::error::Error + Send + Sync>
+            )));
+        }
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// A seat's client asked for a second connection: its one connection is
+/// not idle in its pool, either not yet back or gone. Nothing was sent.
+#[derive(Debug)]
+pub(crate) struct SecondConnection;
+
+impl std::fmt::Display for SecondConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the download slot's connection is not idle")
+    }
+}
+
+impl std::error::Error for SecondConnection {}
+
+/// Whether `err` is a seat's refused second connection.
+pub(crate) fn is_second_connection(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<SecondConnection>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Drop a seat's client and give up its slot file [`CLOSE_GRACE`] later,
+/// once the client's socket is closed. A seat that has had no client within
+/// the grace has no socket, and without a runtime to wait on there is no
+/// choice: the file then goes at once.
+fn retire(seat: Seat) {
+    let Seat {
+        file,
+        line,
+        retired_at,
+        ..
+    } = seat;
+    let socket = line.is_some() || retired_at.is_some_and(|at| at.elapsed() < CLOSE_GRACE);
+    drop(line);
+    let Some(file) = file else { return };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if socket => {
+            handle.spawn(async move {
+                tokio::time::sleep(CLOSE_GRACE).await;
+                let _ = fs4::FileExt::unlock(&file);
+            });
+        }
+        _ => {
+            let _ = fs4::FileExt::unlock(&file);
+        }
+    }
 }
 
 impl Node {
@@ -210,12 +335,65 @@ pub(crate) struct SlotGuard {
     /// The budget's epoch when the slot was taken.
     epoch: u64,
     permit: Option<OwnedSemaphorePermit>,
-    file: Option<std::fs::File>,
+    /// The slot file and the connection this slot owns.
+    seat: Seat,
     /// The file about to start whose first request this slot carries.
     starting: Option<Starting>,
 }
 
 impl SlotGuard {
+    /// The client for this slot's request to `host`: the slot's own, which
+    /// reuses its connection, or a new one when it has none, it goes to
+    /// another host, or it is spent. A replaced client is dropped, and the
+    /// new one connects no sooner than [`CLOSE_GRACE`] after.
+    pub(crate) async fn http(
+        &mut self,
+        client: &crate::IaClient,
+        host: &str,
+    ) -> crate::Result<reqwest::Client> {
+        if let Some(line) = &self.seat.line {
+            if !line.spent && line.host.eq_ignore_ascii_case(host) {
+                return Ok(line.http.clone());
+            }
+        }
+        if self.seat.line.take().is_some() {
+            self.seat.retired_at = Some(Instant::now());
+        }
+        // Cleared only once waited: a request dropped during the wait
+        // leaves the seat to `retire`, which then still waits the grace.
+        if let Some(at) = self.seat.retired_at {
+            tokio::time::sleep_until(at + CLOSE_GRACE).await;
+            self.seat.retired_at = None;
+        }
+        let http = client.slot_http(Arc::new(OneConnection::default()))?;
+        self.seat.line = Some(Line {
+            http: http.clone(),
+            host: host.to_string(),
+            spent: false,
+        });
+        Ok(http)
+    }
+
+    /// Drop the slot's client, if it has one, and wait [`CLOSE_GRACE`] for
+    /// its socket to close: for a request that does not use the slot's
+    /// client (to a host given as an address).
+    pub(crate) async fn drop_client(&mut self) {
+        if self.seat.line.take().is_some() {
+            self.seat.retired_at = Some(Instant::now());
+        }
+        if let Some(at) = self.seat.retired_at {
+            tokio::time::sleep_until(at + CLOSE_GRACE).await;
+            self.seat.retired_at = None;
+        }
+    }
+
+    /// The slot's connection is gone: its next request replaces the client.
+    pub(crate) fn spend(&mut self) {
+        if let Some(line) = self.seat.line.as_mut() {
+            line.spent = true;
+        }
+    }
+
     /// The server this slot is on.
     pub(crate) fn server(&self) -> &str {
         &self.server
@@ -272,19 +450,42 @@ impl SlotGuard {
 }
 
 impl Drop for SlotGuard {
-    /// The file is unlocked and closed before the permit goes back. The
-    /// next task of this process, woken by the permit, then finds the file
-    /// free instead of waiting a poll for it; and on Windows the lock goes
-    /// at once, where closing a handle releases its locks only when the
-    /// system gets to it. A permit owed after a drop is forgotten instead
-    /// of returned.
+    /// The seat stays idle, with its connection and slot file, when it has
+    /// a live connection and in use plus idle stay within the budget; it
+    /// then goes after [`IDLE_KEEP`] unless a request takes it first.
+    /// Otherwise its client is dropped and its file given up
+    /// ([`retire`]). The seat is put down before the permit goes back, so
+    /// the task the permit wakes finds it. A permit owed after a drop is
+    /// forgotten instead of returned.
     fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            // Through the trait, as `try_lock` is (see `try_lock_one`).
-            let _ = fs4::FileExt::unlock(&file);
-        }
+        let seat = std::mem::take(&mut self.seat);
+        let runtime = tokio::runtime::Handle::try_current().ok();
         let mut state = self.node.state();
         state.in_use = state.in_use.saturating_sub(1);
+        let keep = runtime.is_some()
+            && seat.line.as_ref().is_some_and(|line| !line.spent)
+            && state.in_use + state.idle.len() < state.budget;
+        let to_retire = match (keep, runtime) {
+            (true, Some(runtime)) => {
+                let id = state.next_seat;
+                state.next_seat += 1;
+                state.idle.push(Seat { id, ..seat });
+                let node = Arc::clone(&self.node);
+                runtime.spawn(async move {
+                    tokio::time::sleep(IDLE_KEEP).await;
+                    let seat = {
+                        let mut state = node.state();
+                        let at = state.idle.iter().position(|s| s.id == id);
+                        at.map(|i| state.idle.swap_remove(i))
+                    };
+                    if let Some(seat) = seat {
+                        retire(seat);
+                    }
+                });
+                None
+            }
+            _ => Some(seat),
+        };
         if self.starting.is_some() {
             // The `Starting` itself goes with the guard's fields, after
             // this: answered or failed, it is no longer about to start.
@@ -299,6 +500,10 @@ impl Drop for SlotGuard {
             }
         }
         state.shed = state.shed.min(state.in_use.saturating_sub(state.budget));
+        drop(state);
+        if let Some(seat) = to_retire {
+            retire(seat);
+        }
     }
 }
 
@@ -402,6 +607,8 @@ impl ServerSlots {
                     shed: 0,
                     shed_since: Instant::now(),
                     starting_held: 0,
+                    idle: Vec::new(),
+                    next_seat: 0,
                 }),
             })
         }))
@@ -453,7 +660,10 @@ impl ServerSlots {
                 let unlocked =
                     tokio::task::spawn_blocking(move || count_unlocked(&dir, &server, max)).await;
                 if let Ok(unlocked) = unlocked {
-                    free = free.min(unlocked);
+                    // This process's idle seats hold files its own
+                    // requests take first.
+                    let idle = node.state().idle.len();
+                    free = free.min(unlocked + idle);
                 }
             }
         }
@@ -466,10 +676,22 @@ impl ServerSlots {
         free.saturating_sub(to_come)
     }
 
-    /// Wait for a slot on `server` and hold it until the guard is dropped.
-    /// The wait wakes when the budget grows, too. `None` only if the
-    /// semaphore was closed, which this code never does.
+    /// [`Self::acquire_on`] for a request to the host `server` itself.
+    #[cfg(test)]
     pub(crate) async fn acquire(&self, server: &str) -> Option<SlotGuard> {
+        self.acquire_on(server, server).await
+    }
+
+    /// Wait for a slot on `server` (a host, or an item's pair) for a
+    /// request to `host`, and hold it until the guard is dropped. The wait
+    /// wakes when the budget grows, too. `None` only if the semaphore was
+    /// closed, which this code never does.
+    ///
+    /// An idle seat connected to `host` is taken first. Otherwise a new
+    /// seat, with a slot file of its own, while in use plus idle stay
+    /// within the budget; else an idle seat of the other host, whose
+    /// connection is then replaced (see [`SlotGuard::http`]).
+    pub(crate) async fn acquire_on(&self, server: &str, host: &str) -> Option<SlotGuard> {
         let node = self.node(server);
         if node.semaphore.available_permits() == 0 {
             tracing::debug!(
@@ -492,7 +714,24 @@ impl ServerSlots {
                 () = tokio::time::sleep_until(next_look) => {}
             }
         };
-        node.state().in_use += 1;
+        let seat = {
+            let mut state = node.state();
+            state.in_use += 1;
+            let same = state.idle.iter().position(|seat| {
+                seat.line
+                    .as_ref()
+                    .is_some_and(|line| line.host.eq_ignore_ascii_case(host))
+            });
+            match same {
+                Some(i) => Some(state.idle.swap_remove(i)),
+                None if !state.idle.is_empty()
+                    && state.in_use + state.idle.len() > state.budget =>
+                {
+                    Some(state.idle.swap_remove(0))
+                }
+                None => None,
+            }
+        };
         // From here the guard owns the permit, so an early return gives it
         // back.
         let mut guard = SlotGuard {
@@ -500,10 +739,18 @@ impl ServerSlots {
             node,
             epoch: 0,
             permit: Some(permit),
-            file: None,
+            seat: seat.unwrap_or_default(),
             starting: None,
         };
-        guard.file = self.lock_slot_file(server).await;
+        if guard.seat.file.is_none() {
+            match self.lock_slot_file(server, &guard.node).await {
+                Ok(file) => guard.seat.file = file,
+                // Every file is held, some by this process's idle seats of
+                // the pair's other host: one of them is taken instead of
+                // waiting on the other processes.
+                Err(seat) => guard.seat = seat,
+            }
+        }
         // The round is read once the slot is held, after any wait on other
         // processes' slot files: a drop during that wait came before this
         // request was sent, so a 429 to it is part of a new round.
@@ -517,13 +764,14 @@ impl ServerSlots {
     /// answers drops it once; either way the budget waits a full
     /// `growth_interval` again before growing. Free permits are forgotten
     /// at once and the rest owed, range streams over the new budget are
-    /// asked to stop, and the notice callback runs. Other statuses do
+    /// asked to stop, idle seats retire, and the notice callback runs.
+    /// Other statuses do
     /// nothing.
     pub(crate) fn report(&self, guard: &SlotGuard, host: &str, status: u16) {
         if !(status == 429 || (500..=599).contains(&status)) {
             return;
         }
-        let drop = {
+        let (drop, idle) = {
             let mut state = guard.node.state();
             state.calm_since = Instant::now();
             if guard.epoch != state.epoch {
@@ -543,13 +791,21 @@ impl ServerSlots {
             state.owed += lower - forgotten;
             state.shed = state.in_use.saturating_sub(after);
             state.shed_since = Instant::now();
-            BudgetDrop {
-                server: host.to_string(),
-                status,
-                before,
-                after,
-            }
+            // Idle connections close first, before any transfer is shed.
+            let idle = std::mem::take(&mut state.idle);
+            (
+                BudgetDrop {
+                    server: host.to_string(),
+                    status,
+                    before,
+                    after,
+                },
+                idle,
+            )
         };
+        for seat in idle {
+            retire(seat);
+        }
         tracing::info!(
             server = %drop.server,
             status,
@@ -573,13 +829,23 @@ impl ServerSlots {
     /// and a hung mount must not stall the async workers. A look abandoned
     /// with its request still finishes there, and a file it locked is closed
     /// with it, which releases the lock.
-    async fn lock_slot_file(&self, server: &str) -> Option<std::fs::File> {
-        let dir = self.inner.files.as_deref()?;
+    ///
+    /// While it waits, an idle seat of this process on `node` (one of the
+    /// pair's other host, or one whose file came free in the meantime) is
+    /// returned as `Err` instead: its file is this process's to use.
+    async fn lock_slot_file(
+        &self,
+        server: &str,
+        node: &Node,
+    ) -> std::result::Result<Option<std::fs::File>, Seat> {
+        let Some(dir) = self.inner.files.as_deref() else {
+            return Ok(None);
+        };
         let started = Instant::now();
         let mut wait = FIRST_POLL;
         loop {
             if self.inner.files_failed.load(Ordering::Relaxed) {
-                return None;
+                return Ok(None);
             }
             let look = {
                 let (dir, server, max) = (dir.to_path_buf(), server.to_string(), self.inner.max);
@@ -587,8 +853,15 @@ impl ServerSlots {
             };
             let look = look.unwrap_or_else(|e| Err((dir.to_path_buf(), std::io::Error::other(e))));
             match look {
-                Ok(Some(file)) => return Some(file),
+                Ok(Some(file)) => return Ok(Some(file)),
                 Ok(None) => {
+                    let idle = {
+                        let mut state = node.state();
+                        (!state.idle.is_empty()).then(|| state.idle.swap_remove(0))
+                    };
+                    if let Some(seat) = idle {
+                        return Err(seat);
+                    }
                     tracing::debug!(
                         server,
                         max = self.inner.max,
@@ -612,7 +885,7 @@ impl ServerSlots {
                             path.display()
                         );
                     }
-                    return None;
+                    return Ok(None);
                 }
             }
         }
@@ -981,7 +1254,7 @@ mod tests {
             node: slots.node(S),
             epoch: 0,
             permit: None,
-            file: None,
+            seat: Seat::default(),
             starting: None,
         };
         slots.report(&stale, S, 503);
@@ -1338,6 +1611,27 @@ mod tests {
         assert!(path.exists(), "slot files are never removed");
     }
 
+    #[tokio::test]
+    async fn a_request_takes_its_own_idle_seat_before_waiting_on_other_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots = ServerSlots::across_processes_with_cap(2, dir.path());
+        let client = crate::IaClient::from_config(crate::IaConfig::default()).unwrap();
+        // This process leaves one seat idle, with a client for host a.
+        let mut held = slots.acquire_on("pair", "a").await.unwrap();
+        held.http(&client, "a").await.unwrap();
+        drop(held);
+        // Another process holds the other slot file.
+        let other = try_lock_one(dir.path(), "pair", 2)
+            .unwrap()
+            .expect("a free file");
+
+        // A request to the pair's other host takes the idle seat at once.
+        let got = within(&slots, "pair", Duration::from_millis(500)).await;
+
+        assert!(got.is_some(), "waited on the other process");
+        drop(other);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_slot_file_this_user_may_not_write_is_locked_read_only() {
@@ -1355,7 +1649,7 @@ mod tests {
             !slots.inner.files_failed.load(Ordering::SeqCst),
             "the read-only file was given up"
         );
-        assert!(held.file.is_some(), "no slot file is locked");
+        assert!(held.seat.file.is_some(), "no slot file is locked");
     }
 
     #[tokio::test]
