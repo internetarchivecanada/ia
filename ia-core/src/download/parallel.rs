@@ -1086,6 +1086,8 @@ impl Budget {
             self.failed_requests as u32,
         );
         self.failed_requests += 1;
+        // The stream sends the request again (see `RetryStats::record_retry`).
+        shared.client.retry_stats().record_retry();
         warn!(
             file = %shared.file.name,
             start,
@@ -1388,6 +1390,7 @@ async fn fetch_part(
                     });
                 }
                 budget.stalls += 1;
+                shared.client.retry_stats().record_retry();
                 // No backoff, as on one stream: the server is answering,
                 // too slowly.
                 warn!(
@@ -1409,6 +1412,7 @@ async fn fetch_part(
         if budget.stream_errors < super::MAX_STREAM_RETRIES {
             budget.stream_errors += 1;
             let backoff = super::stream_retry_backoff(budget.stream_errors);
+            shared.client.retry_stats().record_retry();
             warn!(
                 file = %shared.file.name,
                 start,
@@ -2689,6 +2693,11 @@ mod tests {
             3,
             "{got:?}"
         );
+        // Each request is in the HTTP line, the two resends as retries.
+        let stats = client.retry_stats().summary();
+        assert_eq!(stats.requests_total, got.len() as u64);
+        assert_eq!(stats.retries_total, 2);
+        assert_eq!(stats.status_5xx_count, 2);
     }
 
     #[tokio::test]
@@ -4454,6 +4463,8 @@ mod tests {
             ],
         );
         assert_eq!(read_journal(dir.path()).done[1], 40);
+        // The three re-requests are retries; the failed fourth is not resent.
+        assert_eq!(client.retry_stats().summary().retries_total, 3);
     }
 
     const DRIP: Duration = Duration::from_millis(250);
@@ -4516,6 +4527,7 @@ mod tests {
             .collect();
         assert_eq!(resumed.len(), 1, "{seen:?}");
         assert!(resumed[0] <= 1024 + 12, "resumed from {}", resumed[0]);
+        assert_eq!(client.retry_stats().summary().retries_total, 1);
     }
 
     #[tokio::test]
