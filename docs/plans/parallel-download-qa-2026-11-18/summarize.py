@@ -7,7 +7,7 @@ import json
 import statistics
 import sys
 
-CASES = ["single", "multi", "many", "twoproc"]
+CASES = ["single", "multi", "many", "twoproc", "tiny", "small"]
 BUILDS = ["new", "v0.27.0"]
 
 
@@ -24,8 +24,8 @@ def main():
         r["md5_bad"] = [n for n in r["md5_bad"] if n not in xml]
         r["md5_absent"] = r["md5_absent"] + xml
     print("| Case | Build | Runs | Median MB/s | Min to max MB/s | Median wall s "
-          "| Median CPU s | Median peak RSS MiB | Peak connections per pair | md5 ok / bad | Exits |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+          "| Median files/s | Median CPU s | Median peak RSS MiB | Peak connections per pair | md5 ok / bad | Exits |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for c in CASES:
         for b in BUILDS:
             rs = [r for r in recs if r["case"] == c and r["build"] == b]
@@ -41,7 +41,9 @@ def main():
             bad = sum(len(r["md5_bad"]) for r in rs)
             exits = sorted({e for r in rs for e in r["exits"]})
             print(f"| {c} | {b} | {len(rs)} | {med(mbs):.2f} | {min(mbs):.2f} to {max(mbs):.2f} "
-                  f"| {med([r['wall_s'] for r in rs]):.1f} | {med([r['cpu_s'] for r in rs]):.2f} "
+                  f"| {med([r['wall_s'] for r in rs]):.1f} "
+                  f"| {med([r.get('files_done', 0) / r['wall_s'] for r in rs]):.1f} "
+                  f"| {med([r['cpu_s'] for r in rs]):.2f} "
                   f"| {med([r['max_rss_bytes'] for r in rs]) / 2**20:.0f} | {peak} | {ok} / {bad} "
                   f"| {','.join(map(str, exits))} |")
     print()

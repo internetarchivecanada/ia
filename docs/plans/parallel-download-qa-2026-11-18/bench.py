@@ -8,7 +8,8 @@ Environment:
           deleted after each run
   IA_NEW  the build under test
   IA_OLD  the released binary to compare against
-  CASES   optional comma-separated subset of: single,multi,many,twoproc
+  CASES   optional comma-separated subset of: single,multi,many,twoproc,
+          tiny,small (default: the first four)
   GAP     seconds between runs (default 30)
 
 Each run starts every process of the case under `/usr/bin/time -l`, which
@@ -35,6 +36,8 @@ import datetime as dt
 U = "ubuntu-18.04.5-desktop-amd64"
 DEB = "Debian-GNULinux-2.2-arch-i386-CD"
 GD = "gd-1995-03-17MVBtapes"
+TINY = "playdrone-metadata-2014-10-14-09"
+SMALL = "pastpages-stltoday-2016-02"
 
 # case -> list of processes; each process is (identifier, extra args)
 CASES = {
@@ -45,6 +48,9 @@ CASES = {
         (DEB, ["--glob", "*-1of3.iso"]),
         (DEB, ["--glob", "*-2of3.iso"]),
     ],
+    # Added after the first run: per-file connection cost.
+    "tiny": [(TINY, [])],
+    "small": [(SMALL, ["--format", "JPEG"])],
 }
 
 
@@ -190,6 +196,7 @@ def run(results, case, build, binary, rnd, meta, hm, pairs):
         "max_rss_bytes": max(r.get("max_rss_bytes", 0) for r in per_proc),
         "exits": [r["exit"] for r in per_proc],
         "procs": per_proc,
+        "files_done": md5_ok + len(md5_bad) + len(md5_none),
         "md5_ok": md5_ok, "md5_bad": md5_bad, "md5_absent": md5_none,
         "partials": partials,
         "peak_conns_per_host": peak_host, "peak_conns_per_pair": peak_pair,
@@ -211,7 +218,7 @@ def main():
     builds = [("new", os.environ["IA_NEW"]), ("v0.27.0", os.environ["IA_OLD"])]
     cases = os.environ.get("CASES", "single,multi,many,twoproc").split(",")
     gap = float(os.environ.get("GAP", "30"))
-    meta = {i: metadata(i) for i in (U, DEB, GD)}
+    meta = {i: metadata(i) for i in {i for c in cases for i, _ in CASES[c]}}
     pairs, hosts = {}, []
     for m in meta.values():
         a, b = m["d1"], m["d2"]

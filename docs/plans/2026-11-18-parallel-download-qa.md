@@ -29,6 +29,13 @@ From one client (Apple M1 Pro, Wi-Fi), 2026-11-18 between 17:06 and
 - **Client cost:** CPU time was lower than v0.27.0's in every case but
   many small files (equal): 20.4 against 25.4 s for the 2.04 GiB file.
   Peak resident memory was higher, 28 to 30 MiB against 19 to 30 MiB.
+- **Many tiny files are slower (added later the same day, build
+  `cb2d36e`):** an item of 1,267 files of a few kilobytes took a median
+  of 26.0 s against 14.3 s for v0.27.0 (48.7 against 88.4 files per
+  second, 0.55 times), and 497 JPEGs of about 190 KB took 22.6 against
+  11.1 s (0.49 times), with 2 to 3 times the CPU time. The cause is a new
+  TCP and TLS connection for every file, to archive.org and again to the
+  datanode, where v0.27.0 reuses a few; see "Many small files" below.
 - **Contract:** no sample of any run of the rebased build saw more than
   6 established connections to a datanode pair. Every finished file
   matched the md5 in the item metadata (198 files per build), every
@@ -121,6 +128,69 @@ In every run, each pair's connections all went to one of its two hosts
   cases. Peak memory is about 10 MiB higher for one large file (29
   against 19 MiB), where six streams run instead of one; it stays under
   32 MiB in every run.
+
+## Many small files (added 18:11 to 18:21 UTC)
+
+A review of `cb2d36e` asked whether opening a connection per file makes
+an item of very many small files slower than v0.27.0. The cases above
+used files of 4 MB or more, which do not show it. Two cases were added
+to `bench.py` and run the same way: the rebased build at `cb2d36e` (the
+#121 head, same download code as `63a8761` plus the review fixes)
+against v0.27.0, three interleaved rounds, default `-j`, 30 s apart.
+Records: `parallel-download-qa-2026-11-18/results/2026-11-18-small-files.jsonl`.
+From these runs on the sampler takes the children of each run from `ps`,
+so connection counts are of the ia-cli processes only, archive.org
+included.
+
+| Case | Command |
+|---|---|
+| tiny | `ia-cli download playdrone-metadata-2014-10-14-09 --json`: 1,267 files downloaded, 7,035,224 bytes, median file 5 KB, largest 235 KB (`ia601906`, `ia801906`) |
+| small | `ia-cli download pastpages-stltoday-2016-02 --format JPEG --json`: 497 JPEGs, 261,889,784 bytes, median 189 KB, 18 KB to 1.3 MB |
+
+| Case | Build | Median wall s | Min to max wall s | Median files/s | Median CPU s | Median peak RSS MiB | Peak connections | md5 ok / bad | Exits |
+|---|---|---|---|---|---|---|---|---|---|
+| tiny | new | 26.0 | 25.8 to 29.5 | 48.7 | 5.63 | 34 | `ia801906` 6, archive.org 7 | 3,798 / 0 | 0 |
+| tiny | v0.27.0 | 14.3 | 12.5 to 14.9 | 88.4 | 1.97 | 32 | `ia801906` 8, archive.org 9 | 3,798 / 0 | 0 |
+| small | new | 22.6 | 21.5 to 22.7 | 22.0 | 4.46 | 33 | archive.org 7 | 1,491 / 0 | 0 |
+| small | v0.27.0 | 11.1 | 10.6 to 13.0 | 44.8 | 2.91 | 34 | archive.org 9 | 1,491 / 0 | 0 |
+
+Paired ratio of throughput, new over v0.27.0: tiny 0.48, 0.51, 0.55;
+small 0.57, 0.49, 0.49. `<identifier>_files.xml` is not counted in the
+md5 column (see Method).
+
+`pastpages-stltoday-2016-02` is answered by archive.org itself: its
+`/download/` request returns 200 with no redirect to a datanode, so
+every connection of both builds went to archive.org, which the new build
+holds to 6 (7 with the metadata connection) and v0.27.0 does not (9).
+
+### Cause
+
+One run of each build on the tiny item with
+`RUST_LOG=hyper_util=debug`, which logs every new TCP connection:
+
+| Build | Wall s | CPU s (user + sys) | New TCP connections | To archive.org | To `ia801906` | Connections reused |
+|---|---|---|---|---|---|---|
+| new | 27.5 | 7.5 | 2,541 | 1,272 | 1,269 | 0 (1 log line) |
+| v0.27.0 | 13.0 | 2.6 | 17 | 9 | 8 | 5,064 log lines |
+
+- **A connection per request.** Every download request sends
+  `Connection: close` on a transport with no idle pool (addition B of
+  #121, which makes the cap count open sockets, not only transfers). A
+  file therefore costs two TCP connects and two TLS handshakes: the
+  `/download/` request to archive.org and the redirected request to the
+  datanode. The median TCP connect took 16 ms in these logs; each TLS
+  handshake adds at least one more round trip. v0.27.0 makes 17
+  connections for the whole item and reuses them.
+- **CPU.** The extra CPU time (2.9 times) is the 2,541 TLS handshakes.
+- **Six connections instead of eight** account for part of the wall
+  time. v0.27.0 with `-j 6` took 16.8, 20.0 and 16.7 s (median 16.8 s)
+  on the tiny item at 18:22 to 18:24 UTC, against 14.3 s at its default
+  `-j 8`: about 1.17 times. The new build's 26.0 s is a further 1.55
+  times, which is the per-file connection cost.
+
+For files of a few megabytes or more the handshakes are a small part of
+each transfer, which is why the earlier cases did not show this. The
+code was not changed.
 
 ## Not measured
 
