@@ -3615,6 +3615,9 @@ mod tests {
         assert_eq!(gauge.most(), 6);
     }
 
+    // Two large files split on one slot table at once: a library caller
+    // can do this, the CLI cannot (it never splits a file of a batch). The
+    // test is of the per-server cap.
     #[tokio::test]
     async fn two_servers_with_a_cap_of_six_reach_six_each_and_twelve_in_all() {
         let _layout = small_layout();

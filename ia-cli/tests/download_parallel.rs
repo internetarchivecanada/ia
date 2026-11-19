@@ -323,16 +323,23 @@ fn assert_big(dir: &TempDir, file: &str, body: &[u8]) {
     assert!(!dir.path().join(format!("{file}.part.json")).exists());
 }
 
-/// Every request is a whole GET, one per file named.
+/// Every file named was fetched whole, on one stream: one plain GET each,
+/// and nothing else but a resume of that stream after a dropped body
+/// (`bytes=N-`, open-ended). A split asks for closed ranges (`bytes=A-B`).
 fn assert_whole(requests: &[(String, Option<String>)], files: &[&str]) {
-    let mut paths: Vec<&str> = requests.iter().map(|(p, _)| p.as_str()).collect();
-    paths.sort_unstable();
+    let mut plain: Vec<&str> = requests
+        .iter()
+        .filter(|(_, range)| range.is_none())
+        .map(|(p, _)| p.as_str())
+        .collect();
+    plain.sort_unstable();
     let mut want = files.to_vec();
     want.sort_unstable();
-    assert_eq!(paths, want, "{requests:?}");
+    assert_eq!(plain, want, "{requests:?}");
     assert!(
-        requests.iter().all(|(_, range)| range.is_none()),
-        "a range request: {requests:?}"
+        requests.iter().all(|(p, range)| files.contains(&p.as_str())
+            && range.as_deref().is_none_or(|r| r.ends_with('-'))),
+        "a closed range request: {requests:?}"
     );
 }
 
@@ -416,6 +423,43 @@ async fn a_file_left_alone_by_one_already_on_disk_downloads_whole() {
 
     assert_whole(&requests, &["/download/one-left/b.bin"]);
     assert_big(&out, "one-left/b.bin", &body);
+}
+
+#[tokio::test]
+async fn a_resumed_batch_with_one_item_left_downloads_it_whole() {
+    // The first run finishes the small item; the rerun of the same batch
+    // skips it by the joblog and has one item left, still a batch.
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "done-item", &[], &["a.txt"], &body).await;
+    mount_item(&server, "left-item", &["b.bin"], &[], &body).await;
+    let dir = TempDir::new().unwrap();
+    let joblog = dir.path().join("jobs.jsonl");
+    let first = dir.path().join("first.txt");
+    fs::write(&first, "done-item\n").unwrap();
+    let both = dir.path().join("both.txt");
+    fs::write(&both, "done-item\nleft-item\n").unwrap();
+    let out = TempDir::new().unwrap();
+    let log = joblog.to_str().unwrap();
+
+    run_downloads(
+        &server,
+        &out,
+        &["--itemlist", first.to_str().unwrap(), "--joblog", log],
+    )
+    .await;
+    server.reset().await;
+    mount_item(&server, "done-item", &[], &["a.txt"], &body).await;
+    mount_item(&server, "left-item", &["b.bin"], &[], &body).await;
+    let requests = run_downloads(
+        &server,
+        &out,
+        &["--itemlist", both.to_str().unwrap(), "--joblog", log],
+    )
+    .await;
+
+    assert_whole(&requests, &["/download/left-item/b.bin"]);
+    assert_big(&out, "left-item/b.bin", &body);
 }
 
 #[tokio::test]
