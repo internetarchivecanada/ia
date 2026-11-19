@@ -43,6 +43,17 @@ From one client (Apple M1 Pro, Wi-Fi), 2026-11-18 between 17:06 and
   files 14.1 against 14.8 s, small files 15.3 against 15.8 s, one large
   file 2.9 times as fast. The tiny-file item opened 13 connections
   against 17 for v0.27.0. See "Connection reuse" below.
+- **Only a run of one file splits (build `c1e5b59`, 2026-11-19, 18:26
+  to 20:34 UTC):** after the change that fetches every file of a
+  multi-file run whole, the three cases it can move were measured again.
+  The link was much slower than the day before (v0.27.0 fetched the
+  2.04 GiB file at 2.5 to 3.0 MB/s). One 2.04 GiB file, which still
+  splits: 246 against 851 s, 3.4 to 3.6 times as fast. The item with a
+  few large files, now whole files only: 337 against 356 s (paired
+  ratios 1.03, 1.06, 0.89), where the split build was 1.29 times as fast
+  the day before. Two processes at once, each one file and so still
+  split: 308 against 350 s (0.95, 1.14, 2.03). See "Only a run of one
+  file splits" below.
 - **Contract:** no sample of any run of the rebased build saw more than
   6 established connections to a datanode pair. Every finished file
   matched the md5 in the item metadata (198 files per build), every
@@ -261,6 +272,49 @@ twoproc 1.64, 2.16, 1.07; tiny 0.92, 1.00, 1.42; small 0.85, 0.68,
   process while its own idle slots could serve it, a connection kept
   after an abandoned body, the close grace on a cancelled request, and a
   host given as an IP address). None is on the path these runs took.
+
+## Only a run of one file splits (added 2026-11-19, 18:26 to 20:34 UTC)
+
+PR #121 now splits a file into byte ranges only when the run downloads
+exactly one file; any run of more than one file fetches every file
+whole, at most 6 at a time per datanode (`docs/usage.md`,
+"Connections"). The three cases that change can move were measured
+again: the #121 head at `c1e5b59` against v0.27.0, three interleaved
+rounds, default `-j`, 30 s apart, same harness. Records:
+`parallel-download-qa-2026-11-18/results/2026-11-19-whole-files.jsonl`.
+The link was much slower than on 2026-11-18 (one connection to
+`ia800807` ran at 2.5 to 3.0 MB/s, against 4.9 to 7.4), so compare
+within this run only.
+
+| Case | Build | Median wall s | Min to max wall s | Median MB/s | Median CPU s | Median peak RSS MiB | Peak connections per pair | md5 ok / bad |
+|---|---|---|---|---|---|---|---|---|
+| single | new | 246.0 | 212.3 to 246.5 | 8.92 | 27.02 | 28 | 6 | 3 / 0 |
+| single | v0.27.0 | 850.6 | 730.6 to 885.1 | 2.58 | 34.64 | 18 | 1 | 3 / 0 |
+| multi | new | 336.6 | 304.8 to 426.1 | 5.55 | 29.37 | 25 | 5 | 45 / 0 |
+| multi | v0.27.0 | 355.6 | 313.4 to 377.4 | 5.25 | 29.76 | 24 | 5 | 45 / 0 |
+| twoproc | new | 307.9 | 189.9 to 308.9 | 4.33 | 17.88 | 26 | 6 | 6 / 0 |
+| twoproc | v0.27.0 | 350.4 | 293.7 to 386.3 | 3.80 | 20.64 | 19 | 2 | 6 / 0 |
+
+Paired ratio of throughput, new over v0.27.0, rounds 0, 1, 2: single
+3.44, 3.45, 3.60; multi 1.03, 1.06, 0.89; twoproc 0.95, 1.14, 2.03.
+Every process exited 0, no run left a `.part` or `.part.json`, and no
+datanode answered 429 or 5xx.
+
+- **One file (single).** Still split, as before: 6 connections against
+  1, 3.4 to 3.6 times as fast, with less CPU time.
+- **An item of a few large files (multi).** Its 15 ISO files are now
+  fetched whole, at most 6 at a time; no sample saw more than 5 at once
+  to the pair, as for v0.27.0. The new build is now level with v0.27.0
+  (median 337 against 356 s; one round 0.89), where on 2026-11-18 the
+  build that split them was 1.29 times as fast. That gain came from
+  splitting files of an item, which the contract does not allow.
+- **Two processes (twoproc).** Each process downloads one file, so each
+  still splits; the two together held at most 6 connections to the pair.
+  Median 308 against 350 s; the paired ratios spread from 0.95 to 2.03
+  on this slower link.
+- **archive.org.** At most 6 connections from one process to
+  archive.org in the single case and 7 in the multi case (6 slots plus
+  one metadata connection), 8 from two processes; v0.27.0 held up to 9.
 
 ## Not measured
 
