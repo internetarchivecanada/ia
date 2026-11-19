@@ -1,7 +1,7 @@
 //! `ia download` and its connection contract (#16): at most 6 connections
-//! to one datanode across every `ia` process, large files split
-//! automatically into the connections a datanode has to spare, and the
-//! back-off on 429 and 5xx.
+//! to one datanode across every `ia` process, a large file split into the
+//! connections its datanode has to spare only when the run downloads that
+//! one file, and the back-off on 429 and 5xx.
 //!
 //! The part size and threshold are fixed in `ia-core` (64 MiB parts, from
 //! 256 MiB), so the end-to-end test serves a 256 MiB body: the smallest
