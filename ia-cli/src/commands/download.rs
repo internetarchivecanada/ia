@@ -162,8 +162,10 @@ pub struct DownloadArgs {
 
     /// Pin the connections for one file of 256 MiB or more, 1 to 8 (1: never split)
     ///
-    /// Hidden; for debugging and support. Without it the number is chosen
-    /// when the file starts, from the connections its datanode has to spare.
+    /// Hidden; for debugging and support. Applies only when the run
+    /// downloads one file; any other run fetches every file whole. Without
+    /// it the number is chosen when the file starts, from the connections
+    /// its datanode has to spare.
     #[arg(
         long,
         value_name = "N",
@@ -629,6 +631,11 @@ pub async fn run(
         bail!("no identifiers provided. Pass identifiers as arguments, use --itemlist, or pipe to stdin.");
     }
 
+    // Whether the run names one item, counted before the joblog skips any:
+    // a resumed batch with one item left is still a batch, whose files are
+    // never split (#16).
+    let one_item_run = identifiers.len() == 1;
+
     // Filter out items already fully downloaded per joblog.
     if !resume_skip.is_empty() {
         identifiers.retain(|id| !resume_skip.contains(id));
@@ -666,12 +673,16 @@ pub async fn run(
         let identifier = &identifiers[0];
 
         // Use disk pool to select destination if multi-disk
-        let item_opts = if let Some(ref mut pool) = disk_pool {
+        let mut item_opts = if let Some(ref mut pool) = disk_pool {
             let dest = pool.assign_item(identifier, 0)?;
             make_opts(dest.to_path_buf())
         } else {
             opts.clone()
         };
+        // One identifier named: the run is one file if the item's filter
+        // selects one (`download_item` clears this otherwise). A batch never
+        // sets it, so its files are never split (#16).
+        item_opts.one_file_run = one_item_run;
 
         let display = if !args.json && quiet == 0 {
             let d = Arc::new(DownloadDisplay::new(identifier));

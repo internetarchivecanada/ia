@@ -40,7 +40,18 @@ What a datanode sees is the other way round. Before this change, whole-file down
 
 ### Choosing the path
 
-`download_file` keeps its skip, dry-run and path checks. The parallel path is taken when all of these hold: the file's metadata has a size; the size is at least 256 MiB; the file is not `{identifier}_files.xml`; and `DownloadOpts::connections_per_file` is not `Some(1)` (the hidden `--connections-per-file 1`, which never splits). Otherwise the single-stream path runs as before.
+`download_file` keeps its skip, dry-run and path checks. The parallel path is taken when all of these hold: the run downloads exactly one file (`DownloadOpts::one_file_run`, below); the file's metadata has a size; the size is at least 256 MiB; the file is not `{identifier}_files.xml`; and `DownloadOpts::connections_per_file` is not `Some(1)` (the hidden `--connections-per-file 1`, which never splits). Otherwise the single-stream path runs as before.
+
+### Only a run of one file splits
+
+Changed 2026-11-19, to match the contract: a large file is split only when the run downloads exactly one file. Any run with more than one file to download, in one item or across items, fetches every file whole, at most 6 at a time per datanode, at any `-j`, at the tail of an item, and in a batch whose files sit on different datanodes. Before this change a file split into whatever room its datanode had when it started, so an item run with `-j` below 6, the last large file of an item, or a batch spread over several datanodes could split; review found that this broke the contract's "never split" for items and batches.
+
+- **Who decides.** `DownloadOpts::one_file_run`, default `false`. Only the caller knows the whole run: the CLI sets it for a run that names one identifier (positional, or an `--itemlist` or stdin of one line) and never for a batch, `--search` or `--dashboard`; `download_item_with_metadata` clears it unless the item's filter selects exactly one file. A library caller of `download_file` that knows its run is one file sets it.
+- **Edge: files already on disk.** The count is of the files the filter selects, before any is skipped as present (or refused for a case collision). A run that selects two files and finds one on disk fetches the other whole: of the readings of "exactly one file", this is the one that does not split.
+- **The hidden `--connections-per-file N`** applies only to a run of one file.
+- **A journal from an earlier split run** is settled by the single-stream path, as for a server that stopped answering ranges: the journal is rewritten to claim only its contiguous prefix, the `.part` is truncated to that prefix, the journal is removed, and one stream resumes from there with `Range: bytes=<prefix>-`. Parts after the first hole are fetched again.
+
+The rest of this section, how many streams a split file runs, now applies only to a run of one file. `room` still counts other `ia` processes' slots, so a lone file splits only into the slots its datanode has free across processes. Its "about to start" term (the `Starting` count) is an in-process count and is always 0 in the CLI now, since a CLI process splits only its one file; it is kept for library callers that run several `download_file` calls with `one_file_run` on one `ServerSlots`. The CLI also counts as a batch, never split, a run with `--search` or `--dashboard`, and a rerun of a batch that `--joblog` leaves with one item (the identifiers are counted before the joblog skips any).
 
 ### Automatic split, files before ranges
 
@@ -52,8 +63,8 @@ The number of streams a large file runs is fixed when it starts, after its first
 There is no rebalancing while a file runs, other than shedding under a back-off (below). Each stream takes a slot for every part request and gives it back when the part ends, so a file waiting for its first slot gets the next one free, before a stream's next part: files go before ranges. With the three examples of the contract:
 
 - **One 2 GiB file** (33 parts), nothing else running: its first request takes one slot, nothing else is about to start, five more are free: `min(8, 33, 6)` = 6 streams.
-- **An item with 50 files** under `-j 8`: eight files have their places, six hold slots and two wait. A file of 256 MiB or more among them finds `room` = 0 (two files waiting) and runs one stream; the item downloads 6 files at a time, none split.
-- **A batch across many items** under `-j 8`: files keep starting, so `room` stays at 0 and no file splits; the files spread over their items' datanodes, at most 6 on each.
+- **An item with 50 files**: not a run of one file, so no file splits (since 2026-11-19 by rule, not by `room`); the item downloads 6 files at a time.
+- **A batch across many items**: not a run of one file, so no file splits; the files spread over their items' datanodes, at most 6 on each.
 
 The parallel path sends the request for the first unfetched part on its own, before any stream starts and before anything on disk changes:
 
@@ -170,6 +181,7 @@ When every stream has finished and every part is complete: the `.part` length mu
 ## Public API changes in `ia-core`
 
 - `download::DownloadOpts::connections_per_file: Option<usize>` (new field; the struct is `#[non_exhaustive]`). Default `None`, the automatic split; `Some(1)` never splits; `Some(n)` pins `n` streams (values above 8 are treated as 8).
+- `download::DownloadOpts::one_file_run: bool` (new field, 2026-11-19). Default `false`; only when it is set does a large file split (see "Only a run of one file splits").
 - `download::DownloadOpts::server_slots: ServerSlots` (new field) and `download::ServerSlots` (new type): `Default` (within the process), `across_processes(dir)` (with the slot files), `with_notices(f)` (a callback for each budget drop), `max()`.
 - `download::BudgetDrop` (new, `#[non_exhaustive]`): `server`, `status`, `before`, `after`, the argument of that callback.
 - `download::default_slot_dir()` (new function), the slot files' default directory.
@@ -177,11 +189,11 @@ When every stream has finished and every part is complete: the `.part` length mu
 - `download::zip::list_zip_contents_with`, `download_zip_member_with` and `download_zip_member_converted_with` (new functions; the last also re-exported from `ai::zip`): the zip functions holding a connection slot of the given options. The existing three take no slot, as before.
 - `download::MAX_CONNECTIONS_PER_SERVER` (6) and `download::MAX_CONNECTIONS_PER_FILE` (8), new constants.
 - `IaError::RangeFailed { file, start, end, attempts, source }`, new variant (the enum is `#[non_exhaustive]`); not retryable; JSON code `range_failed`.
-- Behaviour: `download_file` (and the item functions that call it) holds a slot on its datanode for every request, splits a file of 256 MiB or more into the room its datanode has, may leave `<name>.part.json` beside `<name>.part` after an interrupted download, and the single-stream path reads and settles such a journal.
+- Behaviour: `download_file` (and the item functions that call it) holds a slot on its datanode for every request, splits a file of 256 MiB or more into the room its datanode has when the run is one file, may leave `<name>.part.json` beside `<name>.part` after an interrupted download, and the single-stream path reads and settles such a journal.
 
 ## CLI
 
-No new visible flag. `--connections-per-file <N>` (1 to 8) is hidden: it pins the number of streams for a large file, `1` meaning never split, for debugging and support; it is not in `docs/usage.md`. `-j, --jobs` keeps its name and default (8); its help for download says "Files downloaded at once across all servers (default 8). Any one server gets at most 6 connections, so files on the same server may wait." `-j` is a global flag, whose help clap copies into every subcommand when the command is built, except a subcommand that has an argument of the same id; so `ia_cli::command()` gives `download` its own copy of the global `-j` with that help before the build. The value still reaches the global, and the help for the other commands is unchanged. Parsing, completions and the man page all use `ia_cli::command()`. The `docs/usage.md` section "Connections" carries the contract.
+No new visible flag. `--connections-per-file <N>` (1 to 8) is hidden: it pins the number of streams for a large file in a run of one file, `1` meaning never split, for debugging and support; it is not in `docs/usage.md`. `-j, --jobs` keeps its name and default (8); its help for download says "Files downloaded at once across all servers (default 8). Any one server gets at most 6 connections, so files on the same server may wait." `-j` is a global flag, whose help clap copies into every subcommand when the command is built, except a subcommand that has an argument of the same id; so `ia_cli::command()` gives `download` its own copy of the global `-j` with that help before the build. The value still reaches the global, and the help for the other commands is unchanged. Parsing, completions and the man page all use `ia_cli::command()`. The `docs/usage.md` section "Connections" carries the contract.
 
 ## Tests (written before the implementation)
 
@@ -201,7 +213,7 @@ In-crate tests in `ia-core/src/download/parallel.rs`, with the part size and thr
 - Progress: the reported bytes only grow and end at the file size.
 - `IaError::RangeFailed`: Display, not retryable, JSON.
 
-- Contract, counted on loopback servers: one large file alone splits into exactly 6 with the right bytes; 50 small files under `-j 8` never exceed 6 and send no `Range`; 3 large files under `-j 8` reach 6 in all, and every file's first request comes before any file's second part (files before ranges); three servers reach 6 each, 18 in all with enough `-j`, and no more than `-j` in all; jobs and ranges share one server's 6.
+- Contract, counted on loopback servers: one large file alone splits into exactly 6 with the right bytes; 50 small files under `-j 8` never exceed 6 and send no `Range`; 3 large files of one item are each fetched whole (since 2026-11-19; the test of files before ranges was removed with the rule it tested); a batch of two one-file items on two servers opens one connection per server and sends no `Range`; a `.part.json` from a split run resumes whole, from its contiguous prefix, when the run has two files; three servers reach 6 each, 18 in all with enough `-j`, and no more than `-j` in all; jobs and ranges share one server's 6.
 - Back-off: the budget arithmetic (6 → 3 → 2 → 1, floor 1, one drop per round, growth by one per interval up to 6, owed permits); one 429 holds later requests to 3 and a 503 does the same; a split file under a drop sheds range streams first and completes with the right bytes; the notice callback runs once per drop.
 - Starting files: one whose first request holds a slot on the server is not counted again by `room` there, but is on another server; on a redirect away it counts again; a first request held at the server leaves `room` at 5, not 4.
 - Whole files: under a drop they are asked to stop only after the grace (paused clock); five whole files under `-j 8`, one answered 429, never exceed 3 open after the grace, and one resumes with `Range`.
@@ -211,7 +223,7 @@ In-crate tests in `ia-core/src/download/parallel.rs`, with the part size and thr
 - An item's datanode pair: the key is the two names sorted and joined, whatever the order of `d1` and `d2`, and either host maps to it; with either name missing there is no pair. One item, one large file, eight streams pinned, a front server whose redirect alternates between two nodes: never more than 6 open on the two together. Every download connection, for whole files and split ones, carries one request and asks to close.
 - Across processes: slot file names per server (a port, an IPv6 address, an all-dots name); two tables sharing one directory, as two processes would, never hold more than the cap together; a table with a larger cap uses files beyond a smaller one's; a slot file this user may not write is locked read-only; a slot directory that is a file falls back to the per-process cap without failing.
 
-CLI tests in `ia-cli/tests/`: the `-j` help and no visible connection flags; the hidden `--connections-per-file` range check; a 256 MiB body splits into its four parts by default and is one plain GET with the hidden `--connections-per-file 1`; 50 small files never exceed 6 connections and send no `Range`. Across processes: two `ia download` processes never exceed 6 together; a process killed while holding all 6 slots frees them and a second process then completes; a cache path that cannot hold slot files warns once and keeps the process cap. The back-off notice, once per drop, in text and in `--json`.
+CLI tests in `ia-cli/tests/`: the `-j` help and no visible connection flags; the hidden `--connections-per-file` range check; a 256 MiB body splits into its four parts by default and is one plain GET with the hidden `--connections-per-file 1`; one large file chosen from an item with `--glob` still splits; and every request is a whole GET for a batch from `--itemlist`, an item of two large files at `-j 2`, the last file of an item at `-j 1`, and an item whose other selected file is already on disk; 50 small files never exceed 6 connections and send no `Range`. Across processes: two `ia download` processes never exceed 6 together; a process killed while holding all 6 slots frees them and a second process then completes; a cache path that cannot hold slot files warns once and keeps the process cap. The back-off notice, once per drop, in text and in `--json`.
 
 One live read-only run against the public file used by the measurement, to confirm the 206 path end to end.
 

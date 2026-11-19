@@ -182,8 +182,21 @@ pub struct DownloadOpts {
     /// when it is spent the file fails with [`IaError::DownloadStalled`].
     /// The default is 10 KiB/s.
     pub min_speed: u64,
+    /// Whether the run downloads exactly one file (#16). Only then is a large
+    /// file split into byte ranges; a run of more than one file, in one item
+    /// or across items, fetches every file whole, at most
+    /// [`MAX_CONNECTIONS_PER_SERVER`] at a time per datanode.
+    ///
+    /// The default is `false`: only the caller knows the whole run, so it
+    /// sets this when the run is one file. [`download_item_with_metadata`]
+    /// clears it unless the item's filter selects exactly one file. The
+    /// count is of files selected, before any is skipped as already on
+    /// disk, so a run that selects two files and finds one present still
+    /// fetches the other whole.
+    pub one_file_run: bool,
     /// How many connections fetch one large file at once (#16), each
-    /// carrying one stream of `Range` requests over HTTP/1.1.
+    /// carrying one stream of `Range` requests over HTTP/1.1. Applies only
+    /// when [`one_file_run`](Self::one_file_run) is set.
     ///
     /// A file of 256 MiB or more is cut into 64 MiB parts, which the streams
     /// take in turn, each with one `Range` request. The first request goes
@@ -235,6 +248,7 @@ impl Default for DownloadOpts {
             filter: FileFilter::default(),
             count_views: false,
             min_speed: 10 * 1024,
+            one_file_run: false,
             connections_per_file: None,
             server_slots: ServerSlots::default(),
             datanodes: None,
@@ -1241,8 +1255,10 @@ pub async fn download_file(
     // large file starting now leaves it room before it splits.
     let mut starting = Some(opts.server_slots.starting());
 
-    // A large file goes over parallel ranges (#16) unless the server does
-    // not answer the first range request with the range it asked for.
+    // A large file in a run of one file goes over parallel ranges (#16)
+    // unless the server does not answer the first range request with the
+    // range it asked for. Any other file goes whole, on one stream; a part
+    // journal left by an earlier split run is settled below.
     if parallel::applies(opts, identifier, file) {
         match parallel::download(
             client,
@@ -2007,7 +2023,11 @@ pub async fn download_item_with_metadata(
     let mut handles = Vec::new();
 
     // Requests to either of the item's datanodes count against one budget.
-    let item_opts = opts.for_item(item);
+    let mut item_opts = opts.for_item(item);
+    // Only a run of one file splits a file into ranges (#16).
+    if files_total != 1 {
+        item_opts.one_file_run = false;
+    }
 
     for (file, collides_with) in files_owned.into_iter().zip(collisions) {
         if let Some(kept) = collides_with {

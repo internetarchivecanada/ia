@@ -1,7 +1,7 @@
 //! `ia download` and its connection contract (#16): at most 6 connections
-//! to one datanode across every `ia` process, large files split
-//! automatically into the connections a datanode has to spare, and the
-//! back-off on 429 and 5xx.
+//! to one datanode across every `ia` process, a large file split into the
+//! connections its datanode has to spare only when the run downloads that
+//! one file, and the back-off on 429 and 5xx.
 //!
 //! The part size and threshold are fixed in `ia-core` (64 MiB parts, from
 //! 256 MiB), so the end-to-end test serves a 256 MiB body: the smallest
@@ -243,6 +243,252 @@ async fn a_lone_large_file_splits_into_its_parts_and_the_hidden_pin_of_1_keeps_o
     mount_big_item(&server, &body).await;
     let ranges = download_ranges(&server, &body, &["--connections-per-file", "1"]).await;
     assert_eq!(ranges, vec![None]);
+}
+
+// ─── Only a run of one file splits ──────────────────────────────────────────
+
+/// Mount `identifier` on `server`: every name in `big` is a 256 MiB file
+/// served from `body` (206 for a range, 200 without), and every name in
+/// `small` a file of 16 bytes.
+async fn mount_item(
+    server: &MockServer,
+    identifier: &str,
+    big: &[&str],
+    small: &[&str],
+    body: &Arc<Vec<u8>>,
+) {
+    let files: Vec<serde_json::Value> = big
+        .iter()
+        .map(|name| (name, SIZE))
+        .chain(small.iter().map(|name| (name, FILE_BODY.len())))
+        .map(|(name, size)| {
+            json!({
+                "name": name,
+                "source": "original",
+                "size": size.to_string(),
+                "mtime": "1700000000"
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("/metadata/{identifier}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": {"identifier": identifier, "mediatype": "data"},
+            "files": files
+        })))
+        .mount(server)
+        .await;
+    for name in big {
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{identifier}/{name}")))
+            .respond_with(RangeServer(Arc::clone(body)))
+            .mount(server)
+            .await;
+    }
+    for name in small {
+        Mock::given(method("GET"))
+            .and(path(format!("/download/{identifier}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(FILE_BODY))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Run `ia download` against `server` with `args` after the download
+/// command, into `dir`; require success and return every download request
+/// as (path, Range).
+async fn run_downloads(
+    server: &MockServer,
+    dir: &TempDir,
+    args: &[&str],
+) -> Vec<(String, Option<String>)> {
+    let host = server.uri().replace("http://", "");
+    let mut all = vec!["--insecure", "-H", &host, "download"];
+    all.extend_from_slice(args);
+    all.extend_from_slice(&["--destdir", dir.path().to_str().unwrap()]);
+    ia_cmd().args(&all).assert().success();
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/download/"))
+        .map(|r| (r.url.path().to_string(), range_of(r)))
+        .collect()
+}
+
+fn assert_big(dir: &TempDir, file: &str, body: &[u8]) {
+    let got = fs::read(dir.path().join(file)).unwrap();
+    assert!(got == body, "{file} differs from the body");
+    assert!(!dir.path().join(format!("{file}.part.json")).exists());
+}
+
+/// Every file named was fetched whole, on one stream: one plain GET each,
+/// and nothing else but a resume of that stream after a dropped body
+/// (`bytes=N-`, open-ended). A split asks for closed ranges (`bytes=A-B`).
+fn assert_whole(requests: &[(String, Option<String>)], files: &[&str]) {
+    let mut plain: Vec<&str> = requests
+        .iter()
+        .filter(|(_, range)| range.is_none())
+        .map(|(p, _)| p.as_str())
+        .collect();
+    plain.sort_unstable();
+    let mut want = files.to_vec();
+    want.sort_unstable();
+    assert_eq!(plain, want, "{requests:?}");
+    assert!(
+        requests.iter().all(|(p, range)| files.contains(&p.as_str())
+            && range.as_deref().is_none_or(|r| r.ends_with('-'))),
+        "a closed range request: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_of_large_files_downloads_each_whole() {
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "item-a", &["a.bin"], &[], &body).await;
+    mount_item(&server, "item-b", &["b.bin"], &[], &body).await;
+    let dir = TempDir::new().unwrap();
+    let list = dir.path().join("items.txt");
+    fs::write(&list, "item-a\nitem-b\n").unwrap();
+    let out = TempDir::new().unwrap();
+
+    let requests = run_downloads(
+        &server,
+        &out,
+        &["--itemlist", list.to_str().unwrap(), "-j", "8"],
+    )
+    .await;
+
+    assert_whole(
+        &requests,
+        &["/download/item-a/a.bin", "/download/item-b/b.bin"],
+    );
+    assert_big(&out, "item-a/a.bin", &body);
+    assert_big(&out, "item-b/b.bin", &body);
+}
+
+#[tokio::test]
+async fn an_item_of_large_files_at_two_jobs_downloads_each_whole() {
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "two-big", &["a.bin", "b.bin"], &[], &body).await;
+    let out = TempDir::new().unwrap();
+
+    let requests = run_downloads(&server, &out, &["two-big", "-j", "2"]).await;
+
+    assert_whole(
+        &requests,
+        &["/download/two-big/a.bin", "/download/two-big/b.bin"],
+    );
+    assert_big(&out, "two-big/a.bin", &body);
+    assert_big(&out, "two-big/b.bin", &body);
+}
+
+#[tokio::test]
+async fn the_last_file_of_an_item_downloads_whole_once_slots_are_free() {
+    // At -j 1 the large file starts after the small one has finished, with
+    // every slot of its server free.
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "tail", &["z.bin"], &["a.txt"], &body).await;
+    let out = TempDir::new().unwrap();
+
+    let requests = run_downloads(&server, &out, &["tail", "-j", "1"]).await;
+
+    assert_whole(&requests, &["/download/tail/a.txt", "/download/tail/z.bin"]);
+    assert_big(&out, "tail/z.bin", &body);
+}
+
+#[tokio::test]
+async fn a_file_left_alone_by_one_already_on_disk_downloads_whole() {
+    // Two files are selected; one is on disk already and is skipped. The run
+    // selected two files, so the other is not split.
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "one-left", &["b.bin"], &["a.txt"], &body).await;
+    let out = TempDir::new().unwrap();
+    let item_dir = out.path().join("one-left");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("a.txt"), FILE_BODY).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(item_dir.join("a.txt"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        .unwrap();
+
+    let requests = run_downloads(&server, &out, &["one-left"]).await;
+
+    assert_whole(&requests, &["/download/one-left/b.bin"]);
+    assert_big(&out, "one-left/b.bin", &body);
+}
+
+#[tokio::test]
+async fn a_resumed_batch_with_one_item_left_downloads_it_whole() {
+    // The first run finishes the small item; the rerun of the same batch
+    // skips it by the joblog and has one item left, still a batch.
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "done-item", &[], &["a.txt"], &body).await;
+    mount_item(&server, "left-item", &["b.bin"], &[], &body).await;
+    let dir = TempDir::new().unwrap();
+    let joblog = dir.path().join("jobs.jsonl");
+    let first = dir.path().join("first.txt");
+    fs::write(&first, "done-item\n").unwrap();
+    let both = dir.path().join("both.txt");
+    fs::write(&both, "done-item\nleft-item\n").unwrap();
+    let out = TempDir::new().unwrap();
+    let log = joblog.to_str().unwrap();
+
+    run_downloads(
+        &server,
+        &out,
+        &["--itemlist", first.to_str().unwrap(), "--joblog", log],
+    )
+    .await;
+    server.reset().await;
+    mount_item(&server, "done-item", &[], &["a.txt"], &body).await;
+    mount_item(&server, "left-item", &["b.bin"], &[], &body).await;
+    let requests = run_downloads(
+        &server,
+        &out,
+        &["--itemlist", both.to_str().unwrap(), "--joblog", log],
+    )
+    .await;
+
+    assert_whole(&requests, &["/download/left-item/b.bin"]);
+    assert_big(&out, "left-item/b.bin", &body);
+}
+
+#[tokio::test]
+async fn one_large_file_chosen_from_an_item_still_splits() {
+    let body = Arc::new(big_body());
+    let server = MockServer::start().await;
+    mount_item(&server, "pick-one", &["a.bin", "b.bin"], &[], &body).await;
+    let out = TempDir::new().unwrap();
+
+    let requests = run_downloads(&server, &out, &["pick-one", "--glob", "b.bin"]).await;
+
+    assert!(
+        requests
+            .iter()
+            .all(|(p, r)| p == "/download/pick-one/b.bin" && r.is_some()),
+        "{requests:?}"
+    );
+    // Four 64 MiB parts, each asked for whole at least once.
+    let part = 64 * MIB;
+    for k in 0..4 {
+        let whole = format!("bytes={}-{}", k * part, (k + 1) * part - 1);
+        assert!(
+            requests
+                .iter()
+                .any(|(_, r)| r.as_deref() == Some(whole.as_str())),
+            "part {k} never asked for whole: {requests:?}"
+        );
+    }
+    assert_big(&out, "pick-one/b.bin", &body);
 }
 
 // ─── The cap, counted on a loopback server ───────────────────────────────────

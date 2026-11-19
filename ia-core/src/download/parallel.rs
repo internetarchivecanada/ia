@@ -409,12 +409,15 @@ async fn discard(part_path: &Path) -> std::io::Result<()> {
     remove_journal(&journal_path(part_path)).await
 }
 
-/// Whether `file` is fetched over parallel ranges: not pinned to one stream,
-/// a size in the metadata at or above the threshold, and not the item's own
-/// `_files.xml`, whose size is unknowable. Whether it then splits is decided
-/// when its first range request is answered (see [`stream_count`]).
+/// Whether `file` is fetched over parallel ranges: the run downloads only
+/// this file ([`DownloadOpts::one_file_run`]), it is not pinned to one
+/// stream, its size in the metadata is at or above the threshold, and it is
+/// not the item's own `_files.xml`, whose size is unknowable. Whether it then
+/// splits is decided when its first range request is answered (see
+/// [`stream_count`]).
 pub(super) fn applies(opts: &DownloadOpts, identifier: &str, file: &FileMetadata) -> bool {
-    !matches!(opts.connections_per_file, Some(0 | 1))
+    opts.one_file_run
+        && !matches!(opts.connections_per_file, Some(0 | 1))
         && file.size.is_some_and(|size| size >= layout().min_size)
         && !super::is_size_unknowable(identifier, &file.name)
 }
@@ -1513,13 +1516,23 @@ mod tests {
         config
     }
 
-    /// `connections` per file, two retries, and room for every connection
-    /// a test opens unless the test sets the per-server cap itself.
+    /// A run of one file with `connections` per file, two retries, and room
+    /// for every connection a test opens unless the test sets the
+    /// per-server cap itself.
     fn opts(connections: usize) -> DownloadOpts {
         DownloadOpts {
+            one_file_run: true,
             connections_per_file: Some(connections),
             retries: 2,
             server_slots: ServerSlots::with_cap(64),
+            ..Default::default()
+        }
+    }
+
+    /// The default options for a run of one file.
+    fn one_file() -> DownloadOpts {
+        DownloadOpts {
+            one_file_run: true,
             ..Default::default()
         }
     }
@@ -1931,6 +1944,9 @@ mod tests {
         assert!(!applies(&opts(4), "big-item", &small));
         assert!(!applies(&opts(4), "big-item", &no_size));
         assert!(!applies(&opts(4), "big-item", &files_xml));
+        let mut many = opts(4);
+        many.one_file_run = false;
+        assert!(!applies(&many, "big-item", &big));
     }
 
     #[test]
@@ -1943,17 +1959,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_default_options_split_a_lone_large_file() {
+    async fn the_default_options_split_a_large_file_only_in_a_run_of_one_file() {
         let _layout = small_layout();
         let body = body_of(LEN);
-        let (server, client) = serve(RangeServer::new(&body)).await;
-        let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
 
+        // Without one_file_run the run may hold other files: one GET.
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let dir = tempfile::tempdir().unwrap();
         fetch(&client, &file, dir.path(), &DownloadOpts::default())
             .await
             .unwrap();
+        assert_finished(dir.path(), &body);
+        assert_eq!(ranges(&server).await, vec![None]);
 
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        let dir = tempfile::tempdir().unwrap();
+        fetch(&client, &file, dir.path(), &one_file())
+            .await
+            .unwrap();
         assert_finished(dir.path(), &body);
         assert_eq!(sorted(ranges(&server).await), all_parts());
     }
@@ -2609,6 +2633,76 @@ mod tests {
 
         assert_finished(dir.path(), &body);
         assert_eq!(ranges(&server).await, vec![Some("bytes=1524-".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_journal_from_a_split_run_resumes_whole_when_the_run_has_more_files() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let file = file_meta("big.bin", &body);
+        let dir = tempfile::tempdir().unwrap();
+        // An earlier run of this one file split it and stopped with holes.
+        let done = [1024, 500, 1024, 0, 0];
+        seed(
+            dir.path(),
+            &body,
+            &done,
+            &journal_json(&body, file.md5.as_deref().unwrap(), &done),
+        );
+        let (server, client) = serve(RangeServer::new(&body)).await;
+        Mock::given(method("GET"))
+            .and(path("/download/big-item/other.bin"))
+            .respond_with(RangeServer::new(&body))
+            .mount(&server)
+            .await;
+        let item: crate::types::ItemMetadata = serde_json::from_value(serde_json::json!({
+            "metadata": {"identifier": "big-item"},
+            "files": [file, file_meta("other.bin", &body)],
+        }))
+        .unwrap();
+        let mut o = one_file();
+        o.destdir = dir.path().to_path_buf();
+        o.no_directories = true;
+
+        // This run has two files, so big.bin goes whole: the journal is
+        // settled to its contiguous prefix (1,524 bytes) and one stream
+        // resumes from there.
+        let result = tokio::time::timeout(
+            LIMIT,
+            download_item_with_metadata(
+                &client,
+                "big-item",
+                &item,
+                &o,
+                Arc::new(tokio::sync::Semaphore::new(8)),
+                None,
+            ),
+        )
+        .await
+        .expect("the item download hung")
+        .unwrap();
+
+        assert_eq!(result.files_downloaded, 2, "{:?}", result.results);
+        assert_finished(dir.path(), &body);
+        assert_eq!(std::fs::read(dir.path().join("other.bin")).unwrap(), body);
+        let mut got: Vec<(String, Option<String>)> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.url.path().to_string(), range_of(r)))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "/download/big-item/big.bin".to_string(),
+                    Some("bytes=1524-".to_string())
+                ),
+                ("/download/big-item/other.bin".to_string(), None),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3521,6 +3615,9 @@ mod tests {
         assert_eq!(gauge.most(), 6);
     }
 
+    // Two large files split on one slot table at once: a library caller
+    // can do this, the CLI cannot (it never splits a file of a batch). The
+    // test is of the per-server cap.
     #[tokio::test]
     async fn two_servers_with_a_cap_of_six_reach_six_each_and_twelve_in_all() {
         let _layout = small_layout();
@@ -3764,7 +3861,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
 
-        fetch(&client, &file, dir.path(), &DownloadOpts::default())
+        fetch(&client, &file, dir.path(), &one_file())
             .await
             .unwrap();
 
@@ -3789,29 +3886,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_large_files_share_six_and_each_starts_before_any_splits() {
+    async fn three_large_files_of_one_item_are_each_fetched_whole() {
         let _layout = small_layout();
         let body = body_of(LEN);
         let (client, visits) = recording_server(&body, holding(HOLD)).await;
         let dir = tempfile::tempdir().unwrap();
 
-        download_files(&client, 3, &body, 8, &DownloadOpts::default(), dir.path()).await;
+        // The caller marks the run as one item; the item has three files, so
+        // download_item_with_metadata clears the mark and none splits.
+        download_files(&client, 3, &body, 8, &one_file(), dir.path()).await;
 
-        let mut visits = visits.lock().unwrap().clone();
-        assert_eq!(most_open(&visits), 6);
-        visits.sort_by_key(|v| v.arrived);
-        // Files before ranges: every file's first part was asked for before
-        // any file's second stream.
-        let first_parts = visits
-            .iter()
-            .position(|v| v.range.is_some_and(|(a, _)| a != 0))
-            .expect("some file split");
-        let starts: std::collections::HashSet<&str> = visits[..first_parts]
-            .iter()
-            .filter(|v| v.range.is_some_and(|(a, _)| a == 0))
-            .map(|v| v.path.as_str())
-            .collect();
-        assert_eq!(starts.len(), 3, "{visits:#?}");
+        let visits = visits.lock().unwrap().clone();
+        assert!(visits.iter().all(|v| v.range.is_none()), "{visits:#?}");
+        assert_eq!(visits.len(), 3);
+        assert_eq!(most_open(&visits), 3);
     }
 
     #[tokio::test]
@@ -3925,7 +4013,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = file_meta("big.bin", &body);
 
-        fetch(&client, &file, dir.path(), &DownloadOpts::default())
+        fetch(&client, &file, dir.path(), &one_file())
             .await
             .unwrap();
 
@@ -4011,6 +4099,7 @@ mod tests {
         let o = DownloadOpts {
             destdir: dir.path().to_path_buf(),
             no_directories: true,
+            one_file_run: true,
             connections_per_file: Some(8),
             ..Default::default()
         };
@@ -4319,7 +4408,7 @@ mod tests {
             &client,
             &file_meta("big.bin", &big),
             dir.path(),
-            &DownloadOpts::default(),
+            &one_file(),
         )
         .await
         .unwrap();
@@ -4992,6 +5081,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_of_large_files_on_two_servers_opens_one_connection_per_file_and_none_split() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let servers = [
+            reuse_server(&body, Duration::from_millis(50), Arc::default()).await,
+            reuse_server(&body, Duration::from_millis(50), Arc::default()).await,
+        ];
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        // One set of options and one -j for the whole batch, as the CLI's
+        // batch path builds them.
+        let shared = DownloadOpts::default();
+        let jobs = Arc::new(tokio::sync::Semaphore::new(8));
+        let runs = servers.iter().zip(&dirs).map(|(server, dir)| {
+            let client = client_for(&server.host);
+            let mut o = shared.clone();
+            o.destdir = dir.path().to_path_buf();
+            o.no_directories = true;
+            let (jobs, body) = (Arc::clone(&jobs), body.clone());
+            async move {
+                tokio::time::timeout(
+                    LIMIT,
+                    download_item_with_metadata(
+                        &client,
+                        "big-item",
+                        &item_of(1, &body),
+                        &o,
+                        jobs,
+                        None,
+                    ),
+                )
+                .await
+                .expect("the item download hung")
+                .unwrap()
+            }
+        });
+        let results = futures::future::join_all(runs).await;
+
+        for (result, dir) in results.iter().zip(&dirs) {
+            assert_eq!(result.files_downloaded, 1, "{:?}", result.results);
+            assert_eq!(std::fs::read(dir.path().join("f0.bin")).unwrap(), body);
+        }
+        for server in &servers {
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1, "a split file");
+            assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn forty_small_files_reuse_at_most_six_connections() {
         let body = body_of(2048);
         let server = reuse_server(&body, Duration::from_millis(20), Arc::default()).await;
@@ -5186,7 +5323,7 @@ mod tests {
         let client = client_for(&server.host);
         let dir = tempfile::tempdir().unwrap();
 
-        download_files(&client, 1, &body, 8, &DownloadOpts::default(), dir.path()).await;
+        download_files(&client, 1, &body, 8, &one_file(), dir.path()).await;
 
         // Twelve parts over six streams, each stream on one connection.
         assert_eq!(server.requests.load(Ordering::SeqCst), 12);
