@@ -92,6 +92,8 @@ fn build_skip_set(
          \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
          \n\n  <dim># Force re-upload ignoring joblog</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
+         \n\n  <dim># Send this size hint instead of the files' total size</dim>\
+         \n  <bold>$ ia upload my-item video.mp4 --size-hint 2000000499999744</bold>\
          \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
@@ -162,6 +164,16 @@ pub struct UploadArgs {
     /// Don't send x-archive-size-hint
     #[arg(long)]
     pub no_size_hint: bool,
+
+    /// Send this x-archive-size-hint (whole bytes) instead of the files' total size
+    ///
+    /// Without it, the first file that uploads carries the total size of all
+    /// the item's files as x-archive-size-hint, which IA uses to place a new
+    /// item. --size-hint sends the given number of bytes there instead,
+    /// exactly as given. Refused with --no-size-hint and with a --header
+    /// that sets x-archive-size-hint.
+    #[arg(long, value_name = "BYTES", conflicts_with = "no_size_hint")]
+    pub size_hint: Option<u64>,
 
     /// Skip collection existence check
     #[arg(long)]
@@ -327,6 +339,16 @@ pub struct ImportArgs {
     /// Don't send x-archive-size-hint
     #[arg(long)]
     pub no_size_hint: bool,
+
+    /// Send this x-archive-size-hint (whole bytes) instead of the files' total size
+    ///
+    /// Without it, the first file that uploads carries the total size of all
+    /// the item's files as x-archive-size-hint, which IA uses to place a new
+    /// item. --size-hint sends the given number of bytes there instead,
+    /// exactly as given. Refused with --no-size-hint and with a --header
+    /// that sets x-archive-size-hint.
+    #[arg(long, value_name = "BYTES", conflicts_with = "no_size_hint")]
+    pub size_hint: Option<u64>,
 
     /// Skip collection existence check
     #[arg(long)]
@@ -517,6 +539,7 @@ pub async fn run(
             no_auto_make_bucket: sub.no_auto_make_bucket,
             no_verify: sub.no_verify,
             no_size_hint: sub.no_size_hint,
+            size_hint: sub.size_hint,
             no_collection_check: sub.no_collection_check,
             checksum_file: sub.checksum_file,
             clobber: sub.clobber,
@@ -569,6 +592,7 @@ async fn run_bare_upload(
 
     // Parse --header as key:value pairs
     let headers = parse_key_values(&args.header)?;
+    check_size_hint_header(args.size_hint, &headers)?;
 
     // --delete-after-upload forces verify — non-negotiable data safety invariant
     if args.delete_after_upload && args.no_verify {
@@ -603,6 +627,7 @@ async fn run_bare_upload(
         o.no_backup = args.no_backup;
         o.no_auto_make_bucket = args.no_auto_make_bucket;
         o.no_size_hint = args.no_size_hint;
+        o.size_hint = args.size_hint;
         o.no_collection_check = args.no_collection_check;
         o.test_item = args.test_item;
         o.multipart = args.multipart;
@@ -771,6 +796,7 @@ async fn run_import(
     // Parse extra -m metadata and --header
     let extra_metadata = parse_key_values(&args.metadata)?;
     let headers = parse_key_values(&args.header)?;
+    check_size_hint_header(args.size_hint, &headers)?;
 
     // --delete-after-upload forces verify — non-negotiable data safety invariant
     if args.delete_after_upload && args.no_verify {
@@ -799,6 +825,7 @@ async fn run_import(
         o.no_backup = args.no_backup;
         o.no_auto_make_bucket = args.no_auto_make_bucket;
         o.no_size_hint = args.no_size_hint;
+        o.size_hint = args.size_hint;
         o.no_collection_check = args.no_collection_check;
         o.test_item = args.test_item;
         o.multipart = args.multipart;
@@ -1479,6 +1506,20 @@ fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// Refuse `--size-hint` together with a `--header` that sets
+/// x-archive-size-hint: two values for one header, as `--size-hint` with
+/// `--no-size-hint` is two answers to one question.
+fn check_size_hint_header(size_hint: Option<u64>, headers: &[(String, String)]) -> Result<()> {
+    if size_hint.is_some()
+        && headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-archive-size-hint"))
+    {
+        bail!("--size-hint and --header x-archive-size-hint both set the size hint; give one");
+    }
+    Ok(())
 }
 
 /// Handle stdin ('-') as a file argument.

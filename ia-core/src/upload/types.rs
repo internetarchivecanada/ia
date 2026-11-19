@@ -126,6 +126,10 @@ pub struct UploadOpts {
     pub no_auto_make_bucket: bool,
     /// Don't send x-archive-size-hint header.
     pub no_size_hint: bool,
+    /// Send this value as `x-archive-size-hint` in place of the computed
+    /// total size of the item's files, on the same request that would carry
+    /// the total. Ignored when `no_size_hint` is set.
+    pub size_hint: Option<u64>,
     /// Skip collection existence check.
     pub no_collection_check: bool,
     /// Upload to test_collection (items auto-removed after 30 days).
@@ -168,6 +172,7 @@ impl Default for UploadOpts {
             no_backup: false,
             no_auto_make_bucket: false,
             no_size_hint: false,
+            size_hint: None,
             no_collection_check: false,
             test_item: false,
             multipart: false,
@@ -182,6 +187,14 @@ impl Default for UploadOpts {
 }
 
 impl UploadOpts {
+    /// Whether `headers` sets `name` (compared without regard to case).
+    /// A header the caller sets replaces the one computed from the options.
+    pub(crate) fn sets_header(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
     /// The retry schedule these options describe: truncated exponential
     /// backoff with full jitter between `retry_min_delay` and
     /// `retry_max_delay`, for `retries` attempts. The one place the schedule
@@ -296,6 +309,13 @@ impl UploadOptsBuilder {
     /// Set whether to skip the size hint header.
     pub fn no_size_hint(mut self, no_hint: bool) -> Self {
         self.opts.no_size_hint = no_hint;
+        self
+    }
+
+    /// Send this value as `x-archive-size-hint` in place of the computed
+    /// total (see [`UploadOpts::size_hint`]).
+    pub fn size_hint(mut self, bytes: u64) -> Self {
+        self.opts.size_hint = Some(bytes);
         self
     }
 

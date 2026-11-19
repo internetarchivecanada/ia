@@ -4,8 +4,8 @@ use std::fs;
 use tempfile::{NamedTempFile, TempDir};
 
 /// Helper: create `ia` command with an empty config file to avoid loading real credentials.
-/// All tests in this file exercise CLI argument parsing, validation, and local-only operations.
-/// None of them send any HTTP requests.
+/// Most tests in this file exercise CLI argument parsing, validation, and local-only operations
+/// and send no HTTP requests; the `--size-hint` ones send theirs to a wiremock server.
 fn ia_with_config(config: &NamedTempFile) -> Command {
     let mut cmd = assert_cmd::cargo_bin_cmd!("ia-cli");
     cmd.arg("--config-file")
@@ -668,4 +668,205 @@ fn upload_no_resume_flag_accepted() {
         .assert()
         .failure();
     // It fails for missing file, but --no-resume is accepted as valid flag
+}
+
+// ─── --size-hint ─────────────────────────────────────────────────────────────
+
+fn one_file(dir: &TempDir) -> std::path::PathBuf {
+    let file = dir.path().join("a.txt");
+    fs::write(&file, "content").unwrap();
+    file
+}
+
+#[test]
+fn size_hint_with_no_size_hint_is_a_usage_error() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args(["--size-hint", "5", "--no-size-hint", "--dry-run"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn size_hint_with_no_size_hint_is_a_usage_error_with_a_spreadsheet() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--spreadsheet",
+            "batch.csv",
+            "--size-hint",
+            "5",
+            "--no-size-hint",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn size_hint_must_be_a_whole_number_of_bytes() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    for bad in ["abc", "1.5", "-5", "10GB", ""] {
+        ia_with_config(&cfg)
+            .arg("upload")
+            .arg("my-item")
+            .arg(file.as_os_str())
+            .arg(format!("--size-hint={bad}"))
+            .arg("--dry-run")
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--size-hint"));
+    }
+}
+
+#[test]
+fn size_hint_with_a_size_hint_header_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args([
+            "--size-hint",
+            "5",
+            "--header",
+            "X-Archive-Size-Hint:6",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--size-hint and --header x-archive-size-hint",
+        ));
+}
+
+/// A config for a mock host, with S3 keys.
+fn mock_config(host: &str) -> NamedTempFile {
+    let f = NamedTempFile::new().unwrap();
+    fs::write(
+        f.path(),
+        format!(
+            "[general]\nhost = {host}\nsecure = false\n\n[s3]\naccess = test-access\nsecret = test-secret\n"
+        ),
+    )
+    .unwrap();
+    f
+}
+
+/// Every x-archive-size-hint line on the PUTs the server received, by path.
+async fn put_hints(server: &wiremock::MockServer) -> Vec<(String, Vec<String>)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .map(|r| {
+            (
+                r.url.path().to_string(),
+                r.headers
+                    .get_all("x-archive-size-hint")
+                    .iter()
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// `ia upload --size-hint` reaches IA-S3 exactly as given, on the first file.
+#[tokio::test(flavor = "multi_thread")]
+async fn size_hint_is_sent_as_given() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "aaaa").unwrap();
+    fs::write(&b, "bbbb").unwrap();
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(a.as_os_str())
+        .arg(b.as_os_str())
+        .args([
+            "--size-hint=2000000499999744",
+            "--no-verify",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+
+    let hints = put_hints(&server).await;
+    assert_eq!(
+        hints,
+        vec![
+            ("/test-item/a.txt".into(), vec!["2000000499999744".into()]),
+            ("/test-item/b.txt".into(), vec![]),
+        ]
+    );
+}
+
+/// The same through `--spreadsheet`: each item's first file carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn size_hint_is_sent_as_given_with_a_spreadsheet() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a.txt");
+    fs::write(&a, "aaaa").unwrap();
+    let sheet = dir.path().join("batch.csv");
+    fs::write(
+        &sheet,
+        format!("identifier,file\ntest-item,{}\n", a.display()),
+    )
+    .unwrap();
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "--spreadsheet"])
+        .arg(sheet.as_os_str())
+        .args([
+            "--size-hint",
+            "2000000499999744",
+            "--no-verify",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        put_hints(&server).await,
+        vec![("/test-item/a.txt".into(), vec!["2000000499999744".into()])]
+    );
 }

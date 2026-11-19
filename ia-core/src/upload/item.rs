@@ -122,7 +122,8 @@ pub async fn upload_item(
     }
 
     // 8. Compute total bytes (always needed for progress display).
-    //    Do a single stat pass here; conditionally set size_hint based on no_size_hint.
+    //    Do a single stat pass here. The size hint is the caller's value when
+    //    given, else this total; none with no_size_hint.
     let file_count = expanded.len();
     let total_bytes: u64 = {
         let paths = expanded.clone();
@@ -141,7 +142,7 @@ pub async fn upload_item(
     let size_hint = if opts.no_size_hint {
         None
     } else {
-        Some(total_bytes)
+        Some(opts.size_hint.unwrap_or(total_bytes))
     };
 
     // 9. Emit Enumerated event so consumers know the file list and total size.
@@ -282,7 +283,9 @@ pub async fn upload_item(
             last_idx,
             last_upload_idx,
             first_uploaded,
-            None, // size_hint only on first file
+            // Carried only when no earlier file uploaded: then this file
+            // creates the item (upload_one_file decides from first_uploaded).
+            size_hint,
             progress.clone(),
             on_result.clone(),
             start,

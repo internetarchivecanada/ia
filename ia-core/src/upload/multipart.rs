@@ -822,8 +822,9 @@ pub async fn upload_file_multipart(
             hdrs.push(("x-archive-auto-make-bucket".to_string(), "1".to_string()));
         }
 
-        // x-archive-size-hint (first file only, caller provides)
-        if let Some(hint) = size_hint {
+        // x-archive-size-hint (first file only, caller provides), unless
+        // the custom headers set it
+        if let Some(hint) = size_hint.filter(|_| !opts.sets_header("x-archive-size-hint")) {
             hdrs.push(("x-archive-size-hint".to_string(), hint.to_string()));
         }
 
