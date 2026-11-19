@@ -4992,6 +4992,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_of_large_files_on_two_servers_opens_one_connection_per_file_and_none_split() {
+        let _layout = small_layout();
+        let body = body_of(LEN);
+        let servers = [
+            reuse_server(&body, Duration::from_millis(50), Arc::default()).await,
+            reuse_server(&body, Duration::from_millis(50), Arc::default()).await,
+        ];
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        // One set of options and one -j for the whole batch, as the CLI's
+        // batch path builds them.
+        let shared = DownloadOpts::default();
+        let jobs = Arc::new(tokio::sync::Semaphore::new(8));
+        let runs = servers.iter().zip(&dirs).map(|(server, dir)| {
+            let client = client_for(&server.host);
+            let mut o = shared.clone();
+            o.destdir = dir.path().to_path_buf();
+            o.no_directories = true;
+            let (jobs, body) = (Arc::clone(&jobs), body.clone());
+            async move {
+                tokio::time::timeout(
+                    LIMIT,
+                    download_item_with_metadata(
+                        &client,
+                        "big-item",
+                        &item_of(1, &body),
+                        &o,
+                        jobs,
+                        None,
+                    ),
+                )
+                .await
+                .expect("the item download hung")
+                .unwrap()
+            }
+        });
+        let results = futures::future::join_all(runs).await;
+
+        for (result, dir) in results.iter().zip(&dirs) {
+            assert_eq!(result.files_downloaded, 1, "{:?}", result.results);
+            assert_eq!(std::fs::read(dir.path().join("f0.bin")).unwrap(), body);
+        }
+        for server in &servers {
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1, "a split file");
+            assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn forty_small_files_reuse_at_most_six_connections() {
         let body = body_of(2048);
         let server = reuse_server(&body, Duration::from_millis(20), Arc::default()).await;
