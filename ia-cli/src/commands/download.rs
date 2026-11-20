@@ -40,8 +40,9 @@ use crate::output::DownloadDisplay;
         starts over.\n\n\
         ia opens at most 6 connections to any one datanode, across every ia process on this \
         machine, counting whole files and byte ranges alike. A file of 256 MiB or more is split \
-        into byte ranges fetched at once only when its datanode has connections to spare, with \
-        its progress kept in <name>.part.json so an interrupted download resumes per part. A \
+        into byte ranges fetched at once only when the run downloads that one file, with its \
+        progress kept in <name>.part.json so an interrupted download resumes per part; a run of \
+        more than one file fetches every file whole. A \
         datanode that answers 429 or a 5xx gets half as many connections for the rest of the run, \
         growing back by one per minute without another; see docs/usage.md, \"Connections\".",
     after_long_help = cstr!(
