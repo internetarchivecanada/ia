@@ -63,18 +63,16 @@ fn build_skip_set(
     long_about = "Upload files to the Internet Archive. Uploads one or more files to a single item, \
         with options for metadata, checksum verification, directory structure, and retry logic. Supports batch \
         uploads from spreadsheets and template generation for bulk workflows.\n\n\
-        Each file is sent in one PUT unless --multipart is given. If an upload is interrupted (the process \
+        Each file is sent either in one PUT or as a multipart upload in 100 MiB parts, chosen before its \
+        first attempt from --multipart and the file's size alone. By default (--multipart=auto) a file \
+        larger than 100 MiB is a multipart upload and a file of 100 MiB or less is a single PUT; \
+        --multipart=SIZE moves that cutoff, --multipart (--multipart=on) makes every file multipart, and \
+        --no-multipart (--multipart=off) makes every file a single PUT. A single PUT that dies is retried \
+        as a single PUT; nothing switches to multipart on failure. If an upload is interrupted (the process \
         is killed, the network drops past the retries), a single-PUT file is sent again from byte 0 on the \
-        rerun, except that a file the item already lists with the same md5 is skipped; a --multipart file \
-        resumes from the parts already on IA after checking them against the local file. A single PUT of a \
-        file larger than 2 MiB that dies on the way (not one IA refused or throttled) continues as a \
-        multipart upload with the retries it has left, and every later file larger than 2 MiB in the run \
-        is sent as multipart from the start; a rerun resumes such a file from its parts, because each item \
-        is asked once, at the start of a run, which files have unfinished multipart uploads on IA. \
-        --no-multipart turns off the switch to multipart when a single PUT dies, the switch for later \
-        files, and the start-of-run listing and resume of unfinished multipart uploads: every file is sent \
-        and retried as a single PUT, and no multipart request is sent; the same-md5 skip still applies. \
-        --joblog adds a layer on top of either: files a previous run finished are skipped without a request.",
+        rerun, and a multipart file resumes from the parts already on IA after checking them against the \
+        local file; either way, a file the item already lists with the same md5 is skipped. --joblog adds a \
+        layer on top of both: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
          \n  <dim># Upload a file to an existing or new item</dim>\
@@ -97,7 +95,13 @@ fn build_skip_set(
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
          \n\n  <dim># Send this size hint instead of the files' total size</dim>\
          \n  <bold>$ ia upload my-item video.mp4 --size-hint 2000000499999744</bold>\
-         \n\n  <dim># Every file a single PUT, never multipart</dim>\
+         \n\n  <dim># Default: files over 100 MiB as multipart, the rest as single PUTs</dim>\
+         \n  <bold>$ ia upload my-item ./files/</bold>\
+         \n\n  <dim># Multipart only for files over 500 MiB</dim>\
+         \n  <bold>$ ia upload my-item ./files/ --multipart=500M</bold>\
+         \n\n  <dim># Every file as multipart (same as --multipart=on)</dim>\
+         \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
+         \n\n  <dim># Every file a single PUT, never multipart (same as --multipart=off)</dim>\
          \n  <bold>$ ia upload my-item ./segments/ --no-multipart</bold>\
          \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
@@ -162,7 +166,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub no_auto_make_bucket: bool,
 
-    /// Skip the Content-MD5 header (on the single PUT, and on each part with --multipart)
+    /// Skip the Content-MD5 header (on a single PUT, and on each part of a multipart upload)
     #[arg(long)]
     pub no_verify: bool,
 
@@ -208,15 +212,13 @@ pub struct UploadArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart); a send
+    /// Retry attempts per IA-S3 request (per part of a multipart upload); a send
     /// dead for 60 s, or no answer within 120 s after the request was sent, spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// dead send or an unanswered body is re-sent at once. A file that
-    /// continues as multipart after its single PUT died carries the attempts
-    /// it has left over to each of its multipart requests.
+    /// dead send or an unanswered body is re-sent at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -224,44 +226,58 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Use multipart upload for every file (for large files or unreliable connections)
+    /// When a file is sent as multipart: auto (default), on, off, or a SIZE cutoff
     ///
-    /// Without the flag, a file larger than 2 MiB whose single PUT dies on
-    /// the way continues as a multipart upload, and every later file larger
-    /// than 2 MiB in the run is sent as multipart from the start. A rerun
-    /// resumes a file that left parts on IA, with or without the flag.
-    /// --no-multipart turns off both switches and that resume. Refused with
+    /// auto: a file larger than 100 MiB is a multipart upload from its first
+    /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
+    /// with SIZE as the cutoff, in bytes or with a K, M or G suffix for
+    /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
+    /// multipart); 0 is refused. on, or --multipart with no value: every
+    /// file is a multipart upload. off: every file is a single PUT, as with
+    /// --no-multipart. A value must follow '=': '--multipart 500M' is bare
+    /// --multipart followed by a file named 500M. Refused with
     /// --no-multipart.
     ///
-    /// The file is sent in 100 MiB parts, each retried on its own. A part
-    /// that fails for good (IA refuses it, or its --retries run out) does
-    /// not abort the upload: the parts IA already holds stay there, the
-    /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
-    /// discards a kept upload instead; one left alone may be cleaned up by
-    /// IA after 30 days or more. A rerun resumes only when every
-    /// part IA holds matches the local file by size and md5; otherwise a
-    /// fresh upload starts and the stale one is left for cleanup, named in
-    /// a warning.
+    /// The path is chosen from this setting and the file's size alone. A
+    /// single PUT that dies on the way is retried as a single PUT; nothing
+    /// switches to multipart on failure. A file a single PUT is chosen for
+    /// is sent that way even when IA holds an unfinished multipart upload
+    /// of it, for example one left by an older ia-cli; 'ia upload cleanup
+    /// ITEM' lists such uploads.
+    ///
+    /// A multipart upload is sent in 100 MiB parts, each retried on its own.
+    /// Before sending any part it asks IA for unfinished multipart uploads
+    /// of the same file name. A part that fails for good (IA refuses it, or
+    /// its --retries run out) does not abort the upload: the parts IA
+    /// already holds stay there, the error names its upload ID, and
+    /// rerunning the same command resumes from the parts already on IA.
+    /// 'ia upload cleanup ITEM FILE --abort' discards a kept upload instead;
+    /// one left alone may be cleaned up by IA after 30 days or more. A rerun
+    /// resumes only when every part IA holds matches the local file by size
+    /// and md5; otherwise a fresh upload starts and the stale one is left
+    /// for cleanup, named in a warning.
     ///
     /// A file the item already has is skipped, as with a single PUT
     /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
     /// completion request, and IA checks every part against it before
     /// accepting; an accepted completion is the upload.
-    #[arg(long)]
-    pub multipart: bool,
+    #[arg(
+        long,
+        value_name = "auto|on|off|SIZE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "on",
+        value_parser = parse_multipart
+    )]
+    pub multipart: Option<Multipart>,
 
-    /// Send every file as a single PUT, retried as a single PUT; never multipart
+    /// Send every file as a single PUT, retried as a single PUT (same as --multipart=off)
     ///
-    /// A single PUT that dies on the way is sent again from byte 0 and does
-    /// not continue as a multipart upload, no later file in the run switches
-    /// to multipart, and the item is not asked for unfinished multipart
-    /// uploads at the start of the run, so no multipart request is sent.
-    /// A file with an unfinished multipart upload on IA from an earlier run
-    /// (one whose single PUT fell back to multipart, or a --multipart run)
-    /// is sent as a single PUT; the run does not list, resume or abort that
-    /// upload ('ia upload cleanup ITEM' lists it, 'ia upload cleanup ITEM
-    /// FILE --abort' aborts it). Refused with --multipart.
+    /// No multipart request of any kind is sent. A file with an unfinished
+    /// multipart upload on IA from an earlier run is sent as a single PUT;
+    /// the run does not list, resume or abort that upload ('ia upload
+    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort' aborts
+    /// it). Refused with --multipart in any form.
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
@@ -353,7 +369,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub no_auto_make_bucket: bool,
 
-    /// Skip the Content-MD5 header (on the single PUT, and on each part with --multipart)
+    /// Skip the Content-MD5 header (on a single PUT, and on each part of a multipart upload)
     #[arg(long)]
     pub no_verify: bool,
 
@@ -387,44 +403,58 @@ pub struct ImportArgs {
     #[arg(long)]
     pub test_item: bool,
 
-    /// Use multipart upload for every file (for large files or unreliable connections)
+    /// When a file is sent as multipart: auto (default), on, off, or a SIZE cutoff
     ///
-    /// Without the flag, a file larger than 2 MiB whose single PUT dies on
-    /// the way continues as a multipart upload, and every later file larger
-    /// than 2 MiB in the run is sent as multipart from the start. A rerun
-    /// resumes a file that left parts on IA, with or without the flag.
-    /// --no-multipart turns off both switches and that resume. Refused with
+    /// auto: a file larger than 100 MiB is a multipart upload from its first
+    /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
+    /// with SIZE as the cutoff, in bytes or with a K, M or G suffix for
+    /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
+    /// multipart); 0 is refused. on, or --multipart with no value: every
+    /// file is a multipart upload. off: every file is a single PUT, as with
+    /// --no-multipart. A value must follow '=': '--multipart 500M' is bare
+    /// --multipart followed by a file named 500M. Refused with
     /// --no-multipart.
     ///
-    /// The file is sent in 100 MiB parts, each retried on its own. A part
-    /// that fails for good (IA refuses it, or its --retries run out) does
-    /// not abort the upload: the parts IA already holds stay there, the
-    /// error names its upload ID, and rerunning the same command resumes
-    /// from the parts already on IA. 'ia upload cleanup ITEM FILE --abort'
-    /// discards a kept upload instead; one left alone may be cleaned up by
-    /// IA after 30 days or more. A rerun resumes only when every
-    /// part IA holds matches the local file by size and md5; otherwise a
-    /// fresh upload starts and the stale one is left for cleanup, named in
-    /// a warning.
+    /// The path is chosen from this setting and the file's size alone. A
+    /// single PUT that dies on the way is retried as a single PUT; nothing
+    /// switches to multipart on failure. A file a single PUT is chosen for
+    /// is sent that way even when IA holds an unfinished multipart upload
+    /// of it, for example one left by an older ia-cli; 'ia upload cleanup
+    /// ITEM' lists such uploads.
+    ///
+    /// A multipart upload is sent in 100 MiB parts, each retried on its own.
+    /// Before sending any part it asks IA for unfinished multipart uploads
+    /// of the same file name. A part that fails for good (IA refuses it, or
+    /// its --retries run out) does not abort the upload: the parts IA
+    /// already holds stay there, the error names its upload ID, and
+    /// rerunning the same command resumes from the parts already on IA.
+    /// 'ia upload cleanup ITEM FILE --abort' discards a kept upload instead;
+    /// one left alone may be cleaned up by IA after 30 days or more. A rerun
+    /// resumes only when every part IA holds matches the local file by size
+    /// and md5; otherwise a fresh upload starts and the stale one is left
+    /// for cleanup, named in a warning.
     ///
     /// A file the item already has is skipped, as with a single PUT
     /// (--clobber uploads it anyway). Each part's md5 goes to IA with the
     /// completion request, and IA checks every part against it before
     /// accepting; an accepted completion is the upload.
-    #[arg(long)]
-    pub multipart: bool,
+    #[arg(
+        long,
+        value_name = "auto|on|off|SIZE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "on",
+        value_parser = parse_multipart
+    )]
+    pub multipart: Option<Multipart>,
 
-    /// Send every file as a single PUT, retried as a single PUT; never multipart
+    /// Send every file as a single PUT, retried as a single PUT (same as --multipart=off)
     ///
-    /// A single PUT that dies on the way is sent again from byte 0 and does
-    /// not continue as a multipart upload, no later file in the run switches
-    /// to multipart, and the item is not asked for unfinished multipart
-    /// uploads at the start of the run, so no multipart request is sent.
-    /// A file with an unfinished multipart upload on IA from an earlier run
-    /// (one whose single PUT fell back to multipart, or a --multipart run)
-    /// is sent as a single PUT; the run does not list, resume or abort that
-    /// upload ('ia upload cleanup ITEM' lists it, 'ia upload cleanup ITEM
-    /// FILE --abort' aborts it). Refused with --multipart.
+    /// No multipart request of any kind is sent. A file with an unfinished
+    /// multipart upload on IA from an earlier run is sent as a single PUT;
+    /// the run does not list, resume or abort that upload ('ia upload
+    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort' aborts
+    /// it). Refused with --multipart in any form.
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
@@ -432,15 +462,13 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Retry attempts per IA-S3 request (per part with --multipart); a send
+    /// Retry attempts per IA-S3 request (per part of a multipart upload); a send
     /// dead for 60 s, or no answer within 120 s after the request was sent, spends one
     ///
     /// Waits between attempts are random, up to a cap that doubles from 1 s
     /// to 60 s. A Retry-After header from the server sets the wait instead,
     /// as given, even above 60 s; Retry-After: 0 means re-send at once. A
-    /// dead send or an unanswered body is re-sent at once. A file that
-    /// continues as multipart after its single PUT died carries the attempts
-    /// it has left over to each of its multipart requests.
+    /// dead send or an unanswered body is re-sent at once.
     #[arg(long, default_value = "10")]
     pub retries: u32,
 
@@ -1549,12 +1577,31 @@ fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
 /// The library's multipart setting for `--multipart` / `--no-multipart`
 /// (clap refuses both together).
 fn multipart_setting(args: &UploadArgs) -> Multipart {
-    if args.multipart {
-        Multipart::Always
-    } else if args.no_multipart {
+    if args.no_multipart {
         Multipart::Never
     } else {
-        Multipart::Auto
+        args.multipart.unwrap_or_default()
+    }
+}
+
+/// Parse a `--multipart` value: `auto`, `on`, `off`, or a cutoff in bytes
+/// (a whole number, or one followed by K, M or G for powers of 1024).
+fn parse_multipart(s: &str) -> std::result::Result<Multipart, String> {
+    const ACCEPTED: &str = "expected auto, on, off, or a size above which a file is sent as \
+        multipart: a whole number of bytes, or a whole number followed by K, M or G for powers \
+        of 1024 (for example --multipart=500M)";
+    match s {
+        "auto" => Ok(Multipart::Auto),
+        "on" => Ok(Multipart::Always),
+        "off" => Ok(Multipart::Never),
+        _ => match super::rate::parse_bytes(s) {
+            Some(0) => Err(format!(
+                "a cutoff of 0 would send every file as multipart; use --multipart=on for that \
+                 ({ACCEPTED})"
+            )),
+            Some(cutoff) => Ok(Multipart::Above(cutoff)),
+            None => Err(format!("`{s}` is not a --multipart value: {ACCEPTED}")),
+        },
     }
 }
 

@@ -1033,3 +1033,298 @@ async fn no_multipart_sends_no_listing_with_import() {
         .success();
     server.verify().await;
 }
+
+// ─── --multipart[=auto|on|off|SIZE] (#181) ───────────────────────────────────
+
+/// A dry run of one file with the given extra arguments.
+fn dry_run_with(args: &[&str]) -> assert_cmd::assert::Assert {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args(args)
+        .args([
+            "-m",
+            "mediatype:texts",
+            "--dry-run",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+}
+
+#[test]
+fn multipart_takes_auto_on_off_or_a_size() {
+    for value in ["auto", "on", "off", "5000", "100M", "100m", "512K", "1G"] {
+        dry_run_with(&[&format!("--multipart={value}")]).success();
+    }
+}
+
+#[test]
+fn multipart_refuses_other_values_and_names_the_accepted_ones() {
+    for bad in [
+        "0",
+        "1.5G",
+        "10MB",
+        "-1",
+        "",
+        "ON",
+        "1T",
+        "99999999999999999999",
+        "18446744073709551615G",
+    ] {
+        dry_run_with(&[&format!("--multipart={bad}")])
+            .code(2)
+            .stderr(predicate::str::contains("auto, on, off"));
+    }
+}
+
+#[test]
+fn multipart_zero_points_to_on() {
+    dry_run_with(&["--multipart=0"])
+        .code(2)
+        .stderr(predicate::str::contains("--multipart=on"));
+}
+
+/// Bare `--multipart` takes no value from the next argument: the item and
+/// the file after it stay positionals, wherever the flag stands.
+#[test]
+fn bare_multipart_leaves_the_following_positionals_alone() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "--multipart", "my-item"])
+        .arg(file.as_os_str())
+        .args([
+            "-m",
+            "mediatype:texts",
+            "--dry-run",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+    ia_with_config(&cfg)
+        .args(["upload", "my-item", "--multipart"])
+        .arg(file.as_os_str())
+        .args([
+            "-m",
+            "mediatype:texts",
+            "--dry-run",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+}
+
+const EVERY_MULTIPART_FORM: [&str; 5] = [
+    "--multipart",
+    "--multipart=on",
+    "--multipart=off",
+    "--multipart=auto",
+    "--multipart=100M",
+];
+
+#[test]
+fn every_multipart_form_with_no_multipart_is_a_usage_error() {
+    for form in EVERY_MULTIPART_FORM {
+        dry_run_with(&["--no-multipart", form])
+            .code(2)
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn every_multipart_form_with_no_multipart_is_a_usage_error_with_a_spreadsheet_and_import() {
+    let cfg = empty_config();
+    for form in EVERY_MULTIPART_FORM {
+        ia_with_config(&cfg)
+            .args([
+                "upload",
+                "--spreadsheet",
+                "batch.csv",
+                "--no-multipart",
+                form,
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("cannot be used with"));
+        ia_with_config(&cfg)
+            .args(["upload", "import", "batch.csv", "--no-multipart", form])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+/// A mock for one file over a 1 MiB cutoff (`over.bin`, a one-part
+/// multipart upload after one listing of its name) and one at it
+/// (`at.bin`, a single PUT).
+async fn cutoff_server() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/over.bin"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>cut-1</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/over.bin"))
+        .and(query_param("partNumber", "1"))
+        .and(query_param("uploadId", "cut-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/over.bin"))
+        .and(query_param("uploadId", "cut-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/over.bin"))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/at.bin"))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/at.bin"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// `over.bin` (1 MiB + 1 byte) and `at.bin` (1 MiB) in `dir`.
+fn over_and_at(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let over = dir.path().join("over.bin");
+    let at = dir.path().join("at.bin");
+    fs::write(&over, vec![1u8; 1024 * 1024 + 1]).unwrap();
+    fs::write(&at, vec![2u8; 1024 * 1024]).unwrap();
+    (over, at)
+}
+
+/// A spreadsheet of `over.bin` and `at.bin` for `test-item`.
+fn over_and_at_sheet(dir: &TempDir) -> std::path::PathBuf {
+    let (over, at) = over_and_at(dir);
+    let sheet = dir.path().join("batch.csv");
+    fs::write(
+        &sheet,
+        format!(
+            "identifier,file\ntest-item,{}\ntest-item,{}\n",
+            over.display(),
+            at.display()
+        ),
+    )
+    .unwrap();
+    sheet
+}
+
+const UPLOAD_QUIET: [&str; 3] = ["--no-verify", "--clobber", "--no-collection-check"];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_size_sends_files_over_it_as_multipart() {
+    let server = cutoff_server().await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let (over, at) = over_and_at(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(over.as_os_str())
+        .arg(at.as_os_str())
+        .arg("--multipart=1M")
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_size_with_a_spreadsheet() {
+    let server = cutoff_server().await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let sheet = over_and_at_sheet(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "--spreadsheet"])
+        .arg(sheet.as_os_str())
+        .arg("--multipart=1M")
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_size_with_import() {
+    let server = cutoff_server().await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let sheet = over_and_at_sheet(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "import"])
+        .arg(sheet.as_os_str())
+        .arg("--multipart=1M")
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// The default sends both files, each 1 MiB or so and so under the 100 MiB
+/// cutoff, as single PUTs with no listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_sends_files_under_100_mib_as_single_puts() {
+    let server = single_put_only_server(2).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let (over, at) = over_and_at(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(over.as_os_str())
+        .arg(at.as_os_str())
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}

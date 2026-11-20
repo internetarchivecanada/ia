@@ -21,10 +21,10 @@ use bytes::Bytes;
 /// Default part size: 100 MiB.
 pub const DEFAULT_PART_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Files strictly larger than this fall back to multipart once the run's
-/// [`MultipartFallback`](crate::upload::MultipartFallback) handle is on;
-/// files of this size or less are always sent as a single PUT. 2 MiB.
-pub const MULTIPART_FALLBACK_MIN_SIZE: u64 = 2 * 1024 * 1024;
+/// The default multipart cutoff: with [`Multipart::Auto`](crate::upload::Multipart::Auto)
+/// a file larger than this is a multipart upload from its first attempt,
+/// and a file of this size or less is a single PUT. 100 MiB, the part size.
+pub const MULTIPART_CUTOFF: u64 = DEFAULT_PART_SIZE;
 
 // ── XML parsing helpers ─────────────────────────────────────────────────────
 //

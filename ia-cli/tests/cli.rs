@@ -2262,22 +2262,24 @@ fn cleanup_help_says_unfinished_uploads_may_be_cleaned_up() {
         ));
 }
 
-// -- a single PUT that dies continues as multipart (#21) --
+// -- multipart is chosen by size, with no switch on failure (#181) --
 
 #[test]
-fn upload_help_describes_the_multipart_fallback() {
+fn upload_help_states_the_multipart_cutoff_and_no_switch() {
     ia().args(["upload", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("larger than 2 MiB"))
-        .stdout(predicate::str::contains("continues as a multipart upload"))
+        .stdout(predicate::str::contains("--multipart[=<auto|on|off|SIZE>]"))
         .stdout(predicate::str::contains(
-            "every later file larger than 2 MiB",
+            "a file larger than 100 MiB is a multipart upload",
         ))
         .stdout(predicate::str::contains(
-            "a rerun resumes such a file from its parts",
+            "nothing switches to multipart on failure",
         ))
-        .stdout(predicate::str::contains("Only a rerun with the flag").not());
+        .stdout(predicate::str::contains("--multipart=500M"))
+        .stdout(predicate::str::contains("2 MiB").not())
+        .stdout(predicate::str::contains("continues as a multipart upload").not())
+        .stdout(predicate::str::contains("every later file").not());
 }
 
 // -- upload retries back off; --retry-sleep is gone --
@@ -3078,10 +3080,6 @@ fn download_help_states_the_retry_wait_rule_once() {
 fn upload_help_has_no_size_recommendation_and_no_restated_flag_block() {
     let out = ia().args(["upload", "--help"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains("for large files or unreliable connections"),
-        "{text}"
-    );
     assert!(!text.contains("5 GB"), "{text}");
     assert!(!text.contains("Integrity & Skip Behavior"), "{text}");
     assert!(!text.contains("automatic with --joblog"), "{text}");
