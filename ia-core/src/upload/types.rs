@@ -10,8 +10,7 @@ use std::time::Duration;
 /// `#[non_exhaustive]`: a later version may add a setting (for example a
 /// size above which every file is multipart), so a `match` outside this
 /// crate needs a wildcard arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Multipart {
     /// A single PUT, except that a file IA holds an unfinished multipart

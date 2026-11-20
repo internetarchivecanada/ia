@@ -1225,8 +1225,20 @@ async fn never_fails_a_dead_single_put_with_the_single_put_error() {
 #[tokio::test]
 async fn never_sends_a_single_put_where_an_unfinished_upload_is_held() {
     let server = MockServer::start().await;
+    // IA holds an unfinished upload of a.bin: the listing would name it.
+    // Mounted first, so it is the one that answers a listing; it expects
+    // none.
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<ListMultipartUploadsResult><Upload><Key>a.bin</Key><UploadId>kept-a</UploadId>\
+             <Initiated>2026-10-14T12:00:00.000Z</Initiated></Upload></ListMultipartUploadsResult>",
+        ))
+        .expect(0)
+        .mount(&server)
+        .await;
     mount_no_multipart_requests(&server).await;
-    mount_unfinished_listing(&server, &[("a.bin", "kept-a")]).await;
     mount_single_put(&server, "a.bin", 1).await;
 
     let dir = TempDir::new().unwrap();

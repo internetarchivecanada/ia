@@ -1541,9 +1541,6 @@ fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-/// Refuse `--size-hint` together with a `--header` that sets
-/// x-archive-size-hint: two values for one header, as `--size-hint` with
-/// `--no-size-hint` is two answers to one question.
 /// The library's multipart setting for `--multipart` / `--no-multipart`
 /// (clap refuses both together).
 fn multipart_setting(args: &UploadArgs) -> Multipart {
@@ -1556,6 +1553,9 @@ fn multipart_setting(args: &UploadArgs) -> Multipart {
     }
 }
 
+/// Refuse `--size-hint` together with a `--header` that sets
+/// x-archive-size-hint: two values for one header, as `--size-hint` with
+/// `--no-size-hint` is two answers to one question.
 fn check_size_hint_header(size_hint: Option<u64>, headers: &[(String, String)]) -> Result<()> {
     if size_hint.is_some()
         && headers
