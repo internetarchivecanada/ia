@@ -71,8 +71,9 @@ fn build_skip_set(
         multipart upload with the retries it has left, and every later file larger than 2 MiB in the run \
         is sent as multipart from the start; a rerun resumes such a file from its parts, because each item \
         is asked once, at the start of a run, which files have unfinished multipart uploads on IA. \
-        --no-multipart turns all of that off: every file is sent and retried as a single PUT, and no \
-        multipart request is sent. \
+        --no-multipart turns off the switch to multipart when a single PUT dies, the switch for later \
+        files, and the start-of-run listing and resume of unfinished multipart uploads: every file is sent \
+        and retried as a single PUT, and no multipart request is sent; the same-md5 skip still applies. \
         --joblog adds a layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
@@ -229,7 +230,8 @@ pub struct UploadArgs {
     /// the way continues as a multipart upload, and every later file larger
     /// than 2 MiB in the run is sent as multipart from the start. A rerun
     /// resumes a file that left parts on IA, with or without the flag.
-    /// --no-multipart turns all of this off.
+    /// --no-multipart turns off both switches and that resume. Refused with
+    /// --no-multipart.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -256,9 +258,10 @@ pub struct UploadArgs {
     /// to multipart, and the item is not asked for unfinished multipart
     /// uploads at the start of the run, so no multipart request is sent.
     /// A file with an unfinished multipart upload on IA from an earlier run
-    /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
-    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort'
-    /// discards it).
+    /// (one whose single PUT fell back to multipart, or a --multipart run)
+    /// is sent as a single PUT; the run does not list, resume or abort that
+    /// upload ('ia upload cleanup ITEM' lists it, 'ia upload cleanup ITEM
+    /// FILE --abort' aborts it). Refused with --multipart.
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
@@ -390,7 +393,8 @@ pub struct ImportArgs {
     /// the way continues as a multipart upload, and every later file larger
     /// than 2 MiB in the run is sent as multipart from the start. A rerun
     /// resumes a file that left parts on IA, with or without the flag.
-    /// --no-multipart turns all of this off.
+    /// --no-multipart turns off both switches and that resume. Refused with
+    /// --no-multipart.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -417,9 +421,10 @@ pub struct ImportArgs {
     /// to multipart, and the item is not asked for unfinished multipart
     /// uploads at the start of the run, so no multipart request is sent.
     /// A file with an unfinished multipart upload on IA from an earlier run
-    /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
-    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort'
-    /// discards it).
+    /// (one whose single PUT fell back to multipart, or a --multipart run)
+    /// is sent as a single PUT; the run does not list, resume or abort that
+    /// upload ('ia upload cleanup ITEM' lists it, 'ia upload cleanup ITEM
+    /// FILE --abort' aborts it). Refused with --multipart.
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 

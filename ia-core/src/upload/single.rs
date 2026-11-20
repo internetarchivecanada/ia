@@ -62,7 +62,7 @@ pub async fn upload_file(
     let multipart = match opts.multipart {
         Multipart::Always => true,
         Multipart::Never => false,
-        _ => {
+        Multipart::Auto => {
             opts.multipart_fallback.has_unfinished(identifier, key)
                 || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE)
         }
