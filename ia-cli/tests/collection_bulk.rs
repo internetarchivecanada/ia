@@ -94,10 +94,14 @@ async fn mount_create(server: &MockServer, identifier: &str, status: u16, times:
         .await;
 }
 
-/// Any request no other mock matched fails the test.
+/// Any request no other mock matched fails the test. The answer is one the
+/// S3 retry policy does not retry, so a stray create PUT fails at once
+/// rather than backing off through the whole budget.
 async fn mount_unexpected(server: &MockServer) {
     Mock::given(any())
-        .respond_with(ResponseTemplate::new(599))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<Error><Code>AccessDenied</Code><Message>unexpected request</Message></Error>",
+        ))
         .expect(0)
         .with_priority(u8::MAX)
         .mount(server)
@@ -276,6 +280,53 @@ async fn a_failed_row_does_not_stop_the_others() {
     assert!(stderr.contains("2 created, 1 failed"), "{stderr}");
     let stdout = stdout_of(&out);
     assert!(stdout.contains("/details/good-one") && stdout.contains("/details/good-two"));
+}
+
+#[tokio::test]
+async fn a_throttled_row_is_retried_and_the_run_goes_on() {
+    let server = MockServer::start().await;
+    // The first create PUT for `throttled` is answered with IA's SlowDown;
+    // the retry is answered 200.
+    Mock::given(method("PUT"))
+        .and(path("/throttled"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Retry-After", "0")
+                .set_body_string(
+                    "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+                ),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_create(&server, "throttled", 200, 1).await;
+    mount_create(&server, "after-it", 200, 1).await;
+    mount_unexpected(&server).await;
+    let cfg = config_with_keys(&host_of(&server));
+    let dir = TempDir::new().unwrap();
+    write_file(&dir, "cols.csv", "identifier\nthrottled\nafter-it\n");
+
+    let out = run_create(
+        cfg.path(),
+        dir.path(),
+        &[
+            "--spreadsheet",
+            "cols.csv",
+            "--collection",
+            "parent",
+            "-j",
+            "1",
+        ],
+    );
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("/details/throttled") && stdout.contains("/details/after-it"),
+        "{stdout}"
+    );
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────

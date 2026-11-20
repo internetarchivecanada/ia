@@ -7,7 +7,7 @@ use crate::metadata::write::parse_indexed_key;
 use crate::spreadsheet::SpreadsheetRecord;
 use crate::upload::batch::row_metadata;
 use crate::upload::headers::encode_metadata_headers;
-use crate::upload::s3_error::describe_s3_failure;
+use crate::upload::retry::{send_with_retry, S3RetryCtx};
 use crate::upload::{build_s3_item_url, upload_file, UploadOpts, UploadStatus};
 use crate::IaClient;
 
@@ -39,7 +39,11 @@ pub struct CreateCollectionResult {
 /// Returns `IaError::InvalidIdentifier` if the identifier is invalid.
 /// Returns `IaError::UploadFailed` if the image file is missing or has no extension.
 /// Returns `IaError::Auth` if S3 credentials are missing (when not in dry-run mode).
-/// Returns `IaError::Http` on S3 API errors.
+/// Returns `IaError::UploadFailed` when IA-S3 refuses the create or it still
+/// fails once the retry budget is spent (throttling, server errors and
+/// transport failures are retried, honouring `Retry-After`).
+/// Returns `IaError::SpamDetected` or `IaError::UploadStalled` from the same
+/// retry policy.
 pub async fn create_collection(
     client: &IaClient,
     identifier: &str,
@@ -493,7 +497,9 @@ async fn create_with_image(
 /// Create a collection without a cover image.
 ///
 /// Sends a zero-body PUT to the S3 item URL with all required IA headers
-/// and the encoded metadata headers. Derive is always disabled.
+/// and the encoded metadata headers. Derive is always disabled. The PUT goes
+/// through the IA-S3 retry policy (`upload::retry::send_with_retry`) that
+/// every other S3 control request uses.
 async fn create_without_image(
     client: &IaClient,
     identifier: &str,
@@ -514,42 +520,40 @@ async fn create_without_image(
     let s3_url = build_s3_item_url(client, identifier);
     let metadata_headers = encode_metadata_headers(metadata)?;
 
-    let mut request = client
-        .raw_http()
-        .put(&s3_url)
-        .header("Authorization", &auth_header)
-        .header("x-amz-auto-make-bucket", "1")
-        .header("x-archive-queue-derive", "0")
-        .header("Content-Length", "0");
+    // The budget and schedule the image path gets from `upload_file`, so
+    // both create paths retry the same way. Replaying the PUT is safe: it
+    // names the same item with the same headers.
+    let opts = UploadOpts::default();
+    let ctx = S3RetryCtx {
+        identifier,
+        key: "",
+        retries: opts.retries,
+        backoff: opts.backoff(),
+        bytes_sent: 0,
+        total_bytes: 0,
+        progress: None,
+    };
 
-    for (k, v) in &metadata_headers {
-        request = request.header(k.as_str(), v.as_str());
-    }
+    let sent = send_with_retry(&ctx, "create collection", |_watch| {
+        let mut request = client
+            .upload_http()
+            .put(&s3_url)
+            .header("Authorization", &auth_header)
+            .header("x-amz-auto-make-bucket", "1")
+            .header("x-archive-queue-derive", "0")
+            .header("Content-Length", "0");
+        for (k, v) in &metadata_headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+        request.send()
+    })
+    .await?;
 
-    let response = request.send().await.map_err(|e| IaError::UploadFailed {
+    Ok(CreateCollectionResult {
         identifier: identifier.to_string(),
-        key: String::new(),
-        message: e.to_string(),
-        status: None,
-    })?;
-
-    let status = response.status();
-    if status.is_success() {
-        Ok(CreateCollectionResult {
-            identifier: identifier.to_string(),
-            status: status.as_u16(),
-            url,
-        })
-    } else {
-        let body_text = response.text().await.unwrap_or_default();
-        let message = describe_s3_failure(status, &body_text);
-        Err(IaError::UploadFailed {
-            identifier: identifier.to_string(),
-            key: String::new(),
-            message,
-            status: Some(status.as_u16()),
-        })
-    }
+        status: sent.response.status().as_u16(),
+        url,
+    })
 }
 
 /// Infer a MIME content-type string from a file extension.
@@ -830,6 +834,95 @@ mod tests {
             }
             other => panic!("expected IaError::UploadFailed, got {other:?}"),
         }
+    }
+
+    // -- create PUT retries under the S3 policy (#152) --
+
+    const SLOW_DOWN: &str =
+        "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>";
+
+    #[tokio::test]
+    async fn slow_down_then_success_creates_after_two_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/my-coll"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "0")
+                    .set_body_string(SLOW_DOWN),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/my-coll"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server).await;
+        let result = create_collection(&client, "my-coll", &[], None, false)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_waited_before_the_next_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/my-coll"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/my-coll"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server).await;
+        let started = std::time::Instant::now();
+        create_collection(&client, "my-coll", &[], None, false)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(1),
+            "Retry-After: 1 was not waited ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn access_denied_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/my-coll"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server).await;
+        let err = create_collection(&client, "my-coll", &[], None, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IaError::UploadFailed {
+                status: Some(403),
+                ..
+            }
+        ));
     }
 
     // -- extra_metadata_included --

@@ -1,7 +1,8 @@
-//! The retry policy for IA-S3 multipart requests.
+//! The retry policy for IA-S3 multipart and control requests.
 //!
 //! Every multipart request goes through [`send_with_retry`]: initiate, part
-//! PUTs, complete, abort, and the two listings. They speak the same protocol
+//! PUTs, complete, abort, and the two listings; so does the zero-byte PUT
+//! that creates a collection without an image. They speak the same protocol
 //! to the same endpoint, so they get one policy in one place rather than a
 //! copy per call site that drifts. The single-file PUT in `upload::single`
 //! keeps its own loop, because its body streams from disk and cannot be
