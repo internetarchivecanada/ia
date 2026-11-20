@@ -1396,3 +1396,148 @@ async fn bare_multipart_sends_a_small_file_as_multipart() {
         .success();
     server.verify().await;
 }
+
+// ─── --multipart / --no-multipart before `import` (#181) ─────────────────────
+
+#[test]
+fn multipart_flags_across_import_conflict_like_on_one_side() {
+    let cfg = empty_config();
+    for args in [
+        ["--no-multipart", "import", "batch.csv", "--multipart"],
+        ["--multipart", "import", "batch.csv", "--no-multipart"],
+        ["--multipart=5M", "import", "batch.csv", "--multipart"],
+        ["--no-multipart", "import", "batch.csv", "--no-multipart"],
+    ] {
+        ia_with_config(&cfg)
+            .arg("upload")
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("cannot be used"));
+    }
+}
+
+/// `--multipart=1M` before `import` takes effect: the file over 1 MiB is
+/// multipart, the one at it a single PUT.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_size_before_import_takes_effect() {
+    let server = cutoff_server().await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let sheet = over_and_at_sheet(&dir);
+
+    ia_with_config(&cfg)
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "upload",
+            "--multipart=1M",
+            "import",
+        ])
+        .arg(sheet.as_os_str())
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// A sparse file one byte over the default 100 MiB cutoff: the only size at
+/// which `off` and the default differ.
+fn just_over_100_mib(dir: &TempDir) -> std::path::PathBuf {
+    let p = dir.path().join("big.bin");
+    let f = fs::File::create(&p).unwrap();
+    f.set_len(100 * 1024 * 1024 + 1).unwrap();
+    p
+}
+
+/// `--multipart=off` sends a file over 100 MiB as one single PUT, with no
+/// multipart request of any kind.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_off_sends_a_file_over_100_mib_as_a_single_put() {
+    let server = single_put_only_server(1).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let big = just_over_100_mib(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(big.as_os_str())
+        .arg("--multipart=off")
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// `--no-multipart` before `import` takes effect the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_multipart_before_import_sends_a_file_over_100_mib_as_a_single_put() {
+    let server = single_put_only_server(1).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let big = just_over_100_mib(&dir);
+    let sheet = dir.path().join("batch.csv");
+    fs::write(
+        &sheet,
+        format!("identifier,file\ntest-item,{}\n", big.display()),
+    )
+    .unwrap();
+
+    ia_with_config(&cfg)
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "upload",
+            "--no-multipart",
+            "import",
+        ])
+        .arg(sheet.as_os_str())
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// A dry run says how each file would be sent.
+#[test]
+fn dry_run_says_how_each_file_would_be_sent() {
+    let dir = TempDir::new().unwrap();
+    let (over, at) = over_and_at(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "my-item"])
+        .arg(over.as_os_str())
+        .arg(at.as_os_str())
+        .args([
+            "--multipart=1M",
+            "-m",
+            "mediatype:texts",
+            "--dry-run",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_match(r"over\.bin .*multipart").unwrap())
+        .stderr(predicate::str::is_match(r"at\.bin .*single PUT").unwrap());
+}
+
+/// `--multipart 500M` (no `=`) reads 500M as a file; the error says so.
+#[test]
+fn a_detached_multipart_value_gets_a_hint() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "my-item", "--multipart", "500M"])
+        .arg(file.as_os_str())
+        .args(["--dry-run", "--clobber", "--no-collection-check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--multipart=500M"));
+}

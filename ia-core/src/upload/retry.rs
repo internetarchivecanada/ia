@@ -300,6 +300,94 @@ where
     }
 }
 
+/// Send a request without a body of its own (initiate, the listings) with
+/// [`send_with_retry`] and read the answer's body, within one budget of
+/// `ctx.retries` retries for both.
+///
+/// [`send_with_retry`] bounds the arrival of an answer's headers; this
+/// bounds its body. A body that does not arrive within the response wait
+/// (120 s) is abandoned and the request re-sent at once, as an unanswered
+/// request is; a body whose read fails (the connection drops mid-body) is
+/// retried after the schedule's wait, as a transport error is. Each spends
+/// one retry. Past the budget the request fails: a listing that could not
+/// be read is never taken for an empty one.
+///
+/// Returns the body and the attempts made, counting the first.
+pub(crate) async fn send_read_with_retry<F, Fut>(
+    ctx: &S3RetryCtx<'_>,
+    context: &str,
+    mut send: F,
+) -> std::result::Result<(String, u32), S3Failure>
+where
+    F: FnMut(&BodyWatch) -> Fut,
+    Fut: Future<Output = std::result::Result<reqwest::Response, reqwest_middleware::Error>>,
+{
+    let mut used: u32 = 0;
+    loop {
+        let rest = S3RetryCtx {
+            identifier: ctx.identifier,
+            key: ctx.key,
+            retries: ctx.retries - used,
+            backoff: ctx.backoff,
+            bytes_sent: ctx.bytes_sent,
+            total_bytes: ctx.total_bytes,
+            progress: ctx.progress.clone(),
+        };
+        let sent = send_with_retry(&rest, context, &mut send).await?;
+        used += sent.attempts;
+        let wait = crate::stall::response_wait();
+        let what = match tokio::time::timeout(wait, sent.response.text()).await {
+            Ok(Ok(body)) => return Ok((body, used)),
+            Ok(Err(e)) => {
+                let cause = format_error_chain(&e);
+                if used <= ctx.retries {
+                    let pause = backoff_wait(&ctx.backoff, used - 1);
+                    tracing::warn!(
+                        identifier = ctx.identifier,
+                        key = ctx.key,
+                        attempt = used,
+                        wait_ms = pause.as_millis() as u64,
+                        error = %cause,
+                        "reading the answer to {context} failed, retrying"
+                    );
+                    report_backoff(ctx, UploadProgressStatus::Retrying);
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
+                format!("{context}: reading the answer failed: {cause}")
+            }
+            Err(_elapsed) => {
+                if used <= ctx.retries {
+                    tracing::warn!(
+                        identifier = ctx.identifier,
+                        key = ctx.key,
+                        attempt = used,
+                        "the body of the answer to {context} did not arrive within {} s, \
+                         re-sending",
+                        wait.as_secs()
+                    );
+                    report_backoff(ctx, UploadProgressStatus::Retrying);
+                    continue;
+                }
+                format!(
+                    "{context}: the answer's body did not arrive within {} s",
+                    wait.as_secs()
+                )
+            }
+        };
+        return Err(S3Failure {
+            error: Box::new(IaError::UploadFailed {
+                identifier: ctx.identifier.into(),
+                key: ctx.key.into(),
+                message: describe_attempts(&what, used),
+                status: None,
+            }),
+            code: None,
+            attempts: used,
+        });
+    }
+}
+
 /// Append the attempt count to a final error message when there was more
 /// than one attempt, so the user can tell a first-try failure from an
 /// exhausted budget.

@@ -10,7 +10,7 @@
 //!
 //! Both listings follow S3 pagination (`IsTruncated` and the next marker).
 
-use super::retry::{send_with_retry, S3Failure, S3RetryCtx};
+use super::retry::{send_read_with_retry, send_with_retry, S3Failure, S3RetryCtx};
 use super::stall_watch::bytes_chunks;
 use crate::error::{IaError, Result};
 use crate::upload::checksum::FileHashes;
@@ -198,7 +198,7 @@ pub(crate) async fn initiate_upload_with_retry(
     let (identifier, key) = (ctx.identifier, ctx.key);
     let url = format!("{}?uploads", build_s3_url(client, identifier, key)?);
 
-    let sent = send_with_retry(ctx, "initiate multipart", |_watch| {
+    let (body, attempts) = send_read_with_retry(ctx, "initiate multipart", |_watch| {
         let mut req = client
             .upload_http()
             .post(&url)
@@ -210,9 +210,6 @@ pub(crate) async fn initiate_upload_with_retry(
         req.send()
     })
     .await?;
-
-    let attempts = sent.attempts;
-    let body = read_answer_body(sent.response, ctx, "initiate multipart upload").await?;
 
     let id = parse_initiate_response(&body).ok_or_else(|| IaError::UploadFailed {
         identifier: identifier.into(),
@@ -613,7 +610,7 @@ pub(crate) async fn list_uploads_with_ctx(
             ),
             None => base.clone(),
         };
-        let result = send_with_retry(ctx, "list multipart uploads", |_watch| {
+        let result = send_read_with_retry(ctx, "list multipart uploads", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -623,7 +620,7 @@ pub(crate) async fn list_uploads_with_ctx(
         .await;
 
         let body = match result {
-            Ok(sent) => read_answer_body(sent.response, ctx, "list multipart uploads").await?,
+            Ok((body, _attempts)) => body,
             // A brand-new item has no bucket yet, so there is nothing in
             // progress to list. Treat that as an empty result; the initiate
             // POST that follows carries x-archive-auto-make-bucket and
@@ -648,32 +645,6 @@ pub(crate) async fn list_uploads_with_ctx(
             }
             _ => return Ok(uploads),
         }
-    }
-}
-
-/// Read the body of an answer to a request without a body of its own
-/// (initiate, listings), within the response wait (120 s). The answer's
-/// headers are bounded by `send_with_retry` (#60); this bounds the body, so
-/// a server that sends headers and then goes silent fails the request
-/// instead of hanging the run. A body that cannot be read is empty, as
-/// before; the parsers then find nothing in it.
-async fn read_answer_body(
-    response: reqwest::Response,
-    ctx: &S3RetryCtx<'_>,
-    what: &str,
-) -> Result<String> {
-    let wait = crate::stall::response_wait();
-    match tokio::time::timeout(wait, response.text()).await {
-        Ok(body) => Ok(body.unwrap_or_default()),
-        Err(_elapsed) => Err(IaError::UploadFailed {
-            identifier: ctx.identifier.into(),
-            key: ctx.key.into(),
-            message: format!(
-                "{what}: the answer's body did not arrive within {} s",
-                wait.as_secs()
-            ),
-            status: None,
-        }),
     }
 }
 
@@ -710,7 +681,7 @@ pub(crate) async fn list_parts_with_ctx(
             Some(m) => format!("{base}&part-number-marker={}", urlencoding::encode(m)),
             None => base.clone(),
         };
-        let sent = send_with_retry(ctx, "list parts", |_watch| {
+        let (body, _attempts) = send_read_with_retry(ctx, "list parts", |_watch| {
             client
                 .upload_http()
                 .get(&url)
@@ -718,7 +689,6 @@ pub(crate) async fn list_parts_with_ctx(
                 .send()
         })
         .await?;
-        let body = read_answer_body(sent.response, ctx, "list parts").await?;
         parts.extend(parse_list_parts_response(&body));
         match next_page_marker(&body, "NextPartNumberMarker") {
             // A marker equal to the one just sent would fetch the same
@@ -1856,51 +1826,144 @@ mod tests {
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    /// The resume listing to a server that sends the answer's headers and
-    /// then goes silent mid-body: the body is given the response wait, then
-    /// the listing fails instead of hanging the upload (#181: every file
-    /// over the default cutoff now lists before its parts).
-    #[tokio::test]
-    async fn a_listing_whose_body_never_arrives_fails_within_the_wait() {
-        use crate::upload::stall_watch::test_support::shrink_policy;
+    /// A server that answers every connection with `answers[n]` for its
+    /// n-th connection (the last one repeats): `(head_and_body_start,
+    /// then_close)`. With `then_close` false the connection is held open
+    /// with nothing more sent, so a body promised by Content-Length never
+    /// arrives; with it true the connection is closed, so the body read
+    /// fails. Returns its address and a counter of connections.
+    async fn scripted_answers(
+        answers: Vec<(&'static [u8], bool)>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _policy = shrink_policy();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = [0u8; 4096];
-            let mut seen = Vec::new();
-            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => seen.extend_from_slice(&buf[..n]),
-                }
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (answer, close) = answers[n.min(answers.len() - 1)];
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let _ = stream.write_all(answer).await;
+                    if close {
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    drop(stream);
+                });
             }
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n<ListMultipartUploadsResult>",
-                )
-                .await;
-            // Hold the connection open, sending nothing more.
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            drop(stream);
         });
-        let client = loopback_client(addr);
-        let ctx = default_ctx("item", "big.bin");
+        (addr, connections)
+    }
+
+    /// Headers promising 1000 bytes, then the start of a body.
+    const SILENT_BODY: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n<Result>";
+
+    async fn assert_body_stall_spends_retries<Fut, T>(call: impl FnOnce(IaClient) -> Fut)
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+        T: std::fmt::Debug,
+    {
+        use crate::upload::stall_watch::test_support::shrink_policy;
+        let _policy = shrink_policy();
+        let (addr, connections) = scripted_answers(vec![(SILENT_BODY, false)]).await;
         let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            call(loopback_client(addr)),
+        )
+        .await
+        .expect("a silent body must be abandoned within the shrunk response wait")
+        .expect_err("a request whose body never arrives must fail once the retries are spent");
+        let text = err.to_string();
+        assert!(text.contains("did not arrive within"), "got {text}");
+        assert!(text.contains("after 2 attempts"), "got {text}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The resume listing to a server that sends the answer's headers and
+    /// then goes silent mid-body: each body gets the response wait, the
+    /// request is re-sent once (retries 1), then fails instead of hanging
+    /// the upload (#181: every file over the default cutoff lists first).
+    #[tokio::test]
+    async fn a_listing_whose_body_never_arrives_is_re_sent_then_fails() {
+        assert_body_stall_spends_retries(|client| async move {
+            let mut ctx = default_ctx("item", "big.bin");
+            ctx.retries = 1;
+            list_uploads_with_ctx(&client, &ctx).await
+        })
+        .await;
+    }
+
+    /// The same for the initiate request.
+    #[tokio::test]
+    async fn an_initiate_whose_body_never_arrives_is_re_sent_then_fails() {
+        assert_body_stall_spends_retries(|client| async move {
+            let mut ctx = default_ctx("item", "big.bin");
+            ctx.retries = 1;
+            initiate_upload_with_retry(&client, &ctx, &[]).await
+        })
+        .await;
+    }
+
+    /// The same for the listing of an upload's parts.
+    #[tokio::test]
+    async fn a_parts_listing_whose_body_never_arrives_is_re_sent_then_fails() {
+        assert_body_stall_spends_retries(|client| async move {
+            let mut ctx = default_ctx("item", "big.bin");
+            ctx.retries = 1;
+            list_parts_with_ctx(&client, &ctx, "up-1").await
+        })
+        .await;
+    }
+
+    /// A listing whose body is cut off mid-read (the connection closes) is
+    /// not taken for an empty listing: it is retried, and the next answer's
+    /// upload is found.
+    #[tokio::test]
+    async fn a_listing_cut_off_mid_body_is_retried_not_read_as_empty() {
+        let body = "<ListMultipartUploadsResult><Upload><Key>big.bin</Key>\
+                    <UploadId>kept-1</UploadId></Upload></ListMultipartUploadsResult>";
+        let full: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (addr, connections) = scripted_answers(vec![(SILENT_BODY, true), (full, true)]).await;
+        let client = loopback_client(addr);
+        let mut ctx = default_ctx("item", "big.bin");
+        ctx.retries = 1;
+        ctx.backoff = crate::upload::retry::backoff_policy(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+            1,
+        );
+        let uploads = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             list_uploads_with_ctx(&client, &ctx),
         )
         .await
-        .expect("a silent body must be abandoned within the shrunk response wait")
-        .expect_err("a listing whose body never arrives must fail");
-        assert!(
-            err.to_string().contains("did not arrive within"),
-            "got {err}"
-        );
+        .expect("the retry must not hang")
+        .expect("the second answer is a whole listing");
+        assert_eq!(uploads.len(), 1, "{uploads:?}");
+        assert_eq!(uploads[0].upload_id, "kept-1");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A multipart upload to a server that never answers fails as stalled

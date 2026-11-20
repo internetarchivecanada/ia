@@ -208,7 +208,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub open_after_upload: bool,
 
-    /// Validate everything, upload nothing
+    /// Validate everything, upload nothing; list each file and whether it would be multipart
     #[arg(long)]
     pub dry_run: bool,
 
@@ -228,15 +228,17 @@ pub struct UploadArgs {
 
     /// When a file is sent as multipart: auto (over 100 MiB, the default), on, off, or over SIZE
     ///
-    /// auto: a file larger than 100 MiB is a multipart upload from its first
-    /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
-    /// with SIZE as the cutoff, in bytes or with a K, M or G suffix for
+    /// auto: a file larger than 100 MiB (104857600 bytes) is a multipart
+    /// upload from its first attempt; a file of that size or less is a
+    /// single PUT. SIZE: the same, with SIZE as the cutoff: a whole number
+    /// of bytes, or a whole number followed by K, M or G (either case) for
     /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
     /// multipart); 0 is refused. on, or --multipart with no value: every
     /// file is a multipart upload. off: every file is a single PUT, as with
-    /// --no-multipart. A value must be attached with '=' (--multipart=500M):
-    /// in '--multipart 500M' the flag has no value and 500M is the next
-    /// argument. Refused with --no-multipart.
+    /// --no-multipart. auto, on and off are lower case. A value must be
+    /// attached with '=' (--multipart=500M): in '--multipart 500M' the flag
+    /// has no value and 500M is the next argument. --dry-run shows which
+    /// files would be multipart. Refused with --no-multipart.
     ///
     /// The path is chosen from this setting and the file's size alone. A
     /// single PUT that dies on the way is retried as a single PUT; nothing
@@ -247,8 +249,9 @@ pub struct UploadArgs {
     ///
     /// A multipart upload is sent in 100 MiB parts, each retried on its own.
     /// Before sending any part it lists the item's unfinished multipart
-    /// uploads (one request per multipart file) and looks for ones of the
-    /// same file name; if that listing fails, the file fails. A part that fails for good (IA refuses it, or
+    /// uploads (one listing per multipart file, more than one request if IA
+    /// pages it) and looks for ones of the same file name; if that listing
+    /// fails for good, the file fails. A part that fails for good (IA refuses it, or
     /// its --retries run out) does not abort the upload: the parts IA
     /// already holds stay there, the error names its upload ID, and
     /// rerunning the same command resumes from the parts already on IA.
@@ -406,15 +409,17 @@ pub struct ImportArgs {
 
     /// When a file is sent as multipart: auto (over 100 MiB, the default), on, off, or over SIZE
     ///
-    /// auto: a file larger than 100 MiB is a multipart upload from its first
-    /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
-    /// with SIZE as the cutoff, in bytes or with a K, M or G suffix for
+    /// auto: a file larger than 100 MiB (104857600 bytes) is a multipart
+    /// upload from its first attempt; a file of that size or less is a
+    /// single PUT. SIZE: the same, with SIZE as the cutoff: a whole number
+    /// of bytes, or a whole number followed by K, M or G (either case) for
     /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
     /// multipart); 0 is refused. on, or --multipart with no value: every
     /// file is a multipart upload. off: every file is a single PUT, as with
-    /// --no-multipart. A value must be attached with '=' (--multipart=500M):
-    /// in '--multipart 500M' the flag has no value and 500M is the next
-    /// argument. Refused with --no-multipart.
+    /// --no-multipart. auto, on and off are lower case. A value must be
+    /// attached with '=' (--multipart=500M): in '--multipart 500M' the flag
+    /// has no value and 500M is the next argument. --dry-run shows which
+    /// files would be multipart. Refused with --no-multipart.
     ///
     /// The path is chosen from this setting and the file's size alone. A
     /// single PUT that dies on the way is retried as a single PUT; nothing
@@ -425,8 +430,9 @@ pub struct ImportArgs {
     ///
     /// A multipart upload is sent in 100 MiB parts, each retried on its own.
     /// Before sending any part it lists the item's unfinished multipart
-    /// uploads (one request per multipart file) and looks for ones of the
-    /// same file name; if that listing fails, the file fails. A part that fails for good (IA refuses it, or
+    /// uploads (one listing per multipart file, more than one request if IA
+    /// pages it) and looks for ones of the same file name; if that listing
+    /// fails for good, the file fails. A part that fails for good (IA refuses it, or
     /// its --retries run out) does not abort the upload: the parts IA
     /// already holds stay there, the error names its upload ID, and
     /// rerunning the same command resumes from the parts already on IA.
@@ -460,7 +466,7 @@ pub struct ImportArgs {
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
-    /// Validate everything, upload nothing
+    /// Validate everything, upload nothing; list each file and whether it would be multipart
     #[arg(long)]
     pub dry_run: bool,
 
@@ -591,6 +597,21 @@ pub async fn run(
             "{}: 'ia upload import' is deprecated, use 'ia upload --spreadsheet <FILE>' instead",
             style("warning").yellow().bold(),
         );
+        // --multipart / --no-multipart may stand before 'import' as well as
+        // after it; both positions count, and clap's rules apply across them.
+        let (multipart, no_multipart) = match import_multipart_flags(
+            args.multipart,
+            args.no_multipart,
+            sub.multipart,
+            sub.no_multipart,
+        ) {
+            Ok(flags) => flags,
+            Err(message) => clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("{message}\n"),
+            )
+            .exit(),
+        };
         // Build an UploadArgs from the ImportArgs for run_import
         let merged = UploadArgs {
             spreadsheet: Some(sub.spreadsheet),
@@ -616,8 +637,8 @@ pub async fn run(
             dry_run: sub.dry_run,
             retries: sub.retries,
             json: sub.json,
-            multipart: sub.multipart,
-            no_multipart: sub.no_multipart,
+            multipart,
+            no_multipart,
             dashboard: args.dashboard,
             command: None,
         };
@@ -661,6 +682,7 @@ async fn run_bare_upload(
     // Parse --header as key:value pairs
     let headers = parse_key_values(&args.header)?;
     check_size_hint_header(args.size_hint, &headers)?;
+    check_detached_multipart_value(&args)?;
 
     // --delete-after-upload forces verify — non-negotiable data safety invariant
     if args.delete_after_upload && args.no_verify {
@@ -713,7 +735,7 @@ async fn run_bare_upload(
         let results = upload_item(client, identifier, &files, &opts, None, None, None, 1, None)
             .await
             .context(format!("failed to validate upload to {identifier}"))?;
-        print_dry_run_results(identifier, &results, &opts.metadata);
+        print_dry_run_results(identifier, &results, &opts.metadata, opts.multipart);
         return Ok(());
     }
 
@@ -1111,13 +1133,14 @@ async fn run_import_dry_run(
         // Metadata as the upload sends it (ItemGroup::item_opts)
         print_metadata(&group.item_opts(opts).metadata, 4);
 
-        // Files
+        // Files, and how each would be sent
         for (name, size) in &info.file_details {
             eprintln!(
-                "    {} {}  {}",
+                "    {} {}  {}  {}",
                 style("→").dim(),
                 name,
                 style(crate::output::format_bytes(*size)).dim(),
+                style(send_path(opts.multipart, *size)).dim(),
             );
         }
 
@@ -1132,11 +1155,21 @@ async fn run_import_dry_run(
     Ok(())
 }
 
+/// How a file of `size` bytes would be sent under `multipart`, for dry runs.
+fn send_path(multipart: Multipart, size: u64) -> &'static str {
+    if multipart.is_multipart(size) {
+        "multipart"
+    } else {
+        "single PUT"
+    }
+}
+
 /// Print dry-run results for a single-item upload.
 fn print_dry_run_results(
     identifier: &str,
     results: &[UploadResult],
     metadata: &[(String, String)],
+    multipart: Multipart,
 ) {
     let total_bytes: u64 = results.iter().map(|r| r.bytes).sum();
     let file_word = if results.len() == 1 { "file" } else { "files" };
@@ -1154,13 +1187,14 @@ fn print_dry_run_results(
     // Metadata
     print_metadata(metadata, 2);
 
-    // Files with remote keys
+    // Files with remote keys, and how each would be sent
     for r in results {
         eprintln!(
-            "  {} {}  {}",
+            "  {} {}  {}  {}",
             style("→").dim(),
             r.key,
             style(crate::output::format_bytes(r.bytes)).dim(),
+            style(send_path(multipart, r.bytes)).dim(),
         );
     }
 
@@ -1586,6 +1620,61 @@ fn multipart_setting(args: &UploadArgs) -> Multipart {
     }
 }
 
+/// Refuse a missing file that looks like a `--multipart` value given
+/// without `=` (`--multipart 500M`): clap reads bare `--multipart` and the
+/// value as a file, and the run would otherwise fail on a file that does not
+/// exist without saying why.
+fn check_detached_multipart_value(args: &UploadArgs) -> Result<()> {
+    if args.multipart != Some(Multipart::Always) {
+        return Ok(());
+    }
+    for file in &args.files {
+        let Some(name) = file.to_str() else { continue };
+        if name != "-" && !file.exists() && parse_multipart(name).is_ok() {
+            bail!(
+                "no such file: {name}; a --multipart value must be attached with '=': \
+                 --multipart={name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `--multipart` and `--no-multipart` as given before (`outer_*`) and after
+/// (`inner_*`) the deprecated `import` subcommand name, as one setting.
+/// clap checks each position on its own; across them, the two flags
+/// together, or either flag twice, are refused as clap refuses them in one
+/// position.
+fn import_multipart_flags(
+    outer_multipart: Option<Multipart>,
+    outer_no_multipart: bool,
+    inner_multipart: Option<Multipart>,
+    inner_no_multipart: bool,
+) -> std::result::Result<(Option<Multipart>, bool), String> {
+    let multipart = outer_multipart.is_some() || inner_multipart.is_some();
+    let no_multipart = outer_no_multipart || inner_no_multipart;
+    if multipart && no_multipart {
+        return Err(
+            "the argument '--no-multipart' cannot be used with '--multipart' \
+                    (one is given before 'import', the other after it)"
+                .into(),
+        );
+    }
+    if outer_multipart.is_some() && inner_multipart.is_some() {
+        return Err("the argument '--multipart' cannot be used multiple times \
+                    (it is given both before and after 'import')"
+            .into());
+    }
+    if outer_no_multipart && inner_no_multipart {
+        return Err(
+            "the argument '--no-multipart' cannot be used multiple times \
+                    (it is given both before and after 'import')"
+                .into(),
+        );
+    }
+    Ok((inner_multipart.or(outer_multipart), no_multipart))
+}
+
 /// Parse a `--multipart` value: `auto`, `on`, `off`, or a cutoff in bytes
 /// (a whole number, or one followed by K, M or G for powers of 1024).
 fn parse_multipart(s: &str) -> std::result::Result<Multipart, String> {
@@ -1807,6 +1896,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn import_multipart_flags_count_both_positions() {
+        let on = Some(Multipart::Always);
+        let five = Some(Multipart::Above(5 << 20));
+        assert_eq!(
+            import_multipart_flags(None, false, None, false),
+            Ok((None, false))
+        );
+        assert_eq!(
+            import_multipart_flags(five, false, None, false),
+            Ok((five, false))
+        );
+        assert_eq!(
+            import_multipart_flags(None, false, five, false),
+            Ok((five, false))
+        );
+        assert_eq!(
+            import_multipart_flags(None, true, None, false),
+            Ok((None, true))
+        );
+        assert_eq!(
+            import_multipart_flags(None, false, None, true),
+            Ok((None, true))
+        );
+        for (om, on_, im, in_) in [
+            (None, true, on, false),
+            (on, false, None, true),
+            (five, false, on, false),
+            (None, true, None, true),
+        ] {
+            let err = import_multipart_flags(om, on_, im, in_).unwrap_err();
+            assert!(err.contains("cannot be used"), "{err}");
+        }
+    }
+
+    #[test]
     fn parse_multipart_maps_each_value() {
         assert_eq!(parse_multipart("auto"), Ok(Multipart::Auto));
         assert_eq!(parse_multipart("on"), Ok(Multipart::Always));
@@ -1814,7 +1938,20 @@ mod tests {
         assert_eq!(parse_multipart("1"), Ok(Multipart::Above(1)));
         assert_eq!(parse_multipart("500M"), Ok(Multipart::Above(500 << 20)));
         assert_eq!(parse_multipart("2g"), Ok(Multipart::Above(2 << 30)));
-        for bad in ["0", "", " 5M", "5M ", " on", "Auto", "1.5G", "10MB", "-1"] {
+        for bad in [
+            "0",
+            "",
+            " 5M",
+            "5M ",
+            " on",
+            "Auto",
+            "1.5G",
+            "10MB",
+            "-1",
+            "18446744073709551616",
+            "18446744073709551615G",
+            "17179869184G",
+        ] {
             assert!(parse_multipart(bad).is_err(), "{bad:?}");
         }
     }
