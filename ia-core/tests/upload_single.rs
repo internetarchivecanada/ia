@@ -1459,7 +1459,7 @@ async fn upload_file_multipart_flag_dispatches() {
 
     let opts = {
         let mut o = UploadOpts::default();
-        o.multipart = true;
+        o.multipart = ia_core::upload::Multipart::Always;
         o.verify = false;
         o
     };

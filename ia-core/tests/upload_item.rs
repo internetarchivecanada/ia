@@ -1081,8 +1081,220 @@ async fn a_multipart_run_lists_once_per_file_not_also_per_item() {
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", 1024)];
     let mut opts = fallback_opts();
-    opts.multipart = true;
+    opts.multipart = ia_core::upload::Multipart::Always;
 
+    let results = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &files,
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(results[0].status, UploadStatus::Uploaded),
+        "{results:?}"
+    );
+    server.verify().await;
+}
+
+// -- Multipart::Never: every file a single PUT (#179) --
+
+/// No multipart request of any kind reaches the item: no listing of
+/// unfinished uploads, no initiate or completion (POST), no abort
+/// (DELETE). A part PUT needs an upload ID from one of those first.
+async fn mount_no_multipart_requests(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+fn never_opts() -> UploadOpts {
+    let mut o = fallback_opts();
+    o.multipart = upload::Multipart::Never;
+    o
+}
+
+/// The first file's single PUT dies (its connection is dropped); it is
+/// sent again as a single PUT, not continued as multipart. The second
+/// file, also above the threshold, is a single PUT too: the run's switch
+/// stays off. No listing is taken at the start.
+#[tokio::test]
+async fn never_retries_a_dead_single_put_as_a_single_put() {
+    let server = MockServer::start().await;
+    mount_no_multipart_requests(&server).await;
+    mount_single_put(&server, "a.bin", 1).await;
+    mount_single_put(&server, "b.bin", 1).await;
+    // The first connection is the single PUT of a.bin: no listing before it.
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 1).await;
+
+    let dir = TempDir::new().unwrap();
+    let big = MULTIPART_FALLBACK_MIN_SIZE + 1024 * 1024;
+    let files = [
+        write_sized(&dir, "a.bin", big),
+        write_sized(&dir, "b.bin", big),
+    ];
+
+    let opts = never_opts();
+    let results = upload::upload_item(
+        &client_at(proxy),
+        "test-item",
+        &files,
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(results.len(), 2);
+    for r in &results {
+        assert!(matches!(r.status, UploadStatus::Uploaded), "{r:?}");
+    }
+    assert_eq!(results[0].retries, 1);
+    assert_eq!(results[1].retries, 0);
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A single PUT above the threshold whose every send dies fails with the
+/// single-PUT message once its retries are spent; nothing multipart is sent.
+#[tokio::test]
+async fn never_fails_a_dead_single_put_with_the_single_put_error() {
+    let server = MockServer::start().await;
+    mount_no_multipart_requests(&server).await;
+    mount_single_put(&server, "a.bin", 0).await;
+    let proxy = support::dropping_proxy(support::mock_addr(&server), 0, 100).await;
+
+    let dir = TempDir::new().unwrap();
+    let files = [write_sized(
+        &dir,
+        "a.bin",
+        MULTIPART_FALLBACK_MIN_SIZE + 1024 * 1024,
+    )];
+
+    let opts = never_opts();
+    let results = upload::upload_item(
+        &client_at(proxy),
+        "test-item",
+        &files,
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let UploadStatus::Failed(message) = &results[0].status else {
+        panic!("{results:?}");
+    };
+    assert!(message.contains("test-item/a.bin"), "{message}");
+    assert!(message.contains("after 4 attempts"), "{message}");
+    assert!(!message.contains("multipart"), "{message}");
+    assert!(!opts.multipart_fallback.is_on());
+    server.verify().await;
+}
+
+/// A rerun on an item where IA holds an unfinished multipart upload of the
+/// file: the file is a single PUT, and the item is not listed.
+#[tokio::test]
+async fn never_sends_a_single_put_where_an_unfinished_upload_is_held() {
+    let server = MockServer::start().await;
+    mount_no_multipart_requests(&server).await;
+    mount_unfinished_listing(&server, &[("a.bin", "kept-a")]).await;
+    mount_single_put(&server, "a.bin", 1).await;
+
+    let dir = TempDir::new().unwrap();
+    let files = [write_sized(
+        &dir,
+        "a.bin",
+        MULTIPART_FALLBACK_MIN_SIZE + 1024 * 1024,
+    )];
+
+    let opts = never_opts();
+    let results = upload::upload_item(
+        &test_client(&server),
+        "test-item",
+        &files,
+        &opts,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(results[0].status, UploadStatus::Uploaded),
+        "{results:?}"
+    );
+    assert!(!opts.multipart_fallback.has_unfinished("test-item", "a.bin"));
+    server.verify().await;
+}
+
+/// `Multipart::Never` with a run whose switch is already on (a handle shared
+/// with an earlier `Auto` run): the file is still a single PUT.
+#[tokio::test]
+async fn never_ignores_a_switch_already_on() {
+    let server = MockServer::start().await;
+    mount_no_multipart_requests(&server).await;
+    mount_single_put(&server, "a.bin", 1).await;
+    // Turn a shared handle on with an Auto run whose single PUT dies.
+    let auto_server = MockServer::start().await;
+    mount_empty_resume_listing(&auto_server).await;
+    mount_one_part_multipart(&auto_server, "a.bin", "auto-a").await;
+    let proxy = support::dropping_proxy(support::mock_addr(&auto_server), 1, 1).await;
+    let dir = TempDir::new().unwrap();
+    let files = [write_sized(
+        &dir,
+        "a.bin",
+        MULTIPART_FALLBACK_MIN_SIZE + 1024 * 1024,
+    )];
+    let auto = fallback_opts();
+    upload::upload_item(
+        &client_at(proxy),
+        "test-item",
+        &files,
+        &auto,
+        None,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(auto.multipart_fallback.is_on());
+
+    let mut opts = never_opts();
+    opts.multipart_fallback = auto.multipart_fallback.clone();
     let results = upload::upload_item(
         &test_client(&server),
         "test-item",
@@ -1358,7 +1570,7 @@ async fn a_multipart_upload_refuses_a_key_that_leaves_the_item() {
     fs::write(&f, "a").unwrap();
 
     let mut opts = key_test_opts();
-    opts.multipart = true;
+    opts.multipart = ia_core::upload::Multipart::Always;
     let err = upload::upload_file(
         &test_client(&server),
         "test-item",

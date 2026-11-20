@@ -5,6 +5,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// When a file is sent as a multipart upload instead of a single PUT.
+///
+/// `#[non_exhaustive]`: a later version may add a setting (for example a
+/// size above which every file is multipart), so a `match` outside this
+/// crate needs a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Multipart {
+    /// A single PUT, except that a file IA holds an unfinished multipart
+    /// upload of resumes as multipart, and a single PUT of a file larger
+    /// than [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE)
+    /// that dies continues as multipart and switches the rest of the run
+    /// (see [`MultipartFallback`]).
+    #[default]
+    Auto,
+    /// Every file is a multipart upload.
+    Always,
+    /// Every file is a single PUT, retried as a single PUT. No multipart
+    /// request of any kind is sent, the start-of-run listing of unfinished
+    /// multipart uploads included; an unfinished upload of a file stays on
+    /// IA and the file is sent as a single PUT.
+    Never,
+}
+
+impl From<bool> for Multipart {
+    /// `true` is [`Multipart::Always`], `false` [`Multipart::Auto`]: the
+    /// meaning of the `bool` this setting replaced.
+    fn from(always: bool) -> Self {
+        if always {
+            Self::Always
+        } else {
+            Self::Auto
+        }
+    }
+}
+
 /// The run's multipart state for files that were not asked to be multipart.
 ///
 /// Two facts, both discovered during the run and shared by every clone of
@@ -16,7 +53,7 @@ use std::time::Duration;
 ///   [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE)
 ///   that ends in a dead send, an unanswered body or a transport error with
 ///   a retry left; from then on every file larger than that in the same run
-///   is sent as a multipart upload. Nothing turns it off.
+///   is sent as a multipart upload. [`Multipart::Never`] keeps it off.
 /// - The files IA holds an unfinished multipart upload for, by item and
 ///   name, from one listing per item that `upload_item` takes at the start
 ///   of the run. Such a file is sent as a multipart upload, whatever its
@@ -134,8 +171,8 @@ pub struct UploadOpts {
     pub no_collection_check: bool,
     /// Upload to test_collection (items auto-removed after 30 days).
     pub test_item: bool,
-    /// Send every file as a multipart upload.
-    pub multipart: bool,
+    /// When a file is sent as a multipart upload; see [`Multipart`].
+    pub multipart: Multipart,
     /// The run's multipart state: the switch for files larger than
     /// [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE),
     /// turned on by the first single PUT that dies, and the files found
@@ -175,7 +212,7 @@ impl Default for UploadOpts {
             size_hint: None,
             no_collection_check: false,
             test_item: false,
-            multipart: false,
+            multipart: Multipart::Auto,
             multipart_fallback: MultipartFallback::new(),
             retries: 10,
             retry_min_delay: Duration::from_secs(1),
@@ -331,9 +368,10 @@ impl UploadOptsBuilder {
         self
     }
 
-    /// Set whether to use multipart upload.
-    pub fn multipart(mut self, multipart: bool) -> Self {
-        self.opts.multipart = multipart;
+    /// Set when a file is sent as a multipart upload. A `bool` is accepted:
+    /// `true` is [`Multipart::Always`], `false` [`Multipart::Auto`].
+    pub fn multipart(mut self, multipart: impl Into<Multipart>) -> Self {
+        self.opts.multipart = multipart.into();
         self
     }
 
@@ -703,6 +741,26 @@ mod tests {
         assert!(opts.dry_run);
         assert_eq!(opts.retries, 5);
         assert_eq!(opts.metadata.len(), 1);
+    }
+
+    #[test]
+    fn multipart_setting_default_and_builder() {
+        assert_eq!(UploadOpts::default().multipart, Multipart::Auto);
+        assert_eq!(
+            UploadOptsBuilder::new().multipart(true).build().multipart,
+            Multipart::Always
+        );
+        assert_eq!(
+            UploadOptsBuilder::new().multipart(false).build().multipart,
+            Multipart::Auto
+        );
+        assert_eq!(
+            UploadOptsBuilder::new()
+                .multipart(Multipart::Never)
+                .build()
+                .multipart,
+            Multipart::Never
+        );
     }
 
     #[test]

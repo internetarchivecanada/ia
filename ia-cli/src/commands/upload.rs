@@ -12,8 +12,8 @@ use ia_core::spreadsheet::read_spreadsheet;
 use ia_core::upload::batch::{check_keys, group_records, validate_groups};
 use ia_core::upload::template::TEMPLATE_COLUMNS;
 use ia_core::upload::{
-    generate_template, upload_batch, upload_item, write_template_csv, TemplateOpts, UploadOpts,
-    UploadProgress, UploadResult, UploadStatus,
+    generate_template, upload_batch, upload_item, write_template_csv, Multipart, TemplateOpts,
+    UploadOpts, UploadProgress, UploadResult, UploadStatus,
 };
 use ia_core::IaClient;
 
@@ -71,6 +71,8 @@ fn build_skip_set(
         multipart upload with the retries it has left, and every later file larger than 2 MiB in the run \
         is sent as multipart from the start; a rerun resumes such a file from its parts, because each item \
         is asked once, at the start of a run, which files have unfinished multipart uploads on IA. \
+        --no-multipart turns all of that off: every file is sent and retried as a single PUT, and no \
+        multipart request is sent. \
         --joblog adds a layer on top of either: files a previous run finished are skipped without a request.",
     after_long_help = cstr!(
         "<bold><underline>Examples:</underline></bold>\n\
@@ -94,7 +96,8 @@ fn build_skip_set(
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
          \n\n  <dim># Send this size hint instead of the files' total size</dim>\
          \n  <bold>$ ia upload my-item video.mp4 --size-hint 2000000499999744</bold>\
-         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
+         \n\n  <dim># Every file a single PUT, never multipart</dim>\
+         \n  <bold>$ ia upload my-item *.ts --no-multipart</bold>         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
@@ -225,6 +228,7 @@ pub struct UploadArgs {
     /// the way continues as a multipart upload, and every later file larger
     /// than 2 MiB in the run is sent as multipart from the start. A rerun
     /// resumes a file that left parts on IA, with or without the flag.
+    /// --no-multipart turns all of this off.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -243,6 +247,18 @@ pub struct UploadArgs {
     /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
+
+    /// Send every file as a single PUT, retried as a single PUT; never multipart
+    ///
+    /// A single PUT that dies on the way is sent again from byte 0 and does
+    /// not continue as a multipart upload, no later file in the run switches
+    /// to multipart, and the item is not asked for unfinished multipart
+    /// uploads at the start of the run, so no multipart request is sent.
+    /// A file with an unfinished multipart upload on IA from an earlier run
+    /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
+    /// cleanup ITEM' lists it, '--abort' discards it).
+    #[arg(long, conflicts_with = "multipart")]
+    pub no_multipart: bool,
 
     /// Full-screen TUI dashboard for monitoring upload progress
     #[arg(long)]
@@ -372,6 +388,7 @@ pub struct ImportArgs {
     /// the way continues as a multipart upload, and every later file larger
     /// than 2 MiB in the run is sent as multipart from the start. A rerun
     /// resumes a file that left parts on IA, with or without the flag.
+    /// --no-multipart turns all of this off.
     ///
     /// The file is sent in 100 MiB parts, each retried on its own. A part
     /// that fails for good (IA refuses it, or its --retries run out) does
@@ -390,6 +407,18 @@ pub struct ImportArgs {
     /// accepting; an accepted completion is the upload.
     #[arg(long)]
     pub multipart: bool,
+
+    /// Send every file as a single PUT, retried as a single PUT; never multipart
+    ///
+    /// A single PUT that dies on the way is sent again from byte 0 and does
+    /// not continue as a multipart upload, no later file in the run switches
+    /// to multipart, and the item is not asked for unfinished multipart
+    /// uploads at the start of the run, so no multipart request is sent.
+    /// A file with an unfinished multipart upload on IA from an earlier run
+    /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
+    /// cleanup ITEM' lists it, '--abort' discards it).
+    #[arg(long, conflicts_with = "multipart")]
+    pub no_multipart: bool,
 
     /// Validate everything, upload nothing
     #[arg(long)]
@@ -550,6 +579,7 @@ pub async fn run(
             retries: sub.retries,
             json: sub.json,
             multipart: sub.multipart,
+            no_multipart: sub.no_multipart,
             dashboard: args.dashboard,
             command: None,
         };
@@ -630,7 +660,7 @@ async fn run_bare_upload(
         o.size_hint = args.size_hint;
         o.no_collection_check = args.no_collection_check;
         o.test_item = args.test_item;
-        o.multipart = args.multipart;
+        o.multipart = multipart_setting(&args);
         o.retries = args.retries;
         o.headers = headers;
         o.dry_run = args.dry_run;
@@ -828,7 +858,7 @@ async fn run_import(
         o.size_hint = args.size_hint;
         o.no_collection_check = args.no_collection_check;
         o.test_item = args.test_item;
-        o.multipart = args.multipart;
+        o.multipart = multipart_setting(args);
         o.retries = args.retries;
         o.dry_run = args.dry_run;
         o
@@ -1511,6 +1541,18 @@ fn parse_key_values(items: &[String]) -> Result<Vec<(String, String)>> {
 /// Refuse `--size-hint` together with a `--header` that sets
 /// x-archive-size-hint: two values for one header, as `--size-hint` with
 /// `--no-size-hint` is two answers to one question.
+/// The library's multipart setting for `--multipart` / `--no-multipart`
+/// (clap refuses both together).
+fn multipart_setting(args: &UploadArgs) -> Multipart {
+    if args.multipart {
+        Multipart::Always
+    } else if args.no_multipart {
+        Multipart::Never
+    } else {
+        Multipart::Auto
+    }
+}
+
 fn check_size_hint_header(size_hint: Option<u64>, headers: &[(String, String)]) -> Result<()> {
     if size_hint.is_some()
         && headers

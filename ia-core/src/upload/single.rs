@@ -58,9 +58,15 @@ pub async fn upload_file(
     // listing `upload_item` takes at the start of the run, so a file that
     // switched in an earlier run resumes), or when an earlier single PUT in
     // this run died and the file is above the fallback threshold (#21).
-    let multipart = opts.multipart
-        || opts.multipart_fallback.has_unfinished(identifier, key)
-        || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE);
+    // With `Multipart::Never`, never (#179).
+    let multipart = match opts.multipart {
+        Multipart::Always => true,
+        Multipart::Never => false,
+        _ => {
+            opts.multipart_fallback.has_unfinished(identifier, key)
+                || (opts.multipart_fallback.is_on() && file_size > MULTIPART_FALLBACK_MIN_SIZE)
+        }
+    };
 
     // One read of the file when either the skip check or verification
     // needs its md5 (`--clobber --no-verify` reads nothing). For a
@@ -614,9 +620,13 @@ use super::build_s3_url;
 /// Whether a single PUT that just died continues as a multipart upload
 /// (#21): a retry is left (which also keeps `opts.retries - attempts` from
 /// underflowing in [`continue_as_multipart`]) and the file is larger than
-/// [`MULTIPART_FALLBACK_MIN_SIZE`].
+/// [`MULTIPART_FALLBACK_MIN_SIZE`], and the options are
+/// [`Multipart::Auto`]: with [`Multipart::Never`] the file is retried as a
+/// single PUT (#179).
 fn falls_back(retries: u32, opts: &UploadOpts, file_size: u64) -> bool {
-    retries < opts.retries && file_size > MULTIPART_FALLBACK_MIN_SIZE
+    opts.multipart == Multipart::Auto
+        && retries < opts.retries
+        && file_size > MULTIPART_FALLBACK_MIN_SIZE
 }
 
 /// Continue a file whose single PUT died as a multipart upload (#21).
@@ -1039,6 +1049,55 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// With `Multipart::Never`, a single PUT above the fallback threshold
+    /// whose send stalls is re-sent as a single PUT, not continued as
+    /// multipart, and fails as stalled when the retries are spent (#179):
+    /// one connection per attempt, nothing else.
+    #[tokio::test]
+    async fn never_re_sends_a_stalled_single_put_and_fails_as_stalled() {
+        let _policy = shrink_policy();
+        let (addr, connections) = stalling_listener().await;
+        let client = stalling_client(addr);
+        let f = big_temp_file();
+        let opts = UploadOpts {
+            verify: false,
+            checksum: false,
+            retries: 1,
+            multipart: Multipart::Never,
+            ..Default::default()
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            upload_file(
+                &client,
+                "test-item",
+                f.path(),
+                "big.bin",
+                &opts,
+                true,
+                true,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the stalled sends must be judged within a minute")
+        .expect_err("a stalled send must fail once the retries are spent");
+        assert!(
+            matches!(
+                err,
+                IaError::UploadStalled {
+                    stalls: 2,
+                    unanswered: 0,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!opts.multipart_fallback.is_on());
     }
 
     /// A single-file PUT the server reads in full and never answers is

@@ -13,7 +13,7 @@ use crate::upload::multipart::list_uploads_with_ctx;
 use crate::upload::retry::S3RetryCtx;
 use crate::upload::single::upload_file;
 use crate::upload::types::{
-    UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
+    Multipart, UploadOpts, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 use crate::upload::validate::{validate_file, validate_required_metadata};
 use crate::upload::validate_key;
@@ -115,9 +115,11 @@ pub async fn upload_item(
     // 7b. One listing of the item's unfinished multipart uploads, so that a
     //     file which switched to multipart in an earlier run (#21), or was
     //     uploaded with `multipart` and left parts on IA, resumes from them
-    //     instead of being sent again as a single PUT. Not with `multipart`
-    //     (every file lists for itself) and not on a dry run (no request).
-    if !opts.multipart && !opts.dry_run {
+    //     instead of being sent again as a single PUT. Only with
+    //     `Multipart::Auto`: with `Always` every file lists for itself, and
+    //     with `Never` no file resumes, so no multipart request is sent at
+    //     all; not on a dry run either (no request).
+    if opts.multipart == Multipart::Auto && !opts.dry_run {
         record_unfinished_uploads(client, identifier, &opts).await;
     }
 

@@ -20,7 +20,7 @@ pub use multipart::MULTIPART_FALLBACK_MIN_SIZE;
 pub use single::upload_file;
 pub use template::{generate_template, write_template_csv, TemplateOpts, TemplateRow};
 pub use types::{
-    MultipartFallback, MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts,
+    Multipart, MultipartFallback, MultipartUploadInfo, PartInfo, ProgressCallback, UploadOpts,
     UploadOptsBuilder, UploadProgress, UploadProgressStatus, UploadResult, UploadStatus,
 };
 
