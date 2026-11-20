@@ -97,7 +97,8 @@ fn build_skip_set(
          \n\n  <dim># Send this size hint instead of the files' total size</dim>\
          \n  <bold>$ ia upload my-item video.mp4 --size-hint 2000000499999744</bold>\
          \n\n  <dim># Every file a single PUT, never multipart</dim>\
-         \n  <bold>$ ia upload my-item *.ts --no-multipart</bold>         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
+         \n  <bold>$ ia upload my-item ./segments/ --no-multipart</bold>\
+         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
@@ -256,7 +257,8 @@ pub struct UploadArgs {
     /// uploads at the start of the run, so no multipart request is sent.
     /// A file with an unfinished multipart upload on IA from an earlier run
     /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
-    /// cleanup ITEM' lists it, '--abort' discards it).
+    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort'
+    /// discards it).
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
@@ -416,7 +418,8 @@ pub struct ImportArgs {
     /// uploads at the start of the run, so no multipart request is sent.
     /// A file with an unfinished multipart upload on IA from an earlier run
     /// is sent as a single PUT; the unfinished upload stays on IA ('ia upload
-    /// cleanup ITEM' lists it, '--abort' discards it).
+    /// cleanup ITEM' lists it, 'ia upload cleanup ITEM FILE --abort'
+    /// discards it).
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 

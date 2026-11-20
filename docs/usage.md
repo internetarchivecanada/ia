@@ -767,6 +767,12 @@ cat data.csv | ia upload my-item - --remote-name data.csv
 # Multipart upload for large files
 ia upload my-item big-video.mp4 --multipart
 
+# Every file a single PUT, never multipart (no fallback, no resume, no listing)
+ia upload my-item ./segments/ --no-multipart
+
+# The same for a spreadsheet batch
+ia upload --spreadsheet batch.csv --no-multipart
+
 # Force re-upload even if remote files match
 ia upload my-item ./files/ --clobber
 
