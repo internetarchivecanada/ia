@@ -103,7 +103,7 @@ fn build_skip_set(
          \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
          \n\n  <dim># Every file a single PUT, never multipart (same as --multipart=off)</dim>\
          \n  <bold>$ ia upload my-item ./segments/ --no-multipart</bold>\
-         \n\n  <dim># Ride out a flaky link: 20 attempts per part</dim>\
+         \n\n  <dim># Ride out a flaky link: 20 retries per part</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart --retries 20</bold>\
          \n\n  <dim># A part failed for good? The upload is kept on IA: rerun to resume from</dim>\
          \n  <dim># the parts already there (checked against the file first), or discard it</dim>\
@@ -226,7 +226,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// When a file is sent as multipart: auto (default), on, off, or a SIZE cutoff
+    /// When a file is sent as multipart: auto (over 100 MiB, the default), on, off, or over SIZE
     ///
     /// auto: a file larger than 100 MiB is a multipart upload from its first
     /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
@@ -234,9 +234,9 @@ pub struct UploadArgs {
     /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
     /// multipart); 0 is refused. on, or --multipart with no value: every
     /// file is a multipart upload. off: every file is a single PUT, as with
-    /// --no-multipart. A value must follow '=': '--multipart 500M' is bare
-    /// --multipart followed by a file named 500M. Refused with
-    /// --no-multipart.
+    /// --no-multipart. A value must be attached with '=' (--multipart=500M):
+    /// in '--multipart 500M' the flag has no value and 500M is the next
+    /// argument. Refused with --no-multipart.
     ///
     /// The path is chosen from this setting and the file's size alone. A
     /// single PUT that dies on the way is retried as a single PUT; nothing
@@ -246,8 +246,9 @@ pub struct UploadArgs {
     /// ITEM' lists such uploads.
     ///
     /// A multipart upload is sent in 100 MiB parts, each retried on its own.
-    /// Before sending any part it asks IA for unfinished multipart uploads
-    /// of the same file name. A part that fails for good (IA refuses it, or
+    /// Before sending any part it lists the item's unfinished multipart
+    /// uploads (one request per multipart file) and looks for ones of the
+    /// same file name; if that listing fails, the file fails. A part that fails for good (IA refuses it, or
     /// its --retries run out) does not abort the upload: the parts IA
     /// already holds stay there, the error names its upload ID, and
     /// rerunning the same command resumes from the parts already on IA.
@@ -403,7 +404,7 @@ pub struct ImportArgs {
     #[arg(long)]
     pub test_item: bool,
 
-    /// When a file is sent as multipart: auto (default), on, off, or a SIZE cutoff
+    /// When a file is sent as multipart: auto (over 100 MiB, the default), on, off, or over SIZE
     ///
     /// auto: a file larger than 100 MiB is a multipart upload from its first
     /// attempt; a file of 100 MiB or less is a single PUT. SIZE: the same,
@@ -411,9 +412,9 @@ pub struct ImportArgs {
     /// powers of 1024 (--multipart=500M sends files larger than 500 MiB as
     /// multipart); 0 is refused. on, or --multipart with no value: every
     /// file is a multipart upload. off: every file is a single PUT, as with
-    /// --no-multipart. A value must follow '=': '--multipart 500M' is bare
-    /// --multipart followed by a file named 500M. Refused with
-    /// --no-multipart.
+    /// --no-multipart. A value must be attached with '=' (--multipart=500M):
+    /// in '--multipart 500M' the flag has no value and 500M is the next
+    /// argument. Refused with --no-multipart.
     ///
     /// The path is chosen from this setting and the file's size alone. A
     /// single PUT that dies on the way is retried as a single PUT; nothing
@@ -423,8 +424,9 @@ pub struct ImportArgs {
     /// ITEM' lists such uploads.
     ///
     /// A multipart upload is sent in 100 MiB parts, each retried on its own.
-    /// Before sending any part it asks IA for unfinished multipart uploads
-    /// of the same file name. A part that fails for good (IA refuses it, or
+    /// Before sending any part it lists the item's unfinished multipart
+    /// uploads (one request per multipart file) and looks for ones of the
+    /// same file name; if that listing fails, the file fails. A part that fails for good (IA refuses it, or
     /// its --retries run out) does not abort the upload: the parts IA
     /// already holds stay there, the error names its upload ID, and
     /// rerunning the same command resumes from the parts already on IA.
@@ -1594,6 +1596,8 @@ fn parse_multipart(s: &str) -> std::result::Result<Multipart, String> {
         "auto" => Ok(Multipart::Auto),
         "on" => Ok(Multipart::Always),
         "off" => Ok(Multipart::Never),
+        // Exact values only: no spaces around a size either.
+        _ if s.trim() != s => Err(format!("`{s}` is not a --multipart value: {ACCEPTED}")),
         _ => match super::rate::parse_bytes(s) {
             Some(0) => Err(format!(
                 "a cutoff of 0 would send every file as multipart; use --multipart=on for that \
@@ -1801,6 +1805,19 @@ fn write_template_xlsx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_multipart_maps_each_value() {
+        assert_eq!(parse_multipart("auto"), Ok(Multipart::Auto));
+        assert_eq!(parse_multipart("on"), Ok(Multipart::Always));
+        assert_eq!(parse_multipart("off"), Ok(Multipart::Never));
+        assert_eq!(parse_multipart("1"), Ok(Multipart::Above(1)));
+        assert_eq!(parse_multipart("500M"), Ok(Multipart::Above(500 << 20)));
+        assert_eq!(parse_multipart("2g"), Ok(Multipart::Above(2 << 30)));
+        for bad in ["0", "", " 5M", "5M ", " on", "Auto", "1.5G", "10MB", "-1"] {
+            assert!(parse_multipart(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn parse_key_values_basic() {

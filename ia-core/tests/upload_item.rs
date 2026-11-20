@@ -679,9 +679,7 @@ async fn mount_one_part_multipart(server: &MockServer, key: &str, upload_id: &st
         .await;
 }
 
-/// The item's listing of unfinished multipart uploads, empty. The answer
-/// closes the connection, so the request after it opens a new one; the
-/// fallback tests below drop that one to make a single PUT fail.
+/// The item's listing of unfinished multipart uploads, empty.
 async fn mount_empty_resume_listing(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/test-item"))
@@ -705,7 +703,7 @@ async fn mount_single_put(server: &MockServer, key: &str, times: u64) {
         .await;
 }
 
-fn fallback_opts() -> UploadOpts {
+fn fast_opts() -> UploadOpts {
     let mut o = UploadOpts::default();
     o.verify = false;
     o.checksum = false;
@@ -716,7 +714,7 @@ fn fallback_opts() -> UploadOpts {
     o
 }
 
-/// A dry run sends nothing, the listing included.
+/// A multipart dry run sends nothing, the per-file listing included.
 #[tokio::test]
 async fn a_dry_run_sends_no_listing() {
     let server = MockServer::start().await;
@@ -730,8 +728,9 @@ async fn a_dry_run_sends_no_listing() {
 
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", 1024)];
-    let mut opts = fallback_opts();
+    let mut opts = fast_opts();
     opts.dry_run = true;
+    opts.multipart = upload::Multipart::Always;
 
     let results = upload::upload_item(
         &test_client(&server),
@@ -754,8 +753,8 @@ async fn a_dry_run_sends_no_listing() {
     server.verify().await;
 }
 
-/// With `multipart` on, every file lists for itself before its parts; the
-/// item is not listed a second time at the start of the run.
+/// With `multipart` on, a file lists the item's unfinished uploads once,
+/// before its parts.
 #[tokio::test]
 async fn a_multipart_run_lists_once_per_file_not_also_per_item() {
     let server = MockServer::start().await;
@@ -773,7 +772,7 @@ async fn a_multipart_run_lists_once_per_file_not_also_per_item() {
 
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", 1024)];
-    let mut opts = fallback_opts();
+    let mut opts = fast_opts();
     opts.multipart = ia_core::upload::Multipart::Always;
 
     let results = upload::upload_item(
@@ -822,15 +821,14 @@ async fn mount_no_multipart_requests(server: &MockServer) {
 }
 
 fn never_opts() -> UploadOpts {
-    let mut o = fallback_opts();
+    let mut o = fast_opts();
     o.multipart = upload::Multipart::Never;
     o
 }
 
 /// The first file's single PUT dies (its connection is dropped); it is
 /// sent again as a single PUT, not continued as multipart. The second
-/// file, also above the threshold, is a single PUT too: the run's switch
-/// stays off. No listing is taken at the start.
+/// file is a single PUT too. Nothing is listed.
 #[tokio::test]
 async fn never_retries_a_dead_single_put_as_a_single_put() {
     let server = MockServer::start().await;
@@ -871,7 +869,7 @@ async fn never_retries_a_dead_single_put_as_a_single_put() {
     server.verify().await;
 }
 
-/// A single PUT above the threshold whose every send dies fails with the
+/// A single PUT whose every send dies fails with the
 /// single-PUT message once its retries are spent; nothing multipart is sent.
 #[tokio::test]
 async fn never_fails_a_dead_single_put_with_the_single_put_error() {

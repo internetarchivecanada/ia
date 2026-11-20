@@ -1328,3 +1328,71 @@ async fn the_default_sends_files_under_100_mib_as_single_puts() {
         .success();
     server.verify().await;
 }
+
+/// Bare `--multipart` means `on`: a 1 KiB file, far under any cutoff, is
+/// sent as a multipart upload (listing, initiate, part, complete).
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_multipart_sends_a_small_file_as_multipart() {
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-item"))
+        .and(query_param("uploads", ""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<ListMultipartUploadsResult></ListMultipartUploadsResult>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/a.txt"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<InitiateMultipartUploadResult><UploadId>on-1</UploadId></InitiateMultipartUploadResult>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/test-item/a.txt"))
+        .and(query_param("partNumber", "1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/test-item/a.txt"))
+        .and(query_param("uploadId", "on-1"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(query_param_is_missing("partNumber"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+
+    ia_with_config(&cfg)
+        .args([
+            "--insecure",
+            "-H",
+            &host,
+            "upload",
+            "test-item",
+            "--multipart",
+        ])
+        .arg(file.as_os_str())
+        .args(UPLOAD_QUIET)
+        .assert()
+        .success();
+    server.verify().await;
+}
