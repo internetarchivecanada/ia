@@ -1,0 +1,1 @@
+ubuntu-18.04.5-desktop-amd64.iso|Screenshot0.png|Screenshot1.png|ubuntu-18.04.5-desktop-amd64.iso.md5|ubuntu-18.04.5-desktop-amd64.iso.sha256|FreeBSD 3.2 Special Edition for USENIX (Disc 1)(1999).iso|FreeBSD 3.2 Special Edition for USENIX (Disc 2)(1999).iso|ubuntu-18.04.5-desktop-amd64.iso.sha1
