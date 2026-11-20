@@ -99,6 +99,8 @@ fn build_skip_set(
          \n  <bold>$ ia upload my-item ./files/</bold>\
          \n\n  <dim># Multipart only for files over 500 MiB</dim>\
          \n  <bold>$ ia upload my-item ./files/ --multipart=500M</bold>\
+         \n\n  <dim># See which files would be multipart, without uploading</dim>\
+         \n  <bold>$ ia upload my-item ./files/ --multipart=500M --dry-run</bold>\
          \n\n  <dim># Every file as multipart (same as --multipart=on)</dim>\
          \n  <bold>$ ia upload my-item big.iso --multipart</bold>\
          \n\n  <dim># Every file a single PUT, never multipart (same as --multipart=off)</dim>\
@@ -208,7 +210,7 @@ pub struct UploadArgs {
     #[arg(long)]
     pub open_after_upload: bool,
 
-    /// Validate everything, upload nothing; list each file and whether it would be multipart
+    /// Validate everything, upload nothing; list each file and whether it would be multipart (not in --json output)
     #[arg(long)]
     pub dry_run: bool,
 
@@ -466,7 +468,7 @@ pub struct ImportArgs {
     #[arg(long, conflicts_with = "multipart")]
     pub no_multipart: bool,
 
-    /// Validate everything, upload nothing; list each file and whether it would be multipart
+    /// Validate everything, upload nothing; list each file and whether it would be multipart (not in --json output)
     #[arg(long)]
     pub dry_run: bool,
 
@@ -563,6 +565,22 @@ pub async fn run(
 ) -> Result<()> {
     if args.json && args.dashboard {
         bail!("--json and --dashboard are mutually exclusive");
+    }
+    // A --multipart value written without '=' is read as a positional;
+    // refuse before any request (#181).
+    if let Some(message) = detached_multipart_value(
+        argument_after_bare_multipart().as_deref(),
+        args.identifier.as_deref(),
+        &args.files,
+    ) {
+        let json =
+            args.json || matches!(&args.command, Some(UploadCommand::Import(sub)) if sub.json);
+        let err = ia_core::IaError::InvalidArgument(message);
+        if json {
+            ia_core::write_json_error(&err);
+            std::process::exit(1);
+        }
+        return Err(err.into());
     }
     #[cfg(feature = "tui")]
     if args.dashboard {
@@ -682,7 +700,6 @@ async fn run_bare_upload(
     // Parse --header as key:value pairs
     let headers = parse_key_values(&args.header)?;
     check_size_hint_header(args.size_hint, &headers)?;
-    check_detached_multipart_value(&args)?;
 
     // --delete-after-upload forces verify — non-negotiable data safety invariant
     if args.delete_after_upload && args.no_verify {
@@ -1620,24 +1637,44 @@ fn multipart_setting(args: &UploadArgs) -> Multipart {
     }
 }
 
-/// Refuse a missing file that looks like a `--multipart` value given
-/// without `=` (`--multipart 500M`): clap reads bare `--multipart` and the
-/// value as a file, and the run would otherwise fail on a file that does not
-/// exist without saying why.
-fn check_detached_multipart_value(args: &UploadArgs) -> Result<()> {
-    if args.multipart != Some(Multipart::Always) {
-        return Ok(());
+/// The argument right after a `--multipart` written with no value (not
+/// `--multipart=...`), before any `--`: where a detached value would be.
+fn argument_after_bare_multipart() -> Option<String> {
+    let args: Vec<_> = std::env::args_os().take_while(|a| a != "--").collect();
+    args.windows(2)
+        .find(|w| w[0] == "--multipart")
+        .and_then(|w| w[1].to_str().map(str::to_owned))
+}
+
+/// The refusal for a `--multipart` value written without `=`
+/// (`--multipart 500M`), which clap reads as bare `--multipart` followed by
+/// a positional: the item identifier when the flag stands before it, or a
+/// file after it. `after_bare` is the argument right after a bare
+/// `--multipart`; the refusal is for that argument only, when it parses as
+/// a `--multipart` value and was read as the identifier or as a file that
+/// does not exist. Otherwise `None`.
+fn detached_multipart_value(
+    after_bare: Option<&str>,
+    identifier: Option<&str>,
+    files: &[PathBuf],
+) -> Option<String> {
+    let value = after_bare.filter(|v| parse_multipart(v).is_ok())?;
+    if identifier == Some(value) {
+        return Some(format!(
+            "'{value}' was read as the item identifier: a --multipart value must be attached \
+             with '=' (--multipart={value}); to upload to an item named '{value}' with every \
+             file sent as multipart, write --multipart=on {value} ..."
+        ));
     }
-    for file in &args.files {
-        let Some(name) = file.to_str() else { continue };
-        if name != "-" && !file.exists() && parse_multipart(name).is_ok() {
-            bail!(
-                "no such file: {name}; a --multipart value must be attached with '=': \
-                 --multipart={name}"
-            );
-        }
-    }
-    Ok(())
+    let as_file = files
+        .iter()
+        .any(|f| f.to_str() == Some(value) && !f.exists());
+    as_file.then(|| {
+        format!(
+            "no such file: {value}; a --multipart value must be attached with '=': \
+             --multipart={value}"
+        )
+    })
 }
 
 /// `--multipart` and `--no-multipart` as given before (`outer_*`) and after
@@ -1928,6 +1965,24 @@ mod tests {
             let err = import_multipart_flags(om, on_, im, in_).unwrap_err();
             assert!(err.contains("cannot be used"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_detached_multipart_value_is_refused_only_after_bare_multipart() {
+        let named = [PathBuf::from("500M")];
+        // Identifier position: --multipart 500M two.bin
+        let msg = detached_multipart_value(Some("500M"), Some("500M"), &[]).unwrap();
+        assert!(msg.contains("--multipart=500M"), "{msg}");
+        assert!(msg.contains("--multipart=on 500M"), "{msg}");
+        // File position: my-item --multipart 500M (no such file)
+        let msg = detached_multipart_value(Some("500M"), Some("my-item"), &named).unwrap();
+        assert!(msg.contains("no such file: 500M"), "{msg}");
+        assert!(msg.contains("--multipart=500M"), "{msg}");
+        // The argument after bare --multipart is an ordinary name.
+        assert!(detached_multipart_value(Some("my-item"), Some("my-item"), &[]).is_none());
+        // --multipart=on 500M ..., or my-item 500M --multipart: nothing detached.
+        assert!(detached_multipart_value(None, Some("500M"), &named).is_none());
+        assert!(detached_multipart_value(None, Some("my-item"), &named).is_none());
     }
 
     #[test]

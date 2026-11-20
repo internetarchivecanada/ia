@@ -116,13 +116,30 @@ impl From<S3Failure> for IaError {
 pub(crate) async fn send_with_retry<F, Fut>(
     ctx: &S3RetryCtx<'_>,
     context: &str,
-    mut send: F,
+    send: F,
 ) -> std::result::Result<S3Response, S3Failure>
 where
     F: FnMut(&BodyWatch) -> Fut,
     Fut: Future<Output = std::result::Result<reqwest::Response, reqwest_middleware::Error>>,
 {
-    let mut attempt: u32 = 0;
+    send_with_retry_from(ctx, context, send, 0).await
+}
+
+/// [`send_with_retry`] for a request that has already made `made` attempts
+/// of its budget (see [`send_read_with_retry`]): attempts are numbered on
+/// from `made`, so the budget, the wait schedule and the attempt count in
+/// the final error all continue where they were.
+async fn send_with_retry_from<F, Fut>(
+    ctx: &S3RetryCtx<'_>,
+    context: &str,
+    mut send: F,
+    made: u32,
+) -> std::result::Result<S3Response, S3Failure>
+where
+    F: FnMut(&BodyWatch) -> Fut,
+    Fut: Future<Output = std::result::Result<reqwest::Response, reqwest_middleware::Error>>,
+{
+    let mut attempt: u32 = made;
     let mut stalls: usize = 0;
     let mut unanswered: usize = 0;
     // The window and wait the final error reports; each verdict carries its
@@ -324,17 +341,8 @@ where
 {
     let mut used: u32 = 0;
     loop {
-        let rest = S3RetryCtx {
-            identifier: ctx.identifier,
-            key: ctx.key,
-            retries: ctx.retries - used,
-            backoff: ctx.backoff,
-            bytes_sent: ctx.bytes_sent,
-            total_bytes: ctx.total_bytes,
-            progress: ctx.progress.clone(),
-        };
-        let sent = send_with_retry(&rest, context, &mut send).await?;
-        used += sent.attempts;
+        let sent = send_with_retry_from(ctx, context, &mut send, used).await?;
+        used = sent.attempts;
         let wait = crate::stall::response_wait();
         let what = match tokio::time::timeout(wait, sent.response.text()).await {
             Ok(Ok(body)) => return Ok((body, used)),

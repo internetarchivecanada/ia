@@ -1930,6 +1930,36 @@ mod tests {
         .await;
     }
 
+    /// After a body retry, the attempts already made count: one stalled
+    /// body, then 500s until the budget (retries 3, so 4 attempts) is spent;
+    /// the error names all 4 attempts and 4 connections were made.
+    #[tokio::test]
+    async fn attempts_after_a_body_retry_count_toward_the_budget() {
+        use crate::upload::stall_watch::test_support::shrink_policy;
+        let _policy = shrink_policy();
+        const ERR: &[u8] =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, connections) = scripted_answers(vec![(SILENT_BODY, false), (ERR, true)]).await;
+        let client = loopback_client(addr);
+        let mut ctx = default_ctx("item", "big.bin");
+        ctx.retries = 3;
+        ctx.backoff = crate::upload::retry::backoff_policy(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+            3,
+        );
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            list_uploads_with_ctx(&client, &ctx),
+        )
+        .await
+        .expect("the retries must not hang")
+        .expect_err("500s past the budget must fail");
+        let text = err.to_string();
+        assert!(text.contains("after 4 attempts"), "got {text}");
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
     /// A listing whose body is cut off mid-read (the connection closes) is
     /// not taken for an empty listing: it is retried, and the next answer's
     /// upload is found.

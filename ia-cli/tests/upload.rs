@@ -1541,3 +1541,100 @@ fn a_detached_multipart_value_gets_a_hint() {
         .failure()
         .stderr(predicate::str::contains("--multipart=500M"));
 }
+
+/// `ia upload --multipart 500M two.bin`: clap reads 500M as the item
+/// identifier. Refused before any request, with how to write either intent;
+/// the same on a dry run, and in the JSON error shape with `--json`.
+#[test]
+fn a_multipart_value_read_as_the_identifier_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    for extra in [&[][..], &["--dry-run"][..]] {
+        ia_with_config(&cfg)
+            .args(["upload", "--multipart", "500M"])
+            .arg(file.as_os_str())
+            .args(extra)
+            .args([
+                "--clobber",
+                "--no-collection-check",
+                "-m",
+                "mediatype:texts",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("read as the item identifier"))
+            .stderr(predicate::str::contains("--multipart=500M"))
+            .stderr(predicate::str::contains("--multipart=on 500M"));
+    }
+    let out = ia_with_config(&cfg)
+        .args(["upload", "--multipart", "500M"])
+        .arg(file.as_os_str())
+        .args(["--json", "--dry-run", "--clobber", "--no-collection-check"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let line = String::from_utf8(out).unwrap();
+    let json: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_argument", "{line}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--multipart=on 500M"),
+        "{line}"
+    );
+}
+
+/// The same before the deprecated `import`, where the stray value would
+/// otherwise be dropped silently; with `--spreadsheet`, clap already refuses
+/// the stray positional.
+#[test]
+fn a_multipart_value_before_import_or_a_spreadsheet_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let sheet = over_and_at_sheet(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "--multipart", "500M", "import"])
+        .arg(sheet.as_os_str())
+        .args(["--dry-run", "--clobber", "--no-collection-check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--multipart=500M"));
+    ia_with_config(&cfg)
+        .args(["upload", "--multipart", "500M", "--spreadsheet"])
+        .arg(sheet.as_os_str())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// No detached value: `--multipart=on 500M file` uploads to an item named
+/// 500M (here a dry run), and `my-item 500M --multipart` fails on the
+/// missing file with no `=` advice.
+#[test]
+fn no_hint_where_no_value_was_detached() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args(["upload", "--multipart=on", "500M"])
+        .arg(file.as_os_str())
+        .args([
+            "-m",
+            "mediatype:texts",
+            "--dry-run",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+    ia_with_config(&cfg)
+        .args(["upload", "my-item", "500M", "--multipart"])
+        .args(["--dry-run", "--clobber", "--no-collection-check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--multipart=500M").not());
+}
