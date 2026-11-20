@@ -3143,7 +3143,7 @@ async fn upload_file_multipart_via_upload_file(
     let f = temp_file(THIRTY);
     let opts = {
         let mut o = UploadOpts::default();
-        o.multipart = true;
+        o.multipart = ia_core::upload::Multipart::Always;
         o.checksum = checksum;
         o.verify = verify;
         o
@@ -3257,7 +3257,7 @@ async fn upload_thirty_via_upload_file(
 
 fn no_skip_check_opts() -> UploadOpts {
     let mut o = UploadOpts::default();
-    o.multipart = true;
+    o.multipart = ia_core::upload::Multipart::Always;
     o.checksum = false;
     o.retry_min_delay = std::time::Duration::from_millis(1);
     o.retry_max_delay = std::time::Duration::from_millis(2);
@@ -3324,7 +3324,7 @@ async fn multipart_uses_a_supplied_checksum_for_the_skip_check() {
     );
     let opts = {
         let mut o = UploadOpts::default();
-        o.multipart = true;
+        o.multipart = ia_core::upload::Multipart::Always;
         o.checksum_file = Some(checksums);
         o
     };
@@ -3357,7 +3357,7 @@ async fn multipart_dry_run_reports_the_md5() {
     let f = temp_file(THIRTY);
     let opts = {
         let mut o = UploadOpts::default();
-        o.multipart = true;
+        o.multipart = ia_core::upload::Multipart::Always;
         o.checksum = false;
         o.dry_run = true;
         o

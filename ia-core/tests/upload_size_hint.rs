@@ -293,7 +293,7 @@ async fn size_hint_on_multipart_initiate_and_completion() {
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", 10)];
     let mut o = opts();
-    o.multipart = true;
+    o.multipart = ia_core::upload::Multipart::Always;
     o.size_hint = Some(TV_HINT);
 
     let results = run(&server, &files, &o, None, 1).await;
@@ -355,7 +355,7 @@ async fn size_hint_on_a_resumed_multipart_completion() {
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", size)];
     let mut o = opts();
-    o.multipart = true;
+    o.multipart = ia_core::upload::Multipart::Always;
     o.size_hint = Some(TV_HINT);
 
     let results = run(&server, &files, &o, None, 1).await;
@@ -423,7 +423,7 @@ async fn a_size_hint_header_replaces_the_computed_hint_on_multipart() {
     let dir = TempDir::new().unwrap();
     let files = [write_sized(&dir, "a.bin", 10)];
     let mut o = opts();
-    o.multipart = true;
+    o.multipart = ia_core::upload::Multipart::Always;
     o.headers = vec![("x-archive-size-hint".into(), "123".into())];
 
     run(&server, &files, &o, None, 1).await;

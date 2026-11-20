@@ -870,3 +870,166 @@ async fn size_hint_is_sent_as_given_with_a_spreadsheet() {
         vec![("/test-item/a.txt".into(), vec!["2000000499999744".into()])]
     );
 }
+
+// ─── --no-multipart (#179) ───────────────────────────────────────────────────
+
+#[test]
+fn no_multipart_with_multipart_is_a_usage_error() {
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .arg("upload")
+        .arg("my-item")
+        .arg(file.as_os_str())
+        .args(["--no-multipart", "--multipart", "--dry-run"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn no_multipart_with_multipart_is_a_usage_error_with_a_spreadsheet() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "--spreadsheet",
+            "batch.csv",
+            "--no-multipart",
+            "--multipart",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn no_multipart_with_multipart_is_a_usage_error_with_import() {
+    let cfg = empty_config();
+    ia_with_config(&cfg)
+        .args([
+            "upload",
+            "import",
+            "batch.csv",
+            "--no-multipart",
+            "--multipart",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// A mock that answers single PUTs and refuses, and counts, any multipart
+/// request: the item listing, initiate, completion, abort.
+async fn single_put_only_server(puts: u64) -> wiremock::MockServer {
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("uploads", ""))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(puts)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A one-row spreadsheet for `test-item` with a file in `dir`.
+fn one_row_sheet(dir: &TempDir) -> std::path::PathBuf {
+    let a = dir.path().join("a.txt");
+    fs::write(&a, "aaaa").unwrap();
+    let sheet = dir.path().join("batch.csv");
+    fs::write(
+        &sheet,
+        format!("identifier,file\ntest-item,{}\n", a.display()),
+    )
+    .unwrap();
+    sheet
+}
+
+/// `ia upload --no-multipart` sends the file as a single PUT and does not
+/// list the item's unfinished multipart uploads first.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_multipart_sends_no_listing() {
+    let server = single_put_only_server(1).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(file.as_os_str())
+        .args([
+            "--no-multipart",
+            "--no-verify",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// The same through `--spreadsheet`.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_multipart_sends_no_listing_with_a_spreadsheet() {
+    let server = single_put_only_server(1).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let sheet = one_row_sheet(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "--spreadsheet"])
+        .arg(sheet.as_os_str())
+        .args([
+            "--no-multipart",
+            "--no-verify",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+    server.verify().await;
+}
+
+/// The same through the deprecated `import` subcommand.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_multipart_sends_no_listing_with_import() {
+    let server = single_put_only_server(1).await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let sheet = one_row_sheet(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "import"])
+        .arg(sheet.as_os_str())
+        .args([
+            "--no-multipart",
+            "--no-verify",
+            "--clobber",
+            "--no-collection-check",
+        ])
+        .assert()
+        .success();
+    server.verify().await;
+}
