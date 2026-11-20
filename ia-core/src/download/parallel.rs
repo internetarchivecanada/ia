@@ -3771,7 +3771,6 @@ mod tests {
     /// One request as the recording server saw it.
     #[derive(Debug, Clone)]
     struct Visit {
-        path: String,
         range: Option<(u64, u64)>,
         arrived: std::time::Instant,
         left: std::time::Instant,
@@ -3809,7 +3808,6 @@ mod tests {
                     Reply::Status(_) => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
                 log.lock().unwrap().push(Visit {
-                    path: conn.path.clone(),
                     range,
                     arrived,
                     left: std::time::Instant::now(),
