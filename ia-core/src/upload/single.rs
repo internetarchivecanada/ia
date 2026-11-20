@@ -28,7 +28,8 @@ use std::time::Instant;
 ///
 /// - `is_first_file`: controls `x-archive-auto-make-bucket` and metadata headers
 /// - `is_last_file`: controls `x-archive-queue-derive` (triggers derive on last file)
-/// - `size_hint`: sent as `x-archive-size-hint` (typically total upload size, first file only)
+/// - `size_hint`: sent as `x-archive-size-hint` (typically total upload size, first file only),
+///   unless `opts.headers` sets that header, which then replaces it
 /// - `progress`: optional callback for upload progress reporting
 ///
 /// # Errors
@@ -311,8 +312,9 @@ pub async fn upload_file(
             request = request.header("x-archive-auto-make-bucket", "1");
         }
 
-        // x-archive-size-hint (first file only, caller provides)
-        if let Some(hint) = size_hint {
+        // x-archive-size-hint (first file only, caller provides), unless
+        // the custom headers set it
+        if let Some(hint) = size_hint.filter(|_| !opts.sets_header("x-archive-size-hint")) {
             request = request.header("x-archive-size-hint", hint.to_string());
         }
 

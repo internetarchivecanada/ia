@@ -632,6 +632,7 @@ ia upload <IDENTIFIER> <FILES>... [OPTIONS]
 | `--no-auto-make-bucket` | Error if item doesn't already exist |
 | `--no-collection-check` | Skip collection existence check |
 | `--no-size-hint` | Don't send x-archive-size-hint header |
+| `--size-hint <BYTES>` | Send this whole number of bytes as `x-archive-size-hint` instead of the files' total size (see "Size hint"); refused with `--no-size-hint` |
 | `--test-item` | Upload to test_collection (auto-removed after 30 days) |
 | `--open-after-upload` | Open item in browser after upload |
 | `--multipart` | Use multipart upload for every file, for large files or unreliable connections: 100 MiB parts, each retried and resumed on its own (see the multipart sections below). Without it, a file larger than 2 MiB whose single PUT dies continues as multipart on its own (see "Falling back to multipart") |
@@ -651,6 +652,17 @@ By default a file's remote name is its file name. `--remote-name` names a single
 - Two different files that would get the same name (`/a/scans` and `/b/scans` both give `scans/x.pdf`) are refused, naming both: `--keep-directories gives the remote name 'scans/x.pdf' to both /a/scans/x.pdf and /b/scans/x.pdf; ...`.
 
 Every remote name must be a path inside the item: one that is empty, starts with `/`, or has a `.`, `..` or empty segment is refused before anything is sent, with `invalid remote file name '<name>': <reason>; a remote name is a path inside the item, with no leading '/' and no '.', '..' or empty segments` (`invalid_key` in `--json` errors). This applies however the name is formed, including `--remote-name`, `--remote-dir` and spreadsheet uploads.
+
+#### Size hint
+
+The first file that actually uploads carries `x-archive-size-hint`, which IA uses to place a new item: by default the total size of all the files given for the item, on the single PUT, or on the initiate and completion requests of a multipart upload (a resumed one sends the completion only). A file skipped because a previous run finished it (`--joblog`) does not count as the first; the next file that uploads carries the hint (with `--dashboard`, which uploads the files between the first and the last concurrently, the last file carries it instead). A stdin upload (`-`) is read in full before the upload starts, so its size is counted like a file's.
+
+`--size-hint <BYTES>` sends the given whole number of bytes there instead, exactly as given; anything else (a negative number, a unit such as `10GB`) is refused. `--no-size-hint` sends no hint, and is refused together with `--size-hint`. A `--header x-archive-size-hint:N` replaces the computed hint instead of adding a second header line; like every `--header`, it is sent on every file. `--size-hint` together with such a header is refused. With `--spreadsheet`, each item gets the same `--size-hint` value.
+
+```sh
+# Send a size hint of 2000000499999744 bytes instead of the file's size
+ia upload my-item video.mp4 --size-hint 2000000499999744
+```
 
 #### Retries
 
@@ -712,7 +724,7 @@ Indexed keys (`subject[0]`) take a string, a number, a boolean or `null`, not an
 
 `-m` values apply to every item. A field the row fills in (bare or indexed) replaces every `-m` value for that field, as in the Python client; `-m` fields the row leaves empty are sent as given. With `-m mediatype:texts` and a row whose `mediatype` is `audio`, that item is `audio`. A row that fills in any metadata must itself have `mediatype` and `collection`: the required-field check looks at the row, not at `-m`.
 
-Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
+Supports the same options as the bare command: `-m`, `--header`, `--checksum-file`, `--no-derive`, `--no-backup`, `--no-auto-make-bucket`, `--no-verify`, `--no-size-hint`, `--size-hint`, `--no-collection-check`, `--clobber`, `--delete-after-upload`, `--test-item`, `--multipart`, `--retries`, `--dry-run`, `--json`.
 
 **`ia upload template <DIR>`** — Generate a template spreadsheet from a local directory, pre-filled with file paths. Edit the template to add metadata, then feed it to `ia upload --spreadsheet`. Every format (CSV, TSV, XLSX, JSONL) writes the same columns: `identifier`, `file`, `REMOTE_NAME`, `mediatype`, `collection`, `title`, `creator`, `date`, `description`, `subject`, `language`. `REMOTE_NAME` is upper case because that is the name the Python client reads, so a CSV template works with both tools. (The Python client reads only CSV and matches `REMOTE_NAME` in upper case only.)
 
