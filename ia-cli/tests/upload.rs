@@ -871,6 +871,44 @@ async fn size_hint_is_sent_as_given_with_a_spreadsheet() {
     );
 }
 
+/// The help example uses a shell variable, not a literal size that a reader
+/// might copy.
+#[test]
+fn help_size_hint_example_uses_a_shell_variable() {
+    let out = assert_cmd::cargo_bin_cmd!("ia-cli")
+        .args(["upload", "--help"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(!help.contains("2000000499999744"), "{help}");
+    assert!(help.contains("--size-hint \"$FINAL_SIZE_BYTES\""), "{help}");
+}
+
+/// An unset shell variable expands to `--size-hint ""`: refused as a usage
+/// error before any request is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_size_hint_is_refused_and_sends_no_request() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let host = server.uri().replace("http://", "");
+    let cfg = mock_config(&host);
+    let dir = TempDir::new().unwrap();
+    let file = one_file(&dir);
+
+    ia_with_config(&cfg)
+        .args(["--insecure", "-H", &host, "upload", "test-item"])
+        .arg(file.as_os_str())
+        .args(["--size-hint", "", "--no-verify", "--clobber"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--size-hint"));
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 // ─── --no-multipart (#179) ───────────────────────────────────────────────────
 
 #[test]
