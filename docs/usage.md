@@ -658,11 +658,11 @@ Every remote name must be a path inside the item: one that is empty, starts with
 
 The first file that actually uploads carries `x-archive-size-hint`, which IA uses to place a new item: by default the total size of all the files given for the item, on the single PUT, or on the initiate and completion requests of a multipart upload (a resumed one sends the completion only). A file skipped because a previous run finished it (`--joblog`) does not count as the first; the next file that uploads carries the hint (with `--dashboard`, which uploads the files between the first and the last concurrently, the last file carries it instead). A stdin upload (`-`) is read in full before the upload starts, so its size is counted like a file's.
 
-`--size-hint <BYTES>` sends the given whole number of bytes there instead, exactly as given; anything else (a negative number, a unit such as `10GB`) is refused. `--no-size-hint` sends no hint, and is refused together with `--size-hint`. A `--header x-archive-size-hint:N` replaces the computed hint instead of adding a second header line; like every `--header`, it is sent on every file. `--size-hint` together with such a header is refused. With `--spreadsheet`, each item gets the same `--size-hint` value.
+`--size-hint <BYTES>` sends the given whole number of bytes there instead, exactly as given; anything else (a negative number, a unit such as `10GB`, an empty value such as an unset shell variable) is refused. `--no-size-hint` sends no hint, and is refused together with `--size-hint`. A `--header x-archive-size-hint:N` replaces the computed hint instead of adding a second header line; like every `--header`, it is sent on every file. `--size-hint` together with such a header is refused. With `--spreadsheet`, each item gets the same `--size-hint` value.
 
 ```sh
-# Send a size hint of 2000000499999744 bytes instead of the file's size
-ia upload my-item video.mp4 --size-hint 2000000499999744
+# More files will follow later: send the item's expected final size, in bytes
+ia upload my-item part-001.mp4 --size-hint "$FINAL_SIZE_BYTES"
 ```
 
 #### Retries

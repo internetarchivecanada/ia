@@ -93,8 +93,8 @@ fn build_skip_set(
          \n  <bold>$ ia upload --spreadsheet batch.csv --clobber</bold>\
          \n\n  <dim># Force re-upload ignoring joblog</dim>\
          \n  <bold>$ ia upload --spreadsheet batch.csv --joblog upload.jsonl --no-resume</bold>\
-         \n\n  <dim># Send this size hint instead of the files' total size</dim>\
-         \n  <bold>$ ia upload my-item video.mp4 --size-hint 2000000499999744</bold>\
+         \n\n  <dim># More files will follow later: send the item's expected final size, in bytes</dim>\
+         \n  <bold>$ ia upload my-item part-001.mp4 --size-hint \"$FINAL_SIZE_BYTES\"</bold>\
          \n\n  <dim># Default: files over 100 MiB as multipart, the rest as single PUTs</dim>\
          \n  <bold>$ ia upload my-item ./files/</bold>\
          \n\n  <dim># Multipart only for files over 500 MiB</dim>\
