@@ -293,3 +293,322 @@ async fn export_to_stdout_exits_1_when_an_item_fails() {
         "{stderr}"
     );
 }
+
+// ─── Review of PR #194: --no-resume, nothing to write, failed writes, targets ─
+
+impl Export {
+    /// The export into `out` (or no `-o`), with or without the joblog, and
+    /// `extra` arguments at the end.
+    fn command_into(
+        &self,
+        server: &MockServer,
+        out: Option<&Path>,
+        joblog: bool,
+        extra: &[&str],
+    ) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ia-cli"));
+        cmd.env(
+            "IA_CACHE_DIR",
+            concat!(env!("CARGO_TARGET_TMPDIR"), "/ia-cache"),
+        )
+        .env_remove("IA_ACCESS_KEY_ID")
+        .env_remove("IA_SECRET_ACCESS_KEY")
+        .arg("--config-file")
+        .arg(self.cfg.path())
+        .args(["--insecure", "-H", &server.uri().replace("http://", "")]);
+        if joblog {
+            cmd.arg("--joblog").arg(self.joblog());
+        }
+        cmd.args(["metadata", "export", "--itemlist"])
+            .arg(self.dir.path().join("ids.txt"));
+        if let Some(out) = out {
+            cmd.arg("-o").arg(out);
+        }
+        cmd.args(extra);
+        cmd
+    }
+}
+
+/// Every item the joblog marks `export` `ok` has a row in `out`.
+fn assert_every_marked_item_has_a_row(joblog: &Path, out: &Path) {
+    let log = fs::read_to_string(joblog).unwrap_or_default();
+    let content = fs::read_to_string(out).unwrap_or_default();
+    for line in log.lines() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        if entry["op"] == "export" && entry["status"] == "ok" {
+            let id = entry["item"].as_str().unwrap();
+            assert!(
+                content.lines().any(|l| l.starts_with(&format!("{id},"))),
+                "joblog marks {id} done but the file has no row for it:\n{content}\njoblog:\n{log}"
+            );
+        }
+    }
+}
+
+fn ok_line(id: &str) -> String {
+    format!(
+        "{{\"ts\":\"2026-01-01T00:00:00Z\",\"op\":\"export\",\"item\":\"{id}\",\"file\":\"\",\"status\":\"ok\"}}\n"
+    )
+}
+
+/// Wait until `id` has been requested, then `settle` more.
+async fn wait_requested(server: &MockServer, id: &str, settle: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !requested(server, id).await {
+        assert!(Instant::now() < deadline, "{id} was never requested");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(settle).await;
+}
+
+/// An interrupted `--no-resume` run (past a mid-run rewrite's due time, then
+/// Ctrl+C) leaves the complete earlier file: the joblog still marks the
+/// earlier run's items done, and nothing was read back to keep their rows.
+#[tokio::test]
+async fn no_resume_interrupt_keeps_rows_the_joblog_marks_done() {
+    let export = Export::new("item-a\nitem-b\nitem-c\n");
+    let earlier = "identifier,title\nitem-a,A\nitem-b,B\nitem-c,C\n";
+    fs::write(export.out(), earlier).unwrap();
+    fs::write(
+        export.joblog(),
+        ok_line("item-a") + &ok_line("item-b") + &ok_line("item-c"),
+    )
+    .unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A2"), Duration::ZERO).await;
+    mount(
+        &server,
+        "item-b",
+        item_body("item-b", "B2"),
+        Duration::from_secs(120),
+    )
+    .await;
+    mount(
+        &server,
+        "item-c",
+        item_body("item-c", "C2"),
+        Duration::from_secs(120),
+    )
+    .await;
+    let out = export.out();
+    let mut child = export
+        .command_into(&server, Some(&out), true, &["--no-resume"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Past the 5 s a mid-run rewrite waits for.
+    wait_requested(&server, "item-a", Duration::from_secs(6)).await;
+    signal(&child, libc::SIGINT);
+    child.wait().unwrap();
+
+    assert_every_marked_item_has_a_row(&export.joblog(), &out);
+    assert_eq!(fs::read_to_string(&out).unwrap(), earlier);
+}
+
+/// A resumed run whose list leaves out an item an earlier run marked done
+/// keeps that item's row (the file is read back whenever the joblog marks
+/// any item done).
+#[tokio::test]
+async fn resume_keeps_rows_of_marked_items_outside_this_list() {
+    let export = Export::new("item-a\n");
+    fs::write(export.out(), "identifier,title\nitem-x,X\n").unwrap();
+    fs::write(export.joblog(), ok_line("item-x")).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let output = export.run(&server);
+    assert!(output.status.success(), "{output:?}");
+    assert_every_marked_item_has_a_row(&export.joblog(), &export.out());
+    assert_eq!(rows(&export.out()), vec!["item-a,A", "item-x,X"]);
+}
+
+/// Ctrl+C before any row is fetched leaves an existing file as it is.
+#[tokio::test]
+async fn interrupt_before_any_row_leaves_the_file() {
+    let export = Export::new("item-a\nitem-b\n");
+    let earlier = "identifier,title\nitem-a,A\nitem-b,B\n";
+    fs::write(export.out(), earlier).unwrap();
+
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "item-a",
+        item_body("item-a", "A"),
+        Duration::from_secs(120),
+    )
+    .await;
+    mount(
+        &server,
+        "item-b",
+        item_body("item-b", "B"),
+        Duration::from_secs(120),
+    )
+    .await;
+    let mut child = export.spawn(&server);
+    wait_requested(&server, "item-b", Duration::from_millis(500)).await;
+    signal(&child, libc::SIGINT);
+    child.wait().unwrap();
+
+    assert_eq!(fs::read_to_string(export.out()).unwrap(), earlier);
+}
+
+/// A run in which every item fails leaves an existing file as it is.
+#[tokio::test]
+async fn run_with_no_rows_leaves_the_file() {
+    let export = Export::new("missing\n");
+    let earlier = "identifier,title\nitem-a,A\n";
+    fs::write(export.out(), earlier).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "missing", serde_json::json!({}), Duration::ZERO).await;
+    let output = export.run(&server);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(export.out()).unwrap(), earlier);
+}
+
+/// Ctrl+C whose final write fails still exits 130, reports the write
+/// error, and marks nothing done.
+#[tokio::test]
+async fn interrupt_with_failing_write_exits_130() {
+    use std::os::unix::fs::PermissionsExt;
+    let export = Export::new("item-a\nitem-b\n");
+    let sub = export.dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let out = sub.join("out.csv");
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    mount(
+        &server,
+        "item-b",
+        item_body("item-b", "B"),
+        Duration::from_secs(120),
+    )
+    .await;
+    let child = export
+        .command_into(&server, Some(&out), true, &[])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Well inside the 5 s before a mid-run rewrite.
+    wait_requested(&server, "item-a", Duration::from_secs(1)).await;
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+    signal(&child, libc::SIGINT);
+    let output = child.wait_with_output().unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to write export file"),
+        "the write error should be reported: {stderr}"
+    );
+    assert!(!joblog_marks_ok(&export.joblog(), "item-a"));
+}
+
+/// Replacing the output keeps its mode.
+#[tokio::test]
+async fn export_keeps_the_mode_of_the_file_it_replaces() {
+    use std::os::unix::fs::PermissionsExt;
+    let export = Export::new("item-a\n");
+    fs::write(export.out(), "identifier,title\n").unwrap();
+    fs::set_permissions(export.out(), fs::Permissions::from_mode(0o600)).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let out = export.out();
+    let output = export
+        .command_into(&server, Some(&out), false, &[])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(rows(&out), vec!["item-a,A"]);
+    let mode = fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "mode was {mode:o}");
+}
+
+/// `-o` naming a symlink writes the file it points to and keeps the link.
+#[tokio::test]
+async fn export_through_a_symlink_keeps_the_link() {
+    let export = Export::new("item-a\n");
+    let real = export.dir.path().join("real.csv");
+    fs::write(&real, "identifier,title\n").unwrap();
+    std::os::unix::fs::symlink(&real, export.out()).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let out = export.out();
+    let output = export
+        .command_into(&server, Some(&out), false, &[])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        fs::symlink_metadata(&out).unwrap().file_type().is_symlink(),
+        "the symlink was replaced"
+    );
+    assert_eq!(rows(&real), vec!["item-a,A"]);
+}
+
+/// A writable file in a directory that cannot be written to is written in
+/// place.
+#[tokio::test]
+async fn export_into_a_read_only_directory_writes_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+    let export = Export::new("item-a\n");
+    let sub = export.dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let out = sub.join("out.csv");
+    fs::write(&out, "identifier,title\n").unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let output = export
+        .command_into(&server, Some(&out), true, &[])
+        .output()
+        .unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(rows(&out), vec!["item-a,A"]);
+    assert_every_marked_item_has_a_row(&export.joblog(), &out);
+}
+
+/// `-o` naming a FIFO writes the file into it once, and the FIFO stays.
+#[tokio::test]
+async fn export_into_a_fifo_writes_it_once() {
+    let export = Export::new("item-a\n");
+    let fifo = export.dir.path().join("out.csv");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo(3) on a path in our own temp directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader_path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(fs::read_to_string(reader_path));
+    });
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let output = export
+        .command_into(&server, Some(&fifo), true, &[])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    {
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "the FIFO was replaced"
+        );
+    }
+    let got = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("nothing was written into the FIFO")
+        .unwrap();
+    assert_eq!(got, "identifier,title\nitem-a,A\n");
+}
