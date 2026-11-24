@@ -83,3 +83,43 @@ item or file failed. `docs/usage.md` gives `0`/`1` as the only exit codes.
 4. `export` with one missing item exits 1, names it, and writes the other row.
 5. `audit` of a missing item exits 1 and names it; with `--json`, exit 1 and
    the line's `error` has `code` and `message`.
+
+## Revision after review of PR #194
+
+The invariant: **no state exists, after a run ends or is interrupted at any
+point, in which the joblog marks an item `export` `ok` and the output file
+holds no row for it.** These rules hold it:
+
+1. **Rows the joblog marks done are always read back.** A resumed export
+   reads the output file back whenever the joblog marks any item done, not
+   only when an item of this run's list is skipped. Before, a list that did
+   not include an item an earlier run had marked done rewrote the file
+   without that item's row.
+2. **`--no-resume` never rewrites the file before the end.** It reads
+   nothing back, and the joblog (append-only) keeps the earlier `ok`
+   entries, so a mid-run or Ctrl+C rewrite would replace a complete earlier
+   file with the rows fetched so far. An interrupted `--no-resume` run
+   therefore leaves the earlier file and marks nothing new: the rows it
+   fetched are lost and fetched again by the next run. A `--no-resume` run
+   that completes rewrites the file with the rows of its own list, which is
+   what `--no-resume` asks for; an item that only an earlier run marked
+   done and that is not in this list then has no row. That end state is as
+   on `main` and is documented, not changed here.
+3. **Nothing new, nothing written.** The file is not rewritten when no row
+   was fetched since the last write (Ctrl+C before the first row, or a run
+   in which every item failed), so an existing file is left as it is. A run
+   with no rows and no existing file still creates one.
+4. **Ctrl+C exits 130 even if the final write fails.** The write error is
+   printed and the pending rows stay unmarked (the rerun fetches them).
+5. **The output is replaced by rename only when that is safe.** Decided
+   once, before any request:
+   - a symlink is followed, and the file it points to is replaced (the
+     link stays);
+   - the replacement gets the mode of the file it replaces (owner and group
+     cannot be kept by an unprivileged process);
+   - when the target exists and is not a regular file (a FIFO,
+     `/dev/fd/N`, `/dev/stdout`), or no file can be created in its
+     directory, the file is written in place, once, at the end, as on
+     `main`: no mid-run or Ctrl+C rewrite, since an in-place write is not
+     atomic and a FIFO reader would see the file more than once. The joblog
+     entries still follow the write.
