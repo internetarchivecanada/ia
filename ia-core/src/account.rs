@@ -220,6 +220,13 @@ pub async fn lookup_by(client: &IaClient, lookup: LookupType, value: &str) -> Re
     Ok(account)
 }
 
+/// Whether [`set_locked`] sends a request for `itemname`: it starts with
+/// `@` and has at least one more character.
+#[must_use]
+pub fn is_usable_itemname(itemname: &str) -> bool {
+    itemname.starts_with('@') && itemname.len() >= 2
+}
+
 /// Lock (`locked = true`) or unlock an account by its item name, recording
 /// `comment` when it is non-empty. Returns the answer parsed as JSON, or a
 /// JSON string holding the body when it is not JSON.
@@ -241,7 +248,7 @@ pub async fn set_locked(
         account: itemname.to_string(),
         message,
     };
-    if !itemname.starts_with('@') || itemname.len() < 2 {
+    if !is_usable_itemname(itemname) {
         return Err(api_error("lookup returned no usable itemname".into()));
     }
 

@@ -1,28 +1,35 @@
-//! Parsing of a `--min-speed` rate, shared by download and upload.
+//! Parsing of byte counts with a binary suffix: the `--min-speed` rate
+//! (download and upload) and the `--multipart` cutoff (upload).
 
-/// Parse a `--min-speed` value: bytes per second as a plain number, or a
-/// number followed by `K`, `M`, or `G` for powers of 1024. `0` is accepted
-/// and turns the check off.
-pub(crate) fn parse_rate(s: &str) -> std::result::Result<u64, String> {
+/// Parse a byte count: a whole number, or a whole number followed by `K`,
+/// `M`, or `G` (either case) for powers of 1024. Surrounding spaces are
+/// ignored. `None` for any other form and for a value that overflows u64.
+pub(crate) fn parse_bytes(s: &str) -> Option<u64> {
     let s = s.trim();
-    let err = || {
-        format!(
-            "`{s}` is not a rate: expected bytes per second as a number, or a number \
-             followed by K, M, or G for powers of 1024 (for example 10K or 1M); 0 disables"
-        )
-    };
     let (digits, multiplier) = match s.chars().last() {
         Some(c) if c.is_ascii_digit() => (s, 1u64),
         Some('k' | 'K') => (&s[..s.len() - 1], 1u64 << 10),
         Some('m' | 'M') => (&s[..s.len() - 1], 1u64 << 20),
         Some('g' | 'G') => (&s[..s.len() - 1], 1u64 << 30),
-        _ => return Err(err()),
+        _ => return None,
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(err());
+        return None;
     }
-    let n: u64 = digits.parse().map_err(|_| err())?;
-    n.checked_mul(multiplier).ok_or_else(err)
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+/// Parse a `--min-speed` value: bytes per second as a plain number, or a
+/// number followed by `K`, `M`, or `G` for powers of 1024. `0` is accepted
+/// and turns the check off.
+pub(crate) fn parse_rate(s: &str) -> std::result::Result<u64, String> {
+    parse_bytes(s).ok_or_else(|| {
+        format!(
+            "`{}` is not a rate: expected bytes per second as a number, or a number \
+             followed by K, M, or G for powers of 1024 (for example 10K or 1M); 0 disables",
+            s.trim()
+        )
+    })
 }
 
 #[cfg(test)]

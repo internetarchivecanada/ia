@@ -1,0 +1,72 @@
+name: Install script
+
+# Checks install.sh, the one-line installer for macOS and Linux. Runs when
+# the installer or its tests change, and by hand. The live job downloads
+# the latest release from GitHub; it is an installer smoke test, separate
+# from the hermetic cargo tests in ci.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/test-install.sh
+      - scripts/test-install-live.sh
+      - .github/workflows/install.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - install.sh
+      - scripts/test-install.sh
+      - scripts/test-install-live.sh
+      - .github/workflows/install.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # shellcheck is preinstalled on the Ubuntu runner image.
+      - run: shellcheck --version
+      - run: shellcheck -s sh install.sh scripts/test-install.sh scripts/test-install-live.sh
+
+  offline:
+    name: Installer tests, offline (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # fish and zsh let the tests start real shells and check they find
+      # ia-cli. macOS has zsh; fish is installed on Ubuntu only.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
+      # sh is dash on Ubuntu and bash 3.2 in POSIX mode on macOS. A shell
+      # named in IA_TEST_REQUIRE_SHELLS that is missing fails the tests.
+      - run: scripts/test-install.sh
+        env:
+          IA_TEST_REQUIRE_SHELLS: ${{ runner.os == 'Linux' && 'bash zsh fish' || 'bash zsh' }}
+
+  live:
+    name: Installer smoke test, live release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fish zsh
+      - run: scripts/test-install-live.sh
+        env:
+          IA_TEST_REQUIRE_SHELLS: ${{ runner.os == 'Linux' && 'bash zsh fish' || 'bash zsh' }}

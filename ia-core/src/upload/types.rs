@@ -1,80 +1,61 @@
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// The run's multipart state for files that were not asked to be multipart.
+/// When a file is sent as a multipart upload instead of a single PUT.
 ///
-/// Two facts, both discovered during the run and shared by every clone of
-/// the [`UploadOpts`] made during it (per item in a batch, per file in a
-/// concurrent item), while `Default` gives a fresh one:
+/// The choice is made once per file, from this setting and the file's size
+/// alone ([`Multipart::is_multipart`]). A single PUT that dies is retried as
+/// a single PUT; nothing switches to multipart on failure. A multipart
+/// upload lists the unfinished uploads of its file's name before sending
+/// any part and resumes from the parts IA holds that match the local file.
 ///
-/// - The switch. Off in a fresh [`UploadOpts`]. It is turned on by the
-///   first single PUT of a file larger than
-///   [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE)
-///   that ends in a dead send, an unanswered body or a transport error with
-///   a retry left; from then on every file larger than that in the same run
-///   is sent as a multipart upload. Nothing turns it off.
-/// - The files IA holds an unfinished multipart upload for, by item and
-///   name, from one listing per item that `upload_item` takes at the start
-///   of the run. Such a file is sent as a multipart upload, whatever its
-///   size, and resumes from the parts IA holds; that is how a rerun resumes
-///   a file that switched in an earlier run without being told to.
-#[derive(Debug, Clone, Default)]
-pub struct MultipartFallback(Arc<FallbackState>);
-
-#[derive(Debug, Default)]
-struct FallbackState {
-    on: AtomicBool,
-    /// `(identifier, key)` pairs with an unfinished multipart upload on IA.
-    unfinished: Mutex<HashSet<(String, String)>>,
+/// `#[non_exhaustive]`: a later version may add a setting, so a `match`
+/// outside this crate needs a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Multipart {
+    /// [`Multipart::Above`] with the default cutoff,
+    /// [`MULTIPART_CUTOFF`](crate::upload::multipart::MULTIPART_CUTOFF)
+    /// (100 MiB): a file larger than that is a multipart upload from its
+    /// first attempt, and a file of that size or less is a single PUT.
+    #[default]
+    Auto,
+    /// Every file is a multipart upload, whatever its size.
+    Always,
+    /// Every file is a single PUT. No multipart request of any kind is
+    /// sent; an unfinished multipart upload of a file on IA is not listed,
+    /// resumed or aborted.
+    Never,
+    /// A file larger than this many bytes is a multipart upload from its
+    /// first attempt; a file of this size or less is a single PUT, and as
+    /// with [`Multipart::Never`] no multipart request is sent for it.
+    Above(u64),
 }
 
-impl MultipartFallback {
-    /// A handle that is off, with no unfinished uploads recorded.
+impl Multipart {
+    /// Whether a file of `file_size` bytes is sent as a multipart upload.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn is_multipart(self, file_size: u64) -> bool {
+        match self {
+            Self::Auto => file_size > crate::upload::multipart::MULTIPART_CUTOFF,
+            Self::Always => true,
+            Self::Never => false,
+            Self::Above(cutoff) => file_size > cutoff,
+        }
     }
+}
 
-    /// Whether a single PUT in this run has already died.
-    #[must_use]
-    pub fn is_on(&self) -> bool {
-        self.0.on.load(Ordering::SeqCst)
-    }
-
-    /// Record that a single PUT in this run has died.
-    pub(crate) fn turn_on(&self) {
-        self.0.on.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether the run found an unfinished multipart upload of `key` in
-    /// `identifier` on IA at its start.
-    #[must_use]
-    pub fn has_unfinished(&self, identifier: &str, key: &str) -> bool {
-        self.unfinished()
-            .contains(&(identifier.to_string(), key.to_string()))
-    }
-
-    /// Record the names IA listed as unfinished multipart uploads in
-    /// `identifier`.
-    pub(crate) fn record_unfinished(
-        &self,
-        identifier: &str,
-        keys: impl IntoIterator<Item = String>,
-    ) {
-        self.unfinished()
-            .extend(keys.into_iter().map(|key| (identifier.to_string(), key)));
-    }
-
-    /// The set, recovered from a poisoned lock: the writers only insert.
-    fn unfinished(&self) -> std::sync::MutexGuard<'_, HashSet<(String, String)>> {
-        self.0
-            .unfinished
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+impl From<bool> for Multipart {
+    /// `true` is [`Multipart::Always`], `false` [`Multipart::Auto`].
+    fn from(always: bool) -> Self {
+        if always {
+            Self::Always
+        } else {
+            Self::Auto
+        }
     }
 }
 
@@ -126,17 +107,16 @@ pub struct UploadOpts {
     pub no_auto_make_bucket: bool,
     /// Don't send x-archive-size-hint header.
     pub no_size_hint: bool,
+    /// Send this value as `x-archive-size-hint` in place of the computed
+    /// total size of the item's files, on the same request that would carry
+    /// the total. Ignored when `no_size_hint` is set.
+    pub size_hint: Option<u64>,
     /// Skip collection existence check.
     pub no_collection_check: bool,
     /// Upload to test_collection (items auto-removed after 30 days).
     pub test_item: bool,
-    /// Send every file as a multipart upload.
-    pub multipart: bool,
-    /// The run's multipart state: the switch for files larger than
-    /// [`MULTIPART_FALLBACK_MIN_SIZE`](crate::upload::multipart::MULTIPART_FALLBACK_MIN_SIZE),
-    /// turned on by the first single PUT that dies, and the files found
-    /// with an unfinished multipart upload on IA. Shared by clones.
-    pub multipart_fallback: MultipartFallback,
+    /// When a file is sent as a multipart upload; see [`Multipart`].
+    pub multipart: Multipart,
     /// Maximum retry attempts on transient failure.
     pub retries: u32,
     /// Shortest wait before a retry: the first retry waits up to this long,
@@ -168,10 +148,10 @@ impl Default for UploadOpts {
             no_backup: false,
             no_auto_make_bucket: false,
             no_size_hint: false,
+            size_hint: None,
             no_collection_check: false,
             test_item: false,
-            multipart: false,
-            multipart_fallback: MultipartFallback::new(),
+            multipart: Multipart::Auto,
             retries: 10,
             retry_min_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(60),
@@ -182,6 +162,14 @@ impl Default for UploadOpts {
 }
 
 impl UploadOpts {
+    /// Whether `headers` sets `name` (compared without regard to case).
+    /// A header the caller sets replaces the one computed from the options.
+    pub(crate) fn sets_header(&self, name: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
     /// The retry schedule these options describe: truncated exponential
     /// backoff with full jitter between `retry_min_delay` and
     /// `retry_max_delay`, for `retries` attempts. The one place the schedule
@@ -299,6 +287,13 @@ impl UploadOptsBuilder {
         self
     }
 
+    /// Send this value as `x-archive-size-hint` in place of the computed
+    /// total (see [`UploadOpts::size_hint`]).
+    pub fn size_hint(mut self, bytes: u64) -> Self {
+        self.opts.size_hint = Some(bytes);
+        self
+    }
+
     /// Set whether to skip collection existence check.
     pub fn no_collection_check(mut self, no_check: bool) -> Self {
         self.opts.no_collection_check = no_check;
@@ -311,16 +306,10 @@ impl UploadOptsBuilder {
         self
     }
 
-    /// Set whether to use multipart upload.
-    pub fn multipart(mut self, multipart: bool) -> Self {
-        self.opts.multipart = multipart;
-        self
-    }
-
-    /// Share a run's [`MultipartFallback`] handle with these options, so
-    /// options built separately for the files of one run switch together.
-    pub fn multipart_fallback(mut self, handle: MultipartFallback) -> Self {
-        self.opts.multipart_fallback = handle;
+    /// Set when a file is sent as a multipart upload. A `bool` is accepted:
+    /// `true` is [`Multipart::Always`], `false` [`Multipart::Auto`].
+    pub fn multipart(mut self, multipart: impl Into<Multipart>) -> Self {
+        self.opts.multipart = multipart.into();
         self
     }
 
@@ -629,39 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_handle_is_off_and_clones_share_it() {
-        let opts = UploadOpts::default();
-        assert!(!opts.multipart_fallback.is_on());
-        let clone = opts.clone();
-        clone.multipart_fallback.turn_on();
-        assert!(opts.multipart_fallback.is_on());
-        assert!(!UploadOptsBuilder::new().build().multipart_fallback.is_on());
-        assert!(!UploadOpts::default().multipart_fallback.is_on());
-        let built = UploadOptsBuilder::new()
-            .multipart_fallback(opts.multipart_fallback.clone())
-            .build();
-        assert!(built.multipart_fallback.is_on());
-    }
-
-    #[test]
-    fn a_recorded_unfinished_upload_is_seen_by_every_clone_for_its_item_and_name() {
-        let opts = UploadOpts::default();
-        let clone = opts.clone();
-        assert!(!opts.multipart_fallback.has_unfinished("item", "a.bin"));
-        clone
-            .multipart_fallback
-            .record_unfinished("item", ["a.bin".to_string(), "b.bin".to_string()]);
-        assert!(opts.multipart_fallback.has_unfinished("item", "a.bin"));
-        assert!(opts.multipart_fallback.has_unfinished("item", "b.bin"));
-        assert!(!opts.multipart_fallback.has_unfinished("item", "c.bin"));
-        assert!(!opts.multipart_fallback.has_unfinished("other", "a.bin"));
-        assert!(!opts.multipart_fallback.is_on());
-        assert!(!UploadOpts::default()
-            .multipart_fallback
-            .has_unfinished("item", "a.bin"));
-    }
-
-    #[test]
     fn builder_defaults_match_direct_default() {
         let from_builder = UploadOptsBuilder::new().build();
         let from_default = UploadOpts::default();
@@ -683,6 +639,26 @@ mod tests {
         assert!(opts.dry_run);
         assert_eq!(opts.retries, 5);
         assert_eq!(opts.metadata.len(), 1);
+    }
+
+    #[test]
+    fn multipart_setting_default_and_builder() {
+        assert_eq!(UploadOpts::default().multipart, Multipart::Auto);
+        assert_eq!(
+            UploadOptsBuilder::new().multipart(true).build().multipart,
+            Multipart::Always
+        );
+        assert_eq!(
+            UploadOptsBuilder::new().multipart(false).build().multipart,
+            Multipart::Auto
+        );
+        assert_eq!(
+            UploadOptsBuilder::new()
+                .multipart(Multipart::Never)
+                .build()
+                .multipart,
+            Multipart::Never
+        );
     }
 
     #[test]

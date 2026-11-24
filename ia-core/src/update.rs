@@ -816,6 +816,24 @@ mod tests {
         assert_eq!(result.unwrap().name, "ia-x86_64-pc-windows-msvc.exe");
     }
 
+    /// Intel and Apple Silicon Macs each get their own asset when a release
+    /// carries both (the asset name is `ia-` plus the compile target).
+    #[test]
+    fn find_asset_picks_each_macos_arch() {
+        let assets: Vec<GitHubAsset> = ["ia-aarch64-apple-darwin", "ia-x86_64-apple-darwin"]
+            .into_iter()
+            .map(|name| GitHubAsset {
+                name: name.into(),
+                browser_download_url: format!("https://example.com/{name}"),
+                size: 100,
+            })
+            .collect();
+        let intel = find_matching_asset(&assets, "x86_64-apple-darwin").map(|a| a.name.as_str());
+        let arm = find_matching_asset(&assets, "aarch64-apple-darwin").map(|a| a.name.as_str());
+        assert_eq!(intel, Some("ia-x86_64-apple-darwin"));
+        assert_eq!(arm, Some("ia-aarch64-apple-darwin"));
+    }
+
     #[test]
     fn find_asset_returns_none_when_missing() {
         let assets = vec![GitHubAsset {

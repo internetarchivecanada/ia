@@ -50,6 +50,12 @@ struct Transports {
     upload: reqwest::Client,
     /// Download-auth transport: redirects disabled, read timeout.
     no_redirect: reqwest::Client,
+    /// The download-auth transport over HTTP/1.1 only, for the parallel
+    /// Range requests of one file (#16).
+    range: reqwest::Client,
+    /// The default headers of the download transports, for the clients of
+    /// download slots ([`IaClient::slot_http`]).
+    download_headers: HeaderMap,
     user_agent: String,
 }
 
@@ -105,6 +111,18 @@ pub struct IaClient {
     /// to data-node hosts like `ia600XXX.us.archive.org`, and reqwest
     /// strips `Authorization` on redirects by default.
     no_redirect_http: reqwest::Client,
+    /// [`Self::no_redirect_http`] restricted to HTTP/1.1 and keeping no idle
+    /// connection: the transport of every download request (#16). HTTP/1.1
+    /// carries one request at a time per connection, so concurrent requests
+    /// each get their own connection (the datanodes negotiate HTTP/2, where
+    /// four ranges multiplexed on one connection measured no faster than a
+    /// single stream, 2026-10-30). With no idle pool, and `Connection:
+    /// close` on each request, a connection is closed when its response
+    /// ends, so the sockets open to a datanode never outnumber the slots
+    /// held there: IA operations count open connections.
+    range_http: reqwest::Client,
+    /// See [`Self::slot_http`].
+    download_headers: HeaderMap,
     config: IaConfig,
     user_agent: String,
     retry_stats: Arc<RetryStats>,
@@ -165,7 +183,17 @@ impl IaClient {
         let user_agent = build_user_agent(config);
 
         let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
+        let user_agent_value = HeaderValue::from_str(&user_agent).map_err(|_| {
+            crate::error::IaError::Config(format!(
+                "invalid user_agent_suffix {:?}: it contains a control character",
+                config
+                    .general
+                    .user_agent_suffix
+                    .as_deref()
+                    .unwrap_or_default()
+            ))
+        })?;
+        headers.insert(USER_AGENT, user_agent_value);
 
         let api = configure_transport(
             Self::base_builder(headers.clone()),
@@ -192,7 +220,7 @@ impl IaClient {
         // redirect. We handle redirects manually to preserve auth headers
         // (equivalent to curl --location-trusted).
         let no_redirect = configure_transport(
-            Self::base_builder(headers),
+            Self::base_builder(headers.clone()),
             connect_timeout,
             Some(read_timeout),
         )
@@ -202,10 +230,26 @@ impl IaClient {
             crate::error::IaError::Config(format!("failed to build no-redirect client: {e}"))
         })?;
 
+        // The same, over HTTP/1.1 only and keeping no idle connection: the
+        // download transport. Each request has its own connection, closed
+        // when its response ends.
+        let range = configure_transport(
+            Self::base_builder(headers.clone()),
+            connect_timeout,
+            Some(read_timeout),
+        )
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| crate::error::IaError::Config(format!("failed to build range client: {e}")))?;
+
         Ok(Transports {
             api,
             upload,
             no_redirect,
+            range,
+            download_headers: headers,
             user_agent,
         })
     }
@@ -282,6 +326,8 @@ impl IaClient {
             raw_http,
             api_no_retry,
             no_redirect_http: transports.no_redirect,
+            range_http: transports.range,
+            download_headers: transports.download_headers,
             config,
             user_agent: transports.user_agent,
             retry_stats: stats,
@@ -389,6 +435,37 @@ impl IaClient {
         &self.no_redirect_http
     }
 
+    /// The download transport: [`Self::no_redirect_http`] restricted to
+    /// HTTP/1.1 and keeping no idle connection, so that each download
+    /// request has its own connection, closed when its response ends.
+    pub(crate) fn range_http(&self) -> &reqwest::Client {
+        &self.range_http
+    }
+
+    /// A client for one download slot (#16): the download transport's
+    /// headers and timeouts, HTTP/1.1, no redirects, keep-alive with at
+    /// most one idle connection, and `resolver` for every new connection.
+    /// The slot's resolver lets the client open one connection in its life
+    /// (see `download::slots`), which the slot's requests then reuse.
+    pub(crate) fn slot_http(
+        &self,
+        resolver: Arc<dyn reqwest::dns::Resolve>,
+    ) -> Result<reqwest::Client> {
+        configure_transport(
+            Self::base_builder(self.download_headers.clone()),
+            CONNECT_TIMEOUT,
+            Some(READ_TIMEOUT),
+        )
+        .http1_only()
+        .pool_max_idle_per_host(1)
+        // The slot closes its idle connection itself (`download::slots`).
+        .pool_idle_timeout(None)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(resolver)
+        .build()
+        .map_err(|e| crate::error::IaError::Config(format!("failed to build slot client: {e}")))
+    }
+
     /// The current configuration.
     pub fn config(&self) -> &IaConfig {
         &self.config
@@ -422,6 +499,8 @@ impl IaClient {
             raw_http,
             api_no_retry,
             no_redirect_http: transports.no_redirect,
+            range_http: transports.range,
+            download_headers: transports.download_headers,
             config,
             user_agent: transports.user_agent,
             retry_stats: stats,
@@ -480,6 +559,41 @@ impl IaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_suffix(suffix: &str) -> IaConfig {
+        let mut config = IaConfig::default();
+        config.general.user_agent_suffix = Some(suffix.to_string());
+        config
+    }
+
+    #[test]
+    fn control_character_in_user_agent_suffix_is_a_config_error() {
+        for bad in ["app\n1.0", "app\r1.0", "app\x001.0", "app\x7f1.0"] {
+            for result in [
+                IaClient::from_config(config_with_suffix(bad)),
+                IaClient::from_config_no_retry(config_with_suffix(bad)),
+            ] {
+                match result {
+                    Err(crate::error::IaError::Config(msg)) => {
+                        assert!(msg.contains("user_agent_suffix"), "got: {msg}");
+                        assert!(msg.contains(&format!("{bad:?}")), "got: {msg}");
+                    }
+                    Err(other) => panic!("expected Config error, got {other:?}"),
+                    Ok(_) => panic!("suffix {bad:?} must be rejected"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_and_tab_user_agent_suffix_is_accepted() {
+        for ok in ["caf\u{e9}/1.0", "app\t1.0"] {
+            assert!(
+                IaClient::from_config(config_with_suffix(ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn read_timeout_aborts_stalled_response() {
