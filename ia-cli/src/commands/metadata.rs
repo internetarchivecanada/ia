@@ -3437,6 +3437,25 @@ mod tests {
     /// The hidden sibling is never more permissive than the file it will
     /// replace: it is created with that file's mode, before any row is
     /// written into it (the umask can only remove bits).
+    /// The spreadsheet writer reopens the sibling by path, so it must stay
+    /// writable by its owner (this user) even when the file it replaces is
+    /// not owner-writable (writable through an ACL or a group bit).
+    #[cfg(unix)]
+    #[test]
+    fn sheet_partial_stays_writable_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.csv");
+        std::fs::write(&file, "identifier\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let partial = super::sheet_partial_path(&file, &file);
+
+        super::create_sheet_partial(&partial, &file).unwrap();
+
+        // As csv and rust_xlsxwriter open it.
+        std::fs::File::create(&partial).expect("the writer cannot reopen the sibling");
+    }
+
     #[cfg(unix)]
     #[test]
     fn sheet_partial_is_created_with_the_mode_of_the_file_it_replaces() {
