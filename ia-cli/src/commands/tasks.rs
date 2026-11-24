@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -110,6 +111,10 @@ pub struct TasksArgs {
 pub enum TasksCommand {
     /// Submit a new task
     #[command(
+        long_about = "Submit a new task.\n\n\
+            With --joblog, each task is recorded as soon as IA accepts or refuses it, \
+            and a rerun with the same joblog skips every task it records as accepted: \
+            the same item, command and --args, whatever the comment or priority.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Submit a derive task</dim>\
@@ -121,7 +126,9 @@ pub enum TasksCommand {
              \n\n  <dim># Batch submit from a spreadsheet</dim>\
              \n  <bold>$ ia tasks submit --spreadsheet jobs.csv</bold>\
              \n\n  <dim># Submit from piped identifiers</dim>\
-             \n  <bold>$ cat ids.txt | ia tasks submit --cmd derive</bold>\n"
+             \n  <bold>$ cat ids.txt | ia tasks submit --cmd derive</bold>\
+             \n\n  <dim># Record submissions; a rerun skips the tasks already accepted</dim>\
+             \n  <bold>$ ia tasks submit --cmd derive --itemlist items.txt --joblog derive.jsonl</bold>\n"
         ),
     )]
     Submit(SubmitArgs),
@@ -192,7 +199,7 @@ pub struct SubmitArgs {
     #[arg(long)]
     pub reduced_priority: bool,
 
-    /// Poll until the task completes; exit non-zero if it fails
+    /// Poll until the task completes; exit non-zero if it fails (one task only)
     #[arg(long)]
     pub wait: bool,
 
@@ -204,7 +211,7 @@ pub struct SubmitArgs {
     #[arg(long, default_value = "10")]
     pub max_retries: u32,
 
-    /// Raw API parameter KEY=VALUE (repeatable)
+    /// Raw API parameter KEY=VALUE (repeatable; applies to every task)
     #[arg(short = 'p', long = "parameter")]
     pub parameter: Vec<String>,
 
@@ -551,6 +558,49 @@ async fn run_rate_limit(client: &IaClient, args: RateLimitArgs) -> Result<()> {
 
 // ─── Submit ──────────────────────────────────────────────────────────────────
 
+/// Joblog `op` for a task submission.
+const SUBMIT_OP: &str = "task-submit";
+
+/// The command as the Tasks API receives it: `.php` appended when missing.
+fn php_cmd(cmd: &str) -> String {
+    if cmd.ends_with(".php") {
+        cmd.to_string()
+    } else {
+        format!("{cmd}.php")
+    }
+}
+
+/// What identifies a task in the joblog, stored in the entry's `file` field:
+/// the command as sent, then, when the task has arguments, a space and the
+/// arguments as a JSON object with sorted keys (`derive.php`,
+/// `derive.php {"remove_derived":"*.jpg"}`). The comment, priority and raw
+/// `-p` parameters are not part of it: they change how a task is queued, not
+/// which task it is.
+fn task_key(sub: &TaskSubmission) -> String {
+    let cmd = php_cmd(&sub.cmd);
+    match sub.args.as_ref().filter(|a| !a.is_empty()) {
+        None => cmd,
+        Some(args) => {
+            let sorted: BTreeMap<&String, &String> = args.iter().collect();
+            let json = serde_json::to_string(&sorted).unwrap_or_default();
+            format!("{cmd} {json}")
+        }
+    }
+}
+
+/// Parse repeatable `KEY=VALUE` (or `KEY:VALUE`) flag values.
+fn parse_key_values(values: &[String], flag: &str) -> Result<Vec<(String, String)>> {
+    values
+        .iter()
+        .map(|a| {
+            a.split_once('=')
+                .or_else(|| a.split_once(':'))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or_else(|| anyhow::anyhow!("invalid {flag} value (expected KEY=VALUE): {a}"))
+        })
+        .collect()
+}
+
 async fn run_submit(
     client: &IaClient,
     args: SubmitArgs,
@@ -559,36 +609,68 @@ async fn run_submit(
     joblog: Option<std::path::PathBuf>,
     no_resume: bool,
 ) -> Result<()> {
-    // For spreadsheet mode, cmd comes from the spreadsheet rows
-    if args.spreadsheet.is_some() {
-        return run_submit_spreadsheet(client, &args, quiet, jobs, joblog, no_resume).await;
-    }
+    let task_args = parse_key_values(&args.task_args, "--args")?;
+    let extra_params = parse_key_values(&args.parameter, "--parameter")?;
 
-    // Outside spreadsheet mode, cmd is required
-    let cmd = match args.cmd {
-        Some(ref c) => c.clone(),
-        None => bail!("task command is required (e.g. derive, make_dark)"),
+    let mut submissions = match args.spreadsheet {
+        Some(ref sheet) => spreadsheet_submissions(sheet, &args, &task_args, &extra_params)?,
+        None => identifier_submissions(client, &args, &task_args, &extra_params).await?,
     };
 
-    let mut task_args = HashMap::new();
-    for a in &args.task_args {
-        let (k, v) = a
-            .split_once('=')
-            .or_else(|| a.split_once(':'))
-            .ok_or_else(|| anyhow::anyhow!("invalid --args value (expected KEY=VALUE): {a}"))?;
-        task_args.insert(k.to_string(), v.to_string());
+    if let (false, Some(path)) = (no_resume, joblog.as_deref()) {
+        let skipped = skip_submitted(&mut submissions, path)?;
+        if skipped > 0 && quiet == 0 {
+            eprintln!(
+                "{} skipping {} already-submitted task(s) from joblog",
+                style("resuming:").cyan().bold(),
+                skipped,
+            );
+        }
     }
 
-    let mut extra_params = Vec::new();
-    for p in &args.parameter {
-        let (k, v) = p
-            .split_once('=')
-            .or_else(|| p.split_once(':'))
-            .ok_or_else(|| {
-                anyhow::anyhow!("invalid --parameter value (expected KEY=VALUE): {p}")
-            })?;
-        extra_params.push((k.to_string(), v.to_string()));
+    // The input was not empty (each mode refuses that), so an empty list
+    // here means the joblog records every task as submitted.
+    if submissions.is_empty() {
+        return Ok(());
     }
+
+    if args.wait && submissions.len() > 1 {
+        bail!(
+            "--wait is not supported in batch mode (got {} tasks). \
+             Submit individually with --wait, or use scripting to poll each task.",
+            submissions.len()
+        );
+    }
+
+    if args.dry_run {
+        return print_dry_run(&submissions, &args, quiet);
+    }
+
+    let writer = joblog
+        .as_deref()
+        .map(JoblogWriter::open)
+        .transpose()
+        .context("failed to open joblog")?;
+
+    if submissions.len() == 1 && args.spreadsheet.is_none() {
+        let sub = submissions.remove(0);
+        return submit_single(client, &sub, &args, quiet, writer.as_ref()).await;
+    }
+    submit_batch(client, submissions, &args, quiet, jobs, writer.as_ref()).await
+}
+
+/// One submission per identifier from the positional argument, `--itemlist`
+/// or `--search`.
+async fn identifier_submissions(
+    client: &IaClient,
+    args: &SubmitArgs,
+    task_args: &[(String, String)],
+    extra_params: &[(String, String)],
+) -> Result<Vec<TaskSubmission>> {
+    let Some(ref cmd) = args.cmd else {
+        bail!("task command is required (e.g. derive, make_dark)");
+    };
+    let task_args: HashMap<String, String> = task_args.iter().cloned().collect();
 
     let positional: Vec<String> = args.identifier.iter().cloned().collect();
     let search_opts = ia_core::search::SearchOpts {
@@ -596,350 +678,42 @@ async fn run_submit(
         ..ia_core::search::SearchOpts::default()
     };
     let search = args.search.as_deref().map(|q| (q, &search_opts));
-    let mut identifiers = crate::identifier::collect_identifiers(
+    let identifiers = crate::identifier::collect_identifiers(
         &positional,
         args.itemlist.as_deref(),
         search,
         client,
     )
     .await?;
-
-    // Auto-resume: skip identifiers already successfully submitted in this
-    // joblog, unless --no-resume.
-    if let (false, Some(path)) = (no_resume, joblog.as_ref()) {
-        if path.exists() {
-            let entries =
-                joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
-            let done: std::collections::HashSet<String> = entries
-                .iter()
-                .filter(|e| e.op == "task-submit" && e.status == "ok")
-                .map(|e| e.item.clone())
-                .collect();
-            if !done.is_empty() {
-                let before = identifiers.len();
-                identifiers.retain(|id| !done.contains(id));
-                let skipped = before - identifiers.len();
-                if skipped > 0 && quiet == 0 {
-                    eprintln!(
-                        "{} skipping {} already-submitted item(s) from joblog",
-                        style("resuming:").cyan().bold(),
-                        skipped,
-                    );
-                }
-            }
-        }
-    }
-
     if identifiers.is_empty() {
         bail!("no identifiers provided");
     }
 
-    if args.wait && identifiers.len() > 1 {
-        bail!(
-            "--wait is not supported in batch mode (got {} identifiers). \
-             Submit individually with --wait, or use scripting to poll each task.",
-            identifiers.len()
-        );
-    }
-
-    if args.dry_run {
-        let cmd_display = if cmd.ends_with(".php") {
-            cmd.clone()
-        } else {
-            format!("{cmd}.php")
-        };
-        for id in &identifiers {
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "identifier": id,
-                        "cmd": cmd_display,
-                        "args": task_args,
-                        "comment": args.comment,
-                        "priority": args.priority,
-                        "reduced_priority": args.reduced_priority,
-                        "dry_run": true,
-                    }))?
-                );
-            } else {
-                eprintln!(
-                    "{} {} → {}{}",
-                    style("dry-run").dim(),
-                    id,
-                    cmd_display,
-                    if task_args.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " ({})",
-                            task_args
-                                .iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    }
-                );
-            }
-        }
-        if !args.json && quiet < 2 {
-            eprintln!(
-                "\n{} would submit {} task(s)",
-                style("dry-run").dim(),
-                identifiers.len()
-            );
-        }
-        return Ok(());
-    }
-
-    // Single mode
-    if identifiers.len() == 1 {
-        let submission = TaskSubmission {
-            identifier: identifiers[0].clone(),
+    Ok(identifiers
+        .into_iter()
+        .map(|identifier| TaskSubmission {
+            identifier,
             cmd: cmd.clone(),
-            args: if task_args.is_empty() {
-                None
-            } else {
-                Some(task_args)
-            },
+            args: (!task_args.is_empty()).then(|| task_args.clone()),
             comment: args.comment.clone(),
-            priority: if args.priority == 0 {
-                None
-            } else {
-                Some(args.priority)
-            },
+            priority: (args.priority != 0).then_some(args.priority),
             reduced_priority: args.reduced_priority,
-            extra_params,
-        };
-
-        let result = submit_with_retry(client, &submission, args.max_retries, quiet).await?;
-
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "success": true,
-                    "value": result,
-                }))?
-            );
-        } else if quiet == 0 {
-            eprintln!("Task submitted: {}", style(result.task_id).cyan());
-            eprintln!("Log: {}", style(&result.log).dim());
-        }
-
-        if args.wait {
-            let task_id = result.task_id;
-            let spinner = if quiet == 0 && !args.json {
-                let sp = ProgressBar::new_spinner();
-                sp.set_style(
-                    ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                        .unwrap()
-                        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-                );
-                sp.enable_steady_tick(Duration::from_millis(120));
-                sp.set_message(format!("Task {task_id} — waiting"));
-                Some(sp)
-            } else {
-                None
-            };
-
-            let failed = tasks::wait_for_task_with_progress(
-                client,
-                task_id,
-                Duration::from_secs(args.wait_interval),
-                None,
-                |progress| {
-                    let Some(ref sp) = spinner else {
-                        return;
-                    };
-                    match progress {
-                        tasks::TaskWaitProgress::Active(entry) => {
-                            let state = match entry.color.as_str() {
-                                "green" => "queued",
-                                "blue" => "running",
-                                "brown" => "paused",
-                                other => other,
-                            };
-                            sp.set_message(format!("Task {task_id} — {state}"));
-                        }
-                        tasks::TaskWaitProgress::RateLimited { wait, .. } => {
-                            sp.set_message(format!(
-                                "Task {task_id} — rate limited, polling again in {}s",
-                                wait.as_secs()
-                            ));
-                        }
-                        _ => {}
-                    }
-                },
-            )
-            .await;
-            let failed = match failed {
-                Ok(failed) => failed,
-                Err(e) => {
-                    if let Some(ref sp) = spinner {
-                        sp.abandon();
-                    }
-                    return Err(e.into());
-                }
-            };
-
-            match failed {
-                None => {
-                    if let Some(ref sp) = spinner {
-                        sp.finish_with_message(format!("Task {task_id} — completed"));
-                    }
-                    if args.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string(&serde_json::json!({
-                                "task_id": task_id,
-                                "status": "completed",
-                            }))?
-                        );
-                    } else if quiet == 0 {
-                        eprintln!("Task {task_id} completed");
-                    }
-                }
-                Some(entry) => {
-                    if let Some(ref sp) = spinner {
-                        sp.finish_with_message(format!("Task {task_id} — error"));
-                    }
-                    if args.json {
-                        println!("{}", serde_json::to_string(&entry)?);
-                    }
-                    bail!("task {task_id} failed (error state); see ia tasks log {task_id}");
-                }
-            }
-        }
-
-        return Ok(());
-    }
-
-    // Batch mode — concurrent submission
-    let joblog_writer = joblog
-        .as_ref()
-        .map(|p| JoblogWriter::open(p))
-        .transpose()
-        .context("failed to open joblog")?;
-    let joblog_writer = joblog_writer.map(std::sync::Arc::new);
-
-    let client = client.clone();
-    let comment = args.comment.clone();
-    let json_output = args.json;
-    let max_retries = args.max_retries;
-    let reduced_priority = args.reduced_priority;
-    let priority = args.priority;
-
-    let results: Vec<(String, Result<tasks::TaskSubmitResponse>)> = stream::iter(identifiers)
-        .map(|id| {
-            let client = client.clone();
-            let cmd = cmd.clone();
-            let task_args = task_args.clone();
-            let comment = comment.clone();
-            let extra_params = extra_params.clone();
-            async move {
-                let submission = TaskSubmission {
-                    identifier: id.clone(),
-                    cmd,
-                    args: if task_args.is_empty() {
-                        None
-                    } else {
-                        Some(task_args)
-                    },
-                    comment,
-                    priority: if priority == 0 { None } else { Some(priority) },
-                    reduced_priority,
-                    extra_params,
-                };
-                let result = submit_with_retry(&client, &submission, max_retries, quiet).await;
-                (id, result)
-            }
+            extra_params: extra_params.to_vec(),
         })
-        .buffer_unordered(jobs)
-        .collect()
-        .await;
-
-    let mut succeeded = 0u32;
-    let mut failed = 0u32;
-
-    for (id, result) in &results {
-        match result {
-            Ok(resp) => {
-                succeeded += 1;
-                if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&serde_json::json!({
-                            "identifier": id,
-                            "task_id": resp.task_id,
-                            "success": true,
-                        }))?
-                    );
-                } else if quiet == 0 {
-                    eprintln!("{} {} (task {})", style("ok").green(), id, resp.task_id);
-                }
-                if let Some(ref writer) = joblog_writer {
-                    let entry = JoblogEntry::new("task-submit", id, "").ok(0, 0);
-                    writer.write(&entry);
-                }
-            }
-            Err(e) => {
-                failed += 1;
-                if json_output {
-                    let json_err = serde_json::json!({
-                        "identifier": id,
-                        "success": false,
-                        "error": e.to_string(),
-                    });
-                    eprintln!("{}", serde_json::to_string(&json_err)?);
-                } else {
-                    eprintln!("{} {}: {}", style("error").red(), id, e);
-                }
-                if let Some(ref writer) = joblog_writer {
-                    let entry = JoblogEntry::new("task-submit", id, "").error(&e.to_string(), 0);
-                    writer.write(&entry);
-                }
-            }
-        }
-    }
-
-    if !json_output && quiet < 2 {
-        eprintln!(
-            "\n{} submitted, {} failed",
-            style(succeeded).green(),
-            if failed > 0 {
-                style(failed).red().to_string()
-            } else {
-                style(failed).dim().to_string()
-            }
-        );
-    }
-
-    if failed > 0 {
-        std::process::exit(1);
-    }
-
-    Ok(())
+        .collect())
 }
 
-/// Handle `--spreadsheet` mode for task submission.
+/// One submission per spreadsheet row.
 ///
 /// Expected columns: `identifier`, `cmd`, `comment` (optional), `priority` (optional).
 /// Task arguments use indexed columns with `args.` prefix (e.g. `args.remove_derived`).
-/// Each row becomes a separate task submission.
-async fn run_submit_spreadsheet(
-    client: &IaClient,
+/// `--args` values override a row's, and `-p` values apply to every row.
+fn spreadsheet_submissions(
+    spreadsheet_path: &Path,
     args: &SubmitArgs,
-    quiet: u8,
-    jobs: usize,
-    joblog: Option<std::path::PathBuf>,
-    no_resume: bool,
-) -> Result<()> {
-    let spreadsheet_path = args
-        .spreadsheet
-        .as_ref()
-        .context("spreadsheet path required")?;
+    cli_task_args: &[(String, String)],
+    extra_params: &[(String, String)],
+) -> Result<Vec<TaskSubmission>> {
     let records = read_spreadsheet(spreadsheet_path).context(format!(
         "failed to read spreadsheet: {}",
         spreadsheet_path.display()
@@ -949,7 +723,6 @@ async fn run_submit_spreadsheet(
         bail!("spreadsheet contains no records");
     }
 
-    // Build submissions from spreadsheet rows
     let mut submissions: Vec<TaskSubmission> = Vec::new();
     for (identifier, fields) in &records {
         let cmd = fields.get("cmd").cloned().ok_or_else(|| {
@@ -959,7 +732,6 @@ async fn run_submit_spreadsheet(
             )
         })?;
 
-        // Collect task args from `args.KEY` columns (e.g. args.remove_derived=*.jpg)
         let mut task_args: HashMap<String, String> = fields
             .iter()
             .filter_map(|(k, v)| {
@@ -968,13 +740,7 @@ async fn run_submit_spreadsheet(
                     .map(|arg_name| (arg_name.to_string(), v.clone()))
             })
             .collect();
-
-        // Merge CLI --args into spreadsheet args (CLI takes precedence)
-        for a in &args.task_args {
-            if let Some((k, v)) = a.split_once('=').or_else(|| a.split_once(':')) {
-                task_args.insert(k.to_string(), v.to_string());
-            }
-        }
+        task_args.extend(cli_task_args.iter().cloned());
 
         let comment = fields
             .get("comment")
@@ -989,119 +755,177 @@ async fn run_submit_spreadsheet(
         submissions.push(TaskSubmission {
             identifier: identifier.clone(),
             cmd,
-            args: if task_args.is_empty() {
-                None
-            } else {
-                Some(task_args)
-            },
+            args: (!task_args.is_empty()).then_some(task_args),
             comment,
-            priority: if priority == 0 { None } else { Some(priority) },
+            priority: (priority != 0).then_some(priority),
             reduced_priority: args.reduced_priority,
-            extra_params: Vec::new(),
+            extra_params: extra_params.to_vec(),
         });
     }
+    Ok(submissions)
+}
 
-    // Auto-resume: skip identifiers already successfully submitted in this
-    // joblog, unless --no-resume.
-    if let (false, Some(path)) = (no_resume, joblog.as_ref()) {
-        if path.exists() {
-            let entries =
-                joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
-            let done: std::collections::HashSet<String> = entries
-                .iter()
-                .filter(|e| e.op == "task-submit" && e.status == "ok")
-                .map(|e| e.item.clone())
-                .collect();
-            if !done.is_empty() {
-                let before = submissions.len();
-                submissions.retain(|s| !done.contains(&s.identifier));
-                let skipped = before - submissions.len();
-                if skipped > 0 && quiet == 0 {
-                    eprintln!(
-                        "{} skipping {} already-submitted item(s) from joblog",
-                        style("resuming:").cyan().bold(),
-                        skipped,
-                    );
-                }
-            }
-        }
+/// Drop the submissions the joblog records as accepted, and return how many
+/// were dropped.
+///
+/// A task is done when the joblog has an `ok` `task-submit` entry for its
+/// item whose `file` is the task's key (see [`task_key`]). An `ok` entry with
+/// an empty `file` was written by a version that did not record the task; it
+/// covers every task for that item, so an older joblog never causes a task
+/// to be submitted twice. Any `ok` entry counts, not only the latest: a task
+/// IA accepted is not sent again from the same joblog.
+fn skip_submitted(submissions: &mut Vec<TaskSubmission>, path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
     }
-
-    if submissions.is_empty() {
-        bail!("no tasks to submit");
+    let entries =
+        joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
+    let done: HashSet<(&str, &str)> = entries
+        .iter()
+        .filter(|e| e.op == SUBMIT_OP && e.status == "ok")
+        .map(|e| (e.item.as_str(), e.file.as_str()))
+        .collect();
+    if done.is_empty() {
+        return Ok(0);
     }
+    let before = submissions.len();
+    submissions.retain(|s| {
+        let item = s.identifier.as_str();
+        !done.contains(&(item, "")) && !done.contains(&(item, task_key(s).as_str()))
+    });
+    Ok(before - submissions.len())
+}
 
-    if args.dry_run {
-        for sub in &submissions {
-            let cmd_display = if sub.cmd.ends_with(".php") {
-                sub.cmd.clone()
-            } else {
-                format!("{}.php", sub.cmd)
+/// Write one joblog entry for a finished submission.
+fn record(
+    writer: Option<&JoblogWriter>,
+    sub: &TaskSubmission,
+    result: &Result<tasks::TaskSubmitResponse>,
+    elapsed: Duration,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let entry = JoblogEntry::new(SUBMIT_OP, &sub.identifier, &task_key(sub));
+    let entry = match result {
+        Ok(_) => entry.ok(0, elapsed.as_millis() as u64),
+        Err(e) => entry.error(&e.to_string(), 0),
+    };
+    writer.write(&entry);
+}
+
+fn print_dry_run(submissions: &[TaskSubmission], args: &SubmitArgs, quiet: u8) -> Result<()> {
+    for sub in submissions {
+        let cmd_display = php_cmd(&sub.cmd);
+        let sorted_args: Option<BTreeMap<&String, &String>> =
+            sub.args.as_ref().map(|a| a.iter().collect());
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "identifier": sub.identifier,
+                    "cmd": cmd_display,
+                    "args": sorted_args,
+                    "comment": sub.comment,
+                    "priority": sub.priority.unwrap_or(0),
+                    "reduced_priority": sub.reduced_priority,
+                    "dry_run": true,
+                }))?
+            );
+        } else {
+            let args_display = match sorted_args {
+                Some(a) if !a.is_empty() => format!(
+                    " ({})",
+                    a.iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => String::new(),
             };
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "identifier": sub.identifier,
-                        "cmd": cmd_display,
-                        "args": sub.args,
-                        "comment": sub.comment,
-                        "priority": sub.priority.unwrap_or(0),
-                        "dry_run": true,
-                    }))?
-                );
-            } else {
-                eprintln!(
-                    "{} {} → {}",
-                    style("dry-run").dim(),
-                    sub.identifier,
-                    cmd_display,
-                );
-            }
-        }
-        if !args.json && quiet < 2 {
             eprintln!(
-                "\n{} would submit {} task(s)",
+                "{} {} → {}{}",
                 style("dry-run").dim(),
-                submissions.len()
+                sub.identifier,
+                cmd_display,
+                args_display
             );
         }
-        return Ok(());
+    }
+    if !args.json && quiet < 2 {
+        eprintln!(
+            "\n{} would submit {} task(s)",
+            style("dry-run").dim(),
+            submissions.len()
+        );
+    }
+    Ok(())
+}
+
+/// Submit one task given by identifier, record it, and wait on it with `--wait`.
+async fn submit_single(
+    client: &IaClient,
+    sub: &TaskSubmission,
+    args: &SubmitArgs,
+    quiet: u8,
+    writer: Option<&JoblogWriter>,
+) -> Result<()> {
+    let start = Instant::now();
+    let result = submit_with_retry(client, sub, args.max_retries, quiet).await;
+    record(writer, sub, &result, start.elapsed());
+    let result = result?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "success": true,
+                "value": result,
+            }))?
+        );
+    } else if quiet == 0 {
+        eprintln!("Task submitted: {}", style(result.task_id).cyan());
+        eprintln!("Log: {}", style(&result.log).dim());
     }
 
-    // Concurrent batch submission
-    let joblog_writer = joblog
-        .as_ref()
-        .map(|p| JoblogWriter::open(p))
-        .transpose()
-        .context("failed to open joblog")?;
-    let joblog_writer = joblog_writer.map(std::sync::Arc::new);
+    if args.wait {
+        wait_on_task(client, result.task_id, args, quiet).await?;
+    }
+    Ok(())
+}
 
-    let client = client.clone();
-    let json_output = args.json;
+/// Submit tasks concurrently. Each result is printed and recorded in the
+/// joblog as it arrives, so an interrupted run keeps a record of every task
+/// IA accepted before the interruption.
+async fn submit_batch(
+    client: &IaClient,
+    submissions: Vec<TaskSubmission>,
+    args: &SubmitArgs,
+    quiet: u8,
+    jobs: usize,
+    writer: Option<&JoblogWriter>,
+) -> Result<()> {
     let max_retries = args.max_retries;
-
-    let results: Vec<(String, Result<tasks::TaskSubmitResponse>)> = stream::iter(submissions)
-        .map(|sub| {
-            let client = client.clone();
-            async move {
-                let id = sub.identifier.clone();
-                let result = submit_with_retry(&client, &sub, max_retries, quiet).await;
-                (id, result)
-            }
+    let mut results = stream::iter(submissions)
+        .map(|sub| async move {
+            let start = Instant::now();
+            let result = submit_with_retry(client, &sub, max_retries, quiet).await;
+            (sub, result, start.elapsed())
         })
-        .buffer_unordered(jobs)
-        .collect()
-        .await;
+        .buffer_unordered(jobs);
 
     let mut succeeded = 0u32;
     let mut failed = 0u32;
+    let mut accepted = Vec::new();
 
-    for (id, result) in &results {
+    while let Some((sub, result, elapsed)) = results.next().await {
+        record(writer, &sub, &result, elapsed);
+        let id = &sub.identifier;
         match result {
             Ok(resp) => {
                 succeeded += 1;
-                if json_output {
+                accepted.push(resp.task_id);
+                if args.json {
                     println!(
                         "{}",
                         serde_json::to_string(&serde_json::json!({
@@ -1113,14 +937,10 @@ async fn run_submit_spreadsheet(
                 } else if quiet == 0 {
                     eprintln!("{} {} (task {})", style("ok").green(), id, resp.task_id);
                 }
-                if let Some(ref writer) = joblog_writer {
-                    let entry = JoblogEntry::new("task-submit", id, "").ok(0, 0);
-                    writer.write(&entry);
-                }
             }
             Err(e) => {
                 failed += 1;
-                if json_output {
+                if args.json {
                     let json_err = serde_json::json!({
                         "identifier": id,
                         "success": false,
@@ -1130,15 +950,11 @@ async fn run_submit_spreadsheet(
                 } else {
                     eprintln!("{} {}: {}", style("error").red(), id, e);
                 }
-                if let Some(ref writer) = joblog_writer {
-                    let entry = JoblogEntry::new("task-submit", id, "").error(&e.to_string(), 0);
-                    writer.write(&entry);
-                }
             }
         }
     }
 
-    if !json_output && quiet < 2 {
+    if !args.json && quiet < 2 {
         eprintln!(
             "\n{} submitted, {} failed",
             style(succeeded).green(),
@@ -1154,7 +970,102 @@ async fn run_submit_spreadsheet(
         std::process::exit(1);
     }
 
+    // `--wait` is refused for more than one task, so this is the one task of
+    // a one-row spreadsheet.
+    if args.wait {
+        if let [task_id] = accepted[..] {
+            wait_on_task(client, task_id, args, quiet).await?;
+        }
+    }
+
     Ok(())
+}
+
+/// Poll a submitted task until it leaves the catalog (completed) or turns red
+/// (failed, which is an error).
+async fn wait_on_task(client: &IaClient, task_id: u64, args: &SubmitArgs, quiet: u8) -> Result<()> {
+    let spinner = if quiet == 0 && !args.json {
+        let sp = ProgressBar::new_spinner();
+        sp.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        sp.enable_steady_tick(Duration::from_millis(120));
+        sp.set_message(format!("Task {task_id} — waiting"));
+        Some(sp)
+    } else {
+        None
+    };
+
+    let failed = tasks::wait_for_task_with_progress(
+        client,
+        task_id,
+        Duration::from_secs(args.wait_interval),
+        None,
+        |progress| {
+            let Some(ref sp) = spinner else {
+                return;
+            };
+            match progress {
+                tasks::TaskWaitProgress::Active(entry) => {
+                    let state = match entry.color.as_str() {
+                        "green" => "queued",
+                        "blue" => "running",
+                        "brown" => "paused",
+                        other => other,
+                    };
+                    sp.set_message(format!("Task {task_id} — {state}"));
+                }
+                tasks::TaskWaitProgress::RateLimited { wait, .. } => {
+                    sp.set_message(format!(
+                        "Task {task_id} — rate limited, polling again in {}s",
+                        wait.as_secs()
+                    ));
+                }
+                _ => {}
+            }
+        },
+    )
+    .await;
+    let failed = match failed {
+        Ok(failed) => failed,
+        Err(e) => {
+            if let Some(ref sp) = spinner {
+                sp.abandon();
+            }
+            return Err(e.into());
+        }
+    };
+
+    match failed {
+        None => {
+            if let Some(ref sp) = spinner {
+                sp.finish_with_message(format!("Task {task_id} — completed"));
+            }
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "task_id": task_id,
+                        "status": "completed",
+                    }))?
+                );
+            } else if quiet == 0 {
+                eprintln!("Task {task_id} completed");
+            }
+            Ok(())
+        }
+        Some(entry) => {
+            if let Some(ref sp) = spinner {
+                sp.finish_with_message(format!("Task {task_id} — error"));
+            }
+            if args.json {
+                println!("{}", serde_json::to_string(&entry)?);
+            }
+            bail!("task {task_id} failed (error state); see ia tasks log {task_id}");
+        }
+    }
 }
 
 /// Retry submit on 429 rate-limit responses from the Tasks API.

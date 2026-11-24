@@ -931,7 +931,7 @@ By default, `ia tasks` shows your queued/running tasks. When given an identifier
 | `--active-only` | Only show active tasks (mutually exclusive with `--completed-only`) |
 | `--completed-only` | Only show completed tasks (requires identifier or task_id) |
 | `--no-summary` | Hide the summary counts header |
-| `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
+| `-p, --parameter <K=V>` | Raw API parameter (repeatable); applies to every task, spreadsheet rows included |
 | `--json` | Output as JSONL |
 
 ```sh
@@ -976,7 +976,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--comment <TEXT>` | Explanation for why the task is being submitted |
 | `--priority <N>` | Task priority (-10 to 10, default: 0) |
 | `--reduced-priority` | Submit at reduced priority to avoid rate-limiting |
-| `--wait` | Poll until the task completes. A task that fails (error state) ends the wait with `task <id> failed (error state); see ia tasks log <id>` and exit code 1; with `--json`, its catalog entry is printed first |
+| `--wait` | Poll until the task completes. Accepted only when one task is to be submitted (one identifier, or a spreadsheet with one row left after resume); with more it is refused before any request. A task that fails (error state) ends the wait with `task <id> failed (error state); see ia tasks log <id>` and exit code 1; with `--json`, its catalog entry is printed first |
 | `--wait-interval <SECS>` | Initial poll interval in seconds (default: 2, exponential backoff). A poll answered with `429` waits the response's `Retry-After` (or the poll interval when it has none) and polls again; it does not end the wait, so a server that keeps answering `429` keeps it going |
 | `--max-retries <N>` | Max retries on 429 rate-limit responses (default: 10) |
 | `--itemlist <PATH>` | Batch mode: file with one identifier per line |
@@ -1008,7 +1008,18 @@ ia tasks submit my-item --cmd derive --wait
 
 # Batch submit from a spreadsheet
 ia tasks submit --spreadsheet jobs.csv
+
+# Record submissions; a rerun skips the tasks already accepted
+ia tasks submit --cmd derive --itemlist items.txt --joblog derive.jsonl
 ```
+
+##### Job log
+
+With `--joblog <PATH>`, each task is recorded as soon as its submission finishes, in every mode (one identifier, `--itemlist`, `--search`, `--spreadsheet`), so a run that is killed keeps a record of every task IA accepted before it stopped. `op` is `task-submit`, `item` the identifier, and `status` `ok` or `error` with the message. `file` names the task: the command as sent (`.php` appended when missing), followed, when the task has arguments, by a space and the arguments as a JSON object with sorted keys, for example `derive.php {"remove_derived":"*.jpg"}`. `--wait` does not change the entry: a task accepted and then failed while waited on is recorded `ok`.
+
+A rerun with the same `--joblog` skips a task when the log has an `ok` entry with the same item and `file`, printing `resuming: skipping <n> already-submitted task(s) from joblog` unless `-q`. So a failed `make_dark` row is retried even when a `derive` row for the same item succeeded, and a log from a `--cmd derive` run does not stop a later `--cmd make_dark` run. The comment, priority, `--reduced-priority` and `-p` values are not compared: a rerun with a reworded comment does not submit the task again. When every task is already recorded, the command prints that line and exits 0. `--no-resume` submits every task. `ia status --joblog <PATH>` counts and lists each task separately.
+
+A job log written by version 0.30.0 or earlier records no task (`file` is empty) and only for batches. Such an `ok` entry still skips every task for its item, as it did then, so an older log never causes a task to be submitted twice; use `--no-resume`, or a new log, to submit another command to those items.
 
 #### `ia tasks log`
 
@@ -1626,7 +1637,7 @@ Not on it: the in-stream re-request after a dropped download connection (0.5 s, 
 
 ### Job logging
 
-Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; fully finished items for download, `metadata export`, `metadata modify`, `tasks submit`, `collection create --spreadsheet` and `ai qa`; for `account --lock` and `account --unlock`, accounts whose latest lock or unlock entry is `ok` with the same action (read actions of `ia account` ignore `--joblog`). `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and multipart uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
+Track operations with `--joblog`. The log is a JSONL file (one JSON object per line) recording the outcome of each file operation. When `--joblog` is provided, re-running the same command skips what the log records as done: finished files for upload; accepted tasks for `tasks submit` (see "Job log" under `ia tasks submit`); fully finished items for download, `metadata export`, `metadata modify`, `collection create --spreadsheet` and `ai qa`; for `account --lock` and `account --unlock`, accounts whose latest lock or unlock entry is `ok` with the same action (read actions of `ia account` ignore `--joblog`). `--no-resume` turns that off for all of them. That is one of two resume mechanisms: download resumes a partial file from its `.part` with a `Range` request whether or not a joblog is in use, and multipart uploads resume from the parts IA holds; the joblog works at the level of whole files on top of both (see "After an interruption" under `ia download` and "Resuming uploads" under `ia upload`).
 
 ```sh
 # Download with job logging
