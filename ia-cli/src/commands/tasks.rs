@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -575,17 +575,22 @@ fn php_cmd(cmd: &str) -> String {
 /// arguments as a JSON object with sorted keys (`derive.php`,
 /// `derive.php {"remove_derived":"*.jpg"}`). The comment, priority and raw
 /// `-p` parameters are not part of it: they change how a task is queued, not
-/// which task it is.
+/// which task it is. A `comment` argument (`--args comment=...` or an
+/// `args.comment` column) is left out too, since it is sent as the same field
+/// as `--comment`.
 fn task_key(sub: &TaskSubmission) -> String {
     let cmd = php_cmd(&sub.cmd);
-    match sub.args.as_ref().filter(|a| !a.is_empty()) {
-        None => cmd,
-        Some(args) => {
-            let sorted: BTreeMap<&String, &String> = args.iter().collect();
-            let json = serde_json::to_string(&sorted).unwrap_or_default();
-            format!("{cmd} {json}")
-        }
+    let sorted: BTreeMap<&String, &String> = sub
+        .args
+        .iter()
+        .flatten()
+        .filter(|(k, _)| k.as_str() != "comment")
+        .collect();
+    if sorted.is_empty() {
+        return cmd;
     }
+    let json = serde_json::to_string(&sorted).unwrap_or_default();
+    format!("{cmd} {json}")
 }
 
 /// Parse repeatable `KEY=VALUE` (or `KEY:VALUE`) flag values.
@@ -778,29 +783,44 @@ fn spreadsheet_submissions(
 /// were dropped.
 ///
 /// A task is done when the joblog has an `ok` `task-submit` entry for its
-/// item whose `file` is the task's key (see [`task_key`]). An `ok` entry with
-/// an empty `file` was written by a version that did not record the task; it
-/// covers every task for that item, so an older joblog never causes a task
-/// to be submitted twice. Any `ok` entry counts, not only the latest: a task
-/// IA accepted is not sent again from the same joblog.
+/// item whose `file` is the task's key (see [`task_key`]). Each `ok` entry
+/// covers one submission: of several identical rows, as many are skipped as
+/// the joblog has `ok` entries for that task, and the rest are submitted, so
+/// a row that failed is retried even when an identical row succeeded. An `ok`
+/// entry counts whatever came after it: a task IA accepted is not sent again
+/// from the same joblog.
+///
+/// An `ok` entry with an empty `file` was written by a version that did not
+/// record the task; it covers every task for that item, so an older joblog
+/// never causes a task to be submitted twice.
 fn skip_submitted(submissions: &mut Vec<TaskSubmission>, path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
     let entries =
         joblog::read(path).context(format!("failed to read joblog: {}", path.display()))?;
-    let done: HashSet<(&str, &str)> = entries
-        .iter()
+    let mut done: HashMap<(String, String), usize> = HashMap::new();
+    for e in entries
+        .into_iter()
         .filter(|e| e.op == SUBMIT_OP && e.status == "ok")
-        .map(|e| (e.item.as_str(), e.file.as_str()))
-        .collect();
+    {
+        *done.entry((e.item, e.file)).or_default() += 1;
+    }
     if done.is_empty() {
         return Ok(0);
     }
     let before = submissions.len();
     submissions.retain(|s| {
-        let item = s.identifier.as_str();
-        !done.contains(&(item, "")) && !done.contains(&(item, task_key(s).as_str()))
+        if done.contains_key(&(s.identifier.clone(), String::new())) {
+            return false;
+        }
+        match done.get_mut(&(s.identifier.clone(), task_key(s))) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        }
     });
     Ok(before - submissions.len())
 }

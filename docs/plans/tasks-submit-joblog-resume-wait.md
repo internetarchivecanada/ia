@@ -29,7 +29,9 @@ A task is identified by the item, the command and the task arguments:
 
 The comment, priority, `--reduced-priority` and `-p` values are not part of
 the key: they change how a task is queued, not which task it is, and a rerun
-with a reworded comment must not submit the task again.
+with a reworded comment must not submit the task again. A `comment` task
+argument is left out as well: `submit_task` sends `--comment` as
+`args.comment`, so `--args comment=x` and `--comment x` are the same field.
 
 `file` is used rather than a new field so that `ia-core` is not changed: the
 `JoblogEntry` struct, its format and every other command's joblog stay as
@@ -44,9 +46,15 @@ item, as it did before, so a joblog written by an older version never causes a
 task to be submitted twice. Only entries written by this version can tell a
 `derive` from a `make_dark`.
 
-Any `ok` entry counts, not only the latest: a task IA accepted is never sent
-again from the same joblog, even if a later `--no-resume` run recorded an
-error for it.
+Each `ok` entry covers one row: of several rows with the same item and key
+(identical spreadsheet rows), as many are skipped as the joblog has `ok`
+entries for that key, and the rest are submitted. Two identical rows where
+one failed are therefore retried once on the rerun. An `ok` entry counts
+whatever came after it: a task IA accepted is not sent again from the same
+joblog, even if a later `--no-resume` run recorded an error for it. A
+`--no-resume` run that succeeds adds `ok` entries, so later resumes may skip
+more identical rows than the joblog's first run accepted; that errs toward
+not submitting, never toward submitting twice.
 
 ## When a record is written
 
