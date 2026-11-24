@@ -931,7 +931,7 @@ By default, `ia tasks` shows your queued/running tasks. When given an identifier
 | `--active-only` | Only show active tasks (mutually exclusive with `--completed-only`) |
 | `--completed-only` | Only show completed tasks (requires identifier or task_id) |
 | `--no-summary` | Hide the summary counts header |
-| `-p, --parameter <K=V>` | Raw API parameter (repeatable); applies to every task, spreadsheet rows included |
+| `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
 | `--json` | Output as JSONL |
 
 ```sh
@@ -983,7 +983,7 @@ ia tasks submit [IDENTIFIER] --cmd <CMD> [OPTIONS]
 | `--search <QUERY>` | Batch mode: submit task to all matching items |
 | `--search-parameter <K=V>` | Extra search parameters for `--search` (`key:value` or `key=value`, repeatable; e.g. `--search-parameter sorts='addeddate desc'`). Note: `-p` is a raw *task* parameter, not a search parameter. |
 | `--spreadsheet <PATH>` | Batch mode: submit tasks from a spreadsheet. Required columns: `identifier`, `cmd`. Optional: `comment`, `priority`. Task arguments use `args.` prefix (e.g. `args.remove_derived`). In JSONL, `priority` may be a number (`-5`) or a string (`"-5"`). |
-| `-p, --parameter <K=V>` | Raw API parameter (repeatable) |
+| `-p, --parameter <K=V>` | Raw API parameter (repeatable); applies to every task, spreadsheet rows included. Not part of the job log's task key |
 | `--dry-run` | Print what would be submitted without sending |
 | `--json` | Output as JSON |
 
@@ -1017,7 +1017,7 @@ ia tasks submit --cmd derive --itemlist items.txt --joblog derive.jsonl
 
 With `--joblog <PATH>`, each task is recorded as soon as its submission finishes, in every mode (one identifier, `--itemlist`, `--search`, `--spreadsheet`), so a run that is killed keeps a record of every task IA accepted before it stopped. `op` is `task-submit`, `item` the identifier, and `status` `ok` or `error` with the message. `file` names the task: the command as sent (`.php` appended when missing), followed, when the task has arguments, by a space and the arguments as a JSON object with sorted keys, for example `derive.php {"remove_derived":"*.jpg"}`. `--wait` does not change the entry: a task accepted and then failed while waited on is recorded `ok`.
 
-A rerun with the same `--joblog` skips a task when the log has an `ok` entry with the same item and `file`, printing `resuming: skipping <n> already-submitted task(s) from joblog` unless `-q`. So a failed `make_dark` row is retried even when a `derive` row for the same item succeeded, and a log from a `--cmd derive` run does not stop a later `--cmd make_dark` run. The comment, priority, `--reduced-priority` and `-p` values are not compared: a rerun with a reworded comment does not submit the task again. When every task is already recorded, the command prints that line and exits 0. `--no-resume` submits every task. `ia status --joblog <PATH>` counts and lists each task separately.
+A rerun with the same `--joblog` skips a task when the log has an `ok` entry with the same item and `file`, printing `resuming: skipping <n> already-submitted task(s) from joblog` unless `-q`. So a failed `make_dark` row is retried even when a `derive` row for the same item succeeded, and a log from a `--cmd derive` run does not stop a later `--cmd make_dark` run. The comment, priority, `--reduced-priority` and `-p` values are not compared: a rerun with a reworded comment does not submit the task again. When every task is already recorded, the command prints that line and exits 0; with `--wait` it exits 1 instead, since there is no task of this run to poll (check the task with `ia tasks <identifier>`). `--no-resume` submits every task. `ia status --joblog <PATH>` counts and lists each task separately.
 
 A job log written by version 0.30.0 or earlier records no task (`file` is empty) and only for batches. Such an `ok` entry still skips every task for its item, as it did then, so an older log never causes a task to be submitted twice; use `--no-resume`, or a new log, to submit another command to those items.
 

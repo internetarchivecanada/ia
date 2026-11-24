@@ -629,8 +629,17 @@ async fn run_submit(
     }
 
     // The input was not empty (each mode refuses that), so an empty list
-    // here means the joblog records every task as submitted.
+    // here means the joblog records every task as submitted. With --wait
+    // there is no task of this run to poll, and exit 0 would claim it
+    // completed.
     if submissions.is_empty() {
+        if args.wait {
+            bail!(
+                "--wait has nothing to poll: the joblog records every task as already \
+                 submitted. Check it with `ia tasks <identifier>`, or rerun with --no-resume \
+                 to submit it again."
+            );
+        }
         return Ok(());
     }
 
@@ -825,7 +834,7 @@ fn print_dry_run(submissions: &[TaskSubmission], args: &SubmitArgs, quiet: u8) -
                 serde_json::to_string(&serde_json::json!({
                     "identifier": sub.identifier,
                     "cmd": cmd_display,
-                    "args": sorted_args,
+                    "args": sorted_args.unwrap_or_default(),
                     "comment": sub.comment,
                     "priority": sub.priority.unwrap_or(0),
                     "reduced_priority": sub.reduced_priority,

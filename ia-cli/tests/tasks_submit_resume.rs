@@ -510,3 +510,140 @@ async fn tasks_spreadsheet_sends_parameters() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The resume key sorts task arguments: the same arguments given in another
+/// order are the same task.
+#[tokio::test]
+async fn tasks_resume_key_ignores_argument_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(6))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let host = server.uri().replace("http://", "");
+
+    let first = [
+        "tasks", "submit", "item-a", "--cmd", "derive", "--args", "a=1", "--args", "b=2", "--args",
+        "c=3", "--args", "d=4",
+    ];
+    let second = [
+        "tasks", "submit", "item-a", "--cmd", "derive", "--args", "d=4", "--args", "c=3", "--args",
+        "b=2", "--args", "a=1",
+    ];
+    assert!(run(&host, &log, &first).status.success());
+    let out = run(&host, &log, &second);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        posts(&server, "derive.php", None).await,
+        1,
+        "joblog: {}",
+        joblog_text(&log)
+    );
+    assert!(
+        joblog_text(&log)
+            .contains(r#""file":"derive.php {\"a\":\"1\",\"b\":\"2\",\"c\":\"3\",\"d\":\"4\"}""#),
+        "joblog: {}",
+        joblog_text(&log)
+    );
+}
+
+/// `--dry-run --json` keeps `"args": {}` for a task without arguments.
+#[test]
+fn tasks_dry_run_json_args_is_an_object() {
+    let out = ia_cmd()
+        .args([
+            "tasks",
+            "submit",
+            "item-a",
+            "--cmd",
+            "derive",
+            "--dry-run",
+            "--json",
+        ])
+        .env("IA_ACCESS_KEY_ID", "test_access")
+        .env("IA_SECRET_ACCESS_KEY", "test_secret")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let line: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(line["args"], json!({}));
+}
+
+/// A two-row spreadsheet whose resume leaves one row accepts `--wait` and
+/// polls that task.
+#[tokio::test]
+async fn tasks_spreadsheet_wait_after_resume_leaves_one_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(77))
+        .mount(&server)
+        .await;
+    mount_poll(77, None).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let sheet = dir.path().join("jobs.csv");
+    std::fs::write(&sheet, "identifier,cmd\nitem-a,derive\nitem-b,derive\n").unwrap();
+    let log = dir.path().join("log.jsonl");
+    std::fs::write(
+        &log,
+        "{\"ts\":\"2026-11-24T00:00:00Z\",\"op\":\"task-submit\",\"item\":\"item-a\",\"file\":\"derive.php\",\"status\":\"ok\",\"bytes\":0,\"elapsed_ms\":1}\n",
+    )
+    .unwrap();
+    let host = server.uri().replace("http://", "");
+    let out = run(
+        &host,
+        &log,
+        &[
+            "tasks",
+            "submit",
+            "--spreadsheet",
+            sheet.to_str().unwrap(),
+            "--wait",
+            "--wait-interval",
+            "1",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(posts(&server, "derive.php", Some("item-a")).await, 0);
+    assert_eq!(posts(&server, "derive.php", Some("item-b")).await, 1);
+    assert!(polls(&server).await >= 1);
+}
+
+/// `--wait` when the joblog records every task: nothing to poll, so exit 1
+/// rather than report a completion it has not seen. Without `--wait`, exit 0.
+#[tokio::test]
+async fn tasks_wait_with_everything_recorded_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(8))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let host = server.uri().replace("http://", "");
+    let args = ["tasks", "submit", "item-a", "--cmd", "derive"];
+    assert!(run(&host, &log, &args).status.success());
+
+    let out = run(
+        &host,
+        &log,
+        &["tasks", "submit", "item-a", "--cmd", "derive", "--wait"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("nothing to poll"), "{stderr}");
+    assert_eq!(posts(&server, "derive.php", None).await, 1);
+    assert_eq!(polls(&server).await, 0);
+}

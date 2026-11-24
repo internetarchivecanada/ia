@@ -75,7 +75,9 @@ an error, as in the identifier modes.
 ## Nothing left to submit
 
 When resume skips every task the input names, the command prints the
-`resuming:` line and exits 0, as `ia account` and `ia collection create` do.
+`resuming:` line and exits 0, as `ia account` and `ia collection create` do. With `--wait` it exits 1
+instead: no task of this run is there to poll, and exit 0 would tell a script
+that the task completed.
 Before this change it failed with `no identifiers provided` / `no tasks to
 submit`. Empty input still fails.
 
@@ -87,7 +89,7 @@ they arrive (`buffer_unordered` consumed with `next()`), printing and writing
 the joblog per result. The single-identifier output (`Task submitted: <id>`)
 and the batch output (`ok <id> (task <n>)` and the summary line) are unchanged.
 
-## Tests (wiremock, `ia-cli/tests/tasks.rs`)
+## Tests (wiremock, `ia-cli/tests/tasks_submit_resume.rs`)
 
 1. #186 single item: one identifier in an itemlist, run twice with the same
    joblog; one POST, second run exits 0.
