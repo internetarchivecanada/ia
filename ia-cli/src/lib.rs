@@ -78,8 +78,8 @@ struct Cli {
     /// Write operation results to a JSONL log file
     ///
     /// A rerun with the same --joblog skips what it records as done:
-    /// finished files for upload, finished items for every other command
-    /// that takes it.
+    /// finished files for upload, accepted tasks for tasks submit, finished
+    /// items for every other command that takes it.
     #[arg(long, global = true, help_heading = "Global Options")]
     joblog: Option<PathBuf>,
 
