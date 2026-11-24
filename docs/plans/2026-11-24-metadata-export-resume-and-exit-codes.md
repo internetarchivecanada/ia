@@ -19,7 +19,9 @@ that no file holds. The rerun skips those items and has no rows to read back.
   complete new one), and only then are the pending `ok` entries appended to
   the joblog. Error entries are written as they happen, since they claim no
   row.
-- The file is rewritten:
+- The file is rewritten (mid-run and on Ctrl+C only with `--joblog`; without
+  one there is no resume, so the file is written once, at the end, and an
+  interrupted run leaves an earlier file untouched):
   - at the end of the run;
   - on Ctrl+C (SIGINT): pending rows are written, then the command exits 130,
     as `ia download` does;
@@ -27,7 +29,8 @@ that no file holds. The rerun skips those items and has no rows to read back.
     `max(5 s, 10 × the duration of the last rewrite)` has passed since the
     last rewrite. The 5 s floor bounds the work a hard kill loses; the
     10 × term keeps rewrite time under about a tenth of the run as the file
-    grows. Fixed rule, no flag.
+    grows. Fixed rule, no flag. A mid-run rewrite that fails is a warning and
+    is tried again at the next one; the final write failing is an error.
 - JSONL file and stdout: the line is written (one `write_all` per line) before
   the joblog entry, which today comes first.
 
