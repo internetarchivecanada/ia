@@ -329,20 +329,36 @@ impl Export {
     }
 }
 
-/// Every item the joblog marks `export` `ok` has a row in `out`.
+/// Every item whose latest `export` entry in the joblog is `ok` has a row
+/// in `out`.
 fn assert_every_marked_item_has_a_row(joblog: &Path, out: &Path) {
     let log = fs::read_to_string(joblog).unwrap_or_default();
     let content = fs::read_to_string(out).unwrap_or_default();
+    let mut latest = std::collections::BTreeMap::new();
     for line in log.lines() {
         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
-        if entry["op"] == "export" && entry["status"] == "ok" {
-            let id = entry["item"].as_str().unwrap();
+        if entry["op"] == "export" {
+            latest.insert(
+                entry["item"].as_str().unwrap().to_string(),
+                entry["status"] == "ok",
+            );
+        }
+    }
+    for (id, ok) in latest {
+        if ok {
             assert!(
                 content.lines().any(|l| l.starts_with(&format!("{id},"))),
                 "joblog marks {id} done but the file has no row for it:\n{content}\njoblog:\n{log}"
             );
         }
     }
+}
+
+/// Root ignores directory and file modes, so a test that relies on them
+/// cannot run as root.
+fn running_as_root() -> bool {
+    // SAFETY: geteuid(2) has no preconditions.
+    unsafe { libc::geteuid() == 0 }
 }
 
 fn ok_line(id: &str) -> String {
@@ -401,7 +417,17 @@ async fn no_resume_interrupt_keeps_rows_the_joblog_marks_done() {
     // Past the 5 s a mid-run rewrite waits for.
     wait_requested(&server, "item-a", Duration::from_secs(6)).await;
     signal(&child, libc::SIGINT);
-    child.wait().unwrap();
+    // --no-resume installs no Ctrl+C handler, so SIGINT has its inherited
+    // disposition, which is "ignore" under a backgrounded shell: then kill.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            signal(&child, libc::SIGKILL);
+            child.wait().unwrap();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert_every_marked_item_has_a_row(&export.joblog(), &out);
     assert_eq!(fs::read_to_string(&out).unwrap(), earlier);
@@ -473,6 +499,9 @@ async fn run_with_no_rows_leaves_the_file() {
 #[tokio::test]
 async fn interrupt_with_failing_write_exits_130() {
     use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
     let export = Export::new("item-a\nitem-b\n");
     let sub = export.dir.path().join("sub");
     fs::create_dir(&sub).unwrap();
@@ -558,6 +587,9 @@ async fn export_through_a_symlink_keeps_the_link() {
 #[tokio::test]
 async fn export_into_a_read_only_directory_writes_in_place() {
     use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
     let export = Export::new("item-a\n");
     let sub = export.dir.path().join("sub");
     fs::create_dir(&sub).unwrap();
@@ -611,4 +643,79 @@ async fn export_into_a_fifo_writes_it_once() {
         .expect("nothing was written into the FIFO")
         .unwrap();
     assert_eq!(got, "identifier,title\nitem-a,A\n");
+}
+
+/// A `--no-resume` run that fails an item an earlier run marked done leaves
+/// it not done (its latest entry is the error), so the next run fetches it
+/// again instead of skipping an item with no row.
+#[tokio::test]
+async fn no_resume_failure_unmarks_an_item() {
+    let export = Export::new("item-x\nitem-y\n");
+    fs::write(export.out(), "identifier,title\nitem-x,X\n").unwrap();
+    fs::write(export.joblog(), ok_line("item-x")).unwrap();
+
+    let first = MockServer::start().await;
+    mount(&first, "item-x", serde_json::json!({}), Duration::ZERO).await;
+    mount(&first, "item-y", item_body("item-y", "Y"), Duration::ZERO).await;
+    let out = export.out();
+    let output = export
+        .command_into(&first, Some(&out), true, &["--no-resume"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_every_marked_item_has_a_row(&export.joblog(), &out);
+
+    let second = MockServer::start().await;
+    mount(&second, "item-x", item_body("item-x", "X2"), Duration::ZERO).await;
+    let output = export.run(&second);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(rows(&out), vec!["item-x,X2", "item-y,Y"]);
+}
+
+/// The format comes from the `-o` name, not from the name of the file a
+/// symlink there points to.
+#[tokio::test]
+async fn export_through_a_symlink_uses_the_format_of_the_o_name() {
+    let export = Export::new("item-a\n");
+    let real = export.dir.path().join("data.tsv");
+    fs::write(&real, "identifier\ttitle\n").unwrap();
+    std::os::unix::fs::symlink(&real, export.out()).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let out = export.out();
+    let output = export
+        .command_into(&server, Some(&out), false, &[])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "identifier,title\nitem-a,A\n"
+    );
+}
+
+/// A read-only output file is not replaced: the export fails to write it,
+/// as it did before the rename.
+#[tokio::test]
+async fn export_does_not_replace_a_read_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
+    let export = Export::new("item-a\n");
+    let earlier = "identifier,title\nitem-z,Z\n";
+    fs::write(export.out(), earlier).unwrap();
+    fs::set_permissions(export.out(), fs::Permissions::from_mode(0o444)).unwrap();
+
+    let server = MockServer::start().await;
+    mount(&server, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
+    let out = export.out();
+    let output = export
+        .command_into(&server, Some(&out), true, &[])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(&out).unwrap(), earlier);
+    assert!(!joblog_marks_ok(&export.joblog(), "item-a"));
 }
