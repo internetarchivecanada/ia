@@ -1114,8 +1114,10 @@ async fn finish_part(
         if let Some(mtime) =
             last_modified.or_else(|| file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t)))
         {
-            let _ =
-                filetime::set_file_mtime(file_path, filetime::FileTime::from_system_time(mtime));
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(file_path)
+                .and_then(|f| f.set_modified(mtime));
         }
     }
 
