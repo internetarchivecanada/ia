@@ -284,3 +284,73 @@ async fn audit_no_input_shows_help() {
         .failure()
         .stderr(predicate::str::contains("No input provided"));
 }
+
+/// An item that cannot be fetched makes the audit exit 1 and is named (#189).
+#[tokio::test]
+async fn audit_exits_1_when_item_fetch_fails() {
+    let server = MockServer::start().await;
+    setup_schema_mock(&server).await;
+    setup_mock(&server, "clean-item", clean_item_json()).await;
+    // The Metadata API answers an identifier with no item with `{}`.
+    setup_mock(&server, "missing", "{}").await;
+
+    let host = server.uri().replace("http://", "");
+    let output = assert_cmd::cargo_bin_cmd!("ia-cli")
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "audit",
+            "clean-item",
+            "missing",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "audit of an unfetchable item exited {:?}; stderr: {stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("1 of 2 item(s) could not be fetched: missing"),
+        "stderr should name the item: {stderr}"
+    );
+}
+
+/// With `--json`, the failed item's line carries `{"code", "message"}` and
+/// the audit exits 1.
+#[tokio::test]
+async fn audit_json_exits_1_when_item_fetch_fails() {
+    let server = MockServer::start().await;
+    setup_schema_mock(&server).await;
+    setup_mock(&server, "missing", "{}").await;
+
+    let host = server.uri().replace("http://", "");
+    let output = assert_cmd::cargo_bin_cmd!("ia-cli")
+        .args([
+            "--host",
+            &host,
+            "--insecure",
+            "metadata",
+            "audit",
+            "missing",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(line["identifier"], "missing");
+    assert!(line["error"]["code"].is_string(), "{line}");
+    assert!(
+        line["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("item not found: missing"),
+        "{line}"
+    );
+}
