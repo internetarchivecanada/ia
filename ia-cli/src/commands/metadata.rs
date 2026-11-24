@@ -157,10 +157,12 @@ pub enum MetadataCommand {
             or JSONL format (inferred from extension). In file mode, multi-value fields \
             are expanded into indexed columns: subject[0], subject[1], etc.\n\n\
             The joblog marks an item done only once its output is written. With \
-            --joblog, a CSV, TSV or XLSX file is also rewritten every few seconds \
-            while rows wait and on Ctrl+C (exit 130), so rerunning the same \
-            command after an interruption resumes without losing or doubling rows. \
-            Without --joblog it is written once, at the end.\n\n\
+            --joblog (and without --no-resume), a CSV, TSV or XLSX file is also \
+            rewritten every few seconds while rows wait and on Ctrl+C (exit 130), \
+            so rerunning the same command after an interruption resumes without \
+            losing or doubling rows. Otherwise, and when -o is not a regular file \
+            or its directory is read-only, the file is written once, at the end, \
+            and an interrupted run leaves an earlier file as it was.\n\n\
             Exits 1 when any item could not be fetched, after writing the items \
             that could; the error names the items that failed.",
         after_long_help = cstr!(
@@ -1547,6 +1549,7 @@ fn print_export_summary(
     elapsed_secs: f64,
     errors_shown: usize,
     output_path: Option<&Path>,
+    has_joblog: bool,
     quiet: u8,
 ) {
     if quiet >= 2 {
@@ -1559,8 +1562,9 @@ fn print_export_summary(
     let overflow = errors_shown.saturating_sub(MAX_INLINE_ERRORS);
     if overflow > 0 && quiet == 0 {
         eprintln!(
-            "  {} {overflow} more error(s) (see joblog)",
+            "  {} {overflow} more error(s){}",
             style("...").dim(),
+            if has_joblog { " (see joblog)" } else { "" },
         );
     }
 
@@ -1619,9 +1623,14 @@ fn print_export_summary(
     // Warning for failures
     if failed > 0 {
         eprintln!(
-            "{} {} item(s) failed — re-run the same command to retry (auto-resume skips completed items)",
+            "{} {} item(s) failed — re-run the same command to retry{}",
             style("warning:").yellow().bold(),
             failed,
+            if has_joblog {
+                " (auto-resume skips completed items)"
+            } else {
+                ""
+            },
         );
     }
 }
@@ -1645,6 +1654,52 @@ const SHEET_CHECKPOINT_MIN: std::time::Duration = std::time::Duration::from_secs
 /// run.
 const SHEET_CHECKPOINT_FACTOR: u32 = 10;
 
+/// How a spreadsheet export reaches its output path.
+enum SheetTarget {
+    /// Written whole to a hidden sibling of `file` (the output path, or the
+    /// file a symlink there points to), given `file`'s mode, and renamed over
+    /// it: the file on disk is always complete.
+    Replace { file: PathBuf },
+    /// Written at the output path itself: the target exists and is not a
+    /// regular file (a FIFO, `/dev/fd/N`), or no file can be created beside
+    /// it. Not atomic, so written only once, at the end.
+    InPlace,
+}
+
+impl SheetTarget {
+    /// Decide, before any request, how `path` can be written.
+    fn for_path(path: &Path) -> Self {
+        let file = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(path) {
+                Ok(real) => real,
+                // A dangling link: writing the path creates its target.
+                Err(_) => return Self::InPlace,
+            },
+            Ok(_) => path.to_path_buf(),
+            Err(_) => path.to_path_buf(),
+        };
+        match std::fs::metadata(&file) {
+            Ok(meta) if !meta.is_file() => return Self::InPlace,
+            _ => {}
+        }
+        // Can a file be created beside it? A sibling left by a kill during
+        // an earlier write is replaced.
+        let partial = sheet_partial_path(&file);
+        let _ = std::fs::remove_file(&partial);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&partial);
+                Self::Replace { file }
+            }
+            Err(_) => Self::InPlace,
+        }
+    }
+}
+
 /// The rows of a CSV, TSV or XLSX export and the joblog entries that wait
 /// for them.
 ///
@@ -1657,6 +1712,7 @@ const SHEET_CHECKPOINT_FACTOR: u32 = 10;
 /// already held for its identifier.
 struct SheetExport<'a> {
     path: &'a Path,
+    target: SheetTarget,
     records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
     /// Position in `records` of each identifier's row.
     rows: HashMap<String, usize>,
@@ -1667,7 +1723,11 @@ struct SheetExport<'a> {
 }
 
 impl<'a> SheetExport<'a> {
-    fn new(path: &'a Path, records: Vec<ia_core::spreadsheet::SpreadsheetRecord>) -> Self {
+    fn new(
+        path: &'a Path,
+        target: SheetTarget,
+        records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
+    ) -> Self {
         let rows = records
             .iter()
             .enumerate()
@@ -1675,6 +1735,7 @@ impl<'a> SheetExport<'a> {
             .collect();
         Self {
             path,
+            target,
             records,
             rows,
             pending: Vec::new(),
@@ -1695,6 +1756,17 @@ impl<'a> SheetExport<'a> {
         self.pending.push(entry);
     }
 
+    /// Whether the file can be rewritten safely before the end (it is
+    /// replaced by rename, not written in place).
+    fn can_checkpoint(&self) -> bool {
+        matches!(self.target, SheetTarget::Replace { .. })
+    }
+
+    /// Whether rows were fetched since the last write.
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// After a failed rewrite: wait a full interval before the next try.
     fn postpone(&mut self) {
         self.last_write = Instant::now();
@@ -1712,12 +1784,30 @@ impl<'a> SheetExport<'a> {
     /// Rewrite the file with every row, then mark the pending rows done.
     fn write(&mut self, joblog: Option<&JoblogWriter>) -> Result<()> {
         let started = Instant::now();
-        let partial = sheet_partial_path(self.path);
-        let written = ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
-            .map_err(anyhow::Error::from)
-            .and_then(|()| std::fs::rename(&partial, self.path).map_err(anyhow::Error::from));
+        let written = match &self.target {
+            SheetTarget::InPlace => {
+                ia_core::spreadsheet::write_spreadsheet(self.path, &self.records)
+                    .map_err(anyhow::Error::from)
+            }
+            SheetTarget::Replace { file } => {
+                let partial = sheet_partial_path(file);
+                let written = ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|()| {
+                        // Keep the mode of the file being replaced.
+                        if let Ok(meta) = std::fs::metadata(file) {
+                            std::fs::set_permissions(&partial, meta.permissions())?;
+                        }
+                        std::fs::rename(&partial, file)?;
+                        Ok(())
+                    });
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&partial);
+                }
+                written
+            }
+        };
         if let Err(e) = written {
-            let _ = std::fs::remove_file(&partial);
             return Err(e.context(format!(
                 "failed to write export file: {}",
                 self.path.display()
@@ -1866,12 +1956,13 @@ async fn run_export(
     }
 
     // CSV/TSV/XLSX on resume: read the rows already in the output file, to
-    // merge with the new ones, keeping the case of each key as written. The
-    // file is rewritten at the end, so a file that cannot be read stops the
-    // export before any request: starting fresh would drop the rows of the
-    // items the joblog skips.
+    // merge with the new ones, keeping the case of each key as written. This
+    // happens whenever the joblog marks any item done, in this run's list or
+    // not, so the rewritten file keeps a row for every item it marks. The
+    // file is rewritten, so a file that cannot be read stops the export
+    // before any request: starting fresh would drop those rows.
     let resumed_records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = match &args.output {
-        Some(path) if skipped > 0 && !is_jsonl_path(path) && path.exists() => {
+        Some(path) if !skip_set.is_empty() && !is_jsonl_path(path) && path.exists() => {
             ia_core::spreadsheet::read_exported_spreadsheet(path).with_context(|| {
                 format!(
                     "cannot resume the export into {}: its existing rows cannot be read, \
@@ -1882,6 +1973,12 @@ async fn run_export(
             })?
         }
         _ => Vec::new(),
+    };
+
+    // How a spreadsheet output is written, decided before any request.
+    let sheet_target = match &args.output {
+        Some(path) if !is_jsonl_path(path) => Some(SheetTarget::for_path(path)),
+        _ => None,
     };
 
     // Open joblog writer
@@ -2035,15 +2132,24 @@ async fn run_export(
                 .context(format!("failed to open export file: {}", path.display()))?,
         ),
         // CSV/TSV/XLSX: the rows read back on resume, then the new ones.
-        Some(path) => ExportSink::Sheet(SheetExport::new(path, resumed_records)),
+        Some(path) => ExportSink::Sheet(SheetExport::new(
+            path,
+            sheet_target.unwrap_or(SheetTarget::InPlace),
+            resumed_records,
+        )),
     };
 
     // With a joblog, an interrupted spreadsheet export can be resumed, so the
-    // file is rewritten while rows wait and on Ctrl+C. Without one there is
-    // no resume, and the file is written only at the end, leaving an earlier
-    // file untouched by an interrupted run. JSONL and stdout keep Ctrl+C's
+    // file is rewritten while rows wait and on Ctrl+C. Not without one (no
+    // resume), not with --no-resume (nothing was read back, and the joblog
+    // still marks the earlier run's items done, so an early rewrite would
+    // drop their rows), and not when the file is written in place (not
+    // atomic). Then the file is written only at the end, and an interrupted
+    // run leaves an earlier file as it was. JSONL and stdout keep Ctrl+C's
     // default (exit at once): every line is already written.
-    let checkpoints = joblog.is_some() && matches!(sink, ExportSink::Sheet(_));
+    let checkpoints = joblog.is_some()
+        && !no_resume
+        && matches!(&sink, ExportSink::Sheet(sheet) if sheet.can_checkpoint());
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut watch_ctrl_c = checkpoints;
@@ -2175,7 +2281,21 @@ async fn run_export(
     match &mut sink {
         ExportSink::Stdout { .. } => {}
         ExportSink::Jsonl(f) => f.flush().context("failed to flush export file")?,
-        ExportSink::Sheet(sheet) => sheet.write(joblog.as_ref())?,
+        // Nothing new: an existing file is left as it is. A run with no rows
+        // and no file still creates one.
+        ExportSink::Sheet(sheet)
+            if !sheet.has_pending() && (interrupted || sheet.path.exists()) => {}
+        ExportSink::Sheet(sheet) => {
+            if let Err(e) = sheet.write(joblog.as_ref()) {
+                if !interrupted {
+                    return Err(e);
+                }
+                // Interrupted: the rows stay unmarked, the rerun fetches them.
+                if quiet < 2 {
+                    eprintln!("{} {e:#}", style("error:").red().bold());
+                }
+            }
+        }
     }
 
     if interrupted {
@@ -2198,6 +2318,7 @@ async fn run_export(
         start.elapsed().as_secs_f64(),
         errors_shown.load(Ordering::Relaxed),
         args.output.as_deref(),
+        joblog.is_some(),
         quiet,
     );
     if quiet < 2 {
