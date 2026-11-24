@@ -123,3 +123,22 @@ holds no row for it.** These rules hold it:
      `main`: no mid-run or Ctrl+C rewrite, since an in-place write is not
      atomic and a FIFO reader would see the file more than once. The joblog
      entries still follow the write.
+
+### Second review
+
+6. **An item is done when its latest `export` entry is `ok`.** A
+   `--no-resume` run that fails an item an earlier run exported writes the
+   file without its row; its `error` entry, being latest, makes it not
+   done, so the next run fetches it.
+7. **The format comes from the `-o` name**, also when a symlink there
+   points to a file with another extension.
+8. **A read-only output file is written in place**, which fails as on
+   `main`, instead of being replaced by rename. Only a regular file is read
+   back (a FIFO would block).
+9. **In-place writes are not atomic.** A kill or a full disk during one can
+   truncate the file; the invariant is stated for files replaced by rename,
+   and the documentation says so.
+10. Not changed: a symlink planted at the hidden sibling's name between the
+    probe and the write (shared writable directories only); an output
+    directory that does not exist still fails at the final write, as on
+    `main`.

@@ -160,8 +160,9 @@ pub enum MetadataCommand {
             --joblog (and without --no-resume), a CSV, TSV or XLSX file is also \
             rewritten every few seconds while rows wait and on Ctrl+C (exit 130), \
             so rerunning the same command after an interruption resumes without \
-            losing or doubling rows. Otherwise, and when -o is not a regular file \
-            or its directory is read-only, the file is written once, at the end, \
+            losing or doubling rows. Otherwise, and when -o is not a regular file, \
+            is read-only, or is in a read-only directory, the file is written \
+            once, at the end, \
             and an interrupted run leaves an earlier file as it was.\n\n\
             Exits 1 when any item could not be fetched, after writing the items \
             that could; the error names the items that failed.",
@@ -1539,6 +1540,24 @@ fn completed_items_from_joblog(path: &Path, op: &str) -> Result<HashSet<String>>
         .collect())
 }
 
+/// Items whose latest `export` entry in the joblog is `ok`. Only the latest
+/// entry counts: a `--no-resume` run that fails an item an earlier run
+/// exported rewrites the file without its row, so that item is no longer
+/// done.
+fn exported_items_from_joblog(path: &Path) -> Result<HashSet<String>> {
+    let entries = ia_core::joblog::read(path)
+        .with_context(|| format!("failed to read joblog: {}", path.display()))?;
+    let mut latest: HashMap<&str, bool> = HashMap::new();
+    for e in entries.iter().filter(|e| e.op == "export") {
+        latest.insert(e.item.as_str(), e.status == "ok");
+    }
+    Ok(latest
+        .into_iter()
+        .filter(|&(_, ok)| ok)
+        .map(|(item, _)| item.to_string())
+        .collect())
+}
+
 /// Print the export summary footer to stderr.
 #[allow(clippy::too_many_arguments)]
 fn print_export_summary(
@@ -1679,12 +1698,14 @@ impl SheetTarget {
             Err(_) => path.to_path_buf(),
         };
         match std::fs::metadata(&file) {
-            Ok(meta) if !meta.is_file() => return Self::InPlace,
+            // Not a regular file, or one its owner made read-only: written in
+            // place, which fails for a read-only file as it should.
+            Ok(meta) if !meta.is_file() || meta.permissions().readonly() => return Self::InPlace,
             _ => {}
         }
         // Can a file be created beside it? A sibling left by a kill during
         // an earlier write is replaced.
-        let partial = sheet_partial_path(&file);
+        let partial = sheet_partial_path(&file, path);
         let _ = std::fs::remove_file(&partial);
         match std::fs::OpenOptions::new()
             .write(true)
@@ -1790,7 +1811,7 @@ impl<'a> SheetExport<'a> {
                     .map_err(anyhow::Error::from)
             }
             SheetTarget::Replace { file } => {
-                let partial = sheet_partial_path(file);
+                let partial = sheet_partial_path(file, self.path);
                 let written = ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
                     .map_err(anyhow::Error::from)
                     .and_then(|()| {
@@ -1824,19 +1845,20 @@ impl<'a> SheetExport<'a> {
     }
 }
 
-/// The hidden sibling a spreadsheet export is written to before it is
-/// renamed over `path`: `.<name>.partial.<ext>`, keeping the extension that
-/// picks the format.
-fn sheet_partial_path(path: &Path) -> PathBuf {
-    let name = path
+/// The hidden sibling of `file` a spreadsheet export is written to before
+/// it is renamed over `file`: `.<name>.partial.<ext>`, where `<ext>` is the
+/// extension of `output` (the `-o` path), which picks the format even when
+/// `file` is the target of a symlink with another name.
+fn sheet_partial_path(file: &Path, output: &Path) -> PathBuf {
+    let name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let ext = path
+    let ext = output
         .extension()
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!(".{name}.partial.{ext}"))
+    file.with_file_name(format!(".{name}.partial.{ext}"))
 }
 
 /// An item's metadata as spreadsheet columns: a list becomes `key[0]`,
@@ -1926,7 +1948,7 @@ async fn run_export(
     // unless --no-resume.
     let skip_set: HashSet<String> = if let (false, Some(path)) = (no_resume, joblog_path.as_ref()) {
         if path.exists() {
-            completed_items_from_joblog(path, "export")?
+            exported_items_from_joblog(path)?
         } else {
             HashSet::new()
         }
@@ -1962,7 +1984,12 @@ async fn run_export(
     // file is rewritten, so a file that cannot be read stops the export
     // before any request: starting fresh would drop those rows.
     let resumed_records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = match &args.output {
-        Some(path) if !skip_set.is_empty() && !is_jsonl_path(path) && path.exists() => {
+        // Only a regular file is read back: a FIFO would block the read.
+        Some(path)
+            if !skip_set.is_empty()
+                && !is_jsonl_path(path)
+                && std::fs::metadata(path).is_ok_and(|m| m.is_file()) =>
+        {
             ia_core::spreadsheet::read_exported_spreadsheet(path).with_context(|| {
                 format!(
                     "cannot resume the export into {}: its existing rows cannot be read, \
@@ -2154,6 +2181,7 @@ async fn run_export(
     tokio::pin!(ctrl_c);
     let mut watch_ctrl_c = checkpoints;
     let mut interrupted = false;
+    let mut interrupted_write_failed = false;
     let mut failed_ids: Vec<String> = Vec::new();
 
     loop {
@@ -2291,6 +2319,7 @@ async fn run_export(
                     return Err(e);
                 }
                 // Interrupted: the rows stay unmarked, the rerun fetches them.
+                interrupted_write_failed = true;
                 if quiet < 2 {
                     eprintln!("{} {e:#}", style("error:").red().bold());
                 }
@@ -2299,7 +2328,7 @@ async fn run_export(
     }
 
     if interrupted {
-        if quiet < 2 {
+        if quiet < 2 && !interrupted_write_failed {
             if let Some(ref path) = args.output {
                 eprintln!(
                     "interrupted: rows exported so far are in {}; re-run the same command to resume",
