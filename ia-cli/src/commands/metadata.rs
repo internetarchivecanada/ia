@@ -1858,9 +1858,12 @@ impl<'a> SheetExport<'a> {
 }
 
 /// Create the hidden sibling `partial` empty, before the spreadsheet writer
-/// fills it, with the mode of `file` when it exists (on Unix), so the rows
-/// are never readable more widely than the file they will replace. A stale
-/// sibling is removed first, since an existing file keeps its own mode.
+/// fills it, with the permission bits of `file` when it exists (on Unix), so
+/// the rows are never readable more widely than the file they will replace.
+/// Owner read and write are added: the writer reopens the sibling by path,
+/// and its owner is this user, so that widens nothing; `file`'s exact mode
+/// is set before the rename. A stale sibling is removed first, since an
+/// existing file keeps its own mode.
 fn create_sheet_partial(partial: &Path, file: &Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(partial);
     let mut options = std::fs::OpenOptions::new();
@@ -1869,7 +1872,7 @@ fn create_sheet_partial(partial: &Path, file: &Path) -> std::io::Result<()> {
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         if let Ok(meta) = std::fs::metadata(file) {
-            options.mode(meta.permissions().mode() & 0o7777);
+            options.mode((meta.permissions().mode() & 0o777) | 0o600);
         }
     }
     #[cfg(not(unix))]

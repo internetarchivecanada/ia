@@ -145,11 +145,15 @@ holds no row for it.** These rules hold it:
 
 ### Third review
 
-11. **The sibling is created with the target's mode** (on Unix, `OpenOptions::mode`,
-    removing any stale sibling first since an existing file keeps its mode),
-    so the rows are never readable more widely than the file they replace.
+11. **The sibling is created with the target's permission bits plus owner
+    read and write** (on Unix, `OpenOptions::mode`, removing any stale
+    sibling first since an existing file keeps its mode), so the rows are
+    never readable more widely than the file they replace. Owner read and
+    write are needed because the writer reopens the sibling by path; the
+    owner is this user, so it widens nothing, and the exact mode is set
+    before the rename.
 12. **Writability is checked for the current user** by opening the existing
     output for append (nothing is written). A file the user cannot write is
-    refused before any request with the permission error, as the final
-    write on `main` failed on it; this replaces the `readonly()` check,
+    refused before any metadata request (with `--search`, after the search)
+    with the permission error, as the final write on `main` failed on it; this replaces the `readonly()` check,
     which missed modes such as 0477. Rule 8's read-only case is now this.
