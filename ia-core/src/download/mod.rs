@@ -1114,8 +1114,10 @@ async fn finish_part(
         if let Some(mtime) =
             last_modified.or_else(|| file.mtime.map(|t| UNIX_EPOCH + Duration::from_secs(t)))
         {
-            let _ =
-                filetime::set_file_mtime(file_path, filetime::FileTime::from_system_time(mtime));
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .open(file_path)
+                .and_then(|f| f.set_modified(mtime));
         }
     }
 
@@ -2382,6 +2384,71 @@ mod tests {
 
         let content = std::fs::read_to_string(dir.path().join("test.txt")).unwrap();
         assert_eq!(content, "hello world test content");
+    }
+
+    /// A plain 200 with no Last-Modified: the finished file gets the mtime
+    /// from the item's metadata.
+    #[tokio::test]
+    async fn finished_file_takes_metadata_mtime_when_no_last_modified() {
+        let mock_server = MockServer::start().await;
+        let body = b"hello world test content";
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test.txt", body.len() as u64); // mtime 1700000000
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(mtime_secs(&dir.path().join("test.txt")), 1_700_000_000);
+    }
+
+    /// A plain 200 with Last-Modified: the header wins over the metadata
+    /// mtime.
+    #[tokio::test]
+    async fn finished_file_takes_last_modified_header_over_metadata_mtime() {
+        let mock_server = MockServer::start().await;
+        let body = b"hello world test content";
+        // 1500000000 = Fri, 14 Jul 2017 02:40:00 GMT
+        Mock::given(method("GET"))
+            .and(path("/download/test-item/test.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("Last-Modified", "Fri, 14 Jul 2017 02:40:00 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+        let client = IaClient::from_config(mock_config(&mock_server.uri())).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = test_file_meta("test.txt", body.len() as u64); // mtime 1700000000
+
+        let result = download_file(
+            &client,
+            "test-item",
+            &file,
+            dir.path(),
+            &DownloadOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, DownloadStatus::Complete);
+        assert_eq!(mtime_secs(&dir.path().join("test.txt")), 1_500_000_000);
     }
 
     #[tokio::test]
