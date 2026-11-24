@@ -719,3 +719,37 @@ async fn export_does_not_replace_a_read_only_file() {
     assert_eq!(fs::read_to_string(&out).unwrap(), earlier);
     assert!(!joblog_marks_ok(&export.joblog(), "item-a"));
 }
+
+/// An output file its owner cannot write, though another write bit is set
+/// (mode 0477), is refused before any request, as a file that cannot be
+/// written was before, not replaced by rename.
+#[tokio::test]
+async fn export_refuses_a_file_the_user_cannot_write() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return;
+    }
+    let export = Export::new("item-a\n");
+    let earlier = "identifier,title\nitem-z,Z\n";
+    fs::write(export.out(), earlier).unwrap();
+    fs::set_permissions(export.out(), fs::Permissions::from_mode(0o477)).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metadata/item-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item_body("item-a", "A")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let out = export.out();
+    let output = export
+        .command_into(&server, Some(&out), true, &[])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("ermission denied"), "stderr: {stderr}");
+    assert_eq!(fs::read_to_string(&out).unwrap(), earlier);
+    let mode = fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o477, "the file was replaced");
+}

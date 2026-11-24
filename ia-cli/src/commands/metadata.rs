@@ -1812,8 +1812,12 @@ impl<'a> SheetExport<'a> {
             }
             SheetTarget::Replace { file } => {
                 let partial = sheet_partial_path(file, self.path);
-                let written = ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
+                let written = create_sheet_partial(&partial, file)
                     .map_err(anyhow::Error::from)
+                    .and_then(|()| {
+                        ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
+                            .map_err(anyhow::Error::from)
+                    })
                     .and_then(|()| {
                         // Keep the mode of the file being replaced.
                         if let Ok(meta) = std::fs::metadata(file) {
@@ -1843,6 +1847,12 @@ impl<'a> SheetExport<'a> {
         }
         Ok(())
     }
+}
+
+/// Create the hidden sibling `partial` empty, before the spreadsheet writer
+/// fills it.
+fn create_sheet_partial(partial: &Path, _file: &Path) -> std::io::Result<()> {
+    std::fs::File::create(partial).map(|_| ())
 }
 
 /// The hidden sibling of `file` a spreadsheet export is written to before
@@ -3395,6 +3405,29 @@ pub fn extract_compound_from_argv(
 
 #[cfg(test)]
 mod tests {
+    /// The hidden sibling is never more permissive than the file it will
+    /// replace: it is created with that file's mode, before any row is
+    /// written into it (the umask can only remove bits).
+    #[cfg(unix)]
+    #[test]
+    fn sheet_partial_is_created_with_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.csv");
+        std::fs::write(&file, "identifier\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let partial = super::sheet_partial_path(&file, &file);
+
+        super::create_sheet_partial(&partial, &file).unwrap();
+
+        let mode = std::fs::metadata(&partial).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "sibling created with mode {mode:o}, more permissive than 600"
+        );
+    }
+
     use super::*;
     use ia_core::metadata::write::MetadataOp;
 
