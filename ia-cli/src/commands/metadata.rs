@@ -160,9 +160,8 @@ pub enum MetadataCommand {
             --joblog (and without --no-resume), a CSV, TSV or XLSX file is also \
             rewritten every few seconds while rows wait and on Ctrl+C (exit 130), \
             so rerunning the same command after an interruption resumes without \
-            losing or doubling rows. Otherwise, and when -o is not a regular file, \
-            is read-only, or is in a read-only directory, the file is written \
-            once, at the end, \
+            losing or doubling rows. Otherwise, and when -o is not a regular file \
+            or is in a read-only directory, the file is written once, at the end, \
             and an interrupted run leaves an earlier file as it was.\n\n\
             Exits 1 when any item could not be fetched, after writing the items \
             that could; the error names the items that failed.",
@@ -1686,22 +1685,31 @@ enum SheetTarget {
 }
 
 impl SheetTarget {
-    /// Decide, before any request, how `path` can be written.
-    fn for_path(path: &Path) -> Self {
+    /// Decide, before any request, how `path` can be written. An existing
+    /// file the user cannot write is refused here, as the final write would
+    /// fail on it, rather than replaced by rename.
+    fn for_path(path: &Path) -> Result<Self> {
         let file = match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(path) {
                 Ok(real) => real,
                 // A dangling link: writing the path creates its target.
-                Err(_) => return Self::InPlace,
+                Err(_) => return Ok(Self::InPlace),
             },
             Ok(_) => path.to_path_buf(),
             Err(_) => path.to_path_buf(),
         };
         match std::fs::metadata(&file) {
-            // Not a regular file, or one its owner made read-only: written in
-            // place, which fails for a read-only file as it should.
-            Ok(meta) if !meta.is_file() || meta.permissions().readonly() => return Self::InPlace,
-            _ => {}
+            // Not a regular file: written in place.
+            Ok(meta) if !meta.is_file() => return Ok(Self::InPlace),
+            // A regular file: can this user write it? Opening it for append
+            // writes nothing and checks access as the final write would.
+            Ok(_) => {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&file)
+                    .with_context(|| format!("cannot write export file: {}", path.display()))?;
+            }
+            Err(_) => {}
         }
         // Can a file be created beside it? A sibling left by a kill during
         // an earlier write is replaced.
@@ -1714,9 +1722,9 @@ impl SheetTarget {
         {
             Ok(_) => {
                 let _ = std::fs::remove_file(&partial);
-                Self::Replace { file }
+                Ok(Self::Replace { file })
             }
-            Err(_) => Self::InPlace,
+            Err(_) => Ok(Self::InPlace),
         }
     }
 }
@@ -1850,9 +1858,23 @@ impl<'a> SheetExport<'a> {
 }
 
 /// Create the hidden sibling `partial` empty, before the spreadsheet writer
-/// fills it.
-fn create_sheet_partial(partial: &Path, _file: &Path) -> std::io::Result<()> {
-    std::fs::File::create(partial).map(|_| ())
+/// fills it, with the mode of `file` when it exists (on Unix), so the rows
+/// are never readable more widely than the file they will replace. A stale
+/// sibling is removed first, since an existing file keeps its own mode.
+fn create_sheet_partial(partial: &Path, file: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(partial);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(meta) = std::fs::metadata(file) {
+            options.mode(meta.permissions().mode() & 0o7777);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    options.open(partial).map(|_| ())
 }
 
 /// The hidden sibling of `file` a spreadsheet export is written to before
@@ -2014,7 +2036,7 @@ async fn run_export(
 
     // How a spreadsheet output is written, decided before any request.
     let sheet_target = match &args.output {
-        Some(path) if !is_jsonl_path(path) => Some(SheetTarget::for_path(path)),
+        Some(path) if !is_jsonl_path(path) => Some(SheetTarget::for_path(path)?),
         _ => None,
     };
 
@@ -2340,10 +2362,17 @@ async fn run_export(
     if interrupted {
         if quiet < 2 && !interrupted_write_failed {
             if let Some(ref path) = args.output {
-                eprintln!(
-                    "interrupted: rows exported so far are in {}; re-run the same command to resume",
-                    path.display()
-                );
+                if path.exists() {
+                    eprintln!(
+                        "interrupted: rows exported so far are in {}; re-run the same command to resume",
+                        path.display()
+                    );
+                } else {
+                    eprintln!(
+                        "interrupted before any row was exported; {} was not written",
+                        path.display()
+                    );
+                }
             }
         }
         std::process::exit(130);

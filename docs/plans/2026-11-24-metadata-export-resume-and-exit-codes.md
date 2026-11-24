@@ -142,3 +142,14 @@ holds no row for it.** These rules hold it:
     probe and the write (shared writable directories only); an output
     directory that does not exist still fails at the final write, as on
     `main`.
+
+### Third review
+
+11. **The sibling is created with the target's mode** (on Unix, `OpenOptions::mode`,
+    removing any stale sibling first since an existing file keeps its mode),
+    so the rows are never readable more widely than the file they replace.
+12. **Writability is checked for the current user** by opening the existing
+    output for append (nothing is written). A file the user cannot write is
+    refused before any request with the permission error, as the final
+    write on `main` failed on it; this replaces the `readonly()` check,
+    which missed modes such as 0477. Rule 8's read-only case is now this.
