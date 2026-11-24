@@ -24,7 +24,7 @@ A task is identified by the item, the command and the task arguments:
 - `item`: the identifier, as today.
 - `file`: the task key, the command with `.php` appended when missing (as
   `ia_core::tasks::submit_task` sends it), followed, when the task has
-  arguments, by a space and the arguments as a JSON object with sorted keys.
+  arguments other than `comment`, by a space and the arguments as a JSON object with sorted keys.
   Examples: `derive.php`, `derive.php {"remove_derived":"*.jpg"}`.
 
 The comment, priority, `--reduced-priority` and `-p` values are not part of
@@ -48,7 +48,8 @@ task to be submitted twice. Only entries written by this version can tell a
 
 Each `ok` entry covers one row: of several rows with the same item and key
 (identical spreadsheet rows), as many are skipped as the joblog has `ok`
-entries for that key, and the rest are submitted. Two identical rows where
+entries for that key (the earliest rows in input order), and the rest are
+submitted. Two identical rows where
 one failed are therefore retried once on the rerun. An `ok` entry counts
 whatever came after it: a task IA accepted is not sent again from the same
 joblog, even if a later `--no-resume` run recorded an error for it. A

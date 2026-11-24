@@ -114,7 +114,9 @@ pub enum TasksCommand {
         long_about = "Submit a new task.\n\n\
             With --joblog, each task is recorded as soon as IA accepts or refuses it, \
             and a rerun with the same joblog skips every task it records as accepted: \
-            the same item, command and --args, whatever the comment or priority.",
+            the same item, command and --args, whatever the comment or priority \
+            (a comment argument is not compared either). Each accepted entry covers \
+            one row, so of identical rows where one failed, one is submitted again.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Submit a derive task</dim>\

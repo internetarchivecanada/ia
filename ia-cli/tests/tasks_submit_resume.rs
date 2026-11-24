@@ -759,3 +759,57 @@ async fn tasks_resume_key_leaves_out_comment_arg() {
         joblog_text(&log)
     );
 }
+
+/// A spreadsheet `args.comment` column is left out of the key, and the other
+/// arguments stay in it.
+#[tokio::test]
+async fn tasks_resume_key_drops_comment_column_keeps_other_args() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(13))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let host = server.uri().replace("http://", "");
+
+    let sheet = dir.path().join("jobs.csv");
+    std::fs::write(
+        &sheet,
+        "identifier,cmd,args.comment,args.remove_derived\nitem-a,derive,first,*.jpg\n",
+    )
+    .unwrap();
+    let out = run(
+        &host,
+        &log,
+        &["tasks", "submit", "--spreadsheet", sheet.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        joblog_text(&log).contains(r#""file":"derive.php {\"remove_derived\":\"*.jpg\"}""#),
+        "joblog: {}",
+        joblog_text(&log)
+    );
+
+    std::fs::write(
+        &sheet,
+        "identifier,cmd,args.comment,args.remove_derived\nitem-a,derive,second,*.jpg\n",
+    )
+    .unwrap();
+    let out = run(
+        &host,
+        &log,
+        &["tasks", "submit", "--spreadsheet", sheet.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(posts(&server, "derive.php", None).await, 1);
+}
