@@ -161,7 +161,7 @@ async fn export_csv_resume_after_interrupt_keeps_rows() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     signal(&child, libc::SIGINT);
-    child.wait().unwrap();
+    let status = child.wait().unwrap();
 
     let second = MockServer::start().await;
     mount(&second, "item-a", item_body("item-a", "A"), Duration::ZERO).await;
@@ -170,6 +170,11 @@ async fn export_csv_resume_after_interrupt_keeps_rows() {
     assert!(output.status.success(), "{output:?}");
 
     let content = fs::read_to_string(export.out()).unwrap_or_default();
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "Ctrl+C should write the pending rows and exit 130; file:\n{content}"
+    );
     assert_eq!(
         rows(&export.out()),
         vec!["item-a,A", "item-b,B"],

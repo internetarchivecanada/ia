@@ -952,11 +952,11 @@ fn metadata_export_accepts_file_positional_arg() {
     let csv_path = dir.path().join("items.csv");
     std::fs::write(&csv_path, "identifier,title\ntest-item-nonexistent,Test\n").unwrap();
 
-    // Should succeed (reads identifier from CSV, fetches metadata)
-    // Not fail with "unknown argument" or "unexpected argument"
+    // Exits 1: the identifier is read from the CSV, and its fetch fails
+    // against the closed test host (an argument error would exit 2).
     ia().args(["metadata", "export", csv_path.to_str().unwrap()])
         .assert()
-        .success();
+        .code(1);
 }
 
 #[test]
@@ -982,10 +982,11 @@ fn metadata_export_plain_text_itemlist() {
     let path = dir.path().join("ids.txt");
     std::fs::write(&path, "test-nonexistent-id\n").unwrap();
 
-    // Should succeed (reads identifiers from plain text, fetches metadata)
+    // Exits 1: the identifier is read, and its fetch fails against the
+    // closed test host (an argument error would exit 2).
     ia().args(["metadata", "export", path.to_str().unwrap()])
         .assert()
-        .success();
+        .code(1);
 }
 
 #[test]
@@ -996,7 +997,8 @@ fn metadata_export_multiple_files() {
     std::fs::write(&csv1, "identifier\nid1\n").unwrap();
     std::fs::write(&csv2, "identifier\nid2\n").unwrap();
 
-    // Should succeed with 2 items from 2 files
+    // Exits 1: both items are read from the 2 files, and their fetches
+    // fail against the closed test host.
     ia().args([
         "metadata",
         "export",
@@ -1004,7 +1006,7 @@ fn metadata_export_multiple_files() {
         csv2.to_str().unwrap(),
     ])
     .assert()
-    .success();
+    .code(1);
 }
 
 #[test]
@@ -1249,7 +1251,7 @@ fn metadata_export_writes_joblog() {
         log.to_str().unwrap(),
     ])
     .assert()
-    .success();
+    .code(1);
 
     let content = std::fs::read_to_string(&log).unwrap();
     assert!(!content.is_empty(), "joblog should have entries");
@@ -1267,7 +1269,7 @@ fn metadata_export_progress_bar_shown() {
     // separator and stats are always printed
     ia().args(["metadata", "export", "--itemlist", ids.to_str().unwrap()])
         .assert()
-        .success()
+        .code(1)
         .stderr(predicate::str::contains("──────────"));
 }
 
@@ -1280,7 +1282,7 @@ fn metadata_export_shows_summary_stats() {
     // Summary should show "items exported" and "fetched"
     ia().args(["metadata", "export", "--itemlist", ids.to_str().unwrap()])
         .assert()
-        .success()
+        .code(1)
         .stderr(predicate::str::contains("items exported"))
         .stderr(predicate::str::contains("fetched"));
 }
@@ -1300,7 +1302,7 @@ fn metadata_export_quiet_suppresses_progress() {
         "-q",
     ])
     .assert()
-    .success()
+    .code(1)
     .stderr(predicate::str::contains("Exporting metadata...").not())
     .stderr(predicate::str::contains("items exported"));
 }
@@ -1430,7 +1432,7 @@ fn metadata_export_resume_appends_to_jsonl() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .success()
+    .code(1)
     .stderr(predicate::str::contains("previously completed"));
 
     // Original record must still be present (JSONL appends, doesn't truncate)
@@ -1472,7 +1474,7 @@ fn metadata_export_resume_csv_merges_existing() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .success()
+    .code(1)
     .stderr(predicate::str::contains("previously completed"));
 
     // Original record must still be present after CSV merge

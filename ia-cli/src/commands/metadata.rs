@@ -155,7 +155,14 @@ pub enum MetadataCommand {
             and stdin are read as one identifier per line.\n\n\
             Outputs JSONL to stdout by default, or writes to a file in CSV, TSV, XLSX, \
             or JSONL format (inferred from extension). In file mode, multi-value fields \
-            are expanded into indexed columns: subject[0], subject[1], etc.",
+            are expanded into indexed columns: subject[0], subject[1], etc.\n\n\
+            The joblog marks an item done only once its output is written. With \
+            --joblog, a CSV, TSV or XLSX file is also rewritten every few seconds \
+            while rows wait and on Ctrl+C (exit 130), so rerunning the same \
+            command after an interruption resumes without losing or doubling rows. \
+            Without --joblog it is written once, at the end.\n\n\
+            Exits 1 when any item could not be fetched, after writing the items \
+            that could; the error names the items that failed.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Export from a CSV file</dim>\n  <bold>$ ia metadata export items.csv</bold>\
@@ -253,7 +260,10 @@ pub enum MetadataCommand {
             and repeatability violations.\n\n\
             Fetches the live schema from archive.org and compares each item's \
             metadata against it. Every metadata field of the item is checked \
-            against its schema entry.",
+            against its schema entry.\n\n\
+            Exits 1 when any item could not be fetched, after reporting the items \
+            that could; the error names the items that failed. Findings alone do \
+            not change the exit status.",
         after_long_help = cstr!(
             "<bold><underline>Examples:</underline></bold>\n\
              \n  <dim># Audit a single item</dim>\n  <bold>$ ia metadata audit myitem</bold>\
@@ -1219,7 +1229,7 @@ async fn run_audit(
 
     // Concurrent fetch + audit.
     let sem = Arc::new(Semaphore::new(concurrency));
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<AuditResult, (String, String)>>(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<AuditResult, (String, IaError)>>(64);
 
     let feeder_client = client.clone();
     let field_filter: Arc<Vec<String>> = Arc::new(args.field.clone());
@@ -1253,7 +1263,7 @@ async fn run_audit(
 
                         Ok(audit)
                     }
-                    Err(e) => Err((identifier, format!("{e:#}"))),
+                    Err(e) => Err((identifier, e)),
                 };
 
                 drop(permit);
@@ -1264,7 +1274,7 @@ async fn run_audit(
 
     // Collect results.
     let mut results: Vec<AuditResult> = Vec::new();
-    let mut fetch_errors: Vec<(String, String)> = Vec::new();
+    let mut fetch_errors: Vec<(String, IaError)> = Vec::new();
     let mut items_with_findings = 0usize;
     let mut error_count = 0usize;
     let mut warning_count = 0usize;
@@ -1311,12 +1321,12 @@ async fn run_audit(
             serde_json::to_writer(&mut out, result)?;
             writeln!(out)?;
         }
-        for (id, msg) in &fetch_errors {
+        for (id, e) in &fetch_errors {
             serde_json::to_writer(
                 &mut out,
                 &json!({
                     "identifier": id,
-                    "error": msg,
+                    "error": e.to_json_error().error,
                 }),
             )?;
             writeln!(out)?;
@@ -1339,8 +1349,8 @@ async fn run_audit(
             eprintln!();
         }
 
-        for (id, msg) in &fetch_errors {
-            eprintln!("{} {} — {}", style(ICON_ERROR).red(), style(id).bold(), msg);
+        for (id, e) in &fetch_errors {
+            eprintln!("{} {} — {e:#}", style(ICON_ERROR).red(), style(id).bold());
         }
     }
 
@@ -1370,6 +1380,20 @@ async fn run_audit(
         }
     }
 
+    // Any item that could not be fetched fails the audit, after the items
+    // that could were reported. With `--json` on stdout each such item's line
+    // names it, as `modify --json` does.
+    if !fetch_errors.is_empty() {
+        if args.json && args.output.is_none() {
+            std::process::exit(1);
+        }
+        let ids: Vec<String> = fetch_errors.iter().map(|(id, _)| id.clone()).collect();
+        bail!(
+            "{}",
+            failed_items_message("could not be fetched", &ids, total, false)
+        );
+    }
+
     Ok(())
 }
 
@@ -1381,7 +1405,7 @@ async fn run_audit(
 fn write_audit_file(
     path: &Path,
     results: &[AuditResult],
-    fetch_errors: &[(String, String)],
+    fetch_errors: &[(String, IaError)],
 ) -> Result<()> {
     let mut records: Vec<ia_core::spreadsheet::SpreadsheetRecord> = Vec::new();
 
@@ -1400,11 +1424,11 @@ fn write_audit_file(
         }
     }
 
-    for (id, msg) in fetch_errors {
+    for (id, e) in fetch_errors {
         let mut fields = HashMap::new();
         fields.insert("field".to_string(), String::new());
         fields.insert("severity".to_string(), "error".to_string());
-        fields.insert("message".to_string(), msg.clone());
+        fields.insert("message".to_string(), format!("{e:#}"));
         records.push((id.clone(), fields));
     }
 
@@ -1600,6 +1624,197 @@ fn print_export_summary(
             failed,
         );
     }
+}
+
+/// Where `metadata export` writes each fetched item.
+enum ExportSink<'a> {
+    /// JSONL on stdout.
+    Stdout { pretty: bool },
+    /// A JSONL file, appended to line by line.
+    Jsonl(std::fs::File),
+    /// A CSV, TSV or XLSX file, rewritten whole.
+    Sheet(SheetExport<'a>),
+}
+
+/// The shortest wait between two rewrites of a spreadsheet export while
+/// rows are pending: it bounds the fetched rows a hard kill can lose.
+const SHEET_CHECKPOINT_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The wait between rewrites is at least this many times the last rewrite's
+/// duration, so rewriting a growing file takes at most about a tenth of the
+/// run.
+const SHEET_CHECKPOINT_FACTOR: u32 = 10;
+
+/// The rows of a CSV, TSV or XLSX export and the joblog entries that wait
+/// for them.
+///
+/// A row reaches the file before the joblog marks its item done: the file
+/// is written whole to a hidden sibling and renamed over the output, and
+/// only then are the pending `ok` entries appended. A crash before the
+/// rename leaves the earlier file and no `ok` entries, so the rerun fetches
+/// those items again. A crash after it leaves rows the joblog does not mark,
+/// so the rerun fetches those items again, and each new row replaces the row
+/// already held for its identifier.
+struct SheetExport<'a> {
+    path: &'a Path,
+    records: Vec<ia_core::spreadsheet::SpreadsheetRecord>,
+    /// Position in `records` of each identifier's row.
+    rows: HashMap<String, usize>,
+    /// `ok` entries for rows not yet in the file.
+    pending: Vec<JoblogEntry>,
+    last_write: Instant,
+    last_write_took: std::time::Duration,
+}
+
+impl<'a> SheetExport<'a> {
+    fn new(path: &'a Path, records: Vec<ia_core::spreadsheet::SpreadsheetRecord>) -> Self {
+        let rows = records
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.clone(), i))
+            .collect();
+        Self {
+            path,
+            records,
+            rows,
+            pending: Vec::new(),
+            last_write: Instant::now(),
+            last_write_took: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Hold a fetched row; `entry` is written to the joblog with the file.
+    fn add(&mut self, identifier: String, fields: HashMap<String, String>, entry: JoblogEntry) {
+        match self.rows.get(&identifier) {
+            Some(&i) => self.records[i].1 = fields,
+            None => {
+                self.rows.insert(identifier.clone(), self.records.len());
+                self.records.push((identifier, fields));
+            }
+        }
+        self.pending.push(entry);
+    }
+
+    /// After a failed rewrite: wait a full interval before the next try.
+    fn postpone(&mut self) {
+        self.last_write = Instant::now();
+    }
+
+    /// When the file is next due to be rewritten, if any row is pending.
+    fn next_checkpoint(&self) -> Option<Instant> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let wait = SHEET_CHECKPOINT_MIN.max(self.last_write_took * SHEET_CHECKPOINT_FACTOR);
+        Some(self.last_write + wait)
+    }
+
+    /// Rewrite the file with every row, then mark the pending rows done.
+    fn write(&mut self, joblog: Option<&JoblogWriter>) -> Result<()> {
+        let started = Instant::now();
+        let partial = sheet_partial_path(self.path);
+        let written = ia_core::spreadsheet::write_spreadsheet(&partial, &self.records)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| std::fs::rename(&partial, self.path).map_err(anyhow::Error::from));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e.context(format!(
+                "failed to write export file: {}",
+                self.path.display()
+            )));
+        }
+        self.last_write = Instant::now();
+        self.last_write_took = started.elapsed();
+        for entry in self.pending.drain(..) {
+            if let Some(jl) = joblog {
+                jl.write(&entry);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The hidden sibling a spreadsheet export is written to before it is
+/// renamed over `path`: `.<name>.partial.<ext>`, keeping the extension that
+/// picks the format.
+fn sheet_partial_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.partial.{ext}"))
+}
+
+/// An item's metadata as spreadsheet columns: a list becomes `key[0]`,
+/// `key[1]`, ...; empty values and `identifier` are left out.
+fn flatten_metadata(item: &ia_core::types::ItemMetadata) -> Result<HashMap<String, String>> {
+    fn text(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+    let mut fields = HashMap::new();
+    if let serde_json::Value::Object(map) = serde_json::to_value(&item.metadata)? {
+        for (key, value) in map {
+            if key == "identifier" {
+                continue;
+            }
+            match &value {
+                serde_json::Value::Null => {}
+                serde_json::Value::Array(arr) if arr.len() == 1 => {
+                    let s = text(&arr[0]);
+                    if !s.is_empty() {
+                        fields.insert(key, s);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for (i, elem) in arr.iter().enumerate() {
+                        let s = text(elem);
+                        if !s.is_empty() {
+                            fields.insert(format!("{key}[{i}]"), s);
+                        }
+                    }
+                }
+                other => {
+                    let s = text(other);
+                    if !s.is_empty() {
+                        fields.insert(key, s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// How many identifiers a failure message names before `and N more`.
+const MAX_NAMED_FAILURES: usize = 10;
+
+/// `<n> of <total> item(s) <what>: a, b, ...`, naming the first
+/// [`MAX_NAMED_FAILURES`] identifiers.
+fn failed_items_message(what: &str, ids: &[String], total: usize, has_joblog: bool) -> String {
+    let mut msg = format!(
+        "{} of {total} item(s) {what}: {}",
+        ids.len(),
+        ids.iter()
+            .take(MAX_NAMED_FAILURES)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let more = ids.len().saturating_sub(MAX_NAMED_FAILURES);
+    if more > 0 {
+        msg.push_str(&format!(" and {more} more"));
+        if has_joblog {
+            msg.push_str(" (see the joblog)");
+        }
+    }
+    msg
 }
 
 async fn run_export(
@@ -1807,240 +2022,204 @@ async fn run_export(
         // tx dropped here — signals completion to rx
     });
 
-    if let Some(ref path) = args.output {
-        // Detect JSONL output for streaming writes
-        let is_jsonl = is_jsonl_path(path);
-
-        // JSONL: open in append mode for streaming writes (resilient to Ctrl+C).
-        // CSV/XLSX: collect records in memory for unified column computation.
-        let mut jsonl_file = if is_jsonl {
-            Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .context(format!("failed to open export file: {}", path.display()))?,
-            )
-        } else {
-            None
-        };
-
+    let mut sink = match &args.output {
+        None => ExportSink::Stdout {
+            pretty: args.pretty,
+        },
+        // JSONL: append each line as it arrives.
+        Some(path) if is_jsonl_path(path) => ExportSink::Jsonl(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .context(format!("failed to open export file: {}", path.display()))?,
+        ),
         // CSV/TSV/XLSX: the rows read back on resume, then the new ones.
-        let mut records = resumed_records;
+        Some(path) => ExportSink::Sheet(SheetExport::new(path, resumed_records)),
+    };
 
-        while let Some((identifier, result, elapsed_ms)) = rx.recv().await {
-            match result {
-                Ok(item) => {
-                    let json_bytes = serde_json::to_string(&item)
-                        .map(|s| s.len() as u64)
-                        .unwrap_or(0);
-                    if let Some(ref jl) = joblog {
-                        jl.write(
-                            &JoblogEntry::new("export", &identifier, "").ok(json_bytes, elapsed_ms),
-                        );
-                    }
-                    bytes_total.fetch_add(json_bytes, Ordering::Relaxed);
-                    succeeded.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref pb) = pb {
-                        pb.inc(1);
-                    }
+    // With a joblog, an interrupted spreadsheet export can be resumed, so the
+    // file is rewritten while rows wait and on Ctrl+C. Without one there is
+    // no resume, and the file is written only at the end, leaving an earlier
+    // file untouched by an interrupted run. JSONL and stdout keep Ctrl+C's
+    // default (exit at once): every line is already written.
+    let checkpoints = joblog.is_some() && matches!(sink, ExportSink::Sheet(_));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut watch_ctrl_c = checkpoints;
+    let mut interrupted = false;
+    let mut failed_ids: Vec<String> = Vec::new();
 
-                    // JSONL: write full API response immediately (append mode,
-                    // survives Ctrl+C). Identical to stdout mode output.
-                    // CSV/XLSX: extract metadata fields into flat columns.
-                    if let Some(ref mut f) = jsonl_file {
-                        let line = serde_json::to_string(&item)?;
-                        writeln!(f, "{line}").context("failed to write to export file")?;
-                    } else {
-                        let metadata_json = serde_json::to_value(&item.metadata)?;
-                        let mut fields = HashMap::new();
-                        if let serde_json::Value::Object(map) = metadata_json {
-                            for (key, value) in map {
-                                if key == "identifier" {
-                                    continue;
-                                }
-                                match &value {
-                                    serde_json::Value::String(s) => {
-                                        if !s.is_empty() {
-                                            fields.insert(key, s.clone());
-                                        }
-                                    }
-                                    serde_json::Value::Array(arr) if arr.len() == 1 => {
-                                        let s = match &arr[0] {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            other => other.to_string(),
-                                        };
-                                        if !s.is_empty() {
-                                            fields.insert(key, s);
-                                        }
-                                    }
-                                    serde_json::Value::Array(arr) => {
-                                        for (i, elem) in arr.iter().enumerate() {
-                                            let s = match elem {
-                                                serde_json::Value::String(s) => s.clone(),
-                                                other => other.to_string(),
-                                            };
-                                            if !s.is_empty() {
-                                                fields.insert(format!("{key}[{i}]"), s);
-                                            }
-                                        }
-                                    }
-                                    serde_json::Value::Null => {}
-                                    other => {
-                                        let s = other.to_string();
-                                        if !s.is_empty() {
-                                            fields.insert(key, s);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        records.push((identifier, fields));
+    loop {
+        let checkpoint_at = match &sink {
+            ExportSink::Sheet(sheet) if checkpoints => sheet.next_checkpoint(),
+            _ => None,
+        };
+        let received = tokio::select! {
+            received = rx.recv() => received,
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                checkpoint_at.unwrap_or_else(Instant::now),
+            )), if checkpoint_at.is_some() =>
+            {
+                if let ExportSink::Sheet(sheet) = &mut sink {
+                    // The rows stay pending and the next rewrite tries again;
+                    // only the final write is fatal.
+                    if let Err(e) = sheet.write(joblog.as_ref()) {
+                        sheet.postpone();
+                        tracing::warn!(error = %format!("{e:#}"), "export checkpoint failed; will retry");
                     }
                 }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if let Some(ref jl) = joblog {
-                        jl.write(&JoblogEntry::new("export", &identifier, "").error(&msg, 0));
-                    }
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    let shown = errors_shown.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref pb) = pb {
-                        pb.inc(1);
-                    }
-                    if quiet == 0 && shown < MAX_INLINE_ERRORS {
-                        if let Some(ref pb) = pb {
-                            pb.suspend(|| {
-                                eprintln!(
-                                    "{} {} — {}",
-                                    style(ICON_ERROR).red(),
-                                    style(&identifier).bold(),
-                                    style(&msg).red(),
-                                );
-                            });
+                continue;
+            }
+            res = &mut ctrl_c, if watch_ctrl_c => {
+                if res.is_ok() {
+                    interrupted = true;
+                    break;
+                }
+                // No handler could be installed: Ctrl+C keeps its default.
+                watch_ctrl_c = false;
+                continue;
+            }
+        };
+        let Some((identifier, result, elapsed_ms)) = received else {
+            break;
+        };
+        match result {
+            Ok(item) => {
+                let json_bytes = serde_json::to_string(&item)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                let entry = JoblogEntry::new("export", &identifier, "").ok(json_bytes, elapsed_ms);
+                // The item's output is written before the joblog marks it
+                // done, so a rerun never skips an item whose output is lost.
+                match &mut sink {
+                    ExportSink::Stdout { pretty } => {
+                        let output = if *pretty {
+                            serde_json::to_string_pretty(&item)?
                         } else {
-                            eprintln!(
-                                "{} {} — {}",
-                                style(ICON_ERROR).red(),
-                                style(&identifier).bold(),
-                                style(&msg).red(),
-                            );
+                            serde_json::to_string(&item)?
+                        };
+                        if let Some(ref pb) = pb {
+                            pb.suspend(|| println!("{output}"));
+                        } else {
+                            println!("{output}");
+                        }
+                        if let Some(ref jl) = joblog {
+                            jl.write(&entry);
                         }
                     }
+                    ExportSink::Jsonl(f) => {
+                        // Full API response, identical to stdout mode; one
+                        // write per line.
+                        let mut line = serde_json::to_string(&item)?;
+                        line.push('\n');
+                        f.write_all(line.as_bytes())
+                            .context("failed to write to export file")?;
+                        if let Some(ref jl) = joblog {
+                            jl.write(&entry);
+                        }
+                    }
+                    ExportSink::Sheet(sheet) => {
+                        // Marked done when the file holding the row is written.
+                        sheet.add(identifier, flatten_metadata(&item)?, entry);
+                    }
+                }
+                bytes_total.fetch_add(json_bytes, Ordering::Relaxed);
+                succeeded.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
                 }
             }
-        }
-
-        if let Some(ref pb) = pb {
-            pb.finish_and_clear();
-        }
-
-        // CSV/TSV/XLSX: write all records (existing + new) at once.
-        // JSONL was already streamed above — just flush.
-        if let Some(mut f) = jsonl_file {
-            f.flush().context("failed to flush export file")?;
-        } else {
-            ia_core::spreadsheet::write_spreadsheet(path, &records)
-                .context(format!("failed to write export file: {}", path.display()))?;
-        }
-
-        print_export_summary(
-            succeeded.load(Ordering::Relaxed),
-            failed.load(Ordering::Relaxed),
-            skipped,
-            bytes_total.load(Ordering::Relaxed),
-            start.elapsed().as_secs_f64(),
-            errors_shown.load(Ordering::Relaxed),
-            Some(path.as_path()),
-            quiet,
-        );
-        if quiet < 2 {
-            print_retry_summary(client.retry_stats());
-        }
-    } else {
-        // Stdout mode: stream results as they complete (no buffering).
-        while let Some((identifier, result, elapsed_ms)) = rx.recv().await {
-            match result {
-                Ok(item) => {
-                    let json_bytes = serde_json::to_string(&item)
-                        .map(|s| s.len() as u64)
-                        .unwrap_or(0);
-                    if let Some(ref jl) = joblog {
-                        jl.write(
-                            &JoblogEntry::new("export", &identifier, "").ok(json_bytes, elapsed_ms),
-                        );
-                    }
-                    bytes_total.fetch_add(json_bytes, Ordering::Relaxed);
-                    succeeded.fetch_add(1, Ordering::Relaxed);
-
-                    let output = if args.pretty {
-                        serde_json::to_string_pretty(&item)?
-                    } else {
-                        serde_json::to_string(&item)?
-                    };
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if let Some(ref jl) = joblog {
+                    jl.write(&JoblogEntry::new("export", &identifier, "").error(&msg, 0));
+                }
+                failed.fetch_add(1, Ordering::Relaxed);
+                let shown = errors_shown.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
+                }
+                if quiet == 0 && shown < MAX_INLINE_ERRORS {
+                    let line = format!(
+                        "{} {} — {}",
+                        style(ICON_ERROR).red(),
+                        style(&identifier).bold(),
+                        style(&msg).red(),
+                    );
                     if let Some(ref pb) = pb {
-                        pb.suspend(|| println!("{output}"));
-                        pb.inc(1);
+                        pb.suspend(|| eprintln!("{line}"));
                     } else {
-                        println!("{output}");
+                        eprintln!("{line}");
                     }
                 }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if let Some(ref jl) = joblog {
-                        jl.write(&JoblogEntry::new("export", &identifier, "").error(&msg, 0));
-                    }
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    let shown = errors_shown.fetch_add(1, Ordering::Relaxed);
-                    if let Some(ref pb) = pb {
-                        pb.inc(1);
-                    }
-                    if quiet == 0 && shown < MAX_INLINE_ERRORS {
-                        if let Some(ref pb) = pb {
-                            pb.suspend(|| {
-                                eprintln!(
-                                    "{} {} — {}",
-                                    style(ICON_ERROR).red(),
-                                    style(&identifier).bold(),
-                                    style(&msg).red(),
-                                );
-                            });
-                        } else {
-                            eprintln!(
-                                "{} {} — {}",
-                                style(ICON_ERROR).red(),
-                                style(&identifier).bold(),
-                                style(&msg).red(),
-                            );
-                        }
-                    }
-                }
+                failed_ids.push(identifier);
             }
         }
+    }
 
-        if let Some(ref pb) = pb {
-            pb.finish_and_clear();
-        }
+    if let Some(ref pb) = pb {
+        pb.finish_and_clear();
+    }
 
-        print_export_summary(
-            succeeded.load(Ordering::Relaxed),
-            failed.load(Ordering::Relaxed),
-            skipped,
-            bytes_total.load(Ordering::Relaxed),
-            start.elapsed().as_secs_f64(),
-            errors_shown.load(Ordering::Relaxed),
-            None,
-            quiet,
-        );
+    if interrupted {
+        // A second Ctrl+C quits without waiting for the write below; the
+        // file on disk is then still the last complete version.
+        tokio::spawn(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                std::process::exit(130);
+            }
+        });
+    }
+
+    match &mut sink {
+        ExportSink::Stdout { .. } => {}
+        ExportSink::Jsonl(f) => f.flush().context("failed to flush export file")?,
+        ExportSink::Sheet(sheet) => sheet.write(joblog.as_ref())?,
+    }
+
+    if interrupted {
         if quiet < 2 {
-            print_retry_summary(client.retry_stats());
+            if let Some(ref path) = args.output {
+                eprintln!(
+                    "interrupted: rows exported so far are in {}; re-run the same command to resume",
+                    path.display()
+                );
+            }
         }
+        std::process::exit(130);
+    }
+
+    print_export_summary(
+        succeeded.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+        skipped,
+        bytes_total.load(Ordering::Relaxed),
+        start.elapsed().as_secs_f64(),
+        errors_shown.load(Ordering::Relaxed),
+        args.output.as_deref(),
+        quiet,
+    );
+    if quiet < 2 {
+        print_retry_summary(client.retry_stats());
     }
 
     // Ensure feeder task completes (it should already be done since rx drained).
     feeder
         .await
         .map_err(|e| anyhow::anyhow!("metadata export feeder task panicked: {e}"))?;
+
+    if !failed_ids.is_empty() {
+        bail!(
+            "{}",
+            failed_items_message(
+                "failed",
+                &failed_ids,
+                succeeded.load(Ordering::Relaxed) + failed_ids.len(),
+                joblog_path.is_some(),
+            )
+        );
+    }
 
     Ok(())
 }
