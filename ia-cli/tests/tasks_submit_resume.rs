@@ -647,3 +647,115 @@ async fn tasks_wait_with_everything_recorded_fails() {
     assert_eq!(posts(&server, "derive.php", None).await, 1);
     assert_eq!(polls(&server).await, 0);
 }
+
+/// Two identical spreadsheet rows, one refused: the rerun submits the one
+/// that failed. Each `ok` entry in the joblog covers one matching row, not
+/// every row with that task.
+#[tokio::test]
+async fn tasks_spreadsheet_identical_rows_retry_the_failed_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(11))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sheet = dir.path().join("jobs.csv");
+    std::fs::write(&sheet, "identifier,cmd\nitem-a,derive\nitem-a,derive\n").unwrap();
+    let log = dir.path().join("log.jsonl");
+    let host = server.uri().replace("http://", "");
+    let args = [
+        "tasks",
+        "submit",
+        "-j",
+        "1",
+        "--spreadsheet",
+        sheet.to_str().unwrap(),
+    ];
+
+    let first = run(&host, &log, &args);
+    assert!(!first.status.success(), "one row was refused");
+    assert_eq!(posts(&server, "derive.php", None).await, 2);
+
+    let second = run(&host, &log, &args);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        posts(&server, "derive.php", None).await,
+        3,
+        "the failed row was not retried; rerun stderr: {stderr}"
+    );
+    assert!(second.status.success(), "{stderr}");
+    assert!(stderr.contains("skipping 1 already-submitted"), "{stderr}");
+
+    // A third run: both rows are recorded now, nothing is sent.
+    let third = run(&host, &log, &args);
+    assert!(third.status.success());
+    assert_eq!(posts(&server, "derive.php", None).await, 3);
+}
+
+/// `--args comment=x` and `--comment x` send the same field (`args.comment`),
+/// so neither is part of the task key: rewording the comment either way does
+/// not submit the task again.
+#[tokio::test]
+async fn tasks_resume_key_leaves_out_comment_arg() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/tasks.php"))
+        .respond_with(submit_ok(12))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log.jsonl");
+    let host = server.uri().replace("http://", "");
+
+    let out = run(
+        &host,
+        &log,
+        &[
+            "tasks",
+            "submit",
+            "item-a",
+            "--cmd",
+            "derive",
+            "--args",
+            "comment=first",
+        ],
+    );
+    assert!(out.status.success());
+    let out = run(
+        &host,
+        &log,
+        &[
+            "tasks",
+            "submit",
+            "item-a",
+            "--cmd",
+            "derive",
+            "--comment",
+            "second",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        posts(&server, "derive.php", None).await,
+        1,
+        "joblog: {}",
+        joblog_text(&log)
+    );
+    assert!(
+        joblog_text(&log).contains("\"file\":\"derive.php\""),
+        "joblog: {}",
+        joblog_text(&log)
+    );
+}
